@@ -501,3 +501,25 @@ fn user_mode_code_matches_the_interpreter() {
     assert_eq!(a.eip, b.eip);
     assert_eq!(jit.stats.translated_insns, 4);
 }
+
+#[test]
+fn instruction_across_a_page_end() {
+    let mut code = vec![0x90; 0xffd];
+    code.extend([0xb8, 0x78, 0x56, 0x34, 0x12, 0x40, 0xf4]);
+    let stats = compare(&code, |_| {});
+    assert_eq!(stats.interp_exits, 1, "only the final HLT should be interpreted");
+
+    let mut cpu = flat_cpu(0x1000, 0x8000);
+    let mut bus = bus_with(0x1000, &code);
+    let _vm = VM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut jit = unsafe { Jit::new(bus.ram.as_ptr(), RAM).unwrap() };
+    for round in 0..2 {
+        cpu.eip = 0x1000;
+        cpu.halted = false;
+        while !cpu.halted {
+            jit.run(&mut cpu, &mut bus).unwrap();
+        }
+        assert_eq!(cpu.regs[0], if round == 0 { 0x1234_5679 } else { 0x9934_5679 });
+        bus.ram.as_mut_slice()[0x2001] = 0x99;
+    }
+}

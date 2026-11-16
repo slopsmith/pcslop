@@ -593,16 +593,27 @@ impl Jit {
         self.flush_shadow();
     }
 
-    fn translate_block<B: Bus>(&mut self, bus: &mut B, eip: u32, phys: u32, user: bool) {
+    fn translate_block<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B, eip: u32, phys: u32, user: bool) {
         let key = block_key(phys, user);
         let page = phys & !0xfff;
         let lin_page = eip & !0xfff;
         let block_va = layout::va(self.code_next);
         let rt_va = layout::RUNTIME_VA;
         let entries = self.entries;
+        let next_lin = lin_page.wrapping_add(0x1000);
+        let mut next_phys: Option<Option<u32>> = None;
         let compiled = translate::compile(
             eip,
-            |a| (a & !0xfff == lin_page).then(|| bus.read8(page | (a & 0xfff))),
+            |a| {
+                if a & !0xfff == lin_page {
+                    return Some(bus.read8(page | (a & 0xfff)));
+                }
+                if a & !0xfff != next_lin || next_lin == 0 {
+                    return None;
+                }
+                let p = *next_phys.get_or_insert_with(|| interp::translate(cpu, bus, next_lin, false).ok());
+                p.map(|p| bus.read8(p | (a & 0xfff)))
+            },
             block_va,
             rt_va,
             &entries,
@@ -612,7 +623,7 @@ impl Jit {
         let bytes = compiled.code.len() * 4;
         if self.code_next + bytes > layout::CODE_CACHE_END {
             self.reset_code_cache();
-            return self.translate_block(bus, eip, phys, user);
+            return self.translate_block(cpu, bus, eip, phys, user);
         }
         let code_off = self.code_next;
         self.mem.write_words(code_off, &compiled.code);
@@ -902,7 +913,7 @@ impl Jit {
                             self.insert_lookup(key, va);
                         }
                     }
-                    None => self.translate_block(bus, eip, phys, user),
+                    None => self.translate_block(cpu, bus, eip, phys, user),
                 }
             }
             Err(e) => {

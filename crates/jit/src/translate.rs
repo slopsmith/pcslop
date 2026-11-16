@@ -4,7 +4,7 @@
 //! registers, so a fault on any access leaves the x86 state of the
 //! instruction's start (apart from NZCV, which a restart recomputes).
 
-use a64::{Asm, Cond, Extend, Reg, Shift, Size, Width, ZR, r};
+use a64::{Asm, Cond, Extend, Label, Reg, Shift, Size, Width, ZR, r};
 use x86::decode::{Insn, MemOperand, NO_REG, Rep, decode};
 
 use crate::runtime::{AF_AUX, Entries, ICOUNT, PF_RESULT, STATE, guest_reg};
@@ -137,6 +137,26 @@ impl Emit {
         }
         let off = self.branch_offset(self.dispatch_va);
         self.a.b_offset(off);
+    }
+
+    /// Branches to `slow` unless memory at linear `at` holds `bytes` (1 to 15),
+    /// for the part of an instruction that lies on the next page. NZCV stays.
+    fn check_code_bytes(&mut self, at: u32, bytes: &[u8], slow: Label) {
+        self.a.mov_imm(Size::W, T_ADDR, at as u64);
+        for (i, chunk) in bytes.chunks(8).enumerate() {
+            let mut want = 0u64;
+            for (j, &b) in chunk.iter().enumerate() {
+                want |= (b as u64) << (8 * j);
+            }
+            self.a.ldr(Width::X, T_B, T_ADDR, 8 * i as i32);
+            let drop = 64 - 8 * chunk.len() as u32;
+            if drop != 0 {
+                self.a.lsl_imm(Size::X, T_B, T_B, drop);
+            }
+            self.a.mov_imm(Size::X, T_C, want << drop);
+            self.a.eor(Size::X, T_B, T_B, T_C);
+            self.a.cbnz(Size::X, T_B, slow);
+        }
     }
 
     /// Drops the code from an STI on and leaves the STI to the interpreter,
@@ -1535,7 +1555,8 @@ impl Emit {
 }
 
 /// Translates the block starting at `eip`. `byte(eip)` returns the code byte at
-/// a linear address on the block's page, or `None` past the page.
+/// a linear address on the block's page or the next one, or `None` where it
+/// cannot. Only an instruction that straddles the page end reads the next page.
 pub fn compile(
     eip: u32,
     mut byte: impl FnMut(u32) -> Option<u8>,
@@ -1559,6 +1580,8 @@ pub fn compile(
     let mut insns = 0;
     let mut has_rep = false;
     let mut sti: Option<(usize, u32, usize, usize)> = None;
+    let page = eip & !0xfff;
+    let on_page = |pc: u32| pc & !0xfff == page;
     e.a.nop();
     loop {
         let insn = decode::<()>(true, |i| byte(pc.wrapping_add(i)).ok_or(()));
@@ -1575,12 +1598,39 @@ pub fn compile(
         boundaries.push((e.a.pos() as u32, pc));
         has_rep |= insn.rep != Rep::None && matches!(insn.op, 0xa4..=0xa7 | 0xaa..=0xaf);
         let start = e.a.pos();
+        let end = pc.wrapping_add(insn.len as u32);
+        if !on_page(end.wrapping_sub(1)) {
+            if sti.is_some() {
+                let at = sti.unwrap();
+                e.back_to_sti(at, &mut pc, &mut insns, &mut boundaries);
+                break;
+            }
+            let tail: Vec<u8> = (page.wrapping_add(0x1000)..end).map(|a| byte(a).unwrap_or(0)).collect();
+            let slow = e.a.label();
+            e.check_code_bytes(page.wrapping_add(0x1000), &tail, slow);
+            match e.insn(&insn, pc) {
+                Step::Next => {
+                    insns += 1;
+                    e.goto(end);
+                }
+                Step::End => insns += 1,
+                Step::Unsupported | Step::Sti => {
+                    e.a.code.truncate(start);
+                    e.chains.retain(|&(w, _)| (w as usize) < start);
+                    e.exit_interp(pc);
+                    break;
+                }
+            }
+            e.a.bind(slow);
+            e.exit_interp(pc);
+            break;
+        }
         match e.insn(&insn, pc) {
             Step::Sti if sti.is_none() => {
                 sti = Some((start, pc, insns, boundaries.len() - 1));
                 insns += 1;
                 pc = pc.wrapping_add(insn.len as u32);
-                if insns >= MAX_INSNS || byte(pc).is_none() {
+                if insns >= MAX_INSNS || !on_page(pc) {
                     e.back_to_sti(sti.unwrap(), &mut pc, &mut insns, &mut boundaries);
                     break;
                 }
@@ -1594,7 +1644,7 @@ pub fn compile(
             Step::Next => {
                 insns += 1;
                 pc = pc.wrapping_add(insn.len as u32);
-                if insns >= MAX_INSNS || byte(pc).is_none() {
+                if insns >= MAX_INSNS || !on_page(pc) {
                     e.goto(pc);
                     break;
                 }
