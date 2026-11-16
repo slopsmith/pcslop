@@ -1,10 +1,13 @@
 //! USB 1.1 for the PIIX3 board: the UHCI host controller (PCI 8086:7020)
 //! and the devices plugged into its root ports.
 
+mod control;
+mod tablet;
 mod uhci;
 
 use std::any::Any;
 
+pub use tablet::{MAX_COORD, Tablet};
 pub use uhci::Uhci;
 
 pub const PCI_VENDOR: u16 = 0x8086;
