@@ -19,6 +19,7 @@ const T_B: Reg = Reg(12);
 const T_C: Reg = Reg(13);
 const T_D: Reg = Reg(14);
 const T_E: Reg = Reg(15);
+const CHAIN_TMP: Reg = Reg(16);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Ow {
@@ -60,6 +61,8 @@ pub struct Compiled {
     /// (ARM word index, x86 EIP) at the start of each translated instruction.
     pub boundaries: Vec<(u32, u32)>,
     pub insns: usize,
+    /// (ARM word index of a patchable `b`, target EIP on the same page).
+    pub chains: Vec<(u32, u32)>,
 }
 
 struct Emit {
@@ -67,6 +70,9 @@ struct Emit {
     block_va: u64,
     dispatch_va: u64,
     exit_va: u64,
+    /// Linear page of the block start; jumps within it may be chained.
+    page: Option<u32>,
+    chains: Vec<(u32, u32)>,
 }
 
 enum Step {
@@ -101,6 +107,19 @@ impl Emit {
     }
 
     fn goto(&mut self, eip: u32) {
+        if self.page == Some(eip & !0xfff) {
+            let slow = self.a.label();
+            self.a.ldr(Width::W, CHAIN_TMP, STATE, state::PENDING as i32);
+            self.a.cbnz(Size::W, CHAIN_TMP, slow);
+            self.chains.push((self.a.pos() as u32, eip));
+            self.a.b(slow);
+            self.a.bind(slow);
+        }
+        self.goto_dispatch(eip);
+    }
+
+    /// Jumps through the dispatcher even within the page, so it can check for interrupts.
+    fn goto_dispatch(&mut self, eip: u32) {
         self.a.mov_imm(Size::W, r(0), eip as u64);
         let off = self.branch_offset(self.dispatch_va);
         self.a.b_offset(off);
@@ -607,7 +626,7 @@ impl Emit {
             0xfb => {
                 self.a.movz(Size::W, T_B, 1, 0);
                 self.a.str(Width::W, T_B, STATE, state::IF_FLAG as i32);
-                self.goto(next);
+                self.goto_dispatch(next);
                 return Step::End;
             }
             0x98 if op32 => self.a.sxth(Size::W, guest_reg(0), guest_reg(0)),
@@ -937,12 +956,21 @@ impl Emit {
 
 /// Translates the block starting at `eip`. `byte(eip)` returns the code byte at
 /// a linear address on the block's page, or `None` past the page.
-pub fn compile(eip: u32, mut byte: impl FnMut(u32) -> Option<u8>, block_va: u64, rt_va: u64, rt: &Entries) -> Compiled {
+pub fn compile(
+    eip: u32,
+    mut byte: impl FnMut(u32) -> Option<u8>,
+    block_va: u64,
+    rt_va: u64,
+    rt: &Entries,
+    chain: bool,
+) -> Compiled {
     let mut e = Emit {
         a: Asm::new(),
         block_va,
         dispatch_va: rt_va + rt.dispatch as u64,
         exit_va: rt_va + rt.exit as u64,
+        page: chain.then_some(eip & !0xfff),
+        chains: Vec::new(),
     };
     let mut boundaries = Vec::new();
     let mut pc = eip;
@@ -975,6 +1003,7 @@ pub fn compile(eip: u32, mut byte: impl FnMut(u32) -> Option<u8>, block_va: u64,
             }
             Step::Unsupported => {
                 e.a.code.truncate(start);
+                e.chains.retain(|&(w, _)| (w as usize) < start);
                 e.exit_interp(pc);
                 break;
             }
@@ -984,5 +1013,5 @@ pub fn compile(eip: u32, mut byte: impl FnMut(u32) -> Option<u8>, block_va: u64,
     count.add_imm(Size::X, ICOUNT, ICOUNT, insns as u32);
     let mut code = e.a.finish();
     code[0] = count.code[0];
-    Compiled { code, boundaries, insns }
+    Compiled { code, boundaries, insns, chains: e.chains }
 }

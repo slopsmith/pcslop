@@ -214,6 +214,10 @@ pub struct Jit {
     by_va: BTreeMap<u64, u32>,
     code_pages: HashMap<u32, Vec<u32>>,
     pt_watch: PtWatch,
+    /// Chain sites (code cache offsets) waiting for a block at a physical address.
+    chain_wanted: HashMap<u32, Vec<usize>>,
+    /// Chain sites patched to jump straight into the block at a physical address.
+    chain_in: HashMap<u32, Vec<usize>>,
     /// Shadow leaf entries for non-global x86 mappings, cleared on CR3 loads.
     nonglobal: Vec<usize>,
     /// Linear pages mapped writable in the shadow tables, by physical page.
@@ -280,6 +284,8 @@ impl Jit {
             writable: HashMap::new(),
             nonglobal: Vec::new(),
             pt_watch: PtWatch::default(),
+            chain_wanted: HashMap::new(),
+            chain_in: HashMap::new(),
             stats: Stats::default(),
             interp_profile: std::env::var_os("SLOPPER_JIT_PROFILE").map(|_| HashMap::new()),
             verify: std::env::var_os("SLOPPER_JIT_VERIFY").is_some(),
@@ -419,8 +425,27 @@ impl Jit {
         self.stats.shadow_fills += 1;
     }
 
+    /// Points the `b` at `site` to `target_va`, or back to the slow path right after it.
+    fn patch_chain(&mut self, site: usize, target_va: Option<u64>) {
+        let word = match target_va {
+            Some(va) => {
+                let delta = (va as i64 - layout::va(site) as i64) / 4;
+                0x1400_0000 | (delta as u32 & 0x03ff_ffff)
+            }
+            None => 0x1400_0001,
+        };
+        self.mem.write_words(site, &[word]);
+        self.state().ctl |= ctl::IC_IALLU;
+    }
+
     fn invalidate_code_page(&mut self, page: u32) {
         let Some(eips) = self.code_pages.remove(&page) else { return };
+        for &pa in &eips {
+            for site in self.chain_in.remove(&pa).unwrap_or_default() {
+                self.patch_chain(site, None);
+                self.chain_wanted.entry(pa).or_default().push(site);
+            }
+        }
         for pa in eips {
             if let Some(b) = self.blocks.remove(&pa) {
                 self.by_va.remove(&b.va);
@@ -435,6 +460,8 @@ impl Jit {
     }
 
     fn reset_code_cache(&mut self) {
+        self.chain_wanted.clear();
+        self.chain_in.clear();
         self.blocks.clear();
         self.by_va.clear();
         self.code_pages.clear();
@@ -455,14 +482,35 @@ impl Jit {
             block_va,
             rt_va,
             &entries,
+            !self.verify,
         );
         let bytes = compiled.code.len() * 4;
         if self.code_next + bytes > layout::CODE_CACHE_END {
             self.reset_code_cache();
             return self.translate_block(bus, eip, phys);
         }
-        self.mem.write_words(self.code_next, &compiled.code);
+        let code_off = self.code_next;
+        self.mem.write_words(code_off, &compiled.code);
         self.code_next += bytes.next_multiple_of(16);
+        for &(word, target) in &compiled.chains {
+            let target_pa = page | (target & 0xfff);
+            let site = code_off + word as usize * 4;
+            match self.blocks.get(&target_pa).map(|b| b.va) {
+                Some(va) if target_pa != phys => {
+                    self.patch_chain(site, Some(va));
+                    self.chain_in.entry(target_pa).or_default().push(site);
+                }
+                _ if target_pa == phys => {
+                    self.patch_chain(site, Some(block_va));
+                    self.chain_in.entry(phys).or_default().push(site);
+                }
+                _ => self.chain_wanted.entry(target_pa).or_default().push(site),
+            }
+        }
+        for site in self.chain_wanted.remove(&phys).unwrap_or_default() {
+            self.patch_chain(site, Some(block_va));
+            self.chain_in.entry(phys).or_default().push(site);
+        }
         if !self.verify {
             self.insert_lookup(phys, block_va);
         }
