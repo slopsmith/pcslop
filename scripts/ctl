@@ -3,7 +3,7 @@
 
 Usage: scripts/ctl [SOCKET] COMMAND [COMMAND...]   (each COMMAND is one line, quote it)
 
-Without SOCKET, connects to the newest $TMPDIR/86slopper-PID.sock.
+Without SOCKET, connects to the newest live $TMPDIR/86slopper-PID.sock.
 """
 import glob
 import os
@@ -17,9 +17,19 @@ if args and os.path.exists(args[0]) and stat.S_ISSOCK(os.stat(args[0]).st_mode):
     path = args.pop(0)
 else:
     socks = glob.glob(os.path.join(tempfile.gettempdir(), "86slopper-*.sock"))
-    if not socks:
+    path = None
+    for candidate in sorted(socks, key=os.path.getmtime, reverse=True):
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.connect(candidate)
+            path = candidate
+            break
+        except OSError:
+            pass
+        finally:
+            probe.close()
+    if path is None:
         sys.exit("no running emulator found\n\n" + __doc__)
-    path = max(socks, key=os.path.getmtime)
 if not args:
     sys.exit(__doc__)
 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
