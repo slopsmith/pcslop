@@ -5,6 +5,7 @@ pub mod i8042;
 pub mod pci;
 pub mod pic;
 pub mod pit;
+pub mod ram;
 pub mod rtc;
 
 use std::io::Write;
@@ -20,7 +21,7 @@ pub struct Config {
 }
 
 pub struct Board {
-    ram: Vec<u8>,
+    ram: ram::Ram,
     bios: Vec<u8>,
     a20: bool,
     pci_addr: u32,
@@ -49,7 +50,7 @@ impl Board {
         assert!(cfg.bios.len().is_power_of_two() && cfg.bios.len() >= 0x2_0000, "BIOS must be a power of two >= 128 KiB");
         let ram_bytes = cfg.ram_bytes;
         let mut b = Board {
-            ram: vec![0; ram_bytes as usize],
+            ram: ram::Ram::new(ram_bytes as usize),
             bios: cfg.bios,
             a20: true,
             pci_addr: 0,
@@ -104,6 +105,11 @@ impl Board {
         r[0x3d] = 0x02 | 0x03 << 4;
         r[0x38] = 0x01;
         r[0x5f] = 0;
+    }
+
+    /// Host address and size of guest RAM, which starts at guest physical 0.
+    pub fn ram_region(&mut self) -> (*mut u8, usize) {
+        (self.ram.as_mut_ptr(), self.ram.len())
     }
 
     pub fn now_ns(&self) -> u64 {
@@ -453,7 +459,7 @@ impl Bus for Board {
             return;
         }
         self.ide.set_bus_master_base(self.pci[IDE].1.io_bar(4));
-        if self.ide.io_write(port, size, value, &mut RamDma(&mut self.ram)) {
+        if self.ide.io_write(port, size, value, &mut RamDma(&mut self.ram[..])) {
             self.sync_ide();
             return;
         }
