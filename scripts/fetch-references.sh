@@ -25,6 +25,7 @@ clone berkeley-softfloat-3 https://github.com/ucb-bar/berkeley-softfloat-3.git
 clone test386.asm https://github.com/barotto/test386.asm.git
 clone applecpu https://github.com/dougallj/applecpu.git
 clone asahi-docs https://github.com/AsahiLinux/docs.git
+clone moo https://github.com/dbalsom/moo.git
 
 if [ "${1:-}" = "--tests" ]; then
 	clone SingleStepTests-80386 https://github.com/SingleStepTests/80386.git
