@@ -54,6 +54,27 @@ impl<B: Bus> Bus for Overlay<'_, B> {
     fn io_write(&mut self, _port: u16, _size: u8, _value: u32) {}
 }
 
+/// Adds the time until it is dropped to the stats bucket for one exit kind.
+struct ExitTimer {
+    start: std::time::Instant,
+    slot: u8,
+    stats: *mut Stats,
+}
+
+impl Drop for ExitTimer {
+    fn drop(&mut self) {
+        let ns = self.start.elapsed().as_nanos() as u64;
+        let s = unsafe { &mut *self.stats };
+        match self.slot {
+            0 => s.miss_ns += ns,
+            1 => s.interp_ns += ns,
+            2 => s.fault_ns += ns,
+            3 => s.mmio_ns += ns,
+            _ => {}
+        }
+    }
+}
+
 struct Expected {
     cpu: Cpu,
     writes: HashMap<u32, u8>,
@@ -71,6 +92,12 @@ pub struct Stats {
     pub mmio_exits: u64,
     pub smc_invalidations: u64,
     pub flushes: u64,
+    /// Nanoseconds inside `hv_vcpu_run`, and handling each kind of exit.
+    pub vm_ns: u64,
+    pub miss_ns: u64,
+    pub interp_ns: u64,
+    pub fault_ns: u64,
+    pub mmio_ns: u64,
 }
 
 /// Why `Jit::run` returned.
@@ -314,8 +341,22 @@ impl Jit {
             if self.verify && expected.is_none() {
                 self.state().budget = 0;
             }
+            let t0 = std::time::Instant::now();
             let exit = self.vcpu.run()?;
+            let t1 = std::time::Instant::now();
+            self.stats.vm_ns += (t1 - t0).as_nanos() as u64;
             at_dispatch = true;
+            let kind = match exit {
+                Exit::Exception { .. } if exit.ec() == Some(0x24) => 3,
+                Exit::Exception { .. } if exit.ec() == Some(0x16) => match self.state().reason {
+                    reason::MISS => 0,
+                    reason::INTERP => 1,
+                    reason::FAULT => 2,
+                    _ => 4,
+                },
+                _ => 4,
+            };
+            let _timer = ExitTimer { start: t1, slot: kind, stats: &mut self.stats as *mut Stats };
             if let Some(exp) = expected {
                 let why = self.state().reason;
                 if exit.ec() == Some(0x16) && (why == reason::PENDING || why == reason::INTERP) {

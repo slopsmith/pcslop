@@ -181,7 +181,41 @@ fn random_insn(rng: &mut Rng, out: &mut Vec<u8>) {
         out.push(reg << 3 | 5);
         out.extend((0x3000 + slot * 4).to_le_bytes());
     };
-    match rng.below(20) {
+    match rng.below(30) {
+        20 => {
+            let ops = [0x01, 0x03, 0x09, 0x0b, 0x21, 0x23, 0x29, 0x2b, 0x31, 0x33, 0x39, 0x3b, 0x85, 0x89, 0x8b, 0x87];
+            out.extend([0x66, ops[rng.below(16) as usize], modrm_rr(rng.reg(), rng.reg())]);
+        }
+        21 => {
+            let op = [0, 1, 4, 5, 6, 7][rng.below(6) as usize];
+            if rng.below(2) == 0 {
+                out.extend([0x66, 0x81, modrm_rr(op, rng.reg())]);
+                out.extend((rng.next() as u16).to_le_bytes());
+            } else {
+                out.extend([0x66, 0x83, modrm_rr(op, rng.reg()), rng.next() as u8]);
+            }
+        }
+        22 => {
+            out.extend([0x66, 0xb8 + rng.reg()]);
+            out.extend((rng.next() as u16).to_le_bytes());
+        }
+        23 => out.extend([0x89, 0xe5, 0xc9]),
+        24 => {
+            out.push([0xa1, 0xa3, 0xa0, 0xa2][rng.below(4) as usize]);
+            out.extend((0x3000 + rng.below(4) * 4).to_le_bytes());
+        }
+        25 => out.extend([0xd3, modrm_rr([4, 5, 7][rng.below(3) as usize], rng.reg())]),
+        26 => out.extend([[0x86, 0x87][rng.below(2) as usize], modrm_rr(rng.reg(), rng.reg())]),
+        27 => match rng.below(3) {
+            0 => out.extend([0xf7, modrm_rr(4, rng.reg())]),
+            1 => out.extend([0x6b, modrm_rr(rng.reg(), rng.reg()), rng.next() as u8]),
+            _ => {
+                out.extend([0x69, modrm_rr(rng.reg(), rng.reg())]);
+                out.extend(rng.next().to_le_bytes());
+            }
+        },
+        28 => out.push([0x98, 0x99][rng.below(2) as usize]),
+        29 => out.extend([0xe3, 0x01, 0x40 + rng.reg()]),
         0 | 1 => {
             let ops = [0x01, 0x03, 0x09, 0x0b, 0x11, 0x13, 0x19, 0x1b, 0x21, 0x23, 0x29, 0x2b, 0x31, 0x33, 0x39, 0x3b];
             out.push(ops[rng.below(16) as usize]);

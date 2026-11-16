@@ -19,6 +19,41 @@ const T_B: Reg = Reg(12);
 const T_C: Reg = Reg(13);
 const T_D: Reg = Reg(14);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ow {
+    B,
+    H,
+    D,
+}
+
+impl Ow {
+    fn of(op: u16, op32: bool) -> Ow {
+        if op & 1 == 0 {
+            Ow::B
+        } else if op32 {
+            Ow::D
+        } else {
+            Ow::H
+        }
+    }
+
+    fn mem(self) -> Width {
+        match self {
+            Ow::B => Width::B,
+            Ow::H => Width::H,
+            Ow::D => Width::W,
+        }
+    }
+
+    fn mask(self) -> u64 {
+        match self {
+            Ow::B => 0xff,
+            Ow::H => 0xffff,
+            Ow::D => 0xffff_ffff,
+        }
+    }
+}
+
 pub struct Compiled {
     pub code: Vec<u32>,
     /// (ARM word index, x86 EIP) at the start of each translated instruction.
@@ -182,13 +217,18 @@ impl Emit {
         true
     }
 
-    /// Group-1 operation on 8-bit values in the low bytes of `a` and `b`.
     fn alu8(&mut self, op: usize, a: Reg, b: Reg) -> bool {
+        self.alu_narrow(op, a, b, 24)
+    }
+
+    /// Group-1 operation on the low 32 - `shift` bits of `a` and `b`, done in
+    /// the top bits so NZCV come out right.
+    fn alu_narrow(&mut self, op: usize, a: Reg, b: Reg, shift: u32) -> bool {
         if op == 2 || op == 3 {
             return false;
         }
-        self.a.lsl_imm(Size::W, T_C, a, 24);
-        self.a.lsl_imm(Size::W, T_D, b, 24);
+        self.a.lsl_imm(Size::W, T_C, a, shift);
+        self.a.lsl_imm(Size::W, T_D, b, shift);
         match op {
             0 => {
                 self.a.adds(Size::W, T_RES, T_C, T_D);
@@ -205,7 +245,7 @@ impl Emit {
             }
             _ => self.a.subs(Size::W, T_RES, T_C, T_D),
         }
-        self.a.lsr_imm(Size::W, T_RES, T_RES, 24);
+        self.a.lsr_imm(Size::W, T_RES, T_RES, shift);
         self.a.mov(Size::W, PF_RESULT, T_RES);
         if matches!(op, 1 | 4 | 6) {
             self.a.mov(Size::W, AF_AUX, ZR);
@@ -247,6 +287,122 @@ impl Emit {
             None => self.read_r8(insn.rm(), T_A),
         }
         Some(T_A)
+    }
+
+    fn read_gpr(&mut self, w: Ow, n: usize, scratch: Reg) -> Reg {
+        match w {
+            Ow::D => guest_reg(n),
+            Ow::B => {
+                self.read_r8(n, scratch);
+                scratch
+            }
+            Ow::H => {
+                self.a.uxth(scratch, guest_reg(n));
+                scratch
+            }
+        }
+    }
+
+    fn write_gpr(&mut self, w: Ow, n: usize, src: Reg) {
+        match w {
+            Ow::D => {
+                if guest_reg(n) != src {
+                    self.a.mov(Size::W, guest_reg(n), src);
+                }
+            }
+            Ow::B => self.write_r8(n, src),
+            Ow::H => self.a.bfi(Size::W, guest_reg(n), src, 0, 16),
+        }
+    }
+
+    fn alu(&mut self, op: usize, w: Ow, a: Reg, b: Reg) -> bool {
+        match w {
+            Ow::D => self.alu32(op, a, b),
+            Ow::H => self.alu_narrow(op, a, b, 16),
+            Ow::B => self.alu_narrow(op, a, b, 24),
+        }
+    }
+
+    /// With `probe`, a memory operand is written back first, so the later
+    /// store cannot fault after the flags have changed.
+    fn rm_w(&mut self, insn: &Insn, w: Ow, probe: bool) -> Option<Reg> {
+        match insn.mem {
+            Some(m) => {
+                if !self.ea(insn, &m) {
+                    return None;
+                }
+                self.load(w.mem(), T_A);
+                if probe {
+                    self.store(w.mem(), T_A);
+                }
+                Some(T_A)
+            }
+            None => Some(self.read_gpr(w, insn.rm(), T_A)),
+        }
+    }
+
+    fn write_rm(&mut self, insn: &Insn, w: Ow, src: Reg) {
+        match insn.mem {
+            Some(_) => self.store(w.mem(), src),
+            None => self.write_gpr(w, insn.rm(), src),
+        }
+    }
+
+    /// Sets NZCV from T_RES, with x86 CF in T_B and OF in T_C (each 0 or 1).
+    fn shift_flags(&mut self) {
+        self.a.tst(Size::W, T_RES, T_RES);
+        let ok = self.a.logic_imm(a64::Logic::Eor, Size::W, T_B, T_B, 1);
+        debug_assert!(ok);
+        self.a.logic_shift(a64::Logic::Orr, false, Size::W, T_C, T_C, T_B, Shift::Lsl, 1);
+        self.a.rmif(T_C, 0, 0b0011);
+        self.a.mov(Size::W, PF_RESULT, T_RES);
+    }
+
+    fn shift_cl(&mut self, kind: usize, a: Reg) {
+        let n = T_D;
+        let ok = self.a.logic_imm(a64::Logic::And, Size::W, n, guest_reg(1), 31);
+        debug_assert!(ok);
+        match kind {
+            4 | 6 => {
+                self.a.lslv(Size::W, T_RES, a, n);
+                self.a.movz(Size::W, T_C, 32, 0);
+                self.a.sub(Size::W, T_C, T_C, n);
+                self.a.lsrv(Size::W, T_B, a, T_C);
+                self.a.lsr_imm(Size::W, T_C, T_RES, 31);
+            }
+            5 => {
+                self.a.lsrv(Size::W, T_RES, a, n);
+                self.a.sub_imm(Size::W, T_C, n, 1);
+                self.a.lsrv(Size::W, T_B, a, T_C);
+                self.a.lsr_imm(Size::W, T_C, a, 31);
+            }
+            _ => {
+                self.a.asrv(Size::W, T_RES, a, n);
+                self.a.sub_imm(Size::W, T_C, n, 1);
+                self.a.asrv(Size::W, T_B, a, T_C);
+                self.a.mov(Size::W, T_C, ZR);
+            }
+        }
+        let ok = self.a.logic_imm(a64::Logic::And, Size::W, T_B, T_B, 1);
+        debug_assert!(ok);
+        if matches!(kind, 4 | 6) {
+            self.a.eor(Size::W, T_C, T_C, T_B);
+        }
+        self.shift_flags();
+    }
+
+    /// Signed 32x32 multiply into `dst`, with x86 IMUL flags.
+    fn imul32(&mut self, dst: Reg, a: Reg, b: Reg) {
+        self.a.smull(T_RES, a, b);
+        self.a.addsub_ext(Size::X, true, true, ZR, T_RES, T_RES, Extend::Sxtw, 0);
+        self.a.cset(Size::W, T_B, Cond::Ne);
+        self.a.tst(Size::W, T_RES, T_RES);
+        self.a.movz(Size::W, T_C, 2, 0);
+        self.a.sub(Size::W, T_C, T_C, T_B);
+        self.a.rmif(T_C, 0, 0b0011);
+        self.a.mov(Size::W, PF_RESULT, T_RES);
+        self.a.mov(Size::W, AF_AUX, ZR);
+        self.a.mov(Size::W, dst, T_RES);
     }
 
     fn shift_imm(&mut self, kind: usize, dst: Reg, a: Reg, n: u32) -> bool {
@@ -297,100 +453,36 @@ impl Emit {
         }
         match op {
             0x90 => {}
-            0x00..=0x3f if matches!(op & 7, 1 | 3 | 5) => {
-                if !op32 {
+            0x00..=0x3f if op & 7 < 6 => {
+                let aop = (op >> 3) as usize & 7;
+                let w = Ow::of(op, op32);
+                if w != Ow::D && (aop == 2 || aop == 3) {
                     return Step::Unsupported;
                 }
-                let aop = (op >> 3) as usize & 7;
+                let writes = aop != 7;
                 match op & 7 {
-                    1 => {
-                        let a = match insn.mem {
-                            Some(m) => {
-                                if !self.ea(insn, &m) {
-                                    return Step::Unsupported;
-                                }
-                                self.load(Width::W, T_A);
-                                if aop != 7 {
-                                    self.store(Width::W, T_A);
-                                }
-                                T_A
-                            }
-                            None => guest_reg(insn.rm()),
-                        };
-                        self.alu32(aop, a, guest_reg(insn.reg()));
-                        if aop != 7 {
-                            match insn.mem {
-                                Some(_) => self.store(Width::W, T_RES),
-                                None => self.a.mov(Size::W, guest_reg(insn.rm()), T_RES),
-                            }
+                    0 | 1 => {
+                        let Some(a) = self.rm_w(insn, w, writes) else { return Step::Unsupported };
+                        let b = self.read_gpr(w, insn.reg(), T_B);
+                        self.alu(aop, w, a, b);
+                        if writes {
+                            self.write_rm(insn, w, T_RES);
                         }
                     }
-                    3 => {
-                        let Some(b) = self.rm32(insn) else { return Step::Unsupported };
-                        let dst = guest_reg(insn.reg());
-                        self.alu32(aop, dst, b);
-                        if aop != 7 {
-                            self.a.mov(Size::W, dst, T_RES);
+                    2 | 3 => {
+                        let Some(b) = self.rm_w(insn, w, false) else { return Step::Unsupported };
+                        let a = self.read_gpr(w, insn.reg(), T_B);
+                        self.alu(aop, w, a, b);
+                        if writes {
+                            self.write_gpr(w, insn.reg(), T_RES);
                         }
                     }
                     _ => {
-                        self.a.mov_imm(Size::W, T_B, insn.imm as u64);
-                        self.alu32(aop, guest_reg(0), T_B);
-                        if aop != 7 {
-                            self.a.mov(Size::W, guest_reg(0), T_RES);
-                        }
-                    }
-                }
-            }
-            0x00..=0x3f if matches!(op & 7, 0 | 2 | 4) => {
-                let aop = (op >> 3) as usize & 7;
-                match op & 7 {
-                    0 => {
-                        let a = match insn.mem {
-                            Some(m) => {
-                                if !self.ea(insn, &m) {
-                                    return Step::Unsupported;
-                                }
-                                self.load(Width::B, T_A);
-                                if aop != 7 {
-                                    self.store(Width::B, T_A);
-                                }
-                                T_A
-                            }
-                            None => {
-                                self.read_r8(insn.rm(), T_A);
-                                T_A
-                            }
-                        };
-                        self.read_r8(insn.reg(), T_B);
-                        if !self.alu8(aop, a, T_B) {
-                            return Step::Unsupported;
-                        }
-                        if aop != 7 {
-                            match insn.mem {
-                                Some(_) => self.store(Width::B, T_RES),
-                                None => self.write_r8(insn.rm(), T_RES),
-                            }
-                        }
-                    }
-                    2 => {
-                        let Some(b) = self.rm8(insn) else { return Step::Unsupported };
-                        self.read_r8(insn.reg(), T_B);
-                        if !self.alu8(aop, T_B, b) {
-                            return Step::Unsupported;
-                        }
-                        if aop != 7 {
-                            self.write_r8(insn.reg(), T_RES);
-                        }
-                    }
-                    _ => {
-                        self.read_r8(0, T_A);
-                        self.a.mov_imm(Size::W, T_B, insn.imm as u64 & 0xff);
-                        if !self.alu8(aop, T_A, T_B) {
-                            return Step::Unsupported;
-                        }
-                        if aop != 7 {
-                            self.write_r8(0, T_RES);
+                        let a = self.read_gpr(w, 0, T_A);
+                        self.a.mov_imm(Size::W, T_B, insn.imm as u64 & w.mask());
+                        self.alu(aop, w, a, T_B);
+                        if writes {
+                            self.write_gpr(w, 0, T_RES);
                         }
                     }
                 }
@@ -428,84 +520,51 @@ impl Emit {
                 self.goto(next.wrapping_add(rel));
                 return Step::End;
             }
-            0x80 | 0x81 | 0x83 => {
+            0x80..=0x83 => {
                 let aop = insn.reg();
-                let byte = op == 0x80;
-                if !byte && !op32 {
+                let w = Ow::of(op, op32);
+                if w != Ow::D && (aop == 2 || aop == 3) {
                     return Step::Unsupported;
                 }
-                let imm = match op {
-                    0x81 => insn.imm,
-                    _ => insn.imm as u8 as i8 as i32 as u32,
-                };
-                let w = if byte { Width::B } else { Width::W };
-                let a = match insn.mem {
-                    Some(m) => {
-                        if !self.ea(insn, &m) {
-                            return Step::Unsupported;
-                        }
-                        self.load(w, T_A);
-                        if aop != 7 {
-                            self.store(w, T_A);
-                        }
-                        T_A
-                    }
-                    None if byte => {
-                        self.read_r8(insn.rm(), T_A);
-                        T_A
-                    }
-                    None => guest_reg(insn.rm()),
-                };
-                self.a.mov_imm(Size::W, T_B, if byte { imm as u64 & 0xff } else { imm as u64 });
-                let ok = if byte { self.alu8(aop, a, T_B) } else { self.alu32(aop, a, T_B) };
-                if !ok {
-                    return Step::Unsupported;
-                }
+                let imm = if op == 0x81 { insn.imm } else { insn.imm as u8 as i8 as i32 as u32 };
+                let Some(a) = self.rm_w(insn, w, aop != 7) else { return Step::Unsupported };
+                self.a.mov_imm(Size::W, T_B, imm as u64 & w.mask());
+                self.alu(aop, w, a, T_B);
                 if aop != 7 {
-                    match (insn.mem, byte) {
-                        (Some(_), _) => self.store(w, T_RES),
-                        (None, true) => self.write_r8(insn.rm(), T_RES),
-                        (None, false) => self.a.mov(Size::W, guest_reg(insn.rm()), T_RES),
-                    }
+                    self.write_rm(insn, w, T_RES);
                 }
             }
-            0x84 => {
-                let Some(a) = self.rm8(insn) else { return Step::Unsupported };
-                self.read_r8(insn.reg(), T_B);
-                self.alu8(4, a, T_B);
+            0x84 | 0x85 => {
+                let w = Ow::of(op, op32);
+                let Some(a) = self.rm_w(insn, w, false) else { return Step::Unsupported };
+                let b = self.read_gpr(w, insn.reg(), T_B);
+                self.alu(4, w, a, b);
             }
-            0x85 if op32 => {
-                let Some(a) = self.rm32(insn) else { return Step::Unsupported };
-                self.alu32(4, a, guest_reg(insn.reg()));
+            0x86 | 0x87 => {
+                let w = Ow::of(op, op32);
+                let Some(a) = self.rm_w(insn, w, false) else { return Step::Unsupported };
+                self.a.mov(Size::W, T_C, a);
+                let b = self.read_gpr(w, insn.reg(), T_B);
+                self.write_rm(insn, w, b);
+                self.write_gpr(w, insn.reg(), T_C);
             }
-            0x88 => {
-                self.read_r8(insn.reg(), T_B);
+            0x88 | 0x89 => {
+                let w = Ow::of(op, op32);
+                let v = self.read_gpr(w, insn.reg(), T_B);
                 match insn.mem {
                     Some(m) => {
                         if !self.ea(insn, &m) {
                             return Step::Unsupported;
                         }
-                        self.store(Width::B, T_B);
+                        self.store(w.mem(), v);
                     }
-                    None => self.write_r8(insn.rm(), T_B),
+                    None => self.write_gpr(w, insn.rm(), v),
                 }
             }
-            0x89 if op32 => match insn.mem {
-                Some(m) => {
-                    if !self.ea(insn, &m) {
-                        return Step::Unsupported;
-                    }
-                    self.store(Width::W, guest_reg(insn.reg()));
-                }
-                None => self.a.mov(Size::W, guest_reg(insn.rm()), guest_reg(insn.reg())),
-            },
-            0x8a => {
-                let Some(v) = self.rm8(insn) else { return Step::Unsupported };
-                self.write_r8(insn.reg(), v);
-            }
-            0x8b if op32 => {
-                let Some(v) = self.rm32(insn) else { return Step::Unsupported };
-                self.a.mov(Size::W, guest_reg(insn.reg()), v);
+            0x8a | 0x8b => {
+                let w = Ow::of(op, op32);
+                let Some(v) = self.rm_w(insn, w, false) else { return Step::Unsupported };
+                self.write_gpr(w, insn.reg(), v);
             }
             0x8d if op32 => {
                 let Some(m) = insn.mem else { return Step::Unsupported };
@@ -515,20 +574,73 @@ impl Emit {
                 }
                 self.a.mov(Size::W, guest_reg(insn.reg()), T_ADDR);
             }
-            0xa8 => {
-                self.read_r8(0, T_A);
-                self.a.mov_imm(Size::W, T_B, insn.imm as u64 & 0xff);
-                self.alu8(4, T_A, T_B);
+            0x98 if op32 => self.a.sxth(Size::W, guest_reg(0), guest_reg(0)),
+            0x99 if op32 => self.a.asr_imm(Size::W, guest_reg(2), guest_reg(0), 31),
+            0xa0..=0xa3 => {
+                if !insn.addr32 {
+                    return Step::Unsupported;
+                }
+                let w = Ow::of(op, op32);
+                let m = MemOperand { base: NO_REG, index: NO_REG, scale: 0, disp: insn.imm, default_seg: 3 };
+                if !self.ea(insn, &m) {
+                    return Step::Unsupported;
+                }
+                if op < 0xa2 {
+                    self.load(w.mem(), T_A);
+                    self.write_gpr(w, 0, T_A);
+                } else {
+                    let v = self.read_gpr(w, 0, T_B);
+                    self.store(w.mem(), v);
+                }
             }
-            0xa9 if op32 => {
-                self.a.mov_imm(Size::W, T_B, insn.imm as u64);
-                self.alu32(4, guest_reg(0), T_B);
+            0xa8 | 0xa9 => {
+                let w = Ow::of(op, op32);
+                let a = self.read_gpr(w, 0, T_A);
+                self.a.mov_imm(Size::W, T_B, insn.imm as u64 & w.mask());
+                self.alu(4, w, a, T_B);
             }
             0xb0..=0xb7 => {
                 self.a.mov_imm(Size::W, T_B, insn.imm as u64 & 0xff);
                 self.write_r8((op & 7) as usize, T_B);
             }
             0xb8..=0xbf if op32 => self.a.mov_imm(Size::W, guest_reg((op & 7) as usize), insn.imm as u64),
+            0xb8..=0xbf => {
+                self.a.mov_imm(Size::W, T_B, insn.imm as u64 & 0xffff);
+                self.write_gpr(Ow::H, (op & 7) as usize, T_B);
+            }
+            0xc9 if op32 => {
+                let ebp = guest_reg(5);
+                self.a.mov(Size::W, T_ADDR, ebp);
+                self.load(Width::W, T_A);
+                self.a.add_imm(Size::W, guest_reg(4), ebp, 4);
+                self.a.mov(Size::W, ebp, T_A);
+            }
+            0xd3 if op32 && matches!(insn.reg(), 4..=7) => {
+                let Some(a) = self.rm_w(insn, Ow::D, true) else { return Step::Unsupported };
+                let skip = self.a.label();
+                let ok = self.a.logic_imm(a64::Logic::And, Size::W, T_D, guest_reg(1), 31);
+                debug_assert!(ok);
+                self.a.cbz(Size::W, T_D, skip);
+                self.shift_cl(insn.reg(), a);
+                self.write_rm(insn, Ow::D, T_RES);
+                self.a.bind(skip);
+            }
+            0xe3 if insn.addr32 => {
+                let rel = insn.imm as u8 as i8 as i32 as u32;
+                let taken = self.a.label();
+                self.a.cbz(Size::W, guest_reg(1), taken);
+                self.goto(next);
+                self.a.bind(taken);
+                self.goto(next.wrapping_add(rel));
+                return Step::End;
+            }
+            0x69 | 0x6b if op32 => {
+                let Some(a) = self.rm_w(insn, Ow::D, false) else { return Step::Unsupported };
+                let imm = if op == 0x6b { insn.imm as u8 as i8 as i32 as u32 } else { insn.imm };
+                self.a.mov(Size::W, T_A, a);
+                self.a.mov_imm(Size::W, T_D, imm as u64);
+                self.imul32(guest_reg(insn.reg()), T_A, T_D);
+            }
             0xc1 | 0xd1 if op32 => {
                 let n = if op == 0xc1 { insn.imm } else { 1 };
                 let kind = insn.reg();
@@ -576,16 +688,17 @@ impl Emit {
                     None => self.write_r8(insn.rm(), T_B),
                 }
             }
-            0xc7 if insn.reg() == 0 && op32 => {
+            0xc7 if insn.reg() == 0 => {
+                let w = Ow::of(op, op32);
+                self.a.mov_imm(Size::W, T_B, insn.imm as u64 & w.mask());
                 match insn.mem {
                     Some(m) => {
                         if !self.ea(insn, &m) {
                             return Step::Unsupported;
                         }
-                        self.a.mov_imm(Size::W, T_B, insn.imm as u64);
-                        self.store(Width::W, T_B);
+                        self.store(w.mem(), T_B);
                     }
-                    None => self.a.mov_imm(Size::W, guest_reg(insn.rm()), insn.imm as u64),
+                    None => self.write_gpr(w, insn.rm(), T_B),
                 }
             }
             0xe8 if op32 => {
@@ -605,6 +718,21 @@ impl Emit {
                 self.alu8(4, a, T_B);
             }
             0xf7 if op32 => match insn.reg() {
+                4 => {
+                    let Some(b) = self.rm_w(insn, Ow::D, false) else { return Step::Unsupported };
+                    self.a.umull(T_RES, guest_reg(0), b);
+                    self.a.lsr_imm(Size::X, T_B, T_RES, 32);
+                    self.a.cmp_imm(Size::W, T_B, 0);
+                    self.a.cset(Size::W, T_C, Cond::Ne);
+                    self.a.tst(Size::W, T_RES, T_RES);
+                    self.a.movz(Size::W, T_D, 2, 0);
+                    self.a.sub(Size::W, T_D, T_D, T_C);
+                    self.a.rmif(T_D, 0, 0b0011);
+                    self.a.mov(Size::W, PF_RESULT, T_RES);
+                    self.a.mov(Size::W, AF_AUX, ZR);
+                    self.a.mov(Size::W, guest_reg(0), T_RES);
+                    self.a.mov(Size::W, guest_reg(2), T_B);
+                }
                 0 => {
                     let Some(a) = self.rm32(insn) else { return Step::Unsupported };
                     self.a.mov_imm(Size::W, T_B, insn.imm as u64);
@@ -683,18 +811,9 @@ impl Emit {
                 }
             }
             0x1af if op32 => {
-                let Some(b) = self.rm32(insn) else { return Step::Unsupported };
+                let Some(b) = self.rm_w(insn, Ow::D, false) else { return Step::Unsupported };
                 let dst = guest_reg(insn.reg());
-                self.a.smull(T_RES, dst, b);
-                self.a.addsub_ext(Size::X, true, true, ZR, T_RES, T_RES, Extend::Sxtw, 0);
-                self.a.cset(Size::W, T_B, Cond::Ne);
-                self.a.tst(Size::W, T_RES, T_RES);
-                self.a.movz(Size::W, T_C, 2, 0);
-                self.a.sub(Size::W, T_C, T_C, T_B);
-                self.a.rmif(T_C, 0, 0b0011);
-                self.a.mov(Size::W, PF_RESULT, T_RES);
-                self.a.mov(Size::W, AF_AUX, ZR);
-                self.a.mov(Size::W, dst, T_RES);
+                self.imul32(dst, dst, b);
             }
             0x1b6 | 0x1be => {
                 let signed = op == 0x1be;
