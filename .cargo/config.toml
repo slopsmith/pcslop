@@ -1,6 +1,7 @@
 # Nix's ld64 (first on PATH here) produces binaries whose panics cannot unwind on macOS 27.
 [target.aarch64-apple-darwin]
 linker = "/usr/bin/cc"
+runner = "scripts/hv-run.sh"
 
 # Native code in build scripts (e.g. minifb's Cocoa backend) needs Apple's compiler and the macOS SDK.
 [env]
