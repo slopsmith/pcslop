@@ -1,0 +1,9 @@
+[package]
+name = "ide"
+description = "PIIX3 IDE controller: ATA disks, ATAPI CD-ROMs and bus master DMA"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
