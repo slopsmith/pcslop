@@ -523,3 +523,18 @@ fn instruction_across_a_page_end() {
         bus.ram.as_mut_slice()[0x2001] = 0x99;
     }
 }
+
+#[test]
+fn code_rewritten_every_iteration_matches_the_interpreter() {
+    let code = [
+        0xb9, 0x40, 0, 0, 0, // mov ecx, 64
+        0x88, 0x0d, 0x0d, 0x10, 0, 0, // loop: mov [0x100d], cl (imm of the next mov)
+        0xb8, 0, 0, 0, 0, // mov eax, imm32
+        0x01, 0xc3, // add ebx, eax
+        0x49, // dec ecx
+        0x75, 0xf0, // jnz loop
+        0xf4,
+    ];
+    let stats = compare(&code, |c| c.regs[3] = 0);
+    assert!(stats.stale_blocks > 0, "the page should have switched to self-checking blocks: {stats:?}");
+}

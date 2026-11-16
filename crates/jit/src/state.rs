@@ -14,6 +14,8 @@ pub mod reason {
     pub const FAULT: u32 = 4;
     /// Exit for an exception the runtime cannot handle; `State::info` as for `FAULT`.
     pub const UNEXPECTED: u32 = 5;
+    /// The code bytes of the block at `State::eip` changed; drop it and dispatch again.
+    pub const STALE: u32 = 6;
 }
 
 /// Maintenance the runtime performs before continuing (`State::ctl`).

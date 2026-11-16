@@ -30,6 +30,9 @@ struct BlockInfo {
     verified: u32,
 }
 
+/// Invalidations after which a page switches to self-checking blocks.
+const SELF_CHECK_AFTER: u32 = 4;
+
 /// Executions of each block that verify mode checks before running it freely.
 const VERIFY_RUNS: u32 = 3;
 
@@ -176,6 +179,7 @@ pub struct Stats {
     pub page_faults: u64,
     pub mmio_exits: u64,
     pub smc_invalidations: u64,
+    pub stale_blocks: u64,
     pub flushes: u64,
     pub flush_tlb_gen: u64,
     pub nonglobal_flushes: u64,
@@ -216,6 +220,11 @@ pub struct Jit {
     blocks: HashMap<u64, BlockInfo>,
     by_va: BTreeMap<u64, u64>,
     code_pages: HashMap<u32, Vec<u64>>,
+    /// Times each physical page lost its translations to writes.
+    smc_counts: HashMap<u32, u32>,
+    /// Pages written too often to write-protect: their blocks check their own
+    /// code bytes on entry instead.
+    self_check: std::collections::HashSet<u32>,
     pt_watch: PtWatch,
     /// Chain sites (code cache offsets) waiting for a block at a physical address.
     chain_wanted: HashMap<u64, Vec<usize>>,
@@ -296,6 +305,8 @@ impl Jit {
             blocks: HashMap::new(),
             by_va: BTreeMap::new(),
             code_pages: HashMap::new(),
+            smc_counts: HashMap::new(),
+            self_check: Default::default(),
             writable: [HashMap::new(), HashMap::new()],
             nonglobal: [Vec::new(), Vec::new()],
             pt_watch: PtWatch::default(),
@@ -562,24 +573,32 @@ impl Jit {
     }
 
     fn invalidate_code_page(&mut self, page: u32) {
-        let Some(eips) = self.code_pages.remove(&page) else { return };
-        for &pa in &eips {
-            for site in self.chain_in.remove(&pa).unwrap_or_default() {
-                self.patch_chain(site, None);
-                self.chain_wanted.entry(pa).or_default().push(site);
-            }
-        }
-        for pa in eips {
-            if let Some(b) = self.blocks.remove(&pa) {
-                self.by_va.remove(&b.va);
-            }
-            let off = layout::LOOKUP + hash(pa) * 16;
-            let slot = &mut self.mem.as_mut_slice()[off..off + 16];
-            if u64::from_le_bytes(slot[..8].try_into().unwrap()) == pa {
-                slot.fill(0xff);
-            }
+        let Some(keys) = self.code_pages.remove(&page) else { return };
+        for key in keys {
+            self.remove_block(key);
         }
         self.stats.smc_invalidations += 1;
+        let n = self.smc_counts.entry(page).or_default();
+        *n += 1;
+        if *n >= SELF_CHECK_AFTER && !LEGACY_HOLE.contains(&page) {
+            self.self_check.insert(page);
+        }
+    }
+
+    /// Forgets the block for `key`: unlinks chains into it and clears its lookup slot.
+    fn remove_block(&mut self, key: u64) {
+        for site in self.chain_in.remove(&key).unwrap_or_default() {
+            self.patch_chain(site, None);
+            self.chain_wanted.entry(key).or_default().push(site);
+        }
+        if let Some(b) = self.blocks.remove(&key) {
+            self.by_va.remove(&b.va);
+        }
+        let off = layout::LOOKUP + hash(key) * 16;
+        let slot = &mut self.mem.as_mut_slice()[off..off + 16];
+        if u64::from_le_bytes(slot[..8].try_into().unwrap()) == key {
+            slot.fill(0xff);
+        }
     }
 
     fn reset_code_cache(&mut self) {
@@ -619,6 +638,7 @@ impl Jit {
             &entries,
             !self.verify,
             user,
+            self.self_check.contains(&page),
         );
         let bytes = compiled.code.len() * 4;
         if self.code_next + bytes > layout::CODE_CACHE_END {
@@ -658,6 +678,12 @@ impl Jit {
         }
         self.blocks.insert(key, BlockInfo { va: block_va, boundaries: compiled.boundaries, insns: compiled.insns, verified });
         self.by_va.insert(block_va, key);
+        self.stats.blocks += 1;
+        self.stats.translated_insns += compiled.insns as u64;
+        self.state().ctl |= ctl::IC_IALLU;
+        if self.self_check.contains(&page) {
+            return;
+        }
         let pages = self.code_pages.entry(page).or_default();
         let new_page = pages.is_empty();
         pages.push(key);
@@ -671,9 +697,6 @@ impl Jit {
                 }
             }
         }
-        self.stats.blocks += 1;
-        self.stats.translated_insns += compiled.insns as u64;
-        self.state().ctl |= ctl::IC_IALLU;
     }
 
     fn insert_lookup(&mut self, key: u64, va: u64) {
@@ -784,8 +807,17 @@ impl Jit {
                             self.store_state(cpu);
                             return Ok(RunExit::Kicked);
                         }
+                        reason::STALE => {
+                            self.stats.stale_blocks += 1;
+                            let eip = self.state().eip;
+                            if let Ok(phys) = interp::translate(cpu, bus, eip, false) {
+                                self.remove_block(block_key(phys, cpu.cpl() == 3));
+                            }
+                        }
                         reason::FAULT => {
-                            self.on_fault(cpu, bus);
+                            if let Some(e) = self.on_fault(cpu, bus) {
+                                return Ok(RunExit::Interp(e));
+                            }
                             at_dispatch = self.state().resume == resume::DISPATCH;
                         }
                         _ => {
@@ -926,7 +958,9 @@ impl Jit {
         }
     }
 
-    fn on_fault<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B) {
+    /// Handles a fault in translated code. Some(exit) means the CPU must leave
+    /// translated code.
+    fn on_fault<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B) -> Option<interp::Exit> {
         let [esr, far, elr, _] = self.state().info;
         if self.audit && self.root != (cpu.cpl() == 3) as usize {
             eprintln!("AUDIT fault with root {} at cpl {} far {far:#x} elr {elr:#x}", self.root, cpu.cpl());
@@ -940,7 +974,24 @@ impl Jit {
             Ok((phys, global)) => {
                 let page = phys & !0xfff;
                 if write && self.code_pages.contains_key(&page) {
+                    // The store may rewrite the running block, so finish it in the
+                    // interpreter and continue from fresh translations.
+                    let eip = self.eip_at(elr).expect("fault outside any translated block");
                     self.invalidate_code_page(page);
+                    self.map_shadow(bus, cpu, lin, phys, write, global);
+                    self.tlbi_page(lin);
+                    self.state().eip = eip;
+                    self.store_state(cpu);
+                    let e = self.step_interp(cpu, bus);
+                    if e != interp::Exit::Continue || cpu.halted || !supported(cpu) {
+                        return Some(e);
+                    }
+                    self.check_shadow(cpu, bus);
+                    self.load_state(cpu);
+                    self.set_root(cpu);
+                    self.state().irq = bus.intr() as u32;
+                    self.state().resume = resume::DISPATCH;
+                    return None;
                 }
                 self.map_shadow(bus, cpu, lin, phys, write, global);
                 self.tlbi_page(lin);
@@ -957,6 +1008,7 @@ impl Jit {
                 self.state().resume = resume::DISPATCH;
             }
         }
+        None
     }
 
     /// Hands a REP string op that hit MMIO to the interpreter, avoiding one exit

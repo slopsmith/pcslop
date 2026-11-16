@@ -77,6 +77,8 @@ struct Emit {
     chains: Vec<(u32, u32)>,
     /// Translating CPL 3 code: privileged instructions go to the interpreter.
     user: bool,
+    /// Set by `store`, so a self-checking block can see writes near its own code.
+    stored: bool,
 }
 
 enum Step {
@@ -170,6 +172,43 @@ impl Emit {
         self.exit_interp(eip);
     }
 
+    /// Like `check_code_bytes` for bytes on one page starting at `at`, never
+    /// loading outside that page.
+    fn check_bytes_in_page(&mut self, at: u32, bytes: &[u8], slow: Label) {
+        let full = bytes.len() / 8 * 8;
+        if full > 0 {
+            self.check_code_bytes(at, &bytes[..full], slow);
+        }
+        let rest = &bytes[full..];
+        if rest.is_empty() {
+            return;
+        }
+        let end = at.wrapping_add(bytes.len() as u32);
+        let from = end.wrapping_sub(8);
+        if from & !0xfff == at & !0xfff {
+            let mut want = 0u64;
+            for (j, &b) in rest.iter().enumerate() {
+                want |= (b as u64) << (8 * (8 - rest.len() + j));
+            }
+            let drop = 64 - 8 * rest.len() as u32;
+            self.a.mov_imm(Size::W, T_ADDR, from as u64);
+            self.a.ldr(Width::X, T_B, T_ADDR, 0);
+            self.a.lsr_imm(Size::X, T_B, T_B, drop);
+            self.a.mov_imm(Size::X, T_C, want >> drop);
+            self.a.eor(Size::X, T_B, T_B, T_C);
+            self.a.cbnz(Size::X, T_B, slow);
+        } else {
+            self.check_code_bytes(at.wrapping_add(full as u32), rest, slow);
+        }
+    }
+
+    fn exit_with(&mut self, eip: u32, why: u32) {
+        self.a.mov_imm(Size::W, r(0), eip as u64);
+        self.a.movz(Size::W, r(1), why, 0);
+        let off = self.branch_offset(self.exit_va);
+        self.a.b_offset(off);
+    }
+
     fn exit_interp(&mut self, eip: u32) {
         self.a.mov_imm(Size::W, r(0), eip as u64);
         self.a.movz(Size::W, r(1), reason::INTERP, 0);
@@ -226,6 +265,7 @@ impl Emit {
     }
 
     fn store(&mut self, w: Width, src: Reg) {
+        self.stored = true;
         self.a.str(w, src, T_ADDR, 0);
     }
 
@@ -1565,6 +1605,7 @@ pub fn compile(
     rt: &Entries,
     chain: bool,
     user: bool,
+    self_check: bool,
 ) -> Compiled {
     let mut e = Emit {
         a: Asm::new(),
@@ -1574,6 +1615,7 @@ pub fn compile(
         page: chain.then_some(eip & !0xfff),
         chains: Vec::new(),
         user,
+        stored: false,
     };
     let mut boundaries = Vec::new();
     let mut pc = eip;
@@ -1583,6 +1625,13 @@ pub fn compile(
     let page = eip & !0xfff;
     let on_page = |pc: u32| pc & !0xfff == page;
     e.a.nop();
+    let check = e.a.label();
+    let body = e.a.label();
+    if self_check {
+        e.a.b(check);
+    }
+    e.a.bind(body);
+    let mut code_end = eip;
     loop {
         let insn = decode::<()>(true, |i| byte(pc.wrapping_add(i)).ok_or(()));
         let Ok(insn) = insn else {
@@ -1599,6 +1648,7 @@ pub fn compile(
         has_rep |= insn.rep != Rep::None && matches!(insn.op, 0xa4..=0xa7 | 0xaa..=0xaf);
         let start = e.a.pos();
         let end = pc.wrapping_add(insn.len as u32);
+        code_end = code_end.max(end);
         if !on_page(end.wrapping_sub(1)) {
             if sti.is_some() {
                 let at = sti.unwrap();
@@ -1625,7 +1675,24 @@ pub fn compile(
             e.exit_interp(pc);
             break;
         }
-        match e.insn(&insn, pc) {
+        e.stored = false;
+        let step = e.insn(&insn, pc);
+        if self_check && e.stored && matches!(step, Step::Next | Step::Sti) {
+            // T_ADDR still holds the address of the last store: leave through
+            // the dispatcher when it hit this page, so the entry check sees it.
+            let next = pc.wrapping_add(insn.len as u32);
+            let same = e.a.label();
+            let cont = e.a.label();
+            e.a.lsr_imm(Size::W, T_B, T_ADDR, 12);
+            e.a.mov_imm(Size::W, T_C, (page >> 12) as u64);
+            e.a.eor(Size::W, T_B, T_B, T_C);
+            e.a.cbz(Size::W, T_B, same);
+            e.a.b(cont);
+            e.a.bind(same);
+            e.goto_dispatch(next);
+            e.a.bind(cont);
+        }
+        match step {
             Step::Sti if sti.is_none() => {
                 sti = Some((start, pc, insns, boundaries.len() - 1));
                 insns += 1;
@@ -1664,6 +1731,17 @@ pub fn compile(
                 break;
             }
         }
+    }
+    if self_check {
+        e.a.bind(check);
+        let page_end = page.wrapping_add(0x1000);
+        let last = if code_end > page_end || code_end < eip { page_end } else { code_end };
+        let bytes: Vec<u8> = (eip..last).map(|a| byte(a).unwrap_or(0)).collect();
+        let stale = e.a.label();
+        e.check_bytes_in_page(eip, &bytes, stale);
+        e.a.b(body);
+        e.a.bind(stale);
+        e.exit_with(eip, reason::STALE);
     }
     let mut count = Asm::new();
     count.add_imm(Size::X, ICOUNT, ICOUNT, insns as u32);
