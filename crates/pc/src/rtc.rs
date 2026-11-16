@@ -15,6 +15,9 @@ const B_PIE: u8 = 0x40;
 const B_SET: u8 = 0x80;
 const C_PF: u8 = 0x40;
 const C_IRQF: u8 = 0x80;
+const CENTURY: usize = 0x32;
+/// The IBM PS/2 century byte, which the non-ACPI Windows HAL reads.
+const CENTURY_PS2: usize = 0x37;
 
 pub struct Rtc {
     pub ram: [u8; 128],
@@ -49,6 +52,26 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+#[repr(C)]
+struct Tm {
+    fields: [i32; 9],
+    gmtoff: std::ffi::c_long,
+    zone: *const std::ffi::c_char,
+}
+
+unsafe extern "C" {
+    fn localtime_r(time: *const i64, out: *mut Tm) -> *mut Tm;
+}
+
+/// Seconds east of UTC for the host's time zone at `utc`.
+fn local_offset(utc: i64) -> i64 {
+    let mut tm = Tm { fields: [0; 9], gmtoff: 0, zone: std::ptr::null() };
+    if unsafe { localtime_r(&utc, &mut tm) }.is_null() {
+        return 0;
+    }
+    tm.gmtoff as i64
+}
+
 fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
@@ -60,8 +83,11 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 }
 
 impl Rtc {
+    /// Host time in seconds since 1970 in the local time zone, since PC
+    /// operating systems (Windows in particular) keep the RTC in local time.
     fn host_seconds() -> i64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+        let utc = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+        utc + local_offset(utc)
     }
 
     fn enc(&self, v: u32) -> u8 {
@@ -93,7 +119,8 @@ impl Rtc {
         self.ram[0x07] = self.enc(d);
         self.ram[0x08] = self.enc(mo);
         self.ram[0x09] = self.enc((y % 100) as u32);
-        self.ram[0x32] = self.enc((y / 100) as u32);
+        self.ram[CENTURY] = self.enc((y / 100) as u32);
+        self.ram[CENTURY_PS2] = self.ram[CENTURY];
     }
 
     fn commit_time(&mut self) {
@@ -104,7 +131,7 @@ impl Rtc {
             let h = self.dec(hour_raw & 0x7f) % 12;
             h + if hour_raw & 0x80 != 0 { 12 } else { 0 }
         };
-        let year = self.dec(self.ram[0x32]) as i64 * 100 + self.dec(self.ram[0x09]) as i64;
+        let year = self.dec(self.ram[CENTURY]) as i64 * 100 + self.dec(self.ram[0x09]) as i64;
         let days = days_from_civil(year, self.dec(self.ram[0x08]).max(1), self.dec(self.ram[0x07]).max(1));
         let t = days * 86_400 + hour as i64 * 3600 + self.dec(self.ram[0x02]) as i64 * 60 + self.dec(self.ram[0x00]) as i64;
         self.offset = t - Self::host_seconds();
@@ -143,7 +170,7 @@ impl Rtc {
         }
         let i = self.index as usize;
         match i {
-            0x00..=0x09 | 0x32 => {
+            0x00..=0x09 | CENTURY | CENTURY_PS2 => {
                 self.refresh_time();
                 self.ram[i]
             }
@@ -180,9 +207,12 @@ impl Rtc {
                 }
             }
             REG_C | REG_D => {}
-            0x00..=0x09 | 0x32 => {
+            0x00..=0x09 | CENTURY | CENTURY_PS2 => {
                 self.refresh_time();
                 self.ram[i] = v;
+                if i == CENTURY_PS2 {
+                    self.ram[CENTURY] = v;
+                }
                 if self.ram[REG_B] & B_SET == 0 {
                     self.commit_time();
                 }
@@ -214,6 +244,13 @@ mod tests {
         rtc.write(0x71, 0x20);
         rtc.write(0x70, 0x09);
         assert_eq!(rtc.read(0x71), 0x03);
+    }
+
+    #[test]
+    fn century_is_also_at_the_ps2_location() {
+        let mut rtc = Rtc::default();
+        rtc.write(0x70, 0x37);
+        assert_eq!(rtc.read(0x71), 0x20);
     }
 
     #[test]
