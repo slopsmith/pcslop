@@ -554,30 +554,33 @@ fn control_server(path: PathBuf, tx: Sender<Event>) {
                 if line.is_empty() {
                     continue;
                 }
-                let cmd = line.split_whitespace().next().unwrap_or("");
-                let answer = if matches!(cmd, "screen" | "regs" | "status" | "pause" | "resume" | "mem") {
-                    let (rtx, rrx) = channel();
-                    if tx.send(Event::Query(line.clone(), rtx)).is_err() {
-                        break;
-                    }
-                    rrx.recv_timeout(Duration::from_secs(10)).unwrap_or_else(|_| "no answer".into())
-                } else {
-                    match command_event(&line) {
-                        Ok(evs) => {
-                            for e in evs {
-                                let _ = tx.send(e);
-                            }
-                            "ok".into()
-                        }
-                        Err(e) => e,
-                    }
-                };
+                let Some(answer) = run_command(&line, &tx) else { break };
                 if writeln!(out, "{answer}\n.").is_err() {
                     break;
                 }
             }
         });
     }
+}
+
+/// Runs one stdin or control-socket command and returns its answer, or None
+/// once the emulator has stopped.
+fn run_command(line: &str, tx: &Sender<Event>) -> Option<String> {
+    let cmd = line.split_whitespace().next().unwrap_or("");
+    if matches!(cmd, "screen" | "regs" | "status" | "pause" | "resume" | "mem") {
+        let (rtx, rrx) = channel();
+        tx.send(Event::Query(line.to_string(), rtx)).ok()?;
+        return Some(rrx.recv_timeout(Duration::from_secs(10)).unwrap_or_else(|_| "no answer".into()));
+    }
+    Some(match command_event(line) {
+        Ok(evs) => {
+            for e in evs {
+                tx.send(e).ok()?;
+            }
+            "ok".into()
+        }
+        Err(e) => e,
+    })
 }
 
 /// Parses an input command (`shot`, `type`, `key`, `mouse`, `quit`) into events.
@@ -612,35 +615,11 @@ fn stdin_commands(tx: Sender<Event>) {
     for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else { break };
         let line = line.trim();
-        let (cmd, rest) = line.split_once(' ').unwrap_or((line, ""));
-        let ev = match cmd {
-            "" => continue,
-            "shot" => Event::Screenshot(PathBuf::from(if rest.is_empty() { "screen.png" } else { rest })),
-            "type" => Event::Type(rest.to_string()),
-            "key" => {
-                let mut evs = Vec::new();
-                let names: Vec<&str> = rest.split('+').collect();
-                let codes: Option<Vec<u16>> = names.iter().map(|n| keys::by_name(n)).collect();
-                let Some(codes) = codes else {
-                    eprintln!("unknown key in {rest}");
-                    continue;
-                };
-                evs.extend(codes.iter().map(|&c| Event::Key(c, true)));
-                evs.extend(codes.iter().rev().map(|&c| Event::Key(c, false)));
-                for e in evs {
-                    let _ = tx.send(e);
-                }
-                continue;
-            }
-            "quit" => Event::Quit,
-            _ => {
-                eprintln!("commands: shot [path] | type <text> | key <name>[+name...] | quit");
-                continue;
-            }
-        };
-        if tx.send(ev).is_err() {
-            break;
+        if line.is_empty() {
+            continue;
         }
+        let Some(answer) = run_command(line, &tx) else { break };
+        println!("{answer}");
     }
 }
 
@@ -738,16 +717,15 @@ fn main() -> ExitCode {
     });
     let (tx, rx) = channel();
     let headless = args.headless || !cfg!(feature = "window");
-    let control_path = args.control.clone();
+    let control_path = args.control.clone().unwrap_or_else(|| std::env::temp_dir().join(format!("86slopper-{}.sock", std::process::id())));
     let emu_shared = shared.clone();
     let emu = std::thread::spawn(move || emulate(args, cfg, rx, emu_shared));
 
     let stdin_tx = tx.clone();
     std::thread::spawn(move || stdin_commands(stdin_tx));
-    if let Some(path) = control_path {
-        let ctl_tx = tx.clone();
-        std::thread::spawn(move || control_server(path, ctl_tx));
-    }
+    let ctl_tx = tx.clone();
+    let ctl_path = control_path.clone();
+    std::thread::spawn(move || control_server(ctl_path, ctl_tx));
     #[cfg(feature = "window")]
     if !headless {
         window_loop(tx, shared);
@@ -755,5 +733,7 @@ fn main() -> ExitCode {
     #[cfg(not(feature = "window"))]
     let _ = (tx, shared);
     let _ = headless;
-    emu.join().unwrap_or(ExitCode::FAILURE)
+    let code = emu.join().unwrap_or(ExitCode::FAILURE);
+    let _ = std::fs::remove_file(&control_path);
+    code
 }
