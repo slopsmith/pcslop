@@ -108,6 +108,7 @@ These are the starting decisions for phase 3.
 3. **HVF runtime:** EL1 runtime, shadow paging, block translator for 32-bit flat code; the interpreter covers everything else.
 4. Finish the XP install. **Benchmark** boot time against QEMU TCG.
 5. Optimise: traces, flag liveness, in-VM device fast paths, ACPI HAL. Then SMP with TSO.
+6. **GPU:** an emulated GeForce FX 5200 PCI that draws with Metal, running Nvidia's XP driver. See [gpu.md](gpu.md).
 
 ## Open questions
 

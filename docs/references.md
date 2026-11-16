@@ -1,6 +1,6 @@
 # References
 
-Nothing listed here is committed. Run `scripts/fetch-references.sh` (add `--tests` for the hardware-generated CPU test suites) to clone the source trees into `references/src/`. Spec PDFs go in `references/docs/`. Both directories are gitignored.
+Nothing listed here is committed. Run `scripts/fetch-references.sh` (add `--tests` for the hardware-generated CPU test suites, `--gpu` for the Nvidia GPU references) to clone the source trees into `references/src/`. Spec PDFs go in `references/docs/`. Both directories are gitignored.
 
 **Ground rule:** code copied from, or closely modelled on, any of these projects carries a comment naming the project, the file, the upstream revision, and the original authors where known. Each such use is also listed under [Code we use](#code-we-use).
 
@@ -20,6 +20,10 @@ Nothing listed here is committed. Run `scripts/fetch-references.sh` (add `--test
 | [dbalsom/moo](https://github.com/dbalsom/moo) | MIT | Yes, with attribution | Specification of the MOO test file format (`doc/moo_format_v1.md`) |
 | [dougallj/applecpu](https://github.com/dougallj/applecpu) | No license | **No**, read only | Firestorm/Icestorm instruction latencies and ports, for codegen decisions |
 | [AsahiLinux/docs](https://github.com/AsahiLinux/docs) | CC-BY-3.0 | Text with attribution | Apple CPU implementation-defined registers and features |
+| [envytools](https://github.com/envytools/envytools) | MIT | Yes, with attribution | Nvidia register and method database (`rnndb/`), hardware docs (`docs/hw/`), video BIOS parser (`nvbios/`). See [gpu.md](gpu.md) |
+| [Mesa](https://gitlab.freedesktop.org/mesa/mesa) | MIT (nouveau driver) | Yes, with attribution | `src/gallium/drivers/nouveau/nv30/`: Rankine 3D methods, shader encodings, texture formats |
+| [Nouveau kernel driver](https://gitlab.freedesktop.org/drm/nouveau) (`drivers/gpu/drm/nouveau/` in Linux) | MIT | Yes, with attribution | Video BIOS tables, NV04 to NV40 FIFO and PGRAPH setup, pre-NV50 mode setting |
+| [xemu](https://github.com/xemu-project/xemu) | GPL-2.0 overall; `hw/xbox/nv2a/` files are LGPL-2.0+ | Yes, with attribution; check each file's header | NV2A (Kelvin) emulation drawn with OpenGL/Vulkan: PFIFO, DMA objects, swizzling, surface caching, combiners to shaders |
 
 ## Apple Silicon and Hypervisor.framework
 
@@ -54,6 +58,7 @@ Nothing listed here is committed. Run `scripts/fetch-references.sh` (add `--test
 | Storage | SFF-8020i rev 2.6 (ATAPI CD-ROM), SFF-8038i (bus-master IDE DMA) | The SFF-8020i copy comes from a forum upload, but the content checks out |
 | Video | VESA BIOS Extension 3.0 | |
 | Video | [FreeVGA](http://www.osdever.net/FreeVGA/home.htm) | VGA registers; no free IBM VGA technical reference exists |
+| GPU | OpenGL `NV_vertex_program2`, `NV_fragment_program` specs ([Khronos registry](https://registry.khronos.org/OpenGL/index_gl.php)) | Semantics of NV3x shader instructions |
 | Host | Arm Architecture Reference Manual, A-profile (DDI 0487 M.d) | 129 MB |
 | General | [OSDev wiki](https://wiki.osdev.org/) | Pages on PIC, PIT, CMOS, PS/2, APIC, PCI, ATA, ATAPI, VGA |
 

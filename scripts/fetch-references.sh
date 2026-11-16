@@ -1,6 +1,7 @@
 #!/bin/sh
 # Shallow-clones reference source trees into references/src (gitignored).
-# Pass --tests to also fetch the large hardware-generated CPU test suites.
+# Pass --tests to also fetch the large hardware-generated CPU test suites,
+# and --gpu to fetch the Nvidia GPU references.
 set -eu
 dest="$(cd "$(dirname "$0")/.." && pwd)/references/src"
 mkdir -p "$dest"
@@ -27,6 +28,15 @@ clone applecpu https://github.com/dougallj/applecpu.git
 clone asahi-docs https://github.com/AsahiLinux/docs.git
 clone moo https://github.com/dbalsom/moo.git
 
-if [ "${1:-}" = "--tests" ]; then
-	clone SingleStepTests-80386 https://github.com/SingleStepTests/80386.git
-fi
+for arg in "$@"; do
+	case "$arg" in
+	--tests)
+		clone SingleStepTests-80386 https://github.com/SingleStepTests/80386.git
+		;;
+	--gpu)
+		clone envytools https://github.com/envytools/envytools.git
+		clone mesa https://gitlab.freedesktop.org/mesa/mesa.git
+		clone xemu https://github.com/xemu-project/xemu.git
+		;;
+	esac
+done
