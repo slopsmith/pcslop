@@ -16,6 +16,7 @@ use x86::bus::Bus;
 pub struct Config {
     pub ram_bytes: u32,
     pub bios: Vec<u8>,
+    pub vgabios: Option<Vec<u8>>,
 }
 
 pub struct Board {
@@ -243,6 +244,19 @@ impl Board {
             }
             _ => {}
         }
+    }
+
+    /// Draws the display into `out` as 0x00RRGGBB pixels.
+    pub fn render(&mut self, _out: &mut Vec<u32>) -> Option<(u32, u32)> {
+        None
+    }
+
+    pub fn attach_cdrom(&mut self, _path: &str) -> std::io::Result<()> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "no IDE controller yet"))
+    }
+
+    pub fn attach_disk(&mut self, _path: &str) -> std::io::Result<()> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "no IDE controller yet"))
     }
 
     pub fn reset(&mut self) {

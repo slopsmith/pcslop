@@ -1,5 +1,13 @@
+mod keys;
+
+use std::collections::VecDeque;
+use std::io::BufRead;
+use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use pc::{Board, Config};
 use x86::cpu::Cpu;
@@ -7,27 +15,68 @@ use x86::interp::{Exit, step};
 
 struct Args {
     bios: String,
+    vgabios: Option<String>,
+    cdrom: Option<String>,
+    hda: Option<String>,
     ram_mb: u32,
     max_instructions: Option<u64>,
+    headless: bool,
 }
 
+const USAGE: &str = "usage: slopper --bios <bios.bin> [--vgabios <vgabios.bin>] [--cdrom <iso>] [--hda <img>] \
+[--ram MiB] [--headless] [--max-instructions N]";
+
 fn parse_args() -> Result<Args, String> {
-    let mut args = Args { bios: String::new(), ram_mb: 256, max_instructions: None };
+    let mut args = Args {
+        bios: String::new(),
+        vgabios: None,
+        cdrom: None,
+        hda: None,
+        ram_mb: 256,
+        max_instructions: None,
+        headless: false,
+    };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
+        let mut value = || it.next().ok_or(format!("{a} needs a value"));
         match a.as_str() {
-            "--bios" => args.bios = it.next().ok_or("--bios needs a path")?,
-            "--ram" => args.ram_mb = it.next().and_then(|v| v.parse().ok()).ok_or("--ram needs a size in MiB")?,
+            "--bios" => args.bios = value()?,
+            "--vgabios" => args.vgabios = Some(value()?),
+            "--cdrom" => args.cdrom = Some(value()?),
+            "--hda" => args.hda = Some(value()?),
+            "--ram" => args.ram_mb = value()?.parse().map_err(|_| "--ram needs a size in MiB")?,
             "--max-instructions" => {
-                args.max_instructions = Some(it.next().and_then(|v| v.parse().ok()).ok_or("--max-instructions needs a number")?)
+                args.max_instructions = Some(value()?.parse().map_err(|_| "--max-instructions needs a number")?)
             }
-            _ => return Err(format!("unknown argument {a}")),
+            "--headless" => args.headless = true,
+            _ => return Err(format!("unknown argument {a}\n{USAGE}")),
         }
     }
     if args.bios.is_empty() {
-        return Err("usage: slopper --bios <bios.bin> [--ram MiB] [--max-instructions N]".into());
+        return Err(USAGE.into());
     }
     Ok(args)
+}
+
+enum Event {
+    Key(u16, bool),
+    Type(String),
+    Mouse(i32, i32, u8),
+    Screenshot(PathBuf),
+    Quit,
+}
+
+#[derive(Default)]
+struct Frame {
+    pixels: Vec<u32>,
+    width: u32,
+    height: u32,
+    seq: u64,
+}
+
+struct Shared {
+    frame: Mutex<Frame>,
+    done: AtomicBool,
 }
 
 fn dump(cpu: &Cpu) {
@@ -38,44 +87,84 @@ fn dump(cpu: &Cpu) {
     );
     let s = &cpu.segs;
     eprintln!(
-        "eip={:08x} eflags={:08x} cs={:04x} ss={:04x} ds={:04x} es={:04x} cr0={:08x}",
-        cpu.eip, cpu.eflags, s[1].selector, s[2].selector, s[3].selector, s[0].selector, cpu.cr0
+        "eip={:08x} eflags={:08x} cs={:04x} ss={:04x} ds={:04x} es={:04x} cr0={:08x} cr3={:08x}",
+        cpu.eip, cpu.eflags, s[1].selector, s[2].selector, s[3].selector, s[0].selector, cpu.cr0, cpu.cr3
     );
 }
 
-fn main() -> ExitCode {
-    let args = match parse_args() {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let bios = match std::fs::read(&args.bios) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("cannot read {}: {e}", args.bios);
-            return ExitCode::FAILURE;
-        }
-    };
-    let mut board = Board::new(Config { ram_bytes: args.ram_mb << 20, bios });
-    let mut cpu = Cpu::new();
-    let started = std::time::Instant::now();
-    let mut executed: u64 = 0;
+fn save_png(path: &PathBuf, f: &Frame) -> Result<(), String> {
+    if f.width == 0 {
+        return Err("no picture to save yet".into());
+    }
+    let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), f.width, f.height);
+    enc.set_color(png::ColorType::Rgb);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut w = enc.write_header().map_err(|e| e.to_string())?;
+    let rgb: Vec<u8> = f.pixels.iter().flat_map(|p| [(p >> 16) as u8, (p >> 8) as u8, *p as u8]).collect();
+    w.write_image_data(&rgb).map_err(|e| e.to_string())
+}
 
-    loop {
+/// Keys from `type` commands, released into the guest at a human pace.
+#[derive(Default)]
+struct KeyQueue {
+    pending: VecDeque<(u16, bool)>,
+    next: Option<Instant>,
+}
+
+impl KeyQueue {
+    fn push_char(&mut self, c: char) {
+        let Some((code, shift)) = keys::char_key(c) else { return };
+        if shift {
+            self.pending.push_back((0x2a, true));
+        }
+        self.pending.push_back((code, true));
+        self.pending.push_back((code, false));
+        if shift {
+            self.pending.push_back((0x2a, false));
+        }
+    }
+
+    fn poll(&mut self, board: &mut Board) {
+        let now = Instant::now();
+        if self.next.is_some_and(|t| now < t) {
+            return;
+        }
+        if let Some((code, down)) = self.pending.pop_front() {
+            board.key(code, down);
+            self.next = Some(now + Duration::from_millis(25));
+        }
+    }
+}
+
+fn emulate(args: Args, board_cfg: Config, events: Receiver<Event>, shared: Arc<Shared>) -> ExitCode {
+    let mut board = Board::new(board_cfg);
+    if let Some(path) = &args.cdrom
+        && let Err(e) = board.attach_cdrom(path)
+    {
+        eprintln!("cannot open {path}: {e}");
+        return ExitCode::FAILURE;
+    }
+    if let Some(path) = &args.hda
+        && let Err(e) = board.attach_disk(path)
+    {
+        eprintln!("cannot open {path}: {e}");
+        return ExitCode::FAILURE;
+    }
+    let mut cpu = Cpu::new();
+    let started = Instant::now();
+    let mut executed: u64 = 0;
+    let mut keyq = KeyQueue::default();
+    let mut next_frame = Instant::now();
+    let mut scratch = Vec::new();
+
+    let code = 'run: loop {
         for _ in 0..1024 {
             match step(&mut cpu, &mut board) {
                 Exit::Continue => executed += 1,
                 Exit::Halted => {
-                    let wait = board.next_event_ns();
-                    std::thread::sleep(Duration::from_nanos(wait.min(1_000_000)));
-                    board.tick();
-                    if !cpu.flag(x86::cpu::flags::IF) && !board.pic.intr() {
-                        eprintln!("halted with interrupts disabled after {executed} instructions");
-                        dump(&cpu);
-                        return ExitCode::SUCCESS;
-                    }
+                    let wait = board.next_event_ns().min(1_000_000);
+                    std::thread::sleep(Duration::from_nanos(wait));
                     break;
                 }
                 Exit::Shutdown => {
@@ -88,7 +177,7 @@ fn main() -> ExitCode {
                 Exit::Unimplemented { eip, what } => {
                     eprintln!("unimplemented at {eip:#x}: {what} after {executed} instructions");
                     dump(&cpu);
-                    return ExitCode::FAILURE;
+                    break 'run ExitCode::FAILURE;
                 }
             }
         }
@@ -98,11 +187,172 @@ fn main() -> ExitCode {
             cpu.reset();
             board.reset();
         }
+        keyq.poll(&mut board);
+        while let Ok(ev) = events.try_recv() {
+            match ev {
+                Event::Key(code, down) => board.key(code, down),
+                Event::Type(text) => text.chars().for_each(|c| keyq.push_char(c)),
+                Event::Mouse(dx, dy, b) => board.mouse_motion(dx, dy, b),
+                Event::Screenshot(path) => {
+                    let f = shared.frame.lock().unwrap();
+                    match save_png(&path, &f) {
+                        Ok(()) => eprintln!("saved {}", path.display()),
+                        Err(e) => eprintln!("screenshot failed: {e}"),
+                    }
+                }
+                Event::Quit => break 'run ExitCode::SUCCESS,
+            }
+        }
+        if Instant::now() >= next_frame {
+            next_frame = Instant::now() + Duration::from_millis(16);
+            if let Some((w, h)) = board.render(&mut scratch) {
+                let mut f = shared.frame.lock().unwrap();
+                std::mem::swap(&mut f.pixels, &mut scratch);
+                f.width = w;
+                f.height = h;
+                f.seq += 1;
+            }
+        }
         if args.max_instructions.is_some_and(|m| executed >= m) {
-            let secs = started.elapsed().as_secs_f64();
-            eprintln!("stopped after {executed} instructions ({:.1} MIPS)", executed as f64 / secs / 1e6);
-            dump(&cpu);
-            return ExitCode::SUCCESS;
+            break ExitCode::SUCCESS;
+        }
+    };
+    let secs = started.elapsed().as_secs_f64();
+    eprintln!("ran {executed} instructions in {secs:.1}s ({:.1} MIPS)", executed as f64 / secs / 1e6);
+    dump(&cpu);
+    shared.done.store(true, Ordering::Relaxed);
+    code
+}
+
+fn stdin_commands(tx: Sender<Event>) {
+    for line in std::io::stdin().lock().lines() {
+        let Ok(line) = line else { break };
+        let line = line.trim();
+        let (cmd, rest) = line.split_once(' ').unwrap_or((line, ""));
+        let ev = match cmd {
+            "" => continue,
+            "shot" => Event::Screenshot(PathBuf::from(if rest.is_empty() { "screen.png" } else { rest })),
+            "type" => Event::Type(rest.to_string()),
+            "key" => {
+                let mut evs = Vec::new();
+                let names: Vec<&str> = rest.split('+').collect();
+                let codes: Option<Vec<u16>> = names.iter().map(|n| keys::by_name(n)).collect();
+                let Some(codes) = codes else {
+                    eprintln!("unknown key in {rest}");
+                    continue;
+                };
+                evs.extend(codes.iter().map(|&c| Event::Key(c, true)));
+                evs.extend(codes.iter().rev().map(|&c| Event::Key(c, false)));
+                for e in evs {
+                    let _ = tx.send(e);
+                }
+                continue;
+            }
+            "quit" => Event::Quit,
+            _ => {
+                eprintln!("commands: shot [path] | type <text> | key <name>[+name...] | quit");
+                continue;
+            }
+        };
+        if tx.send(ev).is_err() {
+            break;
         }
     }
+}
+
+#[cfg(feature = "window")]
+fn window_loop(tx: Sender<Event>, shared: Arc<Shared>) {
+    use minifb::{KeyRepeat, MouseMode, Window, WindowOptions};
+    let opts = WindowOptions { resize: true, scale_mode: minifb::ScaleMode::AspectRatioStretch, ..Default::default() };
+    let mut window = match Window::new("86slopper", 720, 400, opts) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("cannot open window: {e}");
+            return;
+        }
+    };
+    window.set_target_fps(60);
+    let mut seq = 0;
+    let mut buf = Vec::new();
+    let (mut w, mut h) = (720usize, 400usize);
+    let mut last_mouse: Option<(f32, f32)> = None;
+    while window.is_open() && !shared.done.load(Ordering::Relaxed) {
+        {
+            let f = shared.frame.lock().unwrap();
+            if f.seq != seq && f.width > 0 {
+                seq = f.seq;
+                buf.clone_from(&f.pixels);
+                (w, h) = (f.width as usize, f.height as usize);
+            }
+        }
+        if buf.len() == w * h && !buf.is_empty() {
+            let _ = window.update_with_buffer(&buf, w, h);
+        } else {
+            window.update();
+        }
+        for k in window.get_keys_pressed(KeyRepeat::No) {
+            if let Some(c) = keys::from_minifb(k) {
+                let _ = tx.send(Event::Key(c, true));
+            }
+        }
+        for k in window.get_keys_released() {
+            if let Some(c) = keys::from_minifb(k) {
+                let _ = tx.send(Event::Key(c, false));
+            }
+        }
+        if let Some((x, y)) = window.get_mouse_pos(MouseMode::Pass) {
+            let buttons = window.get_mouse_down(minifb::MouseButton::Left) as u8
+                | (window.get_mouse_down(minifb::MouseButton::Right) as u8) << 1
+                | (window.get_mouse_down(minifb::MouseButton::Middle) as u8) << 2;
+            if let Some((lx, ly)) = last_mouse
+                && (lx != x || ly != y || buttons != 0)
+            {
+                let _ = tx.send(Event::Mouse((x - lx) as i32, (ly - y) as i32, buttons));
+            }
+            last_mouse = Some((x, y));
+        }
+    }
+    let _ = tx.send(Event::Quit);
+}
+
+fn main() -> ExitCode {
+    let args = match parse_args() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let read = |p: &str| std::fs::read(p).map_err(|e| format!("cannot read {p}: {e}"));
+    let bios = match read(&args.bios) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let vgabios = match args.vgabios.as_deref().map(read).transpose() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let cfg = Config { ram_bytes: args.ram_mb << 20, bios, vgabios };
+    let shared = Arc::new(Shared { frame: Mutex::new(Frame::default()), done: AtomicBool::new(false) });
+    let (tx, rx) = channel();
+    let headless = args.headless || !cfg!(feature = "window");
+    let emu_shared = shared.clone();
+    let emu = std::thread::spawn(move || emulate(args, cfg, rx, emu_shared));
+
+    let stdin_tx = tx.clone();
+    std::thread::spawn(move || stdin_commands(stdin_tx));
+    #[cfg(feature = "window")]
+    if !headless {
+        window_loop(tx, shared);
+    }
+    #[cfg(not(feature = "window"))]
+    let _ = (tx, shared);
+    let _ = headless;
+    emu.join().unwrap_or(ExitCode::FAILURE)
 }
