@@ -2,7 +2,7 @@
 
 use super::{Ctx, Exception, Res, gp, vector};
 use crate::bus::Bus;
-use crate::cpu::{SS, attr, cr0, cr4};
+use crate::cpu::{SS, TLB_SIZE, TlbEntry, attr, cr0, cr4, tlb_perm};
 use crate::decode::{MemOperand, NO_REG};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,6 +157,28 @@ impl<B: Bus> Ctx<'_, B> {
             return Ok(lin);
         }
         let write = acc == Access::Write;
+        let slot = (lin >> 12) as usize % TLB_SIZE;
+        let e = self.cpu.tlb.entries[slot];
+        if e.tag == (lin >> 12) + 1 {
+            let need = match (write, user) {
+                (false, false) => 0,
+                (false, true) => tlb_perm::USER_READ,
+                (true, true) => tlb_perm::USER_WRITE,
+                (true, false) => tlb_perm::SUPER_WRITE,
+            };
+            if e.perms & need == need {
+                return Ok(e.phys | (lin & 0xfff));
+            }
+        }
+        let (phys, perms) = self.walk(lin, acc, user)?;
+        self.cpu.tlb.entries[slot] = TlbEntry { tag: (lin >> 12) + 1, phys: phys & !0xfff, perms };
+        Ok(phys)
+    }
+
+    /// Walks the page tables for `lin`, returning the physical address and
+    /// the TLB permissions the walk established.
+    fn walk(&mut self, lin: u32, acc: Access, user: bool) -> Res<(u32, u8)> {
+        let write = acc == Access::Write;
         let err = (write as u32) << 1 | (user as u32) << 2;
         let pf = |cpu: &mut crate::cpu::Cpu, present: bool| {
             cpu.cr2 = lin;
@@ -198,7 +220,19 @@ impl<B: Bus> Ctx<'_, B> {
             entry = wanted;
             self.bus.write32(entry_addr, entry);
         }
-        Ok(phys)
+        let mut perms = 0;
+        if user_ok {
+            perms |= tlb_perm::USER_READ;
+        }
+        if entry & 0x40 != 0 {
+            if writable && user_ok {
+                perms |= tlb_perm::USER_WRITE;
+            }
+            if writable || self.cpu.cr0 & cr0::WP == 0 {
+                perms |= tlb_perm::SUPER_WRITE;
+            }
+        }
+        Ok((phys, perms))
     }
 
     /// Translates the first and last byte of an access; returns both physical

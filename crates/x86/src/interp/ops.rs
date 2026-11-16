@@ -109,14 +109,38 @@ impl<B: Bus> Ctx<'_, B> {
         self.raise(Exception::new(vec), Source::Software)
     }
 
+    fn decode_slow(&mut self, eip: u32, code32: bool) -> Result<crate::decode::Insn, DecodeError<Trap>> {
+        let this = &mut *self;
+        decode(code32, |i| this.fetch8(eip.wrapping_add(i)))
+    }
+
+    fn code_window(&mut self, eip: u32) -> Option<(u32, u32)> {
+        let cs = &self.cpu.segs[CS];
+        if eip > cs.limit {
+            return None;
+        }
+        let lin = self.seg_check(CS, eip, 1, super::mem::Access::Fetch).ok()?;
+        let in_limit = cs.limit - eip;
+        let in_page = 0xfff - (lin & 0xfff);
+        let avail = in_limit.min(in_page).saturating_add(1).min(crate::decode::MAX_LEN as u32);
+        let phys = self.translate(lin, super::mem::Access::Fetch, self.cpu.cpl() == 3).ok()?;
+        Some((phys, avail))
+    }
+
     pub(super) fn exec(&mut self) -> Res<()> {
         let eip = self.cpu.eip;
         let code32 = self.cpu.segs[CS].big();
-        let insn = {
-            let this = &mut *self;
-            decode(code32, |i| {
-                this.fetch8(eip.wrapping_add(i))
-            })
+        let insn = match self.code_window(eip) {
+            Some((phys, avail)) => {
+                let bus = &mut *self.bus;
+                let fast = decode(code32, |i| if i < avail { Ok(bus.read8(phys + i)) } else { Err(()) });
+                match fast {
+                    Ok(i) => Ok(i),
+                    Err(DecodeError::TooLong) => Err(DecodeError::TooLong),
+                    Err(DecodeError::Fetch(())) => self.decode_slow(eip, code32),
+                }
+            }
+            None => self.decode_slow(eip, code32),
         };
         let insn = match insn {
             Ok(i) => i,
@@ -913,10 +937,13 @@ impl<B: Bus> Ctx<'_, B> {
                     let v = self.read(self.rm_loc(), 2)?;
                     let keep_pe = self.cpu.cr0 & cr0::PE;
                     self.cpu.cr0 = (self.cpu.cr0 & !0xe) | (v & 0xf) | keep_pe;
+                    self.cpu.tlb.flush();
                 }
                 7 => {
                     self.require_cpl0()?;
-                    self.require_mem()?;
+                    let (seg, off) = self.require_mem()?;
+                    let lin = self.cpu.segs[seg].base.wrapping_add(off);
+                    self.cpu.tlb.flush_page(lin);
                 }
                 _ => return ud(),
             },
@@ -961,9 +988,13 @@ impl<B: Bus> Ctx<'_, B> {
                                 return gp(0);
                             }
                             self.cpu.cr0 = v | cr0::ET;
+                            self.cpu.tlb.flush();
                         }
                         2 => self.cpu.cr2 = v,
-                        3 => self.cpu.cr3 = v,
+                        3 => {
+                            self.cpu.cr3 = v;
+                            self.cpu.tlb.flush();
+                        }
                         4 => {
                             let supported = cr4::VME | cr4::PVI | cr4::TSD | cr4::DE | cr4::PSE | cr4::PGE
                                 | cr4::PCE | cr4::OSFXSR | cr4::OSXMMEXCPT;
@@ -971,6 +1002,7 @@ impl<B: Bus> Ctx<'_, B> {
                                 return gp(0);
                             }
                             self.cpu.cr4 = v;
+                            self.cpu.tlb.flush();
                         }
                         _ => return ud(),
                     }

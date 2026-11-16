@@ -134,6 +134,49 @@ pub struct DescriptorTable {
     pub limit: u16,
 }
 
+/// Cached x86 page translation. `tag` is the linear page number plus one, so 0 is empty.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TlbEntry {
+    pub tag: u32,
+    pub phys: u32,
+    pub perms: u8,
+}
+
+pub mod tlb_perm {
+    pub const USER_READ: u8 = 1;
+    pub const USER_WRITE: u8 = 2;
+    pub const SUPER_WRITE: u8 = 4;
+}
+
+pub const TLB_SIZE: usize = 1024;
+
+/// Software TLB for the interpreter. Like a hardware TLB it may hold stale
+/// entries until CR3 is reloaded or INVLPG runs; write permission is only
+/// cached once the Dirty bit is set.
+#[derive(Clone, Debug)]
+pub struct Tlb {
+    pub entries: Box<[TlbEntry; TLB_SIZE]>,
+}
+
+impl Default for Tlb {
+    fn default() -> Self {
+        Tlb { entries: Box::new([TlbEntry::default(); TLB_SIZE]) }
+    }
+}
+
+impl Tlb {
+    pub fn flush(&mut self) {
+        self.entries.fill(TlbEntry::default());
+    }
+
+    pub fn flush_page(&mut self, lin: u32) {
+        let e = &mut self.entries[(lin >> 12) as usize % TLB_SIZE];
+        if e.tag == (lin >> 12) + 1 {
+            *e = TlbEntry::default();
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 #[repr(C)]
 pub struct Cpu {
@@ -167,6 +210,7 @@ pub struct Cpu {
     /// they leave no exception pending. The board may also clear it on a write
     /// to port 0xF0 (IGNNE#).
     pub ferr_pending: bool,
+    pub tlb: Tlb,
 }
 
 impl Default for Cpu {
@@ -202,6 +246,7 @@ impl Cpu {
             xmm: [0; 8],
             mxcsr: 0,
             ferr_pending: false,
+            tlb: Tlb::default(),
         };
         cpu.reset();
         cpu
@@ -234,6 +279,7 @@ impl Cpu {
         self.apic_base = 0xfee0_0000 | (1 << 11) | (1 << 8);
         self.halted = false;
         self.interrupt_shadow = false;
+        self.tlb.flush();
         self.fpu = crate::fpu::Fpu::default();
         self.xmm = [0; 8];
         self.mxcsr = mxcsr::RESET;
