@@ -297,6 +297,18 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
         let bytes: Vec<String> = (0..64).map(|i| format!("{:02x}", x86::bus::Bus::read8(&mut board, phys - 32 + i))).collect();
         eprintln!("code at eip: {}", bytes.join(" "));
     }
+    if let Some(addr) = std::env::var("SLOPPER_DUMP_STR").ok().and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok()) {
+        let mut text = String::new();
+        for i in 0..256 {
+            let Ok(p) = x86::interp::translate(&mut cpu, &mut board, addr + i, false) else { break };
+            let b = x86::bus::Bus::read8(&mut board, p);
+            if b == 0 {
+                break;
+            }
+            text.push(if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' });
+        }
+        eprintln!("string at {addr:#x}: {text}");
+    }
     eprintln!(
         "ran {total} instructions ({jit_insns} translated) in {secs:.1}s ({:.1} MIPS)",
         total as f64 / secs / 1e6
