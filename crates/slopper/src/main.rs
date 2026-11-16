@@ -507,7 +507,9 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
         }
         if Instant::now() >= next_frame {
             next_frame = Instant::now() + Duration::from_millis(16);
-            if let Some((w, h)) = board.render(&mut scratch) {
+            if board.display_changed()
+                && let Some((w, h)) = board.render(&mut scratch)
+            {
                 let mut f = shared.frame.lock().unwrap();
                 std::mem::swap(&mut f.pixels, &mut scratch);
                 f.width = w;

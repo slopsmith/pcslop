@@ -53,6 +53,7 @@ pub struct Vga {
     frames: u64,
     scratch: Vec<u32>,
     pixels: Vec<u8>,
+    changed: bool,
 }
 
 impl Default for Vga {
@@ -91,7 +92,15 @@ impl Vga {
             frames: 0,
             scratch: Vec::new(),
             pixels: Vec::new(),
+            changed: true,
         }
+    }
+
+    /// True if VRAM or a register may have changed since the last call, or
+    /// in text mode, where the cursor and blinking change the picture anyway.
+    pub fn take_changed(&mut self) -> bool {
+        let text = !self.vbe.enabled() && self.gfx[6] & 1 == 0;
+        std::mem::replace(&mut self.changed, false) || text
     }
 
     pub fn vram(&self) -> &[u8] {
@@ -99,6 +108,7 @@ impl Vga {
     }
 
     pub fn vram_mut(&mut self) -> &mut [u8] {
+        self.changed = true;
         &mut self.vram
     }
 
@@ -124,6 +134,7 @@ impl Vga {
 
     /// False if the port is not ours.
     pub fn io_write(&mut self, port: u16, size: u8, value: u32) -> bool {
+        self.changed = true;
         match port {
             0x1ce | 0x1cf => self.vbe_write(port, value as u16),
             0x3b0..=0x3df => {

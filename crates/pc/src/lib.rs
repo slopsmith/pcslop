@@ -358,6 +358,11 @@ impl Board {
         self.vga.render(out)
     }
 
+    /// True if the picture may differ from the last time this was asked.
+    pub fn display_changed(&mut self) -> bool {
+        self.vga.take_changed()
+    }
+
     /// Inserts an ISO image into the CD-ROM drive on the secondary master.
     pub fn attach_cdrom(&mut self, path: &str) -> std::io::Result<()> {
         let b = ide::FileBackend::open(path, true)?;

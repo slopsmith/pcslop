@@ -89,6 +89,7 @@ impl Vga {
     }
 
     pub fn mem_write8(&mut self, addr: u32, v: u8) {
+        self.changed = true;
         if let Some(lin) = self.linear_window(addr) {
             if let Some(i) = lin {
                 self.vram[i] = v;
