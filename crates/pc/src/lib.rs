@@ -49,6 +49,8 @@ pub struct Board {
     a20: bool,
     pci_addr: u32,
     pci: Vec<(Bdf, ConfigSpace)>,
+    /// ISA IRQs currently held high by PCI interrupt lines.
+    pci_irqs: u16,
     pub pic: pic::Pic,
     pub pit: pit::Pit,
     fdc: fdc::Fdc,
@@ -68,6 +70,7 @@ pub struct Board {
 }
 
 const LEGACY_START: u32 = 0xa_0000;
+const PIIX3_ISA: usize = 1;
 const IDE: usize = 2;
 const DISPLAY: usize = 3;
 const LEGACY_END: u32 = 0x10_0000;
@@ -82,6 +85,7 @@ impl Board {
             bios: cfg.bios,
             a20: true,
             pci_addr: 0,
+            pci_irqs: 0,
             pci: vec![
                 (Bdf { dev: 0, func: 0 }, pci::host_bridge()),
                 (Bdf { dev: 1, func: 0 }, pci::piix3_isa()),
@@ -157,6 +161,7 @@ impl Board {
         if self.rtc.poll(now) {
             self.pic.pulse_irq(8);
         }
+        self.sync_pci_irqs();
     }
 
     /// Timer interrupts not yet delivered; it grows when the guest falls behind.
@@ -389,6 +394,36 @@ impl Board {
         Ok(())
     }
 
+    /// Level of the INTx line of `self.pci[function]`.
+    fn intx(&self, function: usize) -> bool {
+        let _ = function;
+        false
+    }
+
+    /// Drives the PIC from the PCI interrupt lines through the PIIX3 PIRQ router.
+    /// PCI interrupts are level-triggered, so an IRQ stays high while any
+    /// device routed to it asserts its line.
+    fn sync_pci_irqs(&mut self) {
+        let route = &self.pci[PIIX3_ISA].1.data[pci::PIRQRC..pci::PIRQRC + 4];
+        let mut levels = 0u16;
+        for (i, (bdf, cfg)) in self.pci.iter().enumerate() {
+            let pin = cfg.data[pci::INTERRUPT_PIN];
+            if pin == 0 || !self.intx(i) {
+                continue;
+            }
+            if let Some(irq) = pci::pirq_route(route[pci::pirq_for(bdf.dev, pin)]) {
+                levels |= 1 << irq;
+            }
+        }
+        let changed = levels ^ self.pci_irqs;
+        self.pci_irqs = levels;
+        for irq in 0..16 {
+            if changed & 1 << irq != 0 {
+                self.pic.set_irq(irq, levels & 1 << irq != 0);
+            }
+        }
+    }
+
     fn sync_ide(&mut self) {
         self.pic.set_irq(14, self.ide.irq(0));
         self.pic.set_irq(15, self.ide.irq(1));
@@ -400,7 +435,11 @@ impl Board {
         for r in PAM0..PAM0 + 7 {
             self.pci[0].1.data[r] = 0;
         }
+        for r in pci::PIRQRC..pci::PIRQRC + 4 {
+            self.pci[PIIX3_ISA].1.data[r] = 0x80;
+        }
         self.pic = pic::Pic::default();
+        self.pci_irqs = 0;
         self.pit = pit::Pit::default();
         self.fdc = fdc::Fdc::default();
         self.irq0_backlog = 0;
@@ -546,6 +585,7 @@ impl Bus for Board {
                 if let Some(f) = self.pci_function() {
                     f.write(off, size as usize, value);
                 }
+                self.sync_pci_irqs();
                 return;
             }
             fw_cfg::PORT_SELECTOR if size == 2 => {

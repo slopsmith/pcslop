@@ -300,6 +300,23 @@ mod tests {
     }
 
     #[test]
+    fn level_triggered_irq_repeats_until_released() {
+        let mut p = Pic::default();
+        init(&mut p);
+        p.io_write(0x4d1, 0x08);
+        p.set_irq(11, true);
+        assert_eq!(p.inta(), 0x73);
+        p.io_write(0xa0, 0x20);
+        p.io_write(0x20, 0x20);
+        assert!(p.intr());
+        assert_eq!(p.inta(), 0x73);
+        p.set_irq(11, false);
+        p.io_write(0xa0, 0x20);
+        p.io_write(0x20, 0x20);
+        assert!(!p.intr());
+    }
+
+    #[test]
     fn masked_irq_is_not_delivered() {
         let mut p = Pic::default();
         init(&mut p);

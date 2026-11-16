@@ -135,6 +135,26 @@ pub fn piix3_ide() -> ConfigSpace {
     c
 }
 
+pub const INTERRUPT_PIN: usize = 0x3d;
+
+/// PIRQ line (0 = PIRQA) that INTx `pin` (1 = INTA#) of a device in `slot`
+/// reaches on the i440FX board. The rotation follows QEMU's
+/// `pc_pci_slot_get_pirq` in hw/i386/pc_piix.c (Fabrice Bellard et al.), which
+/// SeaBIOS's `piix_pci_slot_get_irq` mirrors when it fills Interrupt Line.
+pub fn pirq_for(slot: u8, pin: u8) -> usize {
+    (pin as usize + slot as usize + 2) & 3
+}
+
+/// PIRQ route control registers in the PIIX3 ISA bridge (82371SB datasheet, 2.2.10).
+pub const PIRQRC: usize = 0x60;
+
+/// ISA IRQ a PIRQRC register value routes to. Bit 7 disables routing, and
+/// IRQ 0-2, 8 and 13 are reserved.
+pub fn pirq_route(reg: u8) -> Option<u8> {
+    let irq = reg & 0x0f;
+    (reg & 0x80 == 0 && !matches!(irq, 0 | 1 | 2 | 8 | 13)).then_some(irq)
+}
+
 /// PAM register offsets in the i440FX host bridge (440FX datasheet, section 3.2).
 pub const PAM0: usize = 0x59;
 
@@ -157,5 +177,26 @@ mod tests {
         c.write(0x04, 2, 3);
         assert_eq!(c.mem_bar(0), Some(0xe000_0000));
         assert_eq!(c.io_bar(4), Some(0xc000));
+    }
+
+    #[test]
+    fn pirq_swizzle_matches_seabios() {
+        // SeaBIOS: pci_irqs[(pin - 1 + slot - 1) & 3]
+        for slot in 0..32u8 {
+            for pin in 1..=4u8 {
+                assert_eq!(pirq_for(slot, pin), (pin as usize - 1 + slot as usize).wrapping_sub(1) & 3);
+            }
+        }
+        assert_eq!(pirq_for(1, 4), 3);
+    }
+
+    #[test]
+    fn pirq_route_register() {
+        assert_eq!(pirq_route(0x80), None);
+        assert_eq!(pirq_route(0x8b), None);
+        assert_eq!(pirq_route(0x0b), Some(11));
+        assert_eq!(pirq_route(0x0a), Some(10));
+        assert_eq!(pirq_route(0x02), None);
+        assert_eq!(pirq_route(0x0d), None);
     }
 }
