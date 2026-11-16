@@ -7,4 +7,5 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+vga = { path = "../vga" }
 x86 = { path = "../x86" }

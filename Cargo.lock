@@ -375,6 +375,7 @@ dependencies = [
 name = "pc"
 version = "0.1.0"
 dependencies = [
+ "vga",
  "x86",
 ]
 
@@ -626,6 +627,10 @@ name = "version-compare"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "579a42fc0b8e0c63b76519a339be31bed574929511fa53c1a3acae26eb258f29"
+
+[[package]]
+name = "vga"
+version = "0.1.0"
 
 [[package]]
 name = "wasm-bindgen"

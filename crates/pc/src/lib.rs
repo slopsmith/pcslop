@@ -30,6 +30,8 @@ pub struct Board {
     pub rtc: rtc::Rtc,
     pub fw_cfg: fw_cfg::FwCfg,
     pub kbc: i8042::I8042,
+    pub vga: vga::Vga,
+    vgabios: Vec<u8>,
     pub debugcon: Box<dyn Write + Send>,
     start: Instant,
     pub reset_requested: bool,
@@ -37,6 +39,7 @@ pub struct Board {
 }
 
 const LEGACY_START: u32 = 0xa_0000;
+const DISPLAY: usize = 2;
 const LEGACY_END: u32 = 0x10_0000;
 
 impl Board {
@@ -54,11 +57,24 @@ impl Board {
             rtc: rtc::Rtc::default(),
             fw_cfg: fw_cfg::FwCfg::new(),
             kbc: i8042::I8042::default(),
+            vga: vga::Vga::new(),
+            vgabios: Vec::new(),
             debugcon: Box::new(std::io::stdout()),
             start: Instant::now(),
             reset_requested: false,
             post_code: 0,
         };
+        let mut display = pci::ConfigSpace::new(vga::PCI_VENDOR, vga::PCI_DEVICE, 0x03_00_00, 0x02, 0x00);
+        display.set16(0x2c, 0x1af4);
+        display.set16(0x2e, 0x1100);
+        display.add_bar(0, pci::BarKind::MemPrefetch, vga::VRAM_SIZE as u32);
+        if let Some(rom) = cfg.vgabios {
+            let size = (rom.len() as u32).next_power_of_two().max(0x800);
+            display.add_rom_bar(size);
+            b.vgabios = rom;
+            b.vgabios.resize(size as usize, 0xff);
+        }
+        b.pci.push((Bdf { dev: 2, func: 0 }, display));
         b.setup_cmos(ram_bytes);
         b.fw_cfg.set(fw_cfg::key::RAM_SIZE, (ram_bytes as u64).to_le_bytes().to_vec());
         let e820 = fw_cfg::e820(&[(0, ram_bytes as u64, 1)]);
@@ -156,7 +172,7 @@ impl Board {
         let addr = self.mask_a20(addr);
         if (LEGACY_START..LEGACY_END).contains(&addr) {
             if addr < 0xc_0000 {
-                return self.ram[addr as usize];
+                return self.vga.mem_read8(addr);
             }
             return if self.pam(addr) & 1 != 0 { self.ram[addr as usize] } else { self.rom_byte(addr) };
         }
@@ -167,19 +183,49 @@ impl Board {
         if addr >= bios_base {
             return self.bios[(addr - bios_base) as usize];
         }
+        self.mmio_read(addr)
+    }
+
+    fn display(&self) -> &ConfigSpace {
+        &self.pci[DISPLAY].1
+    }
+
+    fn mmio_read(&mut self, addr: u32) -> u8 {
+        if let Some(base) = self.display().mem_bar(0)
+            && (base..base + vga::VRAM_SIZE as u32).contains(&addr)
+        {
+            return self.vga.vram()[(addr - base) as usize];
+        }
+        if let Some(base) = self.display().rom_bar()
+            && (base..base + self.vgabios.len() as u32).contains(&addr)
+        {
+            return self.vgabios[(addr - base) as usize];
+        }
         0xff
+    }
+
+    fn mmio_write(&mut self, addr: u32, v: u8) {
+        if let Some(base) = self.display().mem_bar(0)
+            && (base..base + vga::VRAM_SIZE as u32).contains(&addr)
+        {
+            self.vga.vram_mut()[(addr - base) as usize] = v;
+        }
     }
 
     fn write_slow(&mut self, addr: u32, v: u8) {
         let addr = self.mask_a20(addr);
         if (LEGACY_START..LEGACY_END).contains(&addr) {
-            if addr < 0xc_0000 || self.pam(addr) & 2 != 0 {
+            if addr < 0xc_0000 {
+                self.vga.mem_write8(addr, v);
+            } else if self.pam(addr) & 2 != 0 {
                 self.ram[addr as usize] = v;
             }
             return;
         }
         if (addr as usize) < self.ram.len() {
             self.ram[addr as usize] = v;
+        } else {
+            self.mmio_write(addr, v);
         }
     }
 
@@ -247,8 +293,8 @@ impl Board {
     }
 
     /// Draws the display into `out` as 0x00RRGGBB pixels.
-    pub fn render(&mut self, _out: &mut Vec<u32>) -> Option<(u32, u32)> {
-        None
+    pub fn render(&mut self, out: &mut Vec<u32>) -> Option<(u32, u32)> {
+        self.vga.render(out)
     }
 
     pub fn attach_cdrom(&mut self, _path: &str) -> std::io::Result<()> {
@@ -333,6 +379,10 @@ impl Bus for Board {
     }
 
     fn io_read(&mut self, port: u16, size: u8) -> u32 {
+        let now = self.now_ns();
+        if let Some(v) = self.vga.io_read(port, size, now) {
+            return v;
+        }
         match port {
             0xcf8 if size == 4 => return self.pci_addr,
             0xcfc..=0xcff => {
@@ -352,6 +402,9 @@ impl Bus for Board {
     }
 
     fn io_write(&mut self, port: u16, size: u8, value: u32) {
+        if self.vga.io_write(port, size, value) {
+            return;
+        }
         match port {
             0xcf8 if size == 4 => {
                 self.pci_addr = value;
