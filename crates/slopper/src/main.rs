@@ -287,6 +287,9 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
     let mut keyq = KeyQueue::default();
     let mut paused = false;
     let mut last_status = (Instant::now(), 0u64);
+    let mut time = HostTime::default();
+    let mut last_time = HostTime::default();
+    let mut last_stats = jit::Stats::default();
     let mut script = match args.script.as_ref().map(Script::load).transpose() {
         Ok(s) => s,
         Err(e) => {
@@ -305,7 +308,10 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
             && !cpu.halted
             && !irq_due
         {
-            match j.run(&mut cpu, &mut board) {
+            let t = Instant::now();
+            let r = j.run(&mut cpu, &mut board);
+            time.jit += t.elapsed();
+            match r {
                 Ok(jit::RunExit::Kicked) => {}
                 Ok(jit::RunExit::Interp(e)) => outcome = Some(e),
                 Err(e) => {
@@ -315,6 +321,7 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                 }
             }
         } else {
+            let t = Instant::now();
             for _ in 0..1024 {
                 let e = step(&mut cpu, &mut board);
                 if e != Exit::Continue {
@@ -326,11 +333,14 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                     break;
                 }
             }
+            time.interp += t.elapsed();
         }
         match outcome {
             Some(Exit::Halted) => {
                 let wait = board.next_event_ns().min(1_000_000);
+                let t = Instant::now();
                 std::thread::sleep(Duration::from_nanos(wait));
+                time.halted += t.elapsed();
             }
             Some(Exit::Shutdown) => {
                 eprintln!("triple fault after {executed} instructions; resetting");
@@ -393,8 +403,17 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                             let total = executed + jit_insns;
                             let now = Instant::now();
                             let (t, n) = last_status;
-                            let mips = total.saturating_sub(n) as f64 / now.duration_since(t).as_secs_f64() / 1e6;
+                            let span = now.duration_since(t).as_secs_f64();
+                            let mips = total.saturating_sub(n) as f64 / span / 1e6;
                             last_status = (now, total);
+                            let pct = |a: Duration, b: Duration| 100.0 * (a - b).as_secs_f64() / span;
+                            let host = format!(
+                                "host: jit {:.0}% interp {:.0}% halted {:.0}% over {span:.1}s",
+                                pct(time.jit, last_time.jit),
+                                pct(time.interp, last_time.interp),
+                                pct(time.halted, last_time.halted)
+                            );
+                            last_time = time;
                             let mode = if jit.is_some() && jit::supported(&cpu) { "jit" } else { "interp" };
                             let mut out = format!(
                                 "time {:.1}s instructions {total} ({jit_insns} translated) mips {mips:.1} mode {mode} cpl {} halted {} paused {paused}\n{}",
@@ -403,11 +422,34 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                                 cpu.halted,
                                 format_regs(&cpu)
                             );
+                            out += &format!("\n{host}");
                             if let Some(j) = jit.as_mut() {
+                                let (a, b) = (j.stats, last_stats);
+                                let r = |x: u64, y: u64| (x - y) as f64 / span;
+                                out += &format!(
+                                    "\nexits/s: interp {:.0} miss {:.0} fault {:.0} mmio {:.0} | translations/s {:.0} smc/s {:.0} flushes/s {:.0} guest #PF/s {:.0}",
+                                    r(a.interp_exits, b.interp_exits),
+                                    r(a.miss_exits, b.miss_exits),
+                                    r(a.shadow_fills + a.page_faults, b.shadow_fills + b.page_faults),
+                                    r(a.mmio_exits, b.mmio_exits),
+                                    r(a.blocks, b.blocks),
+                                    r(a.smc_invalidations, b.smc_invalidations),
+                                    r(a.flushes, b.flushes),
+                                    r(a.page_faults, b.page_faults),
+                                );
+                                last_stats = a;
                                 out += &format!("\n{}\n{:?}", j.debug_state(), j.stats);
                             }
                             out
                         }
+                        "profile" => match (jit.as_mut(), rest) {
+                            (None, _) => "the JIT is off".into(),
+                            (Some(j), "on" | "off") => {
+                                j.set_profiling(rest == "on");
+                                format!("profiling {rest}")
+                            }
+                            (Some(j), _) => j.profile_report(),
+                        },
                         "pause" => {
                             paused = true;
                             "paused".into()
@@ -503,16 +545,21 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
     );
     if let Some(j) = &jit {
         eprintln!("{:?}", j.stats);
-        if let Some(p) = &j.interp_profile {
-            let mut v: Vec<_> = p.iter().collect();
-            v.sort_by(|a, b| b.1.cmp(a.1));
-            let top: Vec<String> = v.iter().take(40).map(|(k, n)| format!("{k:04x}:{n}")).collect();
-            eprintln!("interpreter exits by opcode: {}", top.join(" "));
+        if j.interp_profile.is_some() {
+            eprintln!("{}", j.profile_report());
         }
     }
     dump(&cpu);
     shared.done.store(true, Ordering::Relaxed);
     code
+}
+
+/// Host time spent running translated code, interpreting, and sleeping in HLT.
+#[derive(Default, Clone, Copy)]
+struct HostTime {
+    jit: Duration,
+    interp: Duration,
+    halted: Duration,
 }
 
 fn format_regs(cpu: &Cpu) -> String {
@@ -567,7 +614,7 @@ fn control_server(path: PathBuf, tx: Sender<Event>) {
 /// once the emulator has stopped.
 fn run_command(line: &str, tx: &Sender<Event>) -> Option<String> {
     let cmd = line.split_whitespace().next().unwrap_or("");
-    if matches!(cmd, "screen" | "regs" | "status" | "pause" | "resume" | "mem") {
+    if matches!(cmd, "screen" | "regs" | "status" | "pause" | "resume" | "mem" | "profile") {
         let (rtx, rrx) = channel();
         tx.send(Event::Query(line.to_string(), rtx)).ok()?;
         return Some(rrx.recv_timeout(Duration::from_secs(10)).unwrap_or_else(|_| "no answer".into()));
@@ -606,7 +653,7 @@ fn command_event(line: &str) -> Result<Vec<Event>, String> {
         }
         "quit" => vec![Event::Quit],
         _ => {
-            return Err("commands: screen | status | regs | mem HEXADDR [LEN] | pause | resume | shot PATH | type TEXT | key NAME[+NAME] | mouse DX DY [BUTTONS] | quit".into());
+            return Err("commands: screen | status | regs | mem HEXADDR [LEN] | profile [on|off] | pause | resume | shot PATH | type TEXT | key NAME[+NAME] | mouse DX DY [BUTTONS] | quit".into());
         }
     })
 }

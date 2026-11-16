@@ -373,6 +373,33 @@ impl Jit {
         )
     }
 
+    /// Turns exit timing and the interpreter-exit histogram on or off.
+    pub fn set_profiling(&mut self, on: bool) {
+        self.timing = on;
+        self.interp_profile = on.then(HashMap::new);
+        let s = &mut self.stats;
+        (s.vm_ns, s.miss_ns, s.interp_ns, s.fault_ns, s.mmio_ns) = (0, 0, 0, 0, 0);
+    }
+
+    /// Time per exit kind and the most frequent interpreted opcodes since profiling began.
+    pub fn profile_report(&self) -> String {
+        let Some(p) = &self.interp_profile else { return "profiling is off (profile on)".into() };
+        let s = &self.stats;
+        let ms = |ns: u64| ns as f64 / 1e6;
+        let mut v: Vec<_> = p.iter().collect();
+        v.sort_by(|a, b| b.1.cmp(a.1));
+        let top: Vec<String> = v.iter().take(40).map(|(k, n)| format!("{k:04x}:{n}")).collect();
+        format!(
+            "ms in vm {:.0} miss {:.0} interp {:.0} fault {:.0} mmio {:.0}\ninterpreter exits by opcode: {}",
+            ms(s.vm_ns),
+            ms(s.miss_ns),
+            ms(s.interp_ns),
+            ms(s.fault_ns),
+            ms(s.mmio_ns),
+            top.join(" ")
+        )
+    }
+
     /// x86 instructions retired by translated code so far.
     pub fn instructions(&mut self) -> u64 {
         self.state().icount
