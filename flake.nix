@@ -13,6 +13,26 @@
     {
       packages.${system} = {
         seabios = x86pkgs.seabios.override { ___build-type = "qemu"; };
+
+        seavgabios = (x86pkgs.seabios.override { ___build-type = "qemu"; }).overrideAttrs {
+          pname = "seavgabios-stdvga";
+          postConfigure = ''
+            cat > .config <<CONFIG
+            CONFIG_QEMU=y
+            CONFIG_VGA_BOCHS=y
+            CONFIG_VGA_BOCHS_STDVGA=y
+            CONFIG_VGA_PCI=y
+            CONFIG_OVERRIDE_PCI_ID=n
+            CONFIG
+            make olddefconfig
+          '';
+          installPhase = ''
+            runHook preInstall
+            mkdir -p $doc
+            install -Dm644 out/vgabios.bin -t $out/share/seabios/
+            runHook postInstall
+          '';
+        };
       };
 
       devShells.${system}.default = pkgs.mkShellNoCC {
