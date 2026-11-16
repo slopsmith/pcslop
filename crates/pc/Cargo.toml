@@ -1,0 +1,10 @@
+[package]
+name = "pc"
+description = "i440FX/PIIX PC board and legacy devices"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+x86 = { path = "../x86" }

@@ -1,0 +1,335 @@
+//! An i440FX + PIIX3 PC: memory map, chipset registers and legacy devices.
+
+pub mod fw_cfg;
+pub mod pci;
+pub mod pic;
+pub mod pit;
+pub mod rtc;
+
+use std::io::Write;
+use std::time::Instant;
+
+use pci::{Bdf, ConfigSpace, PAM0};
+use x86::bus::Bus;
+
+pub struct Config {
+    pub ram_bytes: u32,
+    pub bios: Vec<u8>,
+}
+
+pub struct Board {
+    ram: Vec<u8>,
+    bios: Vec<u8>,
+    a20: bool,
+    pci_addr: u32,
+    pci: Vec<(Bdf, ConfigSpace)>,
+    pub pic: pic::Pic,
+    pub pit: pit::Pit,
+    pub rtc: rtc::Rtc,
+    pub fw_cfg: fw_cfg::FwCfg,
+    pub debugcon: Box<dyn Write + Send>,
+    start: Instant,
+    pub reset_requested: bool,
+    pub post_code: u8,
+}
+
+const LEGACY_START: u32 = 0xa_0000;
+const LEGACY_END: u32 = 0x10_0000;
+
+impl Board {
+    pub fn new(cfg: Config) -> Self {
+        assert!(cfg.bios.len().is_power_of_two() && cfg.bios.len() >= 0x2_0000, "BIOS must be a power of two >= 128 KiB");
+        let ram_bytes = cfg.ram_bytes;
+        let mut b = Board {
+            ram: vec![0; ram_bytes as usize],
+            bios: cfg.bios,
+            a20: true,
+            pci_addr: 0,
+            pci: vec![(Bdf { dev: 0, func: 0 }, pci::host_bridge()), (Bdf { dev: 1, func: 0 }, pci::piix3_isa())],
+            pic: pic::Pic::default(),
+            pit: pit::Pit::default(),
+            rtc: rtc::Rtc::default(),
+            fw_cfg: fw_cfg::FwCfg::new(),
+            debugcon: Box::new(std::io::stdout()),
+            start: Instant::now(),
+            reset_requested: false,
+            post_code: 0,
+        };
+        b.setup_cmos(ram_bytes);
+        b.fw_cfg.set(fw_cfg::key::RAM_SIZE, (ram_bytes as u64).to_le_bytes().to_vec());
+        let e820 = fw_cfg::e820(&[(0, ram_bytes as u64, 1)]);
+        b.fw_cfg.add_file("etc/e820", e820);
+        b
+    }
+
+    fn setup_cmos(&mut self, ram: u32) {
+        let r = &mut self.rtc.ram;
+        let ext_kb = ((ram.saturating_sub(0x10_0000)) / 1024).min(0xfc00);
+        r[0x15] = 0x80;
+        r[0x16] = 0x02;
+        r[0x17] = ext_kb as u8;
+        r[0x18] = (ext_kb >> 8) as u8;
+        r[0x30] = ext_kb as u8;
+        r[0x31] = (ext_kb >> 8) as u8;
+        let above16 = (ram.saturating_sub(0x100_0000) / 0x1_0000).min(0xffff);
+        r[0x34] = above16 as u8;
+        r[0x35] = (above16 >> 8) as u8;
+        r[0x3d] = 0x02 | 0x03 << 4;
+        r[0x38] = 0x01;
+        r[0x5f] = 0;
+    }
+
+    pub fn now_ns(&self) -> u64 {
+        self.start.elapsed().as_nanos() as u64
+    }
+
+    /// Advances timers and raises their interrupts.
+    pub fn tick(&mut self) {
+        let now = self.now_ns();
+        for _ in 0..self.pit.poll_irq0(now) {
+            self.pic.pulse_irq(0);
+        }
+        if self.rtc.poll(now) {
+            self.pic.pulse_irq(8);
+        }
+    }
+
+    /// Nanoseconds until a timer will next need attention.
+    pub fn next_event_ns(&self) -> u64 {
+        let now = self.now_ns();
+        self.pit.next_irq0_ns(now).unwrap_or(1_000_000).min(1_000_000)
+    }
+
+    fn mask_a20(&self, addr: u32) -> u32 {
+        if self.a20 { addr } else { addr & !(1 << 20) }
+    }
+
+    /// PAM attribute bits (bit 0 = read from RAM, bit 1 = write to RAM) for a
+    /// legacy-region address in 0xC0000..0x100000.
+    fn pam(&self, addr: u32) -> u8 {
+        let host = &self.pci[0].1.data;
+        if addr >= 0xf_0000 {
+            return (host[PAM0] >> 4) & 3;
+        }
+        let chunk = ((addr - 0xc_0000) >> 14) as usize;
+        let reg = host[PAM0 + 1 + chunk / 2];
+        if chunk & 1 == 0 { reg & 3 } else { (reg >> 4) & 3 }
+    }
+
+    fn rom_byte(&self, addr: u32) -> u8 {
+        if addr >= 0xe_0000 {
+            let off = self.bios.len() - 0x2_0000 + (addr - 0xe_0000) as usize;
+            return self.bios[off];
+        }
+        0xff
+    }
+
+    fn read_slow(&mut self, addr: u32) -> u8 {
+        let addr = self.mask_a20(addr);
+        if (LEGACY_START..LEGACY_END).contains(&addr) {
+            if addr < 0xc_0000 {
+                return self.ram[addr as usize];
+            }
+            return if self.pam(addr) & 1 != 0 { self.ram[addr as usize] } else { self.rom_byte(addr) };
+        }
+        if (addr as usize) < self.ram.len() {
+            return self.ram[addr as usize];
+        }
+        let bios_base = 0u32.wrapping_sub(self.bios.len() as u32);
+        if addr >= bios_base {
+            return self.bios[(addr - bios_base) as usize];
+        }
+        0xff
+    }
+
+    fn write_slow(&mut self, addr: u32, v: u8) {
+        let addr = self.mask_a20(addr);
+        if (LEGACY_START..LEGACY_END).contains(&addr) {
+            if addr < 0xc_0000 || self.pam(addr) & 2 != 0 {
+                self.ram[addr as usize] = v;
+            }
+            return;
+        }
+        if (addr as usize) < self.ram.len() {
+            self.ram[addr as usize] = v;
+        }
+    }
+
+    /// True when `[addr, addr + len)` is ordinary RAM with no special decoding.
+    #[inline]
+    fn plain_ram(&self, addr: u32, len: u32) -> bool {
+        let end = addr as u64 + len as u64;
+        self.a20 && end <= self.ram.len() as u64 && (end <= LEGACY_START as u64 || addr >= LEGACY_END)
+    }
+
+    fn pci_function(&mut self) -> Option<&mut ConfigSpace> {
+        let a = self.pci_addr;
+        if a & 0x8000_0000 == 0 || (a >> 16) & 0xff != 0 {
+            return None;
+        }
+        let bdf = Bdf { dev: ((a >> 11) & 0x1f) as u8, func: ((a >> 8) & 7) as u8 };
+        self.pci.iter_mut().find(|(b, _)| *b == bdf).map(|(_, c)| c)
+    }
+
+    fn io_read8(&mut self, port: u16) -> u8 {
+        let now = self.now_ns();
+        match port {
+            0x20 | 0x21 | 0xa0 | 0xa1 | 0x4d0 | 0x4d1 => self.pic.io_read(port),
+            0x40..=0x43 | 0x61 => self.pit.read(port, now),
+            0x70 | 0x71 => self.rtc.read(port),
+            0x92 => (self.a20 as u8) << 1,
+            0x402 => 0xe9,
+            0x510 => 0,
+            0x511 => self.fw_cfg.read_data(),
+            0x64 => 0x1c,
+            _ => 0xff,
+        }
+    }
+
+    fn io_write8(&mut self, port: u16, v: u8) {
+        let now = self.now_ns();
+        match port {
+            0x20 | 0x21 | 0xa0 | 0xa1 | 0x4d0 | 0x4d1 => self.pic.io_write(port, v),
+            0x40..=0x43 | 0x61 => self.pit.write(port, v, now),
+            0x70 | 0x71 => self.rtc.write(port, v),
+            0x80 => self.post_code = v,
+            0x92 => {
+                self.a20 = v & 2 != 0;
+                if v & 1 != 0 {
+                    self.reset_requested = true;
+                }
+            }
+            0x402 => {
+                let _ = self.debugcon.write_all(&[v]);
+                if v == b'\n' {
+                    let _ = self.debugcon.flush();
+                }
+            }
+            0xcf9 if v & 4 != 0 => self.reset_requested = true,
+            _ => {}
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.a20 = true;
+        for r in PAM0..PAM0 + 7 {
+            self.pci[0].1.data[r] = 0;
+        }
+        self.pic = pic::Pic::default();
+        self.pit = pit::Pit::default();
+        self.reset_requested = false;
+    }
+}
+
+impl Bus for Board {
+    #[inline]
+    fn read8(&mut self, addr: u32) -> u8 {
+        if self.plain_ram(addr, 1) {
+            return self.ram[addr as usize];
+        }
+        self.read_slow(addr)
+    }
+
+    #[inline]
+    fn write8(&mut self, addr: u32, value: u8) {
+        if self.plain_ram(addr, 1) {
+            self.ram[addr as usize] = value;
+            return;
+        }
+        self.write_slow(addr, value)
+    }
+
+    #[inline]
+    fn read16(&mut self, addr: u32) -> u16 {
+        if self.plain_ram(addr, 2) {
+            let a = addr as usize;
+            return u16::from_le_bytes([self.ram[a], self.ram[a + 1]]);
+        }
+        u16::from_le_bytes([self.read_slow(addr), self.read_slow(addr.wrapping_add(1))])
+    }
+
+    #[inline]
+    fn read32(&mut self, addr: u32) -> u32 {
+        if self.plain_ram(addr, 4) {
+            let a = addr as usize;
+            return u32::from_le_bytes(self.ram[a..a + 4].try_into().unwrap());
+        }
+        let b = [0, 1, 2, 3].map(|i| self.read_slow(addr.wrapping_add(i)));
+        u32::from_le_bytes(b)
+    }
+
+    #[inline]
+    fn write16(&mut self, addr: u32, value: u16) {
+        if self.plain_ram(addr, 2) {
+            let a = addr as usize;
+            self.ram[a..a + 2].copy_from_slice(&value.to_le_bytes());
+            return;
+        }
+        for (i, b) in value.to_le_bytes().into_iter().enumerate() {
+            self.write_slow(addr.wrapping_add(i as u32), b);
+        }
+    }
+
+    #[inline]
+    fn write32(&mut self, addr: u32, value: u32) {
+        if self.plain_ram(addr, 4) {
+            let a = addr as usize;
+            self.ram[a..a + 4].copy_from_slice(&value.to_le_bytes());
+            return;
+        }
+        for (i, b) in value.to_le_bytes().into_iter().enumerate() {
+            self.write_slow(addr.wrapping_add(i as u32), b);
+        }
+    }
+
+    fn io_read(&mut self, port: u16, size: u8) -> u32 {
+        match port {
+            0xcf8 if size == 4 => return self.pci_addr,
+            0xcfc..=0xcff => {
+                let off = (self.pci_addr & 0xfc) as usize + (port - 0xcfc) as usize;
+                return match self.pci_function() {
+                    Some(f) => f.read(off, size as usize),
+                    None => u32::MAX >> (32 - 8 * size as u32),
+                };
+            }
+            _ => {}
+        }
+        let mut v = 0;
+        for i in 0..size as u16 {
+            v |= (self.io_read8(port.wrapping_add(i)) as u32) << (8 * i);
+        }
+        v
+    }
+
+    fn io_write(&mut self, port: u16, size: u8, value: u32) {
+        match port {
+            0xcf8 if size == 4 => {
+                self.pci_addr = value;
+                return;
+            }
+            0xcfc..=0xcff => {
+                let off = (self.pci_addr & 0xfc) as usize + (port - 0xcfc) as usize;
+                if let Some(f) = self.pci_function() {
+                    f.write(off, size as usize, value);
+                }
+                return;
+            }
+            fw_cfg::PORT_SELECTOR if size == 2 => {
+                self.fw_cfg.write_selector(value as u16);
+                return;
+            }
+            _ => {}
+        }
+        for i in 0..size as u16 {
+            self.io_write8(port.wrapping_add(i), (value >> (8 * i)) as u8);
+        }
+    }
+
+    fn intr(&mut self) -> bool {
+        self.pic.intr()
+    }
+
+    fn inta(&mut self) -> u8 {
+        self.pic.inta()
+    }
+}
