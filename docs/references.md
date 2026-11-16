@@ -16,7 +16,8 @@ Nothing listed here is committed. Run `scripts/fetch-references.sh` (add `--test
 | [FEX](https://github.com/FEX-Emu/FEX) | MIT | Yes, with attribution | x86 → ARM64 JIT with IR, TSO handling, FlagM usage |
 | [Berkeley SoftFloat 3](https://github.com/ucb-bar/berkeley-softfloat-3) | BSD-3-Clause | Yes, with attribution | `extF80` for an accurate x87 mode |
 | [test386.asm](https://github.com/barotto/test386.asm) | GPL-3.0 | **No**: it would force GPLv3 on the project, which clashes with GPL-2.0-only QEMU code | Assemble it and run the resulting binary as an external test ROM |
-| [SingleStepTests/80386](https://github.com/SingleStepTests/80386) | MIT (code); data is public domain | Yes | Per-instruction register/memory before-and-after tests captured from real hardware (real mode for now) |
+| [SingleStepTests/80386](https://github.com/SingleStepTests/80386) | MIT (code); data is public domain | Yes | Per-instruction register/memory before-and-after tests captured from real hardware (real mode for now). `crates/cputest` runs them |
+| [dbalsom/moo](https://github.com/dbalsom/moo) | MIT | Yes, with attribution | Specification of the MOO test file format (`doc/moo_format_v1.md`) |
 | [dougallj/applecpu](https://github.com/dougallj/applecpu) | No license | **No**, read only | Firestorm/Icestorm instruction latencies and ports, for codegen decisions |
 | [AsahiLinux/docs](https://github.com/AsahiLinux/docs) | CC-BY-3.0 | Text with attribution | Apple CPU implementation-defined registers and features |
 
@@ -60,4 +61,7 @@ Not found as free, trustworthy copies: PCI BIOS Spec 2.1, PCI Local Bus 2.3, the
 
 ## Code we use
 
-None yet.
+| Where | What | Source | License |
+| --- | --- | --- | --- |
+| `crates/pc/src/rtc.rs` | `civil_from_days` / `days_from_civil` date conversions | Howard Hinnant, [chrono-compatible low-level date algorithms](https://howardhinnant.github.io/date_algorithms.html) | Public domain |
+| `crates/cputest/src/moo.rs` | MOO reader, written from the format spec (no code copied) | Daniel Balsom, [moo_format_v1.md](https://github.com/dbalsom/moo/blob/main/doc/moo_format_v1.md) | MIT |
