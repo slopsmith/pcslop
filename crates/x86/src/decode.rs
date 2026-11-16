@@ -323,6 +323,26 @@ mod tests {
     }
 
     #[test]
+    fn sse_opcodes_take_imm8_only_where_defined() {
+        assert_eq!(dec(true, &[0x66, 0x0f, 0x73, 0xfb, 0x03]).len, 5);
+        assert_eq!(dec(true, &[0x0f, 0xc2, 0x41, 0x10, 0x01]).len, 5);
+        assert_eq!(dec(true, &[0xf2, 0x0f, 0x70, 0xc1, 0x1b]).len, 5);
+        assert_eq!(dec(true, &[0x66, 0x0f, 0xc5, 0xc1, 0x07]).len, 5);
+        assert_eq!(dec(true, &[0x0f, 0xc6, 0xc1, 0x44]).len, 4);
+        assert_eq!(dec(true, &[0x0f, 0x77]).len, 2);
+        assert_eq!(dec(true, &[0x66, 0x0f, 0xd6, 0xc1]).len, 4);
+        assert_eq!(dec(true, &[0x0f, 0xae, 0xf8]).len, 3);
+    }
+
+    #[test]
+    fn mandatory_66_is_recorded_separately_from_operand_size() {
+        let i = dec(false, &[0x66, 0x0f, 0x58, 0xc1]);
+        assert!(i.opsize_prefix);
+        let i = dec(true, &[0x66, 0xf3, 0x0f, 0x6f, 0xc1]);
+        assert_eq!((i.opsize_prefix, i.rep), (true, Rep::Rep));
+    }
+
+    #[test]
     fn rejects_too_long() {
         let bytes = [0x26u8; 16];
         assert_eq!(decode::<()>(true, |i| Ok(bytes[i as usize])), Err(DecodeError::TooLong));

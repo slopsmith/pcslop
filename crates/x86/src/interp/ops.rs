@@ -33,7 +33,7 @@ impl<B: Bus> Ctx<'_, B> {
         if self.insn.op & 1 == 0 { 1 } else { self.opsz() }
     }
 
-    fn cond(&self, cc: u16) -> bool {
+    pub(super) fn cond(&self, cc: u16) -> bool {
         let f = |m| self.cpu.flag(m);
         let r = match cc >> 1 {
             0 => f(flags::OF),
@@ -63,12 +63,12 @@ impl<B: Bus> Ctx<'_, B> {
 
     /// Offset of a later part of a multi-part memory operand; wraps at 64 KiB
     /// with 16-bit addressing.
-    fn off_add(&self, off: u32, n: u32) -> u32 {
+    pub(super) fn off_add(&self, off: u32, n: u32) -> u32 {
         let v = off.wrapping_add(n);
         if self.insn.addr32 { v } else { v & 0xffff }
     }
 
-    fn require_mem(&self) -> Res<(usize, u32)> {
+    pub(super) fn require_mem(&self) -> Res<(usize, u32)> {
         match self.rm_loc() {
             Loc::Mem(seg, off) => Ok((seg, off)),
             Loc::Reg(_) => ud(),
@@ -87,7 +87,7 @@ impl<B: Bus> Ctx<'_, B> {
         }
     }
 
-    fn pm(&self) -> bool {
+    pub(super) fn pm(&self) -> bool {
         self.cpu.protected_mode() && !self.cpu.v86_mode()
     }
 
@@ -95,7 +95,7 @@ impl<B: Bus> Ctx<'_, B> {
         if self.cpu.protected_mode() && self.cpu.cpl() != 0 { gp(0) } else { Ok(()) }
     }
 
-    fn unimplemented<T>(&self) -> Res<T> {
+    pub(super) fn unimplemented<T>(&self) -> Res<T> {
         let i = &self.insn;
         let what = if i.has_modrm {
             format!("opcode {:#05x} /{} (modrm {:#04x})", i.op, i.reg(), i.modrm)
@@ -366,11 +366,7 @@ impl<B: Bus> Ctx<'_, B> {
                 self.set_reg(EDX, sz, if neg { 0xffff_ffff } else { 0 });
             }
             0x9a => self.call_far(insn.imm2 as u16, insn.imm, self.opsz())?,
-            0x9b => {
-                if self.cpu.cr0 & (cr0::TS | cr0::MP) == cr0::TS | cr0::MP {
-                    return Err(Exception::new(vector::NM).into());
-                }
-            }
+            0x9b => self.fwait()?,
             0x9c => {
                 if self.cpu.v86_mode() && self.cpu.iopl() < 3 {
                     return gp(0);
@@ -515,12 +511,7 @@ impl<B: Bus> Ctx<'_, B> {
                 let v = self.read_seg(seg, off, 1)?;
                 self.cpu.set_reg8(0, v as u8);
             }
-            0xd8..=0xdf => {
-                if self.cpu.cr0 & (cr0::EM | cr0::TS) != 0 {
-                    return Err(Exception::new(vector::NM).into());
-                }
-                return self.unimplemented();
-            }
+            0xd8..=0xdf => self.x87()?,
             0xe0..=0xe2 => {
                 let count = self.count_reg().wrapping_sub(1);
                 self.set_count_reg(count);
@@ -1076,10 +1067,8 @@ impl<B: Bus> Ctx<'_, B> {
                     self.set_arith(f);
                 }
             }
-            0xae => match (insn.reg(), insn.mem.is_some()) {
-                (5..=7, false) | (7, true) => {}
-                _ => return self.unimplemented(),
-            },
+            0xae => self.group15()?,
+            0x10..=0x17 | 0x28..=0x2f | 0x50..=0x7f | 0xc2..=0xc6 | 0xd0..=0xfe => self.simd()?,
             0xaf => {
                 let sz = self.opsz();
                 let b = self.read(self.rm_loc(), sz)?;

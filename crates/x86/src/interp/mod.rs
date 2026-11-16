@@ -4,8 +4,10 @@
 mod alu;
 mod mem;
 mod ops;
+mod simd;
 mod string;
 mod system;
+mod x87;
 
 use crate::bus::Bus;
 use crate::cpu::{Cpu, flags};
@@ -163,3 +165,6 @@ pub(crate) enum Source {
     /// `INT n`, `INT3` or `INTO`: subject to gate DPL and V86 IOPL checks.
     Software,
 }
+
+#[cfg(test)]
+mod tests;

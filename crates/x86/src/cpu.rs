@@ -50,6 +50,16 @@ pub mod cr4 {
     pub const OSXMMEXCPT: u32 = 1 << 10;
 }
 
+pub mod mxcsr {
+    pub const DAZ: u32 = 1 << 6;
+    pub const MASK_SHIFT: u32 = 7;
+    pub const RC_SHIFT: u32 = 13;
+    pub const FZ: u32 = 1 << 15;
+    pub const RESET: u32 = 0x1f80;
+    /// Writable bits (MXCSR_MASK as reported by FXSAVE).
+    pub const WRITABLE: u32 = 0xffff;
+}
+
 pub const EAX: usize = 0;
 pub const ECX: usize = 1;
 pub const EDX: usize = 2;
@@ -147,6 +157,16 @@ pub struct Cpu {
     pub apic_base: u64,
     pub halted: bool,
     pub interrupt_shadow: bool,
+    pub fpu: crate::fpu::Fpu,
+    pub xmm: [u128; 8],
+    pub mxcsr: u32,
+    /// Level of the FERR# output. A waiting x87 instruction sets it, instead
+    /// of raising #MF, when an unmasked x87 exception is pending and CR0.NE is
+    /// clear. The board should assert IRQ13 while it is set (the PC/AT wiring
+    /// of FERR#); FNCLEX, FNINIT, FLDENV, FRSTOR and FXRSTOR clear it once
+    /// they leave no exception pending. The board may also clear it on a write
+    /// to port 0xF0 (IGNNE#).
+    pub ferr_pending: bool,
 }
 
 impl Default for Cpu {
@@ -178,6 +198,10 @@ impl Cpu {
             apic_base: 0,
             halted: false,
             interrupt_shadow: false,
+            fpu: crate::fpu::Fpu::default(),
+            xmm: [0; 8],
+            mxcsr: 0,
+            ferr_pending: false,
         };
         cpu.reset();
         cpu
@@ -210,6 +234,10 @@ impl Cpu {
         self.apic_base = 0xfee0_0000 | (1 << 11) | (1 << 8);
         self.halted = false;
         self.interrupt_shadow = false;
+        self.fpu = crate::fpu::Fpu::default();
+        self.xmm = [0; 8];
+        self.mxcsr = mxcsr::RESET;
+        self.ferr_pending = false;
     }
 
     pub fn protected_mode(&self) -> bool {
