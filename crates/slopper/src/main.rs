@@ -23,10 +23,11 @@ struct Args {
     headless: bool,
     jit: bool,
     screenshots: Vec<(f64, PathBuf)>,
+    exit_on_text: Option<String>,
 }
 
 const USAGE: &str = "usage: slopper --bios <bios.bin> [--vgabios <vgabios.bin>] [--cdrom <iso>] [--hda <img>] \
-[--ram MiB] [--headless] [--jit] [--screenshot SECONDS:PATH]... [--max-instructions N]";
+[--ram MiB] [--headless] [--jit] [--screenshot SECONDS:PATH]... [--exit-on-text TEXT] [--max-instructions N]";
 
 fn parse_args() -> Result<Args, String> {
     let mut args = Args {
@@ -39,6 +40,7 @@ fn parse_args() -> Result<Args, String> {
         headless: false,
         jit: false,
         screenshots: Vec::new(),
+        exit_on_text: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -54,6 +56,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--headless" => args.headless = true,
             "--jit" => args.jit = true,
+            "--exit-on-text" => args.exit_on_text = Some(value()?),
             "--screenshot" => {
                 let v = value()?;
                 let (secs, path) = v.split_once(':').ok_or("--screenshot needs SECONDS:PATH")?;
@@ -102,6 +105,11 @@ fn dump(cpu: &Cpu) {
         "eip={:08x} eflags={:08x} cs={:04x} ss={:04x} ds={:04x} es={:04x} cr0={:08x} cr3={:08x}",
         cpu.eip, cpu.eflags, s[1].selector, s[2].selector, s[3].selector, s[0].selector, cpu.cr0, cpu.cr3
     );
+}
+
+/// The 80x25 text-mode screen as a string, read through the VGA window.
+fn text_screen(board: &mut Board) -> String {
+    (0..80 * 25).map(|i| x86::bus::Bus::read8(board, 0xb8000 + 2 * i) as char).collect()
 }
 
 fn save_png(path: &PathBuf, f: &Frame) -> Result<(), String> {
@@ -274,6 +282,13 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                     Err(e) => eprintln!("screenshot failed: {e}"),
                 }
             }
+        }
+        if let Some(text) = &args.exit_on_text
+            && Instant::now() >= next_frame
+            && text_screen(&mut board).contains(text.as_str())
+        {
+            eprintln!("found {text:?} after {:.2}s", started.elapsed().as_secs_f64());
+            break ExitCode::SUCCESS;
         }
         if Instant::now() >= next_frame {
             next_frame = Instant::now() + Duration::from_millis(16);
