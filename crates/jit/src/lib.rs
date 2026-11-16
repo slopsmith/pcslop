@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use hvf::{Exit, GuestMemory, Vcpu, VcpuKicker, Vm, mem, reg, sysreg};
 use x86::bus::Bus;
-use x86::cpu::{CS, Cpu, DS, ES, FS, GS, SS};
+use x86::cpu::{CS, Cpu, DS, ES, FS, FlushKind, GS, SS};
 use x86::interp;
 
 use runtime::Entries;
@@ -80,6 +80,85 @@ impl Drop for ExitTimer {
     }
 }
 
+/// Snapshots of the x86 paging structures the shadow tables were built from,
+/// so a TLB flush can be skipped when nothing they depend on has changed.
+#[derive(Default)]
+struct PtWatch {
+    key: Option<(u32, u32, u32)>,
+    pages: HashMap<u32, Box<[u32; 1024]>>,
+}
+
+/// Paging-structure pages watched before a full flush is cheaper than comparing.
+const PT_WATCH_LIMIT: usize = 256;
+
+impl PtWatch {
+    fn cr_key(cpu: &Cpu) -> (u32, u32, u32) {
+        use x86::cpu::{cr0, cr4};
+        (cpu.cr3 & !0xfff, cpu.cr0 & (cr0::PG | cr0::WP | cr0::PE), cpu.cr4 & (cr4::PSE | cr4::PGE | cr4::PAE))
+    }
+
+    fn clear(&mut self) {
+        self.key = None;
+        self.pages.clear();
+    }
+
+    fn snapshot<B: Bus>(&mut self, bus: &mut B, page: u32) -> bool {
+        if self.pages.contains_key(&page) {
+            return true;
+        }
+        if self.pages.len() >= PT_WATCH_LIMIT {
+            return false;
+        }
+        let mut copy = Box::new([0u32; 1024]);
+        for (i, w) in copy.iter_mut().enumerate() {
+            *w = bus.read32(page + i as u32 * 4);
+        }
+        self.pages.insert(page, copy);
+        true
+    }
+
+    /// Takes in the Accessed/Dirty bits our walk just set. False means the
+    /// watch is full or for another CR3, and the caller must flush.
+    fn watch<B: Bus>(&mut self, cpu: &Cpu, bus: &mut B, lin: u32) -> bool {
+        let key = Self::cr_key(cpu);
+        match self.key {
+            None => self.key = Some(key),
+            Some(k) if k != key => return false,
+            _ => {}
+        }
+        let pd = cpu.cr3 & !0xfff;
+        if !self.snapshot(bus, pd) {
+            return false;
+        }
+        let pde = bus.read32(pd + (lin >> 22) * 4);
+        if let Some(copy) = self.pages.get_mut(&pd) {
+            copy[(lin >> 22) as usize] = pde;
+        }
+        let big = pde & 0x80 != 0 && cpu.cr4 & x86::cpu::cr4::PSE != 0;
+        if pde & 1 != 0 && !big {
+            let pt = pde & !0xfff;
+            if !self.snapshot(bus, pt) {
+                return false;
+            }
+            let i = ((lin >> 12) & 0x3ff) as usize;
+            let pte = bus.read32(pt + i as u32 * 4);
+            if let Some(copy) = self.pages.get_mut(&pt) {
+                copy[i] = pte;
+            }
+        }
+        true
+    }
+
+    fn still_valid<B: Bus>(&self, cpu: &Cpu, bus: &mut B) -> bool {
+        if self.key != Some(Self::cr_key(cpu)) {
+            return false;
+        }
+        self.pages.iter().all(|(&page, copy)| {
+            copy.iter().enumerate().all(|(i, &w)| bus.read32(page + i as u32 * 4) == w)
+        })
+    }
+}
+
 struct Expected {
     cpu: Cpu,
     writes: HashMap<u32, u8>,
@@ -99,6 +178,10 @@ pub struct Stats {
     pub smc_invalidations: u64,
     pub flushes: u64,
     pub flush_tlb_gen: u64,
+    pub nonglobal_flushes: u64,
+    pub flushes_avoided: u64,
+    pub flush_single_all: u64,
+    pub flush_multi: u64,
     pub flush_pool: u64,
     /// Nanoseconds inside `hv_vcpu_run`, and handling each kind of exit.
     pub vm_ns: u64,
@@ -130,6 +213,9 @@ pub struct Jit {
     blocks: HashMap<u32, BlockInfo>,
     by_va: BTreeMap<u64, u32>,
     code_pages: HashMap<u32, Vec<u32>>,
+    pt_watch: PtWatch,
+    /// Shadow leaf entries for non-global x86 mappings, cleared on CR3 loads.
+    nonglobal: Vec<usize>,
     /// Linear pages mapped writable in the shadow tables, by physical page.
     writable: HashMap<u32, Vec<u32>>,
     pub stats: Stats,
@@ -192,6 +278,8 @@ impl Jit {
             by_va: BTreeMap::new(),
             code_pages: HashMap::new(),
             writable: HashMap::new(),
+            nonglobal: Vec::new(),
+            pt_watch: PtWatch::default(),
             stats: Stats::default(),
             interp_profile: std::env::var_os("SLOPPER_JIT_PROFILE").map(|_| HashMap::new()),
             verify: std::env::var_os("SLOPPER_JIT_VERIFY").is_some(),
@@ -247,29 +335,54 @@ impl Jit {
     }
 
     fn flush_shadow(&mut self) {
+        self.pt_watch.clear();
         self.shadow.flush(self.mem.as_mut_slice());
         self.writable.clear();
+        self.nonglobal.clear();
         self.state().ctl |= ctl::TLBI_ALL;
         self.stats.flushes += 1;
     }
 
     /// Follows the interpreter's TLB: CR3/CR0/CR4 writes and INVLPG flush it.
-    fn check_shadow(&mut self, cpu: &Cpu) {
+    fn check_shadow<B: Bus>(&mut self, cpu: &Cpu, bus: &mut B) {
         let key = cpu.tlb.generation;
         let paged = cpu.cr0 & x86::cpu::cr0::PG != 0;
         let was_paged = std::mem::replace(&mut self.shadow_paged, paged);
         match self.shadow_key {
             Some(k) if k == key => {}
             Some(_) if !paged && !was_paged => self.shadow_key = Some(key),
-            Some(k) if k + 1 == key && cpu.tlb.last_page.is_some() => {
+            Some(_) if paged && was_paged && self.pt_watch.still_valid(cpu, bus) => {
                 self.shadow_key = Some(key);
-                let lin = cpu.tlb.last_page.unwrap_or(0);
-                self.shadow.unmap(self.mem.as_mut_slice(), lin);
-                self.tlbi_page(lin);
+                self.stats.flushes_avoided += 1;
             }
-            _ => {
+            Some(k) if k + 1 == key && cpu.tlb.last_flush != FlushKind::All => {
+                self.shadow_key = Some(key);
+                match cpu.tlb.last_flush {
+                    FlushKind::Page(lin) => {
+                        self.shadow.unmap(self.mem.as_mut_slice(), lin);
+                        self.tlbi_page(lin);
+                    }
+                    _ => {
+                        for off in std::mem::take(&mut self.nonglobal) {
+                            self.shadow.clear_leaf(self.mem.as_mut_slice(), off);
+                        }
+                        self.state().ctl |= ctl::TLBI_ALL;
+                        self.stats.nonglobal_flushes += 1;
+                    }
+                }
+            }
+            Some(k) => {
+                if k + 1 == key {
+                    self.stats.flush_single_all += 1;
+                } else {
+                    self.stats.flush_multi += 1;
+                }
                 self.shadow_key = Some(key);
                 self.stats.flush_tlb_gen += 1;
+                self.flush_shadow();
+            }
+            None => {
+                self.shadow_key = Some(key);
                 self.flush_shadow();
             }
         }
@@ -284,15 +397,24 @@ impl Jit {
         s.ctl |= ctl::TLBI_PAGE;
     }
 
-    fn map_shadow(&mut self, lin: u32, phys: u32, writable: bool) {
+    fn map_shadow<B: Bus>(&mut self, bus: &mut B, cpu: &Cpu, lin: u32, phys: u32, writable: bool, global: bool) {
+        if cpu.cr0 & x86::cpu::cr0::PG != 0 && !self.pt_watch.watch(cpu, bus, lin) {
+            self.flush_shadow();
+            self.pt_watch.watch(cpu, bus, lin);
+        }
+        let leaf = match self.shadow.map(self.mem.as_mut_slice(), lin, phys, writable) {
+            Some(off) => off,
+            None => {
+                self.stats.flush_pool += 1;
+                self.flush_shadow();
+                self.shadow.map(self.mem.as_mut_slice(), lin, phys, writable).expect("shadow pool smaller than one mapping")
+            }
+        };
         if writable {
             self.writable.entry(phys & !0xfff).or_default().push(lin & !0xfff);
         }
-        if !self.shadow.map(self.mem.as_mut_slice(), lin, phys, writable) {
-            self.stats.flush_pool += 1;
-            self.flush_shadow();
-            let ok = self.shadow.map(self.mem.as_mut_slice(), lin, phys, writable);
-            assert!(ok, "shadow pool smaller than one mapping");
+        if !global {
+            self.nonglobal.push(leaf);
         }
         self.stats.shadow_fills += 1;
     }
@@ -382,7 +504,7 @@ impl Jit {
         for page in bus.take_written_code_pages() {
             self.invalidate_code_page(page << 12);
         }
-        self.check_shadow(cpu);
+        self.check_shadow(cpu, bus);
         self.load_state(cpu);
         self.state().irq = bus.intr() as u32;
         let mut at_dispatch = true;
@@ -448,7 +570,7 @@ impl Jit {
                             if e != interp::Exit::Continue || cpu.halted || !supported(cpu) {
                                 return Ok(RunExit::Interp(e));
                             }
-                            self.check_shadow(cpu);
+                            self.check_shadow(cpu, bus);
                             self.load_state(cpu);
                             self.state().irq = bus.intr() as u32;
                         }
@@ -554,9 +676,9 @@ impl Jit {
     fn on_miss<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B) {
         self.stats.miss_exits += 1;
         let eip = self.state().eip;
-        match interp::translate(cpu, bus, eip, false) {
-            Ok(phys) => {
-                self.map_shadow(eip, phys, false);
+        match interp::translate_global(cpu, bus, eip, false) {
+            Ok((phys, global)) => {
+                self.map_shadow(bus, cpu, eip, phys, false, global);
                 match self.blocks.get(&phys) {
                     Some(b) => {
                         if !self.verify || b.verified >= VERIFY_RUNS {
@@ -583,13 +705,13 @@ impl Jit {
         assert!(far >> 32 == 0, "translated code faulted outside the x86 address space: FAR {far:#x}");
         let lin = far as u32;
         let write = esr & (1 << 6) != 0;
-        match interp::translate(cpu, bus, lin, write) {
-            Ok(phys) => {
+        match interp::translate_global(cpu, bus, lin, write) {
+            Ok((phys, global)) => {
                 let page = phys & !0xfff;
                 if write && self.code_pages.contains_key(&page) {
                     self.invalidate_code_page(page);
                 }
-                self.map_shadow(lin, phys, write);
+                self.map_shadow(bus, cpu, lin, phys, write, global);
                 self.tlbi_page(lin);
                 self.state().resume = resume::RETRY;
             }

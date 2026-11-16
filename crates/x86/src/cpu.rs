@@ -146,6 +146,17 @@ pub mod tlb_perm {
     pub const USER_READ: u8 = 1;
     pub const USER_WRITE: u8 = 2;
     pub const SUPER_WRITE: u8 = 4;
+    /// The mapping is global (PTE.G with CR4.PGE) and survives CR3 loads.
+    pub const GLOBAL: u8 = 8;
+}
+
+/// What the most recent TLB flush covered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlushKind {
+    All,
+    /// A CR3 load with CR4.PGE set: global mappings stay.
+    NonGlobal,
+    Page(u32),
 }
 
 pub const TLB_SIZE: usize = 1024;
@@ -158,13 +169,12 @@ pub struct Tlb {
     pub entries: Box<[TlbEntry; TLB_SIZE]>,
     /// Incremented by every flush, so other translation caches can follow.
     pub generation: u64,
-    /// The linear page of the most recent flush, if it covered only one page.
-    pub last_page: Option<u32>,
+    pub last_flush: FlushKind,
 }
 
 impl Default for Tlb {
     fn default() -> Self {
-        Tlb { entries: Box::new([TlbEntry::default(); TLB_SIZE]), generation: 0, last_page: None }
+        Tlb { entries: Box::new([TlbEntry::default(); TLB_SIZE]), generation: 0, last_flush: FlushKind::All }
     }
 }
 
@@ -172,12 +182,22 @@ impl Tlb {
     pub fn flush(&mut self) {
         self.entries.fill(TlbEntry::default());
         self.generation += 1;
-        self.last_page = None;
+        self.last_flush = FlushKind::All;
+    }
+
+    pub fn flush_nonglobal(&mut self) {
+        for e in self.entries.iter_mut() {
+            if e.perms & tlb_perm::GLOBAL == 0 {
+                *e = TlbEntry::default();
+            }
+        }
+        self.generation += 1;
+        self.last_flush = FlushKind::NonGlobal;
     }
 
     pub fn flush_page(&mut self, lin: u32) {
         self.generation += 1;
-        self.last_page = Some(lin & !0xfff);
+        self.last_flush = FlushKind::Page(lin & !0xfff);
         let e = &mut self.entries[(lin >> 12) as usize % TLB_SIZE];
         if e.tag == (lin >> 12) + 1 {
             *e = TlbEntry::default();

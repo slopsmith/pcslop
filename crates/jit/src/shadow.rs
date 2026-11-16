@@ -109,18 +109,25 @@ impl Shadow {
         true
     }
 
-    /// Maps the x86 linear page of `lin` to physical `phys`. Returns false when
-    /// the pool is exhausted; flush and retry in that case.
+    /// Clears the leaf entry at `off`, as returned by `map`.
+    pub fn clear_leaf(&mut self, mem: &mut [u8], off: usize) {
+        write_desc(mem, off, 0);
+    }
+
+    /// Maps the x86 linear page of `lin` to physical `phys` and returns the
+    /// offset of the leaf entry. Returns None when the pool is exhausted;
+    /// flush and retry in that case.
     #[must_use]
-    pub fn map(&mut self, mem: &mut [u8], lin: u32, phys: u32, writable: bool) -> bool {
+    pub fn map(&mut self, mem: &mut [u8], lin: u32, phys: u32, writable: bool) -> Option<usize> {
         let root = layout::SHADOW_POOL;
-        let Some(l2) = self.table(mem, root + ((lin >> 30) as usize) * 8) else { return false };
-        let Some(l3) = self.table(mem, l2 + (((lin >> 21) & 511) as usize) * 8) else { return false };
+        let l2 = self.table(mem, root + ((lin >> 30) as usize) * 8)?;
+        let l3 = self.table(mem, l2 + (((lin >> 21) & 511) as usize) * 8)?;
         let mut d = (phys as u64 & !0xfff) | AF | SH_INNER | PXN | UXN | PAGE | VALID;
         if !writable {
             d |= AP_RO;
         }
-        write_desc(mem, l3 + (((lin >> 12) & 511) as usize) * 8, d);
-        true
+        let off = l3 + (((lin >> 12) & 511) as usize) * 8;
+        write_desc(mem, off, d);
+        Some(off)
     }
 }

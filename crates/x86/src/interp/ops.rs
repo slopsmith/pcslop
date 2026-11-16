@@ -999,7 +999,11 @@ impl<B: Bus> Ctx<'_, B> {
                         2 => self.cpu.cr2 = v,
                         3 => {
                             self.cpu.cr3 = v;
-                            self.cpu.tlb.flush();
+                            if self.cpu.cr4 & cr4::PGE != 0 {
+                                self.cpu.tlb.flush_nonglobal();
+                            } else {
+                                self.cpu.tlb.flush();
+                            }
                         }
                         4 => {
                             let supported = cr4::VME | cr4::PVI | cr4::TSD | cr4::DE | cr4::PSE | cr4::PGE

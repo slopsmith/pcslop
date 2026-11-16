@@ -153,8 +153,13 @@ impl<B: Bus> Ctx<'_, B> {
     /// Translates a linear address through the x86 page tables, setting the
     /// Accessed and Dirty bits.
     pub fn translate(&mut self, lin: u32, acc: Access, user: bool) -> Res<u32> {
+        self.translate_full(lin, acc, user).map(|(p, _)| p)
+    }
+
+    /// Like `translate`, also returning the TLB permission bits of the mapping.
+    pub fn translate_full(&mut self, lin: u32, acc: Access, user: bool) -> Res<(u32, u8)> {
         if self.cpu.cr0 & cr0::PG == 0 {
-            return Ok(lin);
+            return Ok((lin, 0));
         }
         let write = acc == Access::Write;
         let slot = (lin >> 12) as usize % TLB_SIZE;
@@ -167,12 +172,12 @@ impl<B: Bus> Ctx<'_, B> {
                 (true, false) => tlb_perm::SUPER_WRITE,
             };
             if e.perms & need == need {
-                return Ok(e.phys | (lin & 0xfff));
+                return Ok((e.phys | (lin & 0xfff), e.perms));
             }
         }
         let (phys, perms) = self.walk(lin, acc, user)?;
         self.cpu.tlb.entries[slot] = TlbEntry { tag: (lin >> 12) + 1, phys: phys & !0xfff, perms };
-        Ok(phys)
+        Ok((phys, perms))
     }
 
     /// Walks the page tables for `lin`, returning the physical address and
@@ -223,6 +228,9 @@ impl<B: Bus> Ctx<'_, B> {
         let mut perms = 0;
         if user_ok {
             perms |= tlb_perm::USER_READ;
+        }
+        if entry & 0x100 != 0 && self.cpu.cr4 & cr4::PGE != 0 {
+            perms |= tlb_perm::GLOBAL;
         }
         if entry & 0x40 != 0 {
             if writable && user_ok {

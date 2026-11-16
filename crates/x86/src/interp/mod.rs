@@ -105,11 +105,16 @@ pub fn step<B: Bus>(cpu: &mut Cpu, bus: &mut B) -> Exit {
 /// Accessed and Dirty bits as the CPU would. A failed translation sets CR2 and
 /// returns the page fault to deliver.
 pub fn translate<B: Bus>(cpu: &mut Cpu, bus: &mut B, lin: u32, write: bool) -> Result<u32, Exception> {
+    translate_global(cpu, bus, lin, write).map(|(p, _)| p)
+}
+
+/// Like `translate`, also reporting whether the mapping is global.
+pub fn translate_global<B: Bus>(cpu: &mut Cpu, bus: &mut B, lin: u32, write: bool) -> Result<(u32, bool), Exception> {
     let mut ctx = Ctx { cpu, bus, insn: Insn::default(), start_eip: 0 };
     let user = ctx.cpu.cpl() == 3;
     let acc = if write { mem::Access::Write } else { mem::Access::Read };
-    match ctx.translate(lin, acc, user) {
-        Ok(p) => Ok(p),
+    match ctx.translate_full(lin, acc, user) {
+        Ok((p, perms)) => Ok((p, perms & crate::cpu::tlb_perm::GLOBAL != 0)),
         Err(Trap::Fault(e)) => Err(e),
         Err(Trap::Unimplemented(_)) => unreachable!("page walks are fully implemented"),
     }
