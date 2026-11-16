@@ -18,6 +18,7 @@ const T_RES: Reg = Reg(11);
 const T_B: Reg = Reg(12);
 const T_C: Reg = Reg(13);
 const T_D: Reg = Reg(14);
+const T_E: Reg = Reg(15);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Ow {
@@ -225,7 +226,8 @@ impl Emit {
     /// the top bits so NZCV come out right.
     fn alu_narrow(&mut self, op: usize, a: Reg, b: Reg, shift: u32) -> bool {
         if op == 2 || op == 3 {
-            return false;
+            self.adc_sbb_narrow(op == 3, a, b, 32 - shift);
+            return true;
         }
         self.a.lsl_imm(Size::W, T_C, a, shift);
         self.a.lsl_imm(Size::W, T_D, b, shift);
@@ -253,6 +255,39 @@ impl Emit {
             self.set_af(a, b, T_RES);
         }
         true
+    }
+
+    /// 8- or 16-bit ADC/SBB: carry from a zero-extended sum, N/Z/V from a
+    /// sign-extended one through SETF8/SETF16.
+    fn adc_sbb_narrow(&mut self, sub: bool, a: Reg, b: Reg, width: u32) {
+        let arith = |e: &mut Self, d: Reg, x: Reg, y: Reg| {
+            if sub {
+                e.a.sub(Size::W, d, x, y)
+            } else {
+                e.a.add(Size::W, d, x, y)
+            }
+        };
+        self.a.cset(Size::W, T_D, Cond::Lo);
+        self.a.ubfx(Size::W, T_C, a, 0, width);
+        self.a.ubfx(Size::W, T_RES, b, 0, width);
+        arith(self, T_C, T_C, T_RES);
+        arith(self, T_C, T_C, T_D);
+        self.a.sbfx(Size::W, T_E, a, 0, width);
+        self.a.sbfx(Size::W, T_RES, b, 0, width);
+        arith(self, T_E, T_E, T_RES);
+        arith(self, T_E, T_E, T_D);
+        if width == 8 {
+            self.a.setf8(T_E);
+        } else {
+            self.a.setf16(T_E);
+        }
+        self.a.ubfx(Size::W, T_D, T_C, width, 1);
+        let ok = self.a.logic_imm(a64::Logic::Eor, Size::W, T_D, T_D, 1);
+        debug_assert!(ok);
+        self.a.rmif(T_D, 63, 0b0010);
+        self.a.ubfx(Size::W, T_RES, T_C, 0, width);
+        self.a.mov(Size::W, PF_RESULT, T_RES);
+        self.set_af(a, b, T_RES);
     }
 
     fn push(&mut self, value: Reg) {
@@ -456,9 +491,6 @@ impl Emit {
             0x00..=0x3f if op & 7 < 6 => {
                 let aop = (op >> 3) as usize & 7;
                 let w = Ow::of(op, op32);
-                if w != Ow::D && (aop == 2 || aop == 3) {
-                    return Step::Unsupported;
-                }
                 let writes = aop != 7;
                 match op & 7 {
                     0 | 1 => {
@@ -523,9 +555,6 @@ impl Emit {
             0x80..=0x83 => {
                 let aop = insn.reg();
                 let w = Ow::of(op, op32);
-                if w != Ow::D && (aop == 2 || aop == 3) {
-                    return Step::Unsupported;
-                }
                 let imm = if op == 0x81 { insn.imm } else { insn.imm as u8 as i8 as i32 as u32 };
                 let Some(a) = self.rm_w(insn, w, aop != 7) else { return Step::Unsupported };
                 self.a.mov_imm(Size::W, T_B, imm as u64 & w.mask());
@@ -573,6 +602,13 @@ impl Emit {
                     return Step::Unsupported;
                 }
                 self.a.mov(Size::W, guest_reg(insn.reg()), T_ADDR);
+            }
+            0xfa => self.a.str(Width::W, ZR, STATE, state::IF_FLAG as i32),
+            0xfb => {
+                self.a.movz(Size::W, T_B, 1, 0);
+                self.a.str(Width::W, T_B, STATE, state::IF_FLAG as i32);
+                self.goto(next);
+                return Step::End;
             }
             0x98 if op32 => self.a.sxth(Size::W, guest_reg(0), guest_reg(0)),
             0x99 if op32 => self.a.asr_imm(Size::W, guest_reg(2), guest_reg(0), 31),

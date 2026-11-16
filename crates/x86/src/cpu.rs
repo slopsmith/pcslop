@@ -158,11 +158,13 @@ pub struct Tlb {
     pub entries: Box<[TlbEntry; TLB_SIZE]>,
     /// Incremented by every flush, so other translation caches can follow.
     pub generation: u64,
+    /// The linear page of the most recent flush, if it covered only one page.
+    pub last_page: Option<u32>,
 }
 
 impl Default for Tlb {
     fn default() -> Self {
-        Tlb { entries: Box::new([TlbEntry::default(); TLB_SIZE]), generation: 0 }
+        Tlb { entries: Box::new([TlbEntry::default(); TLB_SIZE]), generation: 0, last_page: None }
     }
 }
 
@@ -170,10 +172,12 @@ impl Tlb {
     pub fn flush(&mut self) {
         self.entries.fill(TlbEntry::default());
         self.generation += 1;
+        self.last_page = None;
     }
 
     pub fn flush_page(&mut self, lin: u32) {
         self.generation += 1;
+        self.last_page = Some(lin & !0xfff);
         let e = &mut self.entries[(lin >> 12) as usize % TLB_SIZE];
         if e.tag == (lin >> 12) + 1 {
             *e = TlbEntry::default();

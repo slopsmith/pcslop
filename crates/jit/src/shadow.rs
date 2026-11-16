@@ -78,6 +78,37 @@ impl Shadow {
         Some(t)
     }
 
+    fn leaf(&self, mem: &[u8], lin: u32) -> Option<usize> {
+        let mut table = layout::SHADOW_POOL;
+        for shift in [30, 21] {
+            let d = read_desc(mem, table + (((lin >> shift) & 511) as usize) * 8);
+            if d & VALID == 0 {
+                return None;
+            }
+            table = (d & 0x0000_ffff_ffff_f000) as usize - layout::RUNTIME_IPA as usize;
+        }
+        Some(table + (((lin >> 12) & 511) as usize) * 8)
+    }
+
+    /// Removes the mapping of one linear page. The caller must invalidate the TLB.
+    pub fn unmap(&mut self, mem: &mut [u8], lin: u32) {
+        if let Some(off) = self.leaf(mem, lin) {
+            write_desc(mem, off, 0);
+        }
+    }
+
+    /// Makes the mapping of `lin` read-only if it points at `phys_page`.
+    /// Returns true when it changed; the caller must invalidate the TLB.
+    pub fn write_protect(&mut self, mem: &mut [u8], lin: u32, phys_page: u32) -> bool {
+        let Some(off) = self.leaf(mem, lin) else { return false };
+        let d = read_desc(mem, off);
+        if d & VALID == 0 || d & AP_RO != 0 || (d & 0xffff_f000) as u32 != phys_page {
+            return false;
+        }
+        write_desc(mem, off, d | AP_RO);
+        true
+    }
+
     /// Maps the x86 linear page of `lin` to physical `phys`. Returns false when
     /// the pool is exhausted; flush and retry in that case.
     #[must_use]

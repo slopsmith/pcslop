@@ -123,6 +123,12 @@ pub fn build() -> (Vec<u32>, Entries) {
     let dispatch_pos = a.pos();
     a.ldr(Width::W, r(1), STATE, state::PENDING as i32);
     a.cbnz(Size::W, r(1), pending);
+    let no_irq = a.label();
+    a.ldr(Width::W, r(1), STATE, state::IRQ as i32);
+    a.cbz(Size::W, r(1), no_irq);
+    a.ldr(Width::W, r(1), STATE, state::IF_FLAG as i32);
+    a.cbnz(Size::W, r(1), pending);
+    a.bind(no_irq);
     let unlimited = a.label();
     a.ldr(Width::W, r(1), STATE, state::BUDGET as i32);
     a.cbz(Size::W, r(1), unlimited);

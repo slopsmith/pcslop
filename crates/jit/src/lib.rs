@@ -26,7 +26,12 @@ struct BlockInfo {
     va: u64,
     boundaries: Vec<(u32, u32)>,
     insns: usize,
+    /// Executions checked against the interpreter in verify mode.
+    verified: u32,
 }
+
+/// Executions of each block that verify mode checks before running it freely.
+const VERIFY_RUNS: u32 = 3;
 
 /// Reads through to the real bus, keeps writes to itself; used to run the
 /// interpreter alongside translated code without touching guest memory.
@@ -79,6 +84,7 @@ struct Expected {
     cpu: Cpu,
     writes: HashMap<u32, u8>,
     eip: u32,
+    phys: u32,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -92,6 +98,8 @@ pub struct Stats {
     pub mmio_exits: u64,
     pub smc_invalidations: u64,
     pub flushes: u64,
+    pub flush_tlb_gen: u64,
+    pub flush_pool: u64,
     /// Nanoseconds inside `hv_vcpu_run`, and handling each kind of exit.
     pub vm_ns: u64,
     pub miss_ns: u64,
@@ -116,10 +124,14 @@ pub struct Jit {
     entries: Entries,
     shadow: Shadow,
     shadow_key: Option<u64>,
+    /// Whether the shadow tables were filled with x86 paging enabled.
+    shadow_paged: bool,
     code_next: usize,
     blocks: HashMap<u32, BlockInfo>,
     by_va: BTreeMap<u64, u32>,
     code_pages: HashMap<u32, Vec<u32>>,
+    /// Linear pages mapped writable in the shadow tables, by physical page.
+    writable: HashMap<u32, Vec<u32>>,
     pub stats: Stats,
     /// Runs each block against the interpreter and stops at the first difference.
     pub verify: bool,
@@ -174,10 +186,12 @@ impl Jit {
             entries,
             shadow: Shadow::default(),
             shadow_key: None,
+            shadow_paged: false,
             code_next: layout::CODE_CACHE,
             blocks: HashMap::new(),
             by_va: BTreeMap::new(),
             code_pages: HashMap::new(),
+            writable: HashMap::new(),
             stats: Stats::default(),
             interp_profile: std::env::var_os("SLOPPER_JIT_PROFILE").map(|_| HashMap::new()),
             verify: std::env::var_os("SLOPPER_JIT_VERIFY").is_some(),
@@ -218,6 +232,7 @@ impl Jit {
         s.regs = cpu.regs;
         s.eip = cpu.eip;
         s.set_eflags(cpu.eflags);
+        s.if_flag = cpu.flag(x86::cpu::flags::IF) as u32;
         s.fs_base = cpu.segs[FS].base;
         s.gs_base = cpu.segs[GS].base;
     }
@@ -226,11 +241,14 @@ impl Jit {
         let s = self.state();
         cpu.regs = s.regs;
         cpu.eip = s.eip;
+        let if_flag = s.if_flag != 0;
         cpu.eflags = s.merge_eflags(cpu.eflags);
+        cpu.set_flag(x86::cpu::flags::IF, if_flag);
     }
 
     fn flush_shadow(&mut self) {
         self.shadow.flush(self.mem.as_mut_slice());
+        self.writable.clear();
         self.state().ctl |= ctl::TLBI_ALL;
         self.stats.flushes += 1;
     }
@@ -238,14 +256,40 @@ impl Jit {
     /// Follows the interpreter's TLB: CR3/CR0/CR4 writes and INVLPG flush it.
     fn check_shadow(&mut self, cpu: &Cpu) {
         let key = cpu.tlb.generation;
-        if self.shadow_key != Some(key) {
-            self.shadow_key = Some(key);
-            self.flush_shadow();
+        let paged = cpu.cr0 & x86::cpu::cr0::PG != 0;
+        let was_paged = std::mem::replace(&mut self.shadow_paged, paged);
+        match self.shadow_key {
+            Some(k) if k == key => {}
+            Some(_) if !paged && !was_paged => self.shadow_key = Some(key),
+            Some(k) if k + 1 == key && cpu.tlb.last_page.is_some() => {
+                self.shadow_key = Some(key);
+                let lin = cpu.tlb.last_page.unwrap_or(0);
+                self.shadow.unmap(self.mem.as_mut_slice(), lin);
+                self.tlbi_page(lin);
+            }
+            _ => {
+                self.shadow_key = Some(key);
+                self.stats.flush_tlb_gen += 1;
+                self.flush_shadow();
+            }
         }
     }
 
+    fn tlbi_page(&mut self, lin: u32) {
+        let s = self.state();
+        if s.ctl & ctl::TLBI_PAGE != 0 && s.tlbi_page != (lin >> 12) as u64 {
+            s.ctl |= ctl::TLBI_ALL;
+        }
+        s.tlbi_page = (lin >> 12) as u64;
+        s.ctl |= ctl::TLBI_PAGE;
+    }
+
     fn map_shadow(&mut self, lin: u32, phys: u32, writable: bool) {
+        if writable {
+            self.writable.entry(phys & !0xfff).or_default().push(lin & !0xfff);
+        }
         if !self.shadow.map(self.mem.as_mut_slice(), lin, phys, writable) {
+            self.stats.flush_pool += 1;
             self.flush_shadow();
             let ok = self.shadow.map(self.mem.as_mut_slice(), lin, phys, writable);
             assert!(ok, "shadow pool smaller than one mapping");
@@ -266,7 +310,6 @@ impl Jit {
             }
         }
         self.stats.smc_invalidations += 1;
-        self.flush_shadow();
     }
 
     fn reset_code_cache(&mut self) {
@@ -298,15 +341,21 @@ impl Jit {
         }
         self.mem.write_words(self.code_next, &compiled.code);
         self.code_next += bytes.next_multiple_of(16);
-        self.insert_lookup(phys, block_va);
-        self.blocks.insert(phys, BlockInfo { va: block_va, boundaries: compiled.boundaries, insns: compiled.insns });
+        if !self.verify {
+            self.insert_lookup(phys, block_va);
+        }
+        self.blocks.insert(phys, BlockInfo { va: block_va, boundaries: compiled.boundaries, insns: compiled.insns, verified: 0 });
         self.by_va.insert(block_va, phys);
         let pages = self.code_pages.entry(page).or_default();
         let new_page = pages.is_empty();
         pages.push(phys);
         bus.watch_code_page(phys);
         if new_page {
-            self.flush_shadow();
+            for lin in self.writable.remove(&page).unwrap_or_default() {
+                if self.shadow.write_protect(self.mem.as_mut_slice(), lin, page) {
+                    self.tlbi_page(lin);
+                }
+            }
         }
         self.stats.blocks += 1;
         self.stats.translated_insns += compiled.insns as u64;
@@ -335,6 +384,7 @@ impl Jit {
         }
         self.check_shadow(cpu);
         self.load_state(cpu);
+        self.state().irq = bus.intr() as u32;
         let mut at_dispatch = true;
         loop {
             let expected = if self.verify && at_dispatch { self.expect_block(cpu, bus) } else { None };
@@ -400,6 +450,7 @@ impl Jit {
                             }
                             self.check_shadow(cpu);
                             self.load_state(cpu);
+                            self.state().irq = bus.intr() as u32;
                         }
                         reason::PENDING => {
                             self.store_state(cpu);
@@ -427,14 +478,13 @@ impl Jit {
             return None;
         }
         let mut c = cpu.clone();
-        {
-            let s = self.state();
-            c.regs = s.regs;
-            c.eip = s.eip;
-            c.eflags = s.merge_eflags(c.eflags);
-        }
+        self.store_state(&mut c);
         let phys = interp::translate(&mut c.clone(), bus, c.eip, false).ok()?;
-        let n = self.blocks.get(&phys)?.insns;
+        let block = self.blocks.get(&phys)?;
+        if block.verified >= VERIFY_RUNS {
+            return None;
+        }
+        let (n, va) = (block.insns, block.va);
         let eip = c.eip;
         let mut ov = Overlay { inner: bus, writes: HashMap::new() };
         for _ in 0..n {
@@ -443,15 +493,23 @@ impl Jit {
             }
         }
         let writes = ov.writes;
+        self.insert_lookup(phys, va);
         self.state().budget = 2;
-        Some(Expected { cpu: c, writes, eip })
+        Some(Expected { cpu: c, writes, eip, phys })
     }
 
     fn check_block<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B, exp: Expected) {
         self.state().budget = 0;
+        if let Some(b) = self.blocks.get_mut(&exp.phys) {
+            b.verified += 1;
+            if b.verified < VERIFY_RUNS {
+                let off = layout::LOOKUP + hash(exp.phys) * 16;
+                self.mem.as_mut_slice()[off..off + 16].fill(0xff);
+            }
+        }
         let mut got = cpu.clone();
         self.store_state(&mut got);
-        let mask = x86::cpu::flags::ARITH;
+        let mask = x86::cpu::flags::ARITH | x86::cpu::flags::IF;
         let mut diffs = Vec::new();
         if got.regs != exp.cpu.regs {
             diffs.push(format!("regs jit {:08x?}\n     interp {:08x?}", got.regs, exp.cpu.regs));
@@ -501,8 +559,10 @@ impl Jit {
                 self.map_shadow(eip, phys, false);
                 match self.blocks.get(&phys) {
                     Some(b) => {
-                        let va = b.va;
-                        self.insert_lookup(phys, va);
+                        if !self.verify || b.verified >= VERIFY_RUNS {
+                            let va = b.va;
+                            self.insert_lookup(phys, va);
+                        }
                     }
                     None => self.translate_block(bus, eip, phys),
                 }
@@ -530,10 +590,8 @@ impl Jit {
                     self.invalidate_code_page(page);
                 }
                 self.map_shadow(lin, phys, write);
-                let s = self.state();
-                s.tlbi_page = (lin >> 12) as u64;
-                s.ctl |= ctl::TLBI_PAGE;
-                s.resume = resume::RETRY;
+                self.tlbi_page(lin);
+                self.state().resume = resume::RETRY;
             }
             Err(e) => {
                 self.stats.page_faults += 1;

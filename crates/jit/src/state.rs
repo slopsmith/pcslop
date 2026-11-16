@@ -47,6 +47,11 @@ pub struct State {
     pub ctl: u32,
     pub resume: u32,
     pub pending: u32,
+    /// Set by the host while the interrupt controller has a request; the
+    /// dispatcher exits on it once IF is set.
+    pub irq: u32,
+    /// x86 IF (0 or 1), so CLI and STI need no exit.
+    pub if_flag: u32,
     pub fs_base: u32,
     pub gs_base: u32,
     pub tlbi_page: u64,
@@ -70,6 +75,8 @@ pub const REASON: usize = offset_of!(State, reason);
 pub const CTL: usize = offset_of!(State, ctl);
 pub const RESUME: usize = offset_of!(State, resume);
 pub const PENDING: usize = offset_of!(State, pending);
+pub const IRQ: usize = offset_of!(State, irq);
+pub const IF_FLAG: usize = offset_of!(State, if_flag);
 pub const FS_BASE: usize = offset_of!(State, fs_base);
 pub const GS_BASE: usize = offset_of!(State, gs_base);
 pub const TLBI_PAGE: usize = offset_of!(State, tlbi_page);

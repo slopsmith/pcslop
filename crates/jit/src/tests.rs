@@ -75,7 +75,7 @@ fn run_jit(cpu: &mut Cpu, bus: &mut FlatBus) -> Stats {
     jit.stats
 }
 
-const ARITH_MASK: u32 = x86::cpu::flags::ARITH;
+const ARITH_MASK: u32 = x86::cpu::flags::ARITH | x86::cpu::flags::IF;
 
 fn compare(code: &[u8], setup: impl Fn(&mut Cpu)) -> Stats {
     let mut a = flat_cpu(0x1000, 0x8000);
@@ -183,8 +183,8 @@ fn random_insn(rng: &mut Rng, out: &mut Vec<u8>) {
     };
     match rng.below(30) {
         20 => {
-            let ops = [0x01, 0x03, 0x09, 0x0b, 0x21, 0x23, 0x29, 0x2b, 0x31, 0x33, 0x39, 0x3b, 0x85, 0x89, 0x8b, 0x87];
-            out.extend([0x66, ops[rng.below(16) as usize], modrm_rr(rng.reg(), rng.reg())]);
+            let ops = [0x01, 0x03, 0x09, 0x0b, 0x11, 0x13, 0x19, 0x1b, 0x21, 0x23, 0x29, 0x2b, 0x31, 0x33, 0x39, 0x3b, 0x85, 0x89, 0x8b, 0x87];
+            out.extend([0x66, ops[rng.below(ops.len() as u32) as usize], modrm_rr(rng.reg(), rng.reg())]);
         }
         21 => {
             let op = [0, 1, 4, 5, 6, 7][rng.below(6) as usize];
@@ -214,7 +214,7 @@ fn random_insn(rng: &mut Rng, out: &mut Vec<u8>) {
                 out.extend(rng.next().to_le_bytes());
             }
         },
-        28 => out.push([0x98, 0x99][rng.below(2) as usize]),
+        28 => out.push([0x98, 0x99, 0xfa, 0xfb][rng.below(4) as usize]),
         29 => out.extend([0xe3, 0x01, 0x40 + rng.reg()]),
         0 | 1 => {
             let ops = [0x01, 0x03, 0x09, 0x0b, 0x11, 0x13, 0x19, 0x1b, 0x21, 0x23, 0x29, 0x2b, 0x31, 0x33, 0x39, 0x3b];
@@ -236,12 +236,12 @@ fn random_insn(rng: &mut Rng, out: &mut Vec<u8>) {
             mem(out, rng.reg(), rng.below(4));
         }
         4 => {
-            let ops = [0x00, 0x02, 0x08, 0x0a, 0x20, 0x22, 0x28, 0x2a, 0x30, 0x32, 0x38, 0x3a, 0x84, 0x88, 0x8a];
+            let ops = [0x00, 0x02, 0x08, 0x0a, 0x10, 0x12, 0x18, 0x1a, 0x20, 0x22, 0x28, 0x2a, 0x30, 0x32, 0x38, 0x3a, 0x84, 0x88, 0x8a];
             out.push(ops[rng.below(ops.len() as u32) as usize]);
             out.push(modrm_rr(rng.below(8) as u8, rng.below(8) as u8));
         }
         5 => {
-            let op = [0, 1, 4, 5, 6, 7][rng.below(6) as usize];
+            let op = rng.below(8) as u8;
             out.extend([0x80, modrm_rr(op, rng.below(8) as u8), rng.next() as u8]);
         }
         6 => out.push(if rng.below(2) == 0 { 0x40 } else { 0x48 } + rng.reg()),

@@ -936,8 +936,11 @@ impl<B: Bus> Ctx<'_, B> {
                     self.require_cpl0()?;
                     let v = self.read(self.rm_loc(), 2)?;
                     let keep_pe = self.cpu.cr0 & cr0::PE;
+                    let old = self.cpu.cr0;
                     self.cpu.cr0 = (self.cpu.cr0 & !0xe) | (v & 0xf) | keep_pe;
-                    self.cpu.tlb.flush();
+                    if (old ^ self.cpu.cr0) & cr0::PE != 0 {
+                        self.cpu.tlb.flush();
+                    }
                 }
                 7 => {
                     self.require_cpl0()?;
@@ -987,8 +990,11 @@ impl<B: Bus> Ctx<'_, B> {
                             if v & cr0::PG != 0 && v & cr0::PE == 0 {
                                 return gp(0);
                             }
+                            let old = self.cpu.cr0;
                             self.cpu.cr0 = v | cr0::ET;
-                            self.cpu.tlb.flush();
+                            if (old ^ self.cpu.cr0) & (cr0::PG | cr0::WP | cr0::PE) != 0 {
+                                self.cpu.tlb.flush();
+                            }
                         }
                         2 => self.cpu.cr2 = v,
                         3 => {
@@ -1001,8 +1007,11 @@ impl<B: Bus> Ctx<'_, B> {
                             if v & !supported != 0 {
                                 return gp(0);
                             }
+                            let old = self.cpu.cr4;
                             self.cpu.cr4 = v;
-                            self.cpu.tlb.flush();
+                            if (old ^ v) & (cr4::PSE | cr4::PGE | cr4::PAE) != 0 {
+                                self.cpu.tlb.flush();
+                            }
                         }
                         _ => return ud(),
                     }
