@@ -128,6 +128,13 @@ pub fn piix3_isa() -> ConfigSpace {
     c
 }
 
+pub fn piix3_ide() -> ConfigSpace {
+    let mut c = ConfigSpace::new(ide::PCI_VENDOR, ide::PCI_DEVICE, ide::PCI_CLASS_CODE, 0x00, 0x00);
+    c.add_bar(4, BarKind::Io, 16);
+    c.writable[0x04] |= 0x04;
+    c
+}
+
 /// PAM register offsets in the i440FX host bridge (440FX datasheet, section 3.2).
 pub const PAM0: usize = 0x59;
 

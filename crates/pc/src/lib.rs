@@ -31,6 +31,7 @@ pub struct Board {
     pub fw_cfg: fw_cfg::FwCfg,
     pub kbc: i8042::I8042,
     pub vga: vga::Vga,
+    pub ide: ide::Ide,
     vgabios: Vec<u8>,
     pub debugcon: Box<dyn Write + Send>,
     start: Instant,
@@ -39,7 +40,8 @@ pub struct Board {
 }
 
 const LEGACY_START: u32 = 0xa_0000;
-const DISPLAY: usize = 2;
+const IDE: usize = 2;
+const DISPLAY: usize = 3;
 const LEGACY_END: u32 = 0x10_0000;
 
 impl Board {
@@ -51,13 +53,18 @@ impl Board {
             bios: cfg.bios,
             a20: true,
             pci_addr: 0,
-            pci: vec![(Bdf { dev: 0, func: 0 }, pci::host_bridge()), (Bdf { dev: 1, func: 0 }, pci::piix3_isa())],
+            pci: vec![
+                (Bdf { dev: 0, func: 0 }, pci::host_bridge()),
+                (Bdf { dev: 1, func: 0 }, pci::piix3_isa()),
+                (Bdf { dev: 1, func: 1 }, pci::piix3_ide()),
+            ],
             pic: pic::Pic::default(),
             pit: pit::Pit::default(),
             rtc: rtc::Rtc::default(),
             fw_cfg: fw_cfg::FwCfg::new(),
             kbc: i8042::I8042::default(),
             vga: vga::Vga::new(),
+            ide: ide::Ide::new(),
             vgabios: Vec::new(),
             debugcon: Box::new(std::io::stdout()),
             start: Instant::now(),
@@ -297,12 +304,23 @@ impl Board {
         self.vga.render(out)
     }
 
-    pub fn attach_cdrom(&mut self, _path: &str) -> std::io::Result<()> {
-        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "no IDE controller yet"))
+    /// Inserts an ISO image into the CD-ROM drive on the secondary master.
+    pub fn attach_cdrom(&mut self, path: &str) -> std::io::Result<()> {
+        let b = ide::FileBackend::open(path, true)?;
+        self.ide.attach_cdrom(1, 0, Some(Box::new(b)));
+        Ok(())
     }
 
-    pub fn attach_disk(&mut self, _path: &str) -> std::io::Result<()> {
-        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "no IDE controller yet"))
+    /// Attaches a raw disk image as the primary master.
+    pub fn attach_disk(&mut self, path: &str) -> std::io::Result<()> {
+        let b = ide::FileBackend::open(path, false)?;
+        self.ide.attach_disk(0, 0, Box::new(b));
+        Ok(())
+    }
+
+    fn sync_ide(&mut self) {
+        self.pic.set_irq(14, self.ide.irq(0));
+        self.pic.set_irq(15, self.ide.irq(1));
     }
 
     pub fn reset(&mut self) {
@@ -314,6 +332,24 @@ impl Board {
         self.pic = pic::Pic::default();
         self.pit = pit::Pit::default();
         self.reset_requested = false;
+    }
+}
+
+struct RamDma<'a>(&'a mut [u8]);
+
+impl ide::DmaMemory for RamDma<'_> {
+    fn read_phys(&mut self, addr: u32, buf: &mut [u8]) {
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = self.0.get(addr as usize + i).copied().unwrap_or(0xff);
+        }
+    }
+
+    fn write_phys(&mut self, addr: u32, buf: &[u8]) {
+        for (i, &b) in buf.iter().enumerate() {
+            if let Some(slot) = self.0.get_mut(addr as usize + i) {
+                *slot = b;
+            }
+        }
     }
 }
 
@@ -383,6 +419,11 @@ impl Bus for Board {
         if let Some(v) = self.vga.io_read(port, size, now) {
             return v;
         }
+        self.ide.set_bus_master_base(self.pci[IDE].1.io_bar(4));
+        if let Some(v) = self.ide.io_read(port, size) {
+            self.sync_ide();
+            return v;
+        }
         match port {
             0xcf8 if size == 4 => return self.pci_addr,
             0xcfc..=0xcff => {
@@ -403,6 +444,11 @@ impl Bus for Board {
 
     fn io_write(&mut self, port: u16, size: u8, value: u32) {
         if self.vga.io_write(port, size, value) {
+            return;
+        }
+        self.ide.set_bus_master_base(self.pci[IDE].1.io_bar(4));
+        if self.ide.io_write(port, size, value, &mut RamDma(&mut self.ram)) {
+            self.sync_ide();
             return;
         }
         match port {

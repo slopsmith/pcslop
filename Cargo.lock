@@ -237,6 +237,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ide"
+version = "0.1.0"
+
+[[package]]
 name = "itoa"
 version = "1.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -375,6 +379,7 @@ dependencies = [
 name = "pc"
 version = "0.1.0"
 dependencies = [
+ "ide",
  "vga",
  "x86",
 ]
