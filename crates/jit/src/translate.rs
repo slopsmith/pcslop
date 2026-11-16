@@ -7,7 +7,7 @@
 use a64::{Asm, Cond, Extend, Reg, Shift, Size, Width, ZR, r};
 use x86::decode::{Insn, MemOperand, NO_REG, Rep, decode};
 
-use crate::runtime::{AF_AUX, Entries, PF_RESULT, STATE, guest_reg};
+use crate::runtime::{AF_AUX, Entries, ICOUNT, PF_RESULT, STATE, guest_reg};
 use crate::state::{self, reason};
 
 const MAX_INSNS: usize = 64;
@@ -792,6 +792,7 @@ pub fn compile(eip: u32, mut byte: impl FnMut(u32) -> Option<u8>, block_va: u64,
     let mut boundaries = Vec::new();
     let mut pc = eip;
     let mut insns = 0;
+    e.a.nop();
     loop {
         let insn = decode::<()>(true, |i| byte(pc.wrapping_add(i)).ok_or(()));
         let Ok(insn) = insn else {
@@ -824,5 +825,9 @@ pub fn compile(eip: u32, mut byte: impl FnMut(u32) -> Option<u8>, block_va: u64,
             }
         }
     }
-    Compiled { code: e.a.finish(), boundaries, insns }
+    let mut count = Asm::new();
+    count.add_imm(Size::X, ICOUNT, ICOUNT, insns as u32);
+    let mut code = e.a.finish();
+    code[0] = count.code[0];
+    Compiled { code, boundaries, insns }
 }

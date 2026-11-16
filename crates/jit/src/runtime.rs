@@ -14,6 +14,7 @@ pub const fn guest_reg(n: usize) -> Reg {
 pub const PF_RESULT: Reg = Reg(27);
 pub const AF_AUX: Reg = Reg(18);
 pub const STATE: Reg = Reg(28);
+pub const ICOUNT: Reg = Reg(17);
 
 /// Offsets (from the start of the runtime region) of entry points that
 /// translated code branches to.
@@ -65,6 +66,7 @@ fn store_guest(a: &mut Asm, nzcv_from_spsr: Option<Reg>) {
     a.str(Width::W, r(9), STATE, state::NZCV as i32);
     a.str(Width::W, PF_RESULT, STATE, state::PF_RESULT as i32);
     a.str(Width::W, AF_AUX, STATE, state::AF_AUX as i32);
+    a.str(Width::X, ICOUNT, STATE, state::ICOUNT as i32);
 }
 
 fn load_guest(a: &mut Asm) {
@@ -75,6 +77,7 @@ fn load_guest(a: &mut Asm) {
     a.msr(sysreg::NZCV, r(9));
     a.ldr(Width::W, PF_RESULT, STATE, state::PF_RESULT as i32);
     a.ldr(Width::W, AF_AUX, STATE, state::AF_AUX as i32);
+    a.ldr(Width::X, ICOUNT, STATE, state::ICOUNT as i32);
 }
 
 fn save_scratch(a: &mut Asm) {
@@ -120,6 +123,13 @@ pub fn build() -> (Vec<u32>, Entries) {
     let dispatch_pos = a.pos();
     a.ldr(Width::W, r(1), STATE, state::PENDING as i32);
     a.cbnz(Size::W, r(1), pending);
+    let unlimited = a.label();
+    a.ldr(Width::W, r(1), STATE, state::BUDGET as i32);
+    a.cbz(Size::W, r(1), unlimited);
+    a.sub_imm(Size::W, r(1), r(1), 1);
+    a.str(Width::W, r(1), STATE, state::BUDGET as i32);
+    a.cbz(Size::W, r(1), pending);
+    a.bind(unlimited);
     a.at_s1e1r(r(0));
     a.isb();
     a.mrs(r(1), sysreg::PAR_EL1);

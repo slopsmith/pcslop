@@ -156,20 +156,24 @@ pub const TLB_SIZE: usize = 1024;
 #[derive(Clone, Debug)]
 pub struct Tlb {
     pub entries: Box<[TlbEntry; TLB_SIZE]>,
+    /// Incremented by every flush, so other translation caches can follow.
+    pub generation: u64,
 }
 
 impl Default for Tlb {
     fn default() -> Self {
-        Tlb { entries: Box::new([TlbEntry::default(); TLB_SIZE]) }
+        Tlb { entries: Box::new([TlbEntry::default(); TLB_SIZE]), generation: 0 }
     }
 }
 
 impl Tlb {
     pub fn flush(&mut self) {
         self.entries.fill(TlbEntry::default());
+        self.generation += 1;
     }
 
     pub fn flush_page(&mut self, lin: u32) {
+        self.generation += 1;
         let e = &mut self.entries[(lin >> 12) as usize % TLB_SIZE];
         if e.tag == (lin >> 12) + 1 {
             *e = TlbEntry::default();

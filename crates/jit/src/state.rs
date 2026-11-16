@@ -51,6 +51,10 @@ pub struct State {
     pub gs_base: u32,
     pub tlbi_page: u64,
     pub lookup: u64,
+    /// x86 instructions retired by translated code.
+    pub icount: u64,
+    /// When non-zero, counts dispatches down and exits with PENDING at zero.
+    pub budget: u32,
     /// ESR, FAR, ELR, SPSR for FAULT exits.
     pub info: [u64; 4],
     /// x0..x17 saved across FAULT exits.
@@ -70,6 +74,8 @@ pub const FS_BASE: usize = offset_of!(State, fs_base);
 pub const GS_BASE: usize = offset_of!(State, gs_base);
 pub const TLBI_PAGE: usize = offset_of!(State, tlbi_page);
 pub const LOOKUP: usize = offset_of!(State, lookup);
+pub const ICOUNT: usize = offset_of!(State, icount);
+pub const BUDGET: usize = offset_of!(State, budget);
 pub const INFO: usize = offset_of!(State, info);
 pub const SCRATCH: usize = offset_of!(State, scratch);
 

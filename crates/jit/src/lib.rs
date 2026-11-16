@@ -18,11 +18,46 @@ use runtime::Entries;
 use shadow::Shadow;
 use state::{State, ctl, reason, resume};
 
-const VGA_HOLE: std::ops::Range<u32> = 0xa_0000..0xc_0000;
+/// VGA window plus the PAM-controlled ROM/shadow area: left unmapped so every
+/// access goes through the board, which knows the current PAM settings.
+const LEGACY_HOLE: std::ops::Range<u32> = 0xa_0000..0x10_0000;
 
 struct BlockInfo {
     va: u64,
     boundaries: Vec<(u32, u32)>,
+    insns: usize,
+}
+
+/// Reads through to the real bus, keeps writes to itself; used to run the
+/// interpreter alongside translated code without touching guest memory.
+struct Overlay<'a, B: Bus> {
+    inner: &'a mut B,
+    writes: HashMap<u32, u8>,
+}
+
+impl<B: Bus> Bus for Overlay<'_, B> {
+    fn read8(&mut self, addr: u32) -> u8 {
+        match self.writes.get(&addr) {
+            Some(&v) => v,
+            None => self.inner.read8(addr),
+        }
+    }
+
+    fn write8(&mut self, addr: u32, value: u8) {
+        self.writes.insert(addr, value);
+    }
+
+    fn io_read(&mut self, _port: u16, _size: u8) -> u32 {
+        0xffff_ffff
+    }
+
+    fn io_write(&mut self, _port: u16, _size: u8, _value: u32) {}
+}
+
+struct Expected {
+    cpu: Cpu,
+    writes: HashMap<u32, u8>,
+    eip: u32,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -53,12 +88,16 @@ pub struct Jit {
     mem: GuestMemory,
     entries: Entries,
     shadow: Shadow,
-    shadow_key: Option<(u32, u32, u32)>,
+    shadow_key: Option<u64>,
     code_next: usize,
     blocks: HashMap<u32, BlockInfo>,
     by_va: BTreeMap<u64, u32>,
     code_pages: HashMap<u32, Vec<u32>>,
     pub stats: Stats,
+    /// Runs each block against the interpreter and stops at the first difference.
+    pub verify: bool,
+    /// Interpreter exits by opcode, when profiling is on.
+    pub interp_profile: Option<HashMap<u16, u64>>,
     /// Declared last so it is dropped after the vCPU.
     _vm: Vm,
 }
@@ -87,8 +126,8 @@ impl Jit {
     /// `ram` must stay valid for `ram_len` bytes for the lifetime of the `Jit`.
     pub unsafe fn new(ram: *mut u8, ram_len: usize) -> hvf::Result<Jit> {
         let vm = Vm::new(layout::IPA_BITS)?;
-        let low = VGA_HOLE.start as usize;
-        let high = VGA_HOLE.end as usize;
+        let low = LEGACY_HOLE.start as usize;
+        let high = LEGACY_HOLE.end as usize;
         unsafe {
             vm.map(ram, 0, low, mem::READ | mem::WRITE)?;
             vm.map(ram.add(high), high as u64, ram_len - high, mem::READ | mem::WRITE)?;
@@ -103,7 +142,6 @@ impl Jit {
         let vcpu = Vcpu::new(&vm)?;
         let tcr: u64 = 32 | 1 << 8 | 1 << 10 | 3 << 12 | 25 << 16 | 1 << 24 | 1 << 26 | 3 << 28 | 2 << 30 | 1 << 32;
         let mut jit = Jit {
-            _vm: vm,
             vcpu,
             mem: rt,
             entries,
@@ -114,6 +152,9 @@ impl Jit {
             by_va: BTreeMap::new(),
             code_pages: HashMap::new(),
             stats: Stats::default(),
+            interp_profile: std::env::var_os("SLOPPER_JIT_PROFILE").map(|_| HashMap::new()),
+            verify: std::env::var_os("SLOPPER_JIT_VERIFY").is_some(),
+            _vm: vm,
         };
         jit.shadow.flush(jit.mem.as_mut_slice());
         let v = &jit.vcpu;
@@ -130,6 +171,11 @@ impl Jit {
         v.set_reg(reg::X0 + 28, layout::va(layout::STATE))?;
         jit.state().lookup = layout::va(layout::LOOKUP);
         Ok(jit)
+    }
+
+    /// x86 instructions retired by translated code so far.
+    pub fn instructions(&mut self) -> u64 {
+        self.state().icount
     }
 
     pub fn kicker(&self) -> VcpuKicker {
@@ -162,9 +208,9 @@ impl Jit {
         self.stats.flushes += 1;
     }
 
-    /// The x86 TLB is flushed by CR3 writes and by paging-related CR0/CR4 changes.
+    /// Follows the interpreter's TLB: CR3/CR0/CR4 writes and INVLPG flush it.
     fn check_shadow(&mut self, cpu: &Cpu) {
-        let key = (cpu.cr3, cpu.cr0 & 0x8001_0001, cpu.cr4 & 0xb0);
+        let key = cpu.tlb.generation;
         if self.shadow_key != Some(key) {
             self.shadow_key = Some(key);
             self.flush_shadow();
@@ -225,16 +271,26 @@ impl Jit {
         }
         self.mem.write_words(self.code_next, &compiled.code);
         self.code_next += bytes.next_multiple_of(16);
-        let off = layout::LOOKUP + hash(phys) * 16;
-        let slot = &mut self.mem.as_mut_slice()[off..off + 16];
-        slot[..8].copy_from_slice(&(phys as u64).to_le_bytes());
-        slot[8..].copy_from_slice(&block_va.to_le_bytes());
-        self.blocks.insert(phys, BlockInfo { va: block_va, boundaries: compiled.boundaries });
+        self.insert_lookup(phys, block_va);
+        self.blocks.insert(phys, BlockInfo { va: block_va, boundaries: compiled.boundaries, insns: compiled.insns });
         self.by_va.insert(block_va, phys);
-        self.code_pages.entry(page).or_default().push(phys);
+        let pages = self.code_pages.entry(page).or_default();
+        let new_page = pages.is_empty();
+        pages.push(phys);
+        bus.watch_code_page(phys);
+        if new_page {
+            self.flush_shadow();
+        }
         self.stats.blocks += 1;
         self.stats.translated_insns += compiled.insns as u64;
         self.state().ctl |= ctl::IC_IALLU;
+    }
+
+    fn insert_lookup(&mut self, phys: u32, va: u64) {
+        let off = layout::LOOKUP + hash(phys) * 16;
+        let slot = &mut self.mem.as_mut_slice()[off..off + 16];
+        slot[..8].copy_from_slice(&(phys as u64).to_le_bytes());
+        slot[8..].copy_from_slice(&va.to_le_bytes());
     }
 
     fn eip_at(&self, elr: u64) -> Option<u32> {
@@ -247,17 +303,38 @@ impl Jit {
     /// Runs translated code until the CPU needs the interpreter for more than
     /// single instructions, or until the vCPU is kicked.
     pub fn run<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B) -> hvf::Result<RunExit> {
+        for page in bus.take_written_code_pages() {
+            self.invalidate_code_page(page << 12);
+        }
         self.check_shadow(cpu);
         self.load_state(cpu);
+        let mut at_dispatch = true;
         loop {
+            let expected = if self.verify && at_dispatch { self.expect_block(cpu, bus) } else { None };
+            if self.verify && expected.is_none() {
+                self.state().budget = 0;
+            }
             let exit = self.vcpu.run()?;
+            at_dispatch = true;
+            if let Some(exp) = expected {
+                let why = self.state().reason;
+                if exit.ec() == Some(0x16) && (why == reason::PENDING || why == reason::INTERP) {
+                    self.check_block(cpu, bus, exp);
+                    if why == reason::PENDING {
+                        continue;
+                    }
+                }
+            }
             match exit {
                 Exit::Canceled => {
-                    self.store_state(cpu);
-                    return Ok(RunExit::Kicked);
+                    // The vCPU may have stopped mid-block with guest state still in
+                    // registers; let it run to the next dispatch, which saves it.
+                    self.state().pending = 1;
+                    at_dispatch = false;
                 }
                 Exit::Exception { syndrome, ipa, .. } if exit.ec() == Some(0x24) => {
                     self.mmio(bus, syndrome, ipa as u32)?;
+                    at_dispatch = false;
                 }
                 Exit::Exception { .. } if exit.ec() == Some(0x16) => {
                     let why = self.state().reason;
@@ -266,7 +343,17 @@ impl Jit {
                         reason::INTERP => {
                             self.stats.interp_exits += 1;
                             self.store_state(cpu);
+                            if self.interp_profile.is_some() {
+                                self.profile_interp(cpu, bus);
+                            }
+                            let before = (cpu.eip, cpu.eflags);
                             let e = interp::step(cpu, bus);
+                            if before.0 == 0x801a_4540 {
+                                eprintln!("TRACE sti: before {:x?} after eip {:#x} eflags {:#x} e {:?}", before, cpu.eip, cpu.eflags, e);
+                            }
+                            for page in bus.take_written_code_pages() {
+                                self.invalidate_code_page(page << 12);
+                            }
                             if e != interp::Exit::Continue || cpu.halted || !supported(cpu) {
                                 return Ok(RunExit::Interp(e));
                             }
@@ -277,7 +364,10 @@ impl Jit {
                             self.store_state(cpu);
                             return Ok(RunExit::Kicked);
                         }
-                        reason::FAULT => self.on_fault(cpu, bus),
+                        reason::FAULT => {
+                            self.on_fault(cpu, bus);
+                            at_dispatch = self.state().resume == resume::DISPATCH;
+                        }
                         _ => {
                             let s = self.state();
                             panic!("unexpected exception in the VM: ESR {:#x} FAR {:#x} ELR {:#x}", s.info[0], s.info[1], s.info[2]);
@@ -289,14 +379,91 @@ impl Jit {
         }
     }
 
+    /// Runs the block at the current EIP in the interpreter on an overlay and
+    /// arms the runtime to stop after that block.
+    fn expect_block<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B) -> Option<Expected> {
+        if self.state().pending != 0 {
+            return None;
+        }
+        let mut c = cpu.clone();
+        {
+            let s = self.state();
+            c.regs = s.regs;
+            c.eip = s.eip;
+            c.eflags = s.merge_eflags(c.eflags);
+        }
+        let phys = interp::translate(&mut c.clone(), bus, c.eip, false).ok()?;
+        let n = self.blocks.get(&phys)?.insns;
+        let eip = c.eip;
+        let mut ov = Overlay { inner: bus, writes: HashMap::new() };
+        for _ in 0..n {
+            if interp::step(&mut c, &mut ov) != interp::Exit::Continue {
+                return None;
+            }
+        }
+        let writes = ov.writes;
+        self.state().budget = 2;
+        Some(Expected { cpu: c, writes, eip })
+    }
+
+    fn check_block<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B, exp: Expected) {
+        self.state().budget = 0;
+        let mut got = cpu.clone();
+        self.store_state(&mut got);
+        let mask = x86::cpu::flags::ARITH;
+        let mut diffs = Vec::new();
+        if got.regs != exp.cpu.regs {
+            diffs.push(format!("regs jit {:08x?}\n     interp {:08x?}", got.regs, exp.cpu.regs));
+        }
+        if got.eip != exp.cpu.eip {
+            diffs.push(format!("eip jit {:#x} interp {:#x}", got.eip, exp.cpu.eip));
+        }
+        if got.eflags & mask != exp.cpu.eflags & mask {
+            diffs.push(format!("flags jit {:#x} interp {:#x}", got.eflags & mask, exp.cpu.eflags & mask));
+        }
+        for (&a, &v) in &exp.writes {
+            let real = bus.read8(a);
+            if real != v {
+                diffs.push(format!("mem[{a:#x}] jit {real:#04x} interp {v:#04x}"));
+            }
+        }
+        if diffs.is_empty() {
+            return;
+        }
+        let mut c = cpu.clone();
+        let bytes = match interp::translate(&mut c, bus, exp.eip, false) {
+            Ok(p) => (0..48).map(|i| format!("{:02x}", bus.read8(p + i))).collect::<Vec<_>>().join(" "),
+            Err(_) => String::from("?"),
+        };
+        panic!("JIT block at {:#x} differs from the interpreter:\n{}\ncode: {}", exp.eip, diffs.join("\n"), bytes);
+    }
+
+    fn profile_interp<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B) {
+        let eip = cpu.eip;
+        let Ok(phys) = interp::translate(cpu, bus, eip, false) else { return };
+        let insn = x86::decode::decode::<()>(true, |i| Ok(bus.read8(phys.wrapping_add(i))));
+        if let (Ok(i), Some(p)) = (insn, self.interp_profile.as_mut()) {
+            let key = if i.has_modrm && matches!(i.op, 0x80..=0x83 | 0xc0 | 0xc1 | 0xd0..=0xd3 | 0xf6 | 0xf7 | 0xfe | 0xff) {
+                i.op << 4 | i.reg() as u16 | 0x8000
+            } else {
+                i.op | if i.op32 { 0 } else { 0x4000 } | if i.rep != x86::decode::Rep::None { 0x2000 } else { 0 }
+            };
+            *p.entry(key).or_default() += 1;
+        }
+    }
+
     fn on_miss<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B) {
         self.stats.miss_exits += 1;
         let eip = self.state().eip;
         match interp::translate(cpu, bus, eip, false) {
             Ok(phys) => {
                 self.map_shadow(eip, phys, false);
-                if !self.blocks.contains_key(&phys) {
-                    self.translate_block(bus, eip, phys);
+                match self.blocks.get(&phys) {
+                    Some(b) => {
+                        let va = b.va;
+                        self.insert_lookup(phys, va);
+                    }
+                    None => self.translate_block(bus, eip, phys),
                 }
             }
             Err(e) => {
