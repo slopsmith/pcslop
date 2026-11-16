@@ -190,6 +190,11 @@ impl Pic {
         }
     }
 
+    /// True while an edge on `irq` (master PIC) is latched but not yet acknowledged.
+    pub fn requested(&self, irq: u8) -> bool {
+        self.chips[0].irr & (1 << irq) != 0
+    }
+
     pub fn pulse_irq(&mut self, irq: u8) {
         self.set_irq(irq, true);
         self.set_irq(irq, false);

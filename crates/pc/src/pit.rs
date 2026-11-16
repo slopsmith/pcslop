@@ -100,6 +100,9 @@ pub struct Pit {
     port61: u8,
 }
 
+/// Timer ticks remembered for catch-up; beyond this, time is lost.
+pub const MAX_BACKLOG: u32 = 1000;
+
 impl Default for Pit {
     fn default() -> Self {
         let mut ch: [Channel; 3] = Default::default();
@@ -111,6 +114,7 @@ impl Default for Pit {
 
 impl Pit {
     /// Number of channel-0 rising edges between the last poll and `now_ns`.
+    /// Channel-0 edges since the last call, capped at one second's worth.
     pub fn poll_irq0(&mut self, now_ns: u64) -> u32 {
         let now = ticks_at(now_ns);
         let mut edges = 0;
@@ -120,7 +124,7 @@ impl Pit {
             }
             self.irq_seen = edge;
             edges += 1;
-            if self.ch[0].mode == 0 || edges > 4 {
+            if self.ch[0].mode == 0 || edges >= MAX_BACKLOG {
                 self.irq_seen = now;
                 break;
             }

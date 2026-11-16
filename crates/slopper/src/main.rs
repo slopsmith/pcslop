@@ -276,7 +276,7 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
         let shared = shared.clone();
         std::thread::spawn(move || {
             while !shared.done.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(1));
+                std::thread::sleep(Duration::from_micros(500));
                 kicker.kick();
             }
         });
@@ -422,7 +422,7 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                                 cpu.halted,
                                 format_regs(&cpu)
                             );
-                            out += &format!("\n{host}");
+                            out += &format!("\n{host} timer backlog {}", board.timer_backlog());
                             if let Some(j) = jit.as_mut() {
                                 let (a, b) = (j.stats, last_stats);
                                 let r = |x: u64, y: u64| (x - y) as f64 / span;

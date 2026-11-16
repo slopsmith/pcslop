@@ -50,6 +50,9 @@ pub struct Board {
     pci: Vec<(Bdf, ConfigSpace)>,
     pub pic: pic::Pic,
     pub pit: pit::Pit,
+    /// Timer interrupts owed to the guest: Windows counts them to keep time,
+    /// so ticks that arrive while one is still pending are delivered later.
+    irq0_backlog: u32,
     pub rtc: rtc::Rtc,
     pub fw_cfg: fw_cfg::FwCfg,
     pub kbc: i8042::I8042,
@@ -84,6 +87,7 @@ impl Board {
             ],
             pic: pic::Pic::default(),
             pit: pit::Pit::default(),
+            irq0_backlog: 0,
             rtc: rtc::Rtc::default(),
             fw_cfg: fw_cfg::FwCfg::new(),
             kbc: i8042::I8042::default(),
@@ -142,7 +146,9 @@ impl Board {
     /// Advances timers and raises their interrupts.
     pub fn tick(&mut self) {
         let now = self.now_ns();
-        for _ in 0..self.pit.poll_irq0(now) {
+        self.irq0_backlog = (self.irq0_backlog + self.pit.poll_irq0(now)).min(pit::MAX_BACKLOG);
+        if self.irq0_backlog > 0 && !self.pic.requested(0) {
+            self.irq0_backlog -= 1;
             self.pic.pulse_irq(0);
         }
         if self.rtc.poll(now) {
@@ -150,9 +156,17 @@ impl Board {
         }
     }
 
+    /// Timer interrupts not yet delivered; it grows when the guest falls behind.
+    pub fn timer_backlog(&self) -> u32 {
+        self.irq0_backlog
+    }
+
     /// Nanoseconds until a timer will next need attention.
     pub fn next_event_ns(&self) -> u64 {
         let now = self.now_ns();
+        if self.irq0_backlog > 0 && !self.pic.requested(0) {
+            return 0;
+        }
         self.pit.next_irq0_ns(now).unwrap_or(1_000_000).min(1_000_000)
     }
 
@@ -371,6 +385,7 @@ impl Board {
         }
         self.pic = pic::Pic::default();
         self.pit = pit::Pit::default();
+        self.irq0_backlog = 0;
         self.reset_requested = false;
     }
 }
