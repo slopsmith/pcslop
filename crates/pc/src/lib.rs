@@ -264,6 +264,12 @@ impl Board {
             0x511 => self.fw_cfg.read_data(),
             0x60 | 0x64 => {
                 let v = self.kbc.read(port);
+                if port == 0x60 {
+                    // Reading the output buffer drops IRQ 1/12; dropping them here gives the
+                    // PIC an edge for the next byte even when it is loaded straight away.
+                    self.pic.set_irq(1, false);
+                    self.pic.set_irq(12, false);
+                }
                 self.sync_kbc();
                 v
             }
