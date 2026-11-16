@@ -1,0 +1,32 @@
+//! Addresses of the runtime inside the VM. See docs/architecture.md, "VM runtime layout".
+
+/// Guest physical address of the runtime region, above any x86 physical address.
+pub const RUNTIME_IPA: u64 = 0x8_0000_0000;
+pub const RUNTIME_SIZE: usize = 64 << 20;
+pub const IPA_BITS: u32 = 36;
+
+/// Virtual address of the runtime region (TTBR1, first 1 GiB slot).
+pub const RUNTIME_VA: u64 = 0xffff_ff80_0000_0000;
+/// Virtual address of the linear view of x86 physical memory (TTBR1, slots 256..260).
+pub const PHYS_VA: u64 = 0xffff_ffc0_0000_0000;
+
+pub const VECTORS: usize = 0x0;
+pub const RUNTIME_CODE: usize = 0x800;
+pub const STATE: usize = 0x1_0000;
+pub const STACK_TOP: usize = 0x2_0000;
+pub const TTBR1_L1: usize = 0x2_0000;
+pub const TTBR1_L2: usize = 0x2_1000;
+pub const LOOKUP: usize = 0x4_0000;
+pub const LOOKUP_ENTRIES: usize = 1 << 16;
+pub const SHADOW_POOL: usize = 0x20_0000;
+pub const SHADOW_POOL_END: usize = 0x100_0000;
+pub const CODE_CACHE: usize = 0x100_0000;
+pub const CODE_CACHE_END: usize = RUNTIME_SIZE;
+
+pub const fn va(offset: usize) -> u64 {
+    RUNTIME_VA + offset as u64
+}
+
+pub const fn ipa(offset: usize) -> u64 {
+    RUNTIME_IPA + offset as u64
+}
