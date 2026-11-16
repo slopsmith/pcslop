@@ -60,6 +60,8 @@ pub struct State {
     /// Current CS selector, so a RETF to the same segment needs no exit.
     pub cs_sel: u32,
     pub gs_base: u32,
+    /// EFLAGS without the arithmetic flags, IF and DF; POPF exits if it would change them.
+    pub eflags_rest: u32,
     pub tlbi_page: u64,
     pub lookup: u64,
     /// x86 instructions retired by translated code.
@@ -70,6 +72,9 @@ pub struct State {
     pub info: [u64; 4],
     /// x0..x17 saved across FAULT exits.
     pub scratch: [u64; 18],
+    /// 1 when SSE instructions may run: CR0.TS and CR0.EM clear, CR4.OSFXSR set.
+    pub sse_ok: u32,
+    pub xmm: [u128; 8],
 }
 
 pub const REGS: usize = offset_of!(State, regs);
@@ -88,12 +93,15 @@ pub const USER: usize = offset_of!(State, user);
 pub const CS_SEL: usize = offset_of!(State, cs_sel);
 pub const FS_BASE: usize = offset_of!(State, fs_base);
 pub const GS_BASE: usize = offset_of!(State, gs_base);
+pub const EFLAGS_REST: usize = offset_of!(State, eflags_rest);
 pub const TLBI_PAGE: usize = offset_of!(State, tlbi_page);
 pub const LOOKUP: usize = offset_of!(State, lookup);
 pub const ICOUNT: usize = offset_of!(State, icount);
 pub const BUDGET: usize = offset_of!(State, budget);
 pub const INFO: usize = offset_of!(State, info);
 pub const SCRATCH: usize = offset_of!(State, scratch);
+pub const SSE_OK: usize = offset_of!(State, sse_ok);
+pub const XMM: usize = offset_of!(State, xmm);
 
 const NZCV_N: u32 = 1 << 31;
 const NZCV_Z: u32 = 1 << 30;

@@ -181,7 +181,103 @@ fn random_insn(rng: &mut Rng, out: &mut Vec<u8>) {
         out.push(reg << 3 | 5);
         out.extend((0x3000 + slot * 4).to_le_bytes());
     };
-    match rng.below(34) {
+    match rng.below(38) {
+        36 | 37 => match rng.below(9) {
+            0 => out.extend([0x0f, 0xc8 + rng.reg()]),
+            1 => {
+                let kind = [0, 1, 4, 5, 6, 7][rng.below(6) as usize];
+                match rng.below(3) {
+                    0 => out.extend([0xc0, modrm_rr(kind, rng.below(8) as u8), rng.below(40) as u8]),
+                    1 => out.extend([0xd0, modrm_rr(kind, rng.below(8) as u8)]),
+                    _ => out.extend([0xd2, modrm_rr(kind, rng.below(8) as u8)]),
+                }
+            }
+            2 => {
+                let kind = [0, 1, 4, 5, 6, 7][rng.below(6) as usize];
+                match rng.below(3) {
+                    0 => out.extend([0x66, 0xc1, modrm_rr(kind, rng.reg()), rng.below(40) as u8]),
+                    1 => out.extend([0x66, 0xd1, modrm_rr(kind, rng.reg())]),
+                    _ => out.extend([0x66, 0xd3, modrm_rr(kind, rng.reg())]),
+                }
+            }
+            3 => {
+                let r = rng.reg();
+                out.extend([0x9c, 0x58 + r]);
+            }
+            4 => {
+                let r = rng.reg();
+                out.extend([0x81, modrm_rr(4, r)]);
+                out.extend(0x0cd5u32.to_le_bytes());
+                out.extend([0x50 + r, 0x9d]);
+            }
+            5 => {
+                if rng.below(2) == 0 {
+                    out.extend([0x0f, 0xba, modrm_rr(4 + rng.below(4) as u8, rng.reg()), rng.next() as u8]);
+                } else {
+                    out.extend([0x66, 0x0f, 0xba, modrm_rr(4 + rng.below(4) as u8, rng.reg()), rng.next() as u8]);
+                }
+            }
+            6 => {
+                out.extend([0x0f, 0xba, (4 + rng.below(4) as u8) << 3 | 5]);
+                out.extend((0x3000 + rng.below(4) * 4).to_le_bytes());
+                out.push(rng.next() as u8);
+            }
+            7 => out.push([0xf5, 0xf8, 0xf9][rng.below(3) as usize]),
+            _ => {
+                out.extend([0x0f, 0x18, (rng.below(4) as u8) << 3 | 5]);
+                out.extend((0x3000u32).to_le_bytes());
+            }
+        },
+        34 | 35 => match rng.below(10) {
+            0 => out.extend([0xc1, modrm_rr(rng.below(2) as u8, rng.reg()), rng.below(40) as u8]),
+            1 => out.extend([0xd1, modrm_rr(rng.below(2) as u8, rng.reg())]),
+            2 => out.extend([0xd3, modrm_rr(rng.below(2) as u8, rng.reg())]),
+            3 => {
+                if rng.below(2) == 0 {
+                    out.extend([0xf6, modrm_rr(2 + rng.below(2) as u8, rng.below(8) as u8)]);
+                } else {
+                    out.extend([0x66, 0xf7, modrm_rr(2 + rng.below(2) as u8, rng.reg())]);
+                }
+            }
+            4 => {
+                if rng.below(2) == 0 {
+                    out.extend([0x66, 0x40 + rng.reg() + 8 * rng.below(2) as u8]);
+                } else {
+                    out.extend([0x66, 0xff, modrm_rr(rng.below(2) as u8, rng.reg())]);
+                }
+            }
+            5 | 6 => {
+                let op = if rng.below(2) == 0 { 0xc1 } else { 0xb1 };
+                match rng.below(3) {
+                    0 => out.extend([0x0f, op, modrm_rr(rng.reg(), rng.reg())]),
+                    1 => out.extend([0x0f, op - 1, modrm_rr(rng.below(8) as u8, rng.below(8) as u8)]),
+                    _ => {
+                        out.extend([0x0f, op]);
+                        mem(out, rng.reg(), rng.below(4));
+                    }
+                }
+            }
+            7 => {
+                out.extend([0x0f, 0xc7, 1 << 3 | 5]);
+                out.extend((0x3000 + rng.below(2) * 8).to_le_bytes());
+            }
+            8 => {
+                let op = [0xa4, 0xa5, 0xac, 0xad][rng.below(4) as usize];
+                out.extend([0x0f, op]);
+                if rng.below(2) == 0 {
+                    out.push(modrm_rr(rng.reg(), rng.reg()));
+                } else {
+                    mem(out, rng.reg(), rng.below(4));
+                }
+                if op & 1 == 0 {
+                    out.push(rng.below(40) as u8);
+                }
+            }
+            _ => {
+                out.extend([0x0f, 0x2b, (rng.below(8) as u8) << 3 | 5]);
+                out.extend((0x3000 + rng.below(4) * 16).to_le_bytes());
+            }
+        },
         30 => {
             out.extend([0xbe]);
             out.extend((0x3000 + rng.below(16)).to_le_bytes());
@@ -347,6 +443,7 @@ fn random_programs_match_the_interpreter() {
         code.push(0xf4);
         let regs: Vec<u32> = (0..8).map(|_| rng.next()).collect();
         let flags = rng.next() & ARITH_MASK;
+        let xmm: Vec<u128> = (0..8).map(|_| (rng.next() as u128) << 96 | (rng.next() as u128) << 32 | rng.next() as u128).collect();
         let result = std::panic::catch_unwind(|| {
             compare(&code, |c| {
                 for (i, v) in regs.iter().enumerate() {
@@ -355,6 +452,8 @@ fn random_programs_match_the_interpreter() {
                     }
                 }
                 c.eflags |= flags;
+                c.cr4 |= x86::cpu::cr4::OSFXSR;
+                c.xmm.copy_from_slice(&xmm);
             })
         });
         match result {

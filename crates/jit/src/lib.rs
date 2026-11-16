@@ -418,11 +418,18 @@ impl Jit {
         s.regs = cpu.regs;
         s.eip = cpu.eip;
         s.set_eflags(cpu.eflags);
+        {
+            use x86::cpu::flags::*;
+            s.eflags_rest = cpu.eflags & !(ARITH | IF | DF);
+        }
         s.if_flag = cpu.flag(x86::cpu::flags::IF) as u32;
         s.df = cpu.flag(x86::cpu::flags::DF) as u32;
         s.fs_base = cpu.segs[FS].base;
         s.cs_sel = cpu.segs[CS].selector as u32;
         s.gs_base = cpu.segs[GS].base;
+        let ts_em = x86::cpu::cr0::TS | x86::cpu::cr0::EM;
+        s.sse_ok = (cpu.cr0 & ts_em == 0 && cpu.cr4 & x86::cpu::cr4::OSFXSR != 0) as u32;
+        s.xmm = cpu.xmm;
     }
 
     fn store_state(&mut self, cpu: &mut Cpu) {
@@ -433,6 +440,7 @@ impl Jit {
         cpu.eflags = s.merge_eflags(cpu.eflags);
         cpu.set_flag(x86::cpu::flags::IF, if_flag);
         cpu.set_flag(x86::cpu::flags::DF, df);
+        cpu.xmm = s.xmm;
     }
 
     /// Points TTBR0 at the shadow tree for the current CPL, each with its own ASID.
