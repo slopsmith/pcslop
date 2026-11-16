@@ -101,6 +101,27 @@ pub fn step<B: Bus>(cpu: &mut Cpu, bus: &mut B) -> Exit {
     ctx.step()
 }
 
+/// Translates `lin` for an access at the current privilege level, setting the
+/// Accessed and Dirty bits as the CPU would. A failed translation sets CR2 and
+/// returns the page fault to deliver.
+pub fn translate<B: Bus>(cpu: &mut Cpu, bus: &mut B, lin: u32, write: bool) -> Result<u32, Exception> {
+    let mut ctx = Ctx { cpu, bus, insn: Insn::default(), start_eip: 0 };
+    let user = ctx.cpu.cpl() == 3;
+    let acc = if write { mem::Access::Write } else { mem::Access::Read };
+    match ctx.translate(lin, acc, user) {
+        Ok(p) => Ok(p),
+        Err(Trap::Fault(e)) => Err(e),
+        Err(Trap::Unimplemented(_)) => unreachable!("page walks are fully implemented"),
+    }
+}
+
+/// Delivers `e` as a fault raised by the instruction at `cpu.eip`.
+pub fn deliver_fault<B: Bus>(cpu: &mut Cpu, bus: &mut B, e: Exception) -> Exit {
+    let mut ctx = Ctx { cpu, bus, insn: Insn::default(), start_eip: 0 };
+    ctx.start_eip = ctx.cpu.eip;
+    ctx.deliver(e, Source::Fault)
+}
+
 impl<B: Bus> Ctx<'_, B> {
     fn step(&mut self) -> Exit {
         if self.cpu.interrupt_shadow {
