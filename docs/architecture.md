@@ -72,9 +72,34 @@ A plain host-side interpreter comes first, for three reasons:
 - **Board:** i440FX + PIIX3/PIIX4, the board SeaBIOS knows best.
 - **Configuration:** goes through QEMU's `fw_cfg` interface (I/O ports `0x510`/`0x511`), so SeaBIOS can run its QEMU code path unchanged.
 - **ACPI:** current SeaBIOS no longer builds ACPI tables itself. It expects the VMM to pass them through `fw_cfg` (`etc/table-loader`). The plan:
-  - First boot XP with **no ACPI** ("Standard PC" HAL, PIC + PIT). SeaBIOS still builds the MP and `$PIR` tables.
+  - First boot XP with **no ACPI and no MP table** ("Standard PC" HAL, PIC + PIT). Our SeaBIOS build sets `CONFIG_MPTABLE=n`: with an MP table present, Setup would pick the MPS uniprocessor HAL, which needs a local APIC and an I/O APIC.
   - Generate our own ACPI tables later, for the ACPI uniprocessor HAL and power-off.
 - **Hot MMIO and ports, handled inside the VM:** APIC TPR (if we move to an APIC HAL), PIC EOI, and PIT counter reads. Everything else exits to the host.
+
+## VM runtime layout
+
+These are the starting decisions for phase 3.
+
+**Guest physical (IPA) map**
+- `0 .. 4 GiB` mirrors x86 physical memory. RAM is the same host allocation the board and interpreter use, mapped with `hv_vm_map`. MMIO holes stay unmapped, so an access there is a stage-2 fault: a VM exit that carries the faulting register and access size in ESR (ISV), and the host emulates it.
+- `4 GiB and up` holds the runtime: exception vectors, dispatcher, code cache, shadow page tables, CPU state and lookup tables. Guest code cannot form addresses there.
+
+**Stage-1 translation**
+- TTBR0 (`T0SZ = 32`, exactly 4 GiB, 4 KiB granule) is the shadow of the x86 page tables. VA equals the x86 linear address, so a guest load is one ARM load at a zero-extended 32-bit address.
+- TTBR1 maps the runtime and a linear view of x86 physical memory, for the page walker.
+- Shadow entries are filled lazily by the EL1 data-abort handler. Pages start read-only so the first write can set the x86 Dirty bit (the hardware does no A/D updates here). Pages holding translated code stay read-only to catch self-modifying code.
+- x86 user pages are EL0-accessible and supervisor pages EL1-only. CPL 3 runs at EL0, so the MMU enforces U/S and CR0.WP.
+
+**Register assignment in translated code**
+- `w19..w26`: EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI (callee-saved, so runtime calls do not spill them).
+- `x27`: base of FS (TEB/KPCR accesses add it).
+- `x28`: pointer to the CPU state block.
+- NZCV: x86 CF, ZF, SF and OF, with carry inverted after subtraction (FlagM `CFINV` fixes it up only when needed). PF and AF come from the last result and operands, saved in the state block when a later instruction might read them.
+
+**Control flow**
+- A lookup table in runtime memory maps x86 EIP to translated code. A miss makes a VM exit, the host translates the block into the shared code cache, and the guest resumes.
+- Port I/O, unimplemented instructions and mode changes exit to the host. The interpreter runs anything the JIT does not handle: real mode, V86, task switches.
+- Interrupts: the host sets a pending word in the state block, which translated code checks on backward branches and block exits.
 
 ## Phases
 
@@ -86,6 +111,7 @@ A plain host-side interpreter comes first, for three reasons:
 
 ## Open questions
 
-- Should CPL 0 code run at EL1 alongside our runtime, or should our runtime sit at EL1 and both x86 CPLs run at EL0 with two shadow roots? Running CPL 0 at EL1 is faster, but a translator bug can then corrupt the runtime.
+- (Decided) x86 CPL 0 runs at EL1 alongside the runtime; vic agreed that the speed is worth the risk.
+
 - Where do the shadow page-table caches live across CR3 switches? The first version flushes them on every CR3 write, which is what a real TLB does.
 - I-cache maintenance when the host patches code that the guest executes. `CTR_EL0` traps in macOS user space, so we need to read it inside the VM.
