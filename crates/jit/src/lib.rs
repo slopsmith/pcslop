@@ -555,7 +555,13 @@ impl Jit {
         if !self.verify {
             self.insert_lookup(key, block_va);
         }
-        self.blocks.insert(key, BlockInfo { va: block_va, boundaries: compiled.boundaries, insns: compiled.insns, verified: 0 });
+        // REP string ops can run for millions of iterations; replaying them on
+        // the verifier's overlay is too slow, so those blocks are trusted.
+        let verified = if compiled.has_rep { VERIFY_RUNS } else { 0 };
+        if self.verify && compiled.has_rep {
+            self.insert_lookup(key, block_va);
+        }
+        self.blocks.insert(key, BlockInfo { va: block_va, boundaries: compiled.boundaries, insns: compiled.insns, verified });
         self.by_va.insert(block_va, key);
         let pages = self.code_pages.entry(page).or_default();
         let new_page = pages.is_empty();
@@ -631,7 +637,9 @@ impl Jit {
             let _timer = t1.map(|start| ExitTimer { start, slot: kind, stats: &mut self.stats as *mut Stats });
             if let Some(exp) = expected {
                 let why = self.state().reason;
-                if exit.ec() == Some(0x16) && (why == reason::PENDING || why == reason::INTERP) {
+                let budget_spent = self.state().budget == 0;
+                let left_early = why == reason::INTERP && self.state().eip != exp.cpu.eip;
+                if exit.ec() == Some(0x16) && ((why == reason::PENDING && budget_spent) || why == reason::INTERP) && !left_early {
                     self.check_block(cpu, bus, exp);
                     if why == reason::PENDING {
                         continue;
@@ -696,13 +704,14 @@ impl Jit {
     /// Runs the block at the current EIP in the interpreter on an overlay and
     /// arms the runtime to stop after that block.
     fn expect_block<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B) -> Option<Expected> {
-        if self.state().pending != 0 {
+        let s = self.state();
+        if s.pending != 0 || (s.irq != 0 && s.if_flag != 0) {
             return None;
         }
         let mut c = cpu.clone();
         self.store_state(&mut c);
         let phys = interp::translate(&mut c.clone(), bus, c.eip, false).ok()?;
-        let key = block_key(phys, self.root == 1);
+        let key = block_key(phys, cpu.cpl() == 3);
         let block = self.blocks.get(&key)?;
         if block.verified >= VERIFY_RUNS {
             return None;
@@ -793,7 +802,7 @@ impl Jit {
         match interp::translate_global(cpu, bus, eip, false) {
             Ok((phys, global)) => {
                 self.map_shadow(bus, cpu, eip, phys, false, global);
-                let user = self.root == 1;
+                let user = cpu.cpl() == 3;
                 let key = block_key(phys, user);
                 match self.blocks.get(&key) {
                     Some(b) => {

@@ -63,6 +63,8 @@ pub struct Compiled {
     pub insns: usize,
     /// (ARM word index of a patchable `b`, target EIP on the same page).
     pub chains: Vec<(u32, u32)>,
+    /// The block contains a REP string instruction.
+    pub has_rep: bool,
 }
 
 struct Emit {
@@ -1142,6 +1144,7 @@ pub fn compile(
     let mut boundaries = Vec::new();
     let mut pc = eip;
     let mut insns = 0;
+    let mut has_rep = false;
     let mut sti: Option<(usize, u32, usize, usize)> = None;
     e.a.nop();
     loop {
@@ -1157,6 +1160,7 @@ pub fn compile(
             break;
         };
         boundaries.push((e.a.pos() as u32, pc));
+        has_rep |= insn.rep != Rep::None && matches!(insn.op, 0xa4..=0xa7 | 0xaa..=0xaf);
         let start = e.a.pos();
         match e.insn(&insn, pc) {
             Step::Sti if sti.is_none() => {
@@ -1202,5 +1206,5 @@ pub fn compile(
     count.add_imm(Size::X, ICOUNT, ICOUNT, insns as u32);
     let mut code = e.a.finish();
     code[0] = count.code[0];
-    Compiled { code, boundaries, insns, chains: e.chains }
+    Compiled { code, boundaries, insns, chains: e.chains, has_rep }
 }
