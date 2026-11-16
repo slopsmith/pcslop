@@ -230,6 +230,8 @@ pub struct Jit {
     pub verify: bool,
     /// Measures time spent in the VM and per exit kind (SLOPPER_JIT_PROFILE).
     timing: bool,
+    audit: bool,
+    audit_seen: std::collections::HashSet<(usize, u32, u32)>,
     /// Interpreter exits by opcode, when profiling is on.
     pub interp_profile: Option<HashMap<u16, u64>>,
     /// Declared last so it is dropped after the vCPU.
@@ -303,6 +305,8 @@ impl Jit {
             interp_profile: std::env::var_os("SLOPPER_JIT_PROFILE").map(|_| HashMap::new()),
             verify: std::env::var_os("SLOPPER_JIT_VERIFY").is_some(),
             timing: std::env::var_os("SLOPPER_JIT_PROFILE").is_some(),
+            audit: std::env::var_os("SLOPPER_JIT_AUDIT").is_some(),
+            audit_seen: std::collections::HashSet::new(),
             _vm: vm,
         };
         for t in &mut jit.shadow {
@@ -322,6 +326,42 @@ impl Jit {
         v.set_reg(reg::X0 + 28, layout::va(layout::STATE))?;
         jit.state().lookup = layout::va(layout::LOOKUP);
         Ok(jit)
+    }
+
+    /// Compares every shadow mapping with the x86 page tables and reports
+    /// mappings that disagree (SLOPPER_JIT_AUDIT).
+    fn audit<B: Bus>(&mut self, cpu: &Cpu, bus: &mut B) {
+        if cpu.cr0 & x86::cpu::cr0::PG == 0 {
+            return;
+        }
+        let pse = cpu.cr4 & x86::cpu::cr4::PSE != 0;
+        let mut reported = 0;
+        for r in 0..2 {
+            for (lin, phys, writable, off) in self.shadow[r].leaves(self.mem.as_slice()) {
+                let pde = bus.read32((cpu.cr3 & !0xfff) + (lin >> 22) * 4);
+                let want = if pde & 1 == 0 {
+                    None
+                } else if pde & 0x80 != 0 && pse {
+                    Some(((pde & 0xffc0_0000) | (lin & 0x3f_f000), pde))
+                } else {
+                    let pte = bus.read32((pde & !0xfff) + ((lin >> 12) & 0x3ff) * 4);
+                    (pte & 1 != 0).then_some((pte & !0xfff, pde & pte))
+                };
+                let bad = match want {
+                    None => true,
+                    Some((p, perms)) => p != phys || (writable && perms & 2 == 0 && r == 1),
+                };
+                if bad && reported < 10 && self.audit_seen.insert((r, lin, phys)) {
+                    reported += 1;
+                    eprintln!(
+                        "AUDIT root {r} lin {lin:#010x} shadow {phys:#x}{} x86 {want:x?} nonglobal_tracked {} gen {}",
+                        if writable { " rw" } else { " ro" },
+                        self.nonglobal[r].contains(&off),
+                        cpu.tlb.generation
+                    );
+                }
+            }
+        }
     }
 
     /// x86 instructions retired by translated code so far.
@@ -608,6 +648,9 @@ impl Jit {
             self.invalidate_code_page(page << 12);
         }
         self.check_shadow(cpu, bus);
+        if self.audit {
+            self.audit(cpu, bus);
+        }
         self.load_state(cpu);
         self.set_root(cpu);
         self.state().irq = bus.intr() as u32;
@@ -798,6 +841,10 @@ impl Jit {
 
     fn on_miss<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B) {
         self.stats.miss_exits += 1;
+        if self.audit && self.root != (cpu.cpl() == 3) as usize {
+            let (root, eip) = (self.root, self.state().eip);
+            eprintln!("AUDIT miss with root {root} at cpl {} eip {eip:#x}", cpu.cpl());
+        }
         let eip = self.state().eip;
         match interp::translate_global(cpu, bus, eip, false) {
             Ok((phys, global)) => {
@@ -826,6 +873,9 @@ impl Jit {
 
     fn on_fault<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B) {
         let [esr, far, elr, _] = self.state().info;
+        if self.audit && self.root != (cpu.cpl() == 3) as usize {
+            eprintln!("AUDIT fault with root {} at cpl {} far {far:#x} elr {elr:#x}", self.root, cpu.cpl());
+        }
         let ec = esr >> 26;
         assert!(ec == 0x25, "unhandled fault in translated code: ESR {esr:#x} FAR {far:#x} ELR {elr:#x}");
         assert!(far >> 32 == 0, "translated code faulted outside the x86 address space: FAR {far:#x}");

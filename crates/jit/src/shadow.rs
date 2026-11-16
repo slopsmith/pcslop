@@ -111,6 +111,35 @@ impl Shadow {
         true
     }
 
+    /// Every valid leaf as (linear page, physical page, writable, leaf offset).
+    pub fn leaves(&self, mem: &[u8]) -> Vec<(u32, u32, bool, usize)> {
+        let mut out = Vec::new();
+        let table_of = |d: u64| (d & 0x0000_ffff_ffff_f000) as usize - layout::RUNTIME_IPA as usize;
+        for i1 in 0..4usize {
+            let d1 = read_desc(mem, self.root + i1 * 8);
+            if d1 & VALID == 0 {
+                continue;
+            }
+            let l2 = table_of(d1);
+            for i2 in 0..512usize {
+                let d2 = read_desc(mem, l2 + i2 * 8);
+                if d2 & VALID == 0 {
+                    continue;
+                }
+                let l3 = table_of(d2);
+                for i3 in 0..512usize {
+                    let off = l3 + i3 * 8;
+                    let d = read_desc(mem, off);
+                    if d & VALID != 0 {
+                        let lin = ((i1 << 30) | (i2 << 21) | (i3 << 12)) as u32;
+                        out.push((lin, (d & 0xffff_f000) as u32, d & AP_RO == 0, off));
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Clears the leaf entry at `off`, as returned by `map`.
     pub fn clear_leaf(&mut self, mem: &mut [u8], off: usize) {
         write_desc(mem, off, 0);
