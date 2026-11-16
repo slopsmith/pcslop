@@ -7,7 +7,8 @@ pub mod shadow;
 pub mod state;
 mod translate;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+use std::hash::{BuildHasherDefault, Hasher};
 
 use hvf::{Exit, GuestMemory, Vcpu, VcpuKicker, Vm, mem, reg, sysreg};
 use x86::bus::Bus;
@@ -15,6 +16,38 @@ use x86::cpu::{CS, Cpu, DS, ES, FS, FlushKind, GS, SS};
 use x86::interp;
 
 use runtime::Entries;
+
+/// The Fx hash from rustc-hash (originally Firefox's hash, by the Rust project
+/// developers): far cheaper than SipHash for the integer keys used here.
+#[derive(Default, Clone, Copy)]
+struct FxHasher(u64);
+
+impl Hasher for FxHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(b as u64);
+        }
+    }
+
+    fn write_u64(&mut self, v: u64) {
+        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(0x51_7cc1_b727_220a_95);
+    }
+
+    fn write_u32(&mut self, v: u32) {
+        self.write_u64(v as u64);
+    }
+
+    fn write_usize(&mut self, v: usize) {
+        self.write_u64(v as u64);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type HashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
+type HashSet<K> = std::collections::HashSet<K, BuildHasherDefault<FxHasher>>;
 use shadow::Shadow;
 use state::{State, ctl, reason, resume};
 
@@ -224,7 +257,7 @@ pub struct Jit {
     smc_counts: HashMap<u32, u32>,
     /// Pages written too often to write-protect: their blocks check their own
     /// code bytes on entry instead.
-    self_check: std::collections::HashSet<u32>,
+    self_check: HashSet<u32>,
     pt_watch: PtWatch,
     /// Chain sites (code cache offsets) waiting for a block at a physical address.
     chain_wanted: HashMap<u64, Vec<usize>>,
@@ -240,9 +273,9 @@ pub struct Jit {
     /// Measures time spent in the VM and per exit kind (SLOPPER_JIT_PROFILE).
     timing: bool,
     audit: bool,
-    audit_seen: std::collections::HashSet<(usize, u32, u32)>,
+    audit_seen: HashSet<(usize, u32, u32)>,
     /// Interpreter exits by opcode, when profiling is on.
-    pub interp_profile: Option<HashMap<u16, u64>>,
+    interp_profile: Option<HashMap<u16, u64>>,
     /// Declared last so it is dropped after the vCPU.
     _vm: Vm,
 }
@@ -302,22 +335,22 @@ impl Jit {
             shadow_key: None,
             shadow_paged: false,
             code_next: layout::CODE_CACHE,
-            blocks: HashMap::new(),
+            blocks: HashMap::default(),
             by_va: BTreeMap::new(),
-            code_pages: HashMap::new(),
-            smc_counts: HashMap::new(),
+            code_pages: HashMap::default(),
+            smc_counts: HashMap::default(),
             self_check: Default::default(),
-            writable: [HashMap::new(), HashMap::new()],
+            writable: [HashMap::default(), HashMap::default()],
             nonglobal: [Vec::new(), Vec::new()],
             pt_watch: PtWatch::default(),
-            chain_wanted: HashMap::new(),
-            chain_in: HashMap::new(),
+            chain_wanted: HashMap::default(),
+            chain_in: HashMap::default(),
             stats: Stats::default(),
-            interp_profile: std::env::var_os("SLOPPER_JIT_PROFILE").map(|_| HashMap::new()),
+            interp_profile: std::env::var_os("SLOPPER_JIT_PROFILE").map(|_| HashMap::default()),
             verify: std::env::var_os("SLOPPER_JIT_VERIFY").is_some(),
             timing: std::env::var_os("SLOPPER_JIT_PROFILE").is_some(),
             audit: std::env::var_os("SLOPPER_JIT_AUDIT").is_some(),
-            audit_seen: std::collections::HashSet::new(),
+            audit_seen: HashSet::default(),
             _vm: vm,
         };
         for t in &mut jit.shadow {
@@ -384,10 +417,14 @@ impl Jit {
         )
     }
 
+    pub fn profiling(&self) -> bool {
+        self.interp_profile.is_some()
+    }
+
     /// Turns exit timing and the interpreter-exit histogram on or off.
     pub fn set_profiling(&mut self, on: bool) {
         self.timing = on;
-        self.interp_profile = on.then(HashMap::new);
+        self.interp_profile = on.then(HashMap::default);
         let s = &mut self.stats;
         (s.vm_ns, s.miss_ns, s.interp_ns, s.fault_ns, s.mmio_ns) = (0, 0, 0, 0, 0);
     }
@@ -848,7 +885,7 @@ impl Jit {
         }
         let (n, va) = (block.insns, block.va);
         let eip = c.eip;
-        let mut ov = Overlay { inner: bus, writes: HashMap::new() };
+        let mut ov = Overlay { inner: bus, writes: HashMap::default() };
         for _ in 0..n {
             if interp::step(&mut c, &mut ov) != interp::Exit::Continue {
                 return None;

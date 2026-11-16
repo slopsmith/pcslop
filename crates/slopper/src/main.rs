@@ -547,7 +547,7 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
     );
     if let Some(j) = &jit {
         eprintln!("{:?}", j.stats);
-        if j.interp_profile.is_some() {
+        if j.profiling() {
             eprintln!("{}", j.profile_report());
         }
     }
