@@ -181,6 +181,7 @@ impl Rtc {
             }
             REG_C | REG_D => {}
             0x00..=0x09 | 0x32 => {
+                self.refresh_time();
                 self.ram[i] = v;
                 if self.ram[REG_B] & B_SET == 0 {
                     self.commit_time();
@@ -213,5 +214,16 @@ mod tests {
         rtc.write(0x71, 0x20);
         rtc.write(0x70, 0x09);
         assert_eq!(rtc.read(0x71), 0x03);
+    }
+
+    #[test]
+    fn writing_one_field_keeps_the_date() {
+        let mut rtc = Rtc::default();
+        rtc.write(0x70, 0x00);
+        rtc.write(0x71, 0x00);
+        rtc.write(0x70, 0x32);
+        assert_eq!(rtc.read(0x71), 0x20);
+        rtc.write(0x70, 0x08);
+        assert_ne!(rtc.read(0x71), 0);
     }
 }
