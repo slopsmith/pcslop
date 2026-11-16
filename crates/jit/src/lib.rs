@@ -364,6 +364,15 @@ impl Jit {
         }
     }
 
+    /// The runtime's shared state fields, for the control socket.
+    pub fn debug_state(&mut self) -> String {
+        let s = self.state();
+        format!(
+            "jit eip={:#x} reason={} pending={} irq={} if={} budget={} user={} ctl={}",
+            s.eip, s.reason, s.pending, s.irq, s.if_flag, s.budget, s.user, s.ctl
+        )
+    }
+
     /// x86 instructions retired by translated code so far.
     pub fn instructions(&mut self) -> u64 {
         self.state().icount

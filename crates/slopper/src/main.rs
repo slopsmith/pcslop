@@ -24,10 +24,12 @@ struct Args {
     jit: bool,
     screenshots: Vec<(f64, PathBuf)>,
     exit_on_text: Option<String>,
+    script: Option<PathBuf>,
+    control: Option<PathBuf>,
 }
 
 const USAGE: &str = "usage: slopper --bios <bios.bin> [--vgabios <vgabios.bin>] [--cdrom <iso>] [--hda <img>] \
-[--ram MiB] [--headless] [--jit] [--screenshot SECONDS:PATH]... [--exit-on-text TEXT] [--max-instructions N]";
+[--ram MiB] [--headless] [--jit] [--screenshot SECONDS:PATH]... [--exit-on-text TEXT] [--script FILE] [--control SOCKET] [--max-instructions N]";
 
 fn parse_args() -> Result<Args, String> {
     let mut args = Args {
@@ -41,6 +43,8 @@ fn parse_args() -> Result<Args, String> {
         jit: false,
         screenshots: Vec::new(),
         exit_on_text: None,
+        script: None,
+        control: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -57,6 +61,8 @@ fn parse_args() -> Result<Args, String> {
             "--headless" => args.headless = true,
             "--jit" => args.jit = true,
             "--exit-on-text" => args.exit_on_text = Some(value()?),
+            "--script" => args.script = Some(PathBuf::from(value()?)),
+            "--control" => args.control = Some(PathBuf::from(value()?)),
             "--screenshot" => {
                 let v = value()?;
                 let (secs, path) = v.split_once(':').ok_or("--screenshot needs SECONDS:PATH")?;
@@ -77,6 +83,8 @@ enum Event {
     Type(String),
     Mouse(i32, i32, u8),
     Screenshot(PathBuf),
+    /// A control-socket query answered by the emulator thread.
+    Query(String, Sender<String>),
     Quit,
 }
 
@@ -107,9 +115,21 @@ fn dump(cpu: &Cpu) {
     );
 }
 
-/// The 80x25 text-mode screen as a string, read through the VGA window.
+/// The 80x25 text-mode screen as 25 newline-separated rows, with non-ASCII
+/// characters shown as spaces.
 fn text_screen(board: &mut Board) -> String {
-    (0..80 * 25).map(|i| x86::bus::Bus::read8(board, 0xb8000 + 2 * i) as char).collect()
+    (0..25)
+        .map(|row| {
+            let line: String = (0..80)
+                .map(|col| {
+                    let b = x86::bus::Bus::read8(board, 0xb8000 + 2 * (row * 80 + col));
+                    if b.is_ascii_graphic() || b == b' ' { b as char } else { ' ' }
+                })
+                .collect();
+            line.trim_end().to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn save_png(path: &PathBuf, f: &Frame) -> Result<(), String> {
@@ -123,6 +143,74 @@ fn save_png(path: &PathBuf, f: &Frame) -> Result<(), String> {
     let mut w = enc.write_header().map_err(|e| e.to_string())?;
     let rgb: Vec<u8> = f.pixels.iter().flat_map(|p| [(p >> 16) as u8, (p >> 8) as u8, *p as u8]).collect();
     w.write_image_data(&rgb).map_err(|e| e.to_string())
+}
+
+/// Steps from a `--script` file, run against the text-mode screen:
+/// `wait TEXT`, `key NAME[+NAME]`, `type TEXT`, `sleep SECONDS`, `shot PATH`, `quit`.
+struct Script {
+    steps: VecDeque<String>,
+    sleep_until: Option<Instant>,
+}
+
+enum ScriptAction {
+    Idle,
+    Event(Event),
+    Quit,
+}
+
+impl Script {
+    fn load(path: &PathBuf) -> std::io::Result<Script> {
+        let text = std::fs::read_to_string(path)?;
+        let steps = text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).map(String::from).collect();
+        Ok(Script { steps, sleep_until: None })
+    }
+
+    fn poll(&mut self, board: &mut Board, keyq: &mut KeyQueue) -> ScriptAction {
+        if self.sleep_until.is_some_and(|t| Instant::now() < t) || !keyq.pending.is_empty() {
+            return ScriptAction::Idle;
+        }
+        self.sleep_until = None;
+        let Some(step) = self.steps.front().cloned() else { return ScriptAction::Idle };
+        let (cmd, rest) = step.split_once(' ').unwrap_or((step.as_str(), ""));
+        let action = match cmd {
+            "wait" => {
+                if !text_screen(board).contains(rest) {
+                    return ScriptAction::Idle;
+                }
+                eprintln!("script: saw {rest:?}");
+                ScriptAction::Idle
+            }
+            "key" => {
+                for name in rest.split('+') {
+                    if let Some(c) = keys::by_name(name) {
+                        keyq.pending.push_back((c, true));
+                    }
+                }
+                for name in rest.split('+').rev() {
+                    if let Some(c) = keys::by_name(name) {
+                        keyq.pending.push_back((c, false));
+                    }
+                }
+                ScriptAction::Idle
+            }
+            "type" => {
+                rest.chars().for_each(|c| keyq.push_char(c));
+                ScriptAction::Idle
+            }
+            "sleep" => {
+                self.sleep_until = Some(Instant::now() + Duration::from_secs_f64(rest.parse().unwrap_or(1.0)));
+                ScriptAction::Idle
+            }
+            "shot" => ScriptAction::Event(Event::Screenshot(PathBuf::from(rest))),
+            "quit" => ScriptAction::Quit,
+            other => {
+                eprintln!("script: unknown step {other:?}");
+                ScriptAction::Idle
+            }
+        };
+        self.steps.pop_front();
+        action
+    }
 }
 
 /// Keys from `type` commands, released into the guest at a human pace.
@@ -197,6 +285,15 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
     let started = Instant::now();
     let mut executed: u64 = 0;
     let mut keyq = KeyQueue::default();
+    let mut paused = false;
+    let mut last_status = (Instant::now(), 0u64);
+    let mut script = match args.script.as_ref().map(Script::load).transpose() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("cannot read script: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let mut next_frame = Instant::now();
     let mut scratch = Vec::new();
 
@@ -258,6 +355,22 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
             board.reset();
         }
         keyq.poll(&mut board);
+        if let Some(sc) = script.as_mut() {
+            match sc.poll(&mut board, &mut keyq) {
+                ScriptAction::Idle => {}
+                ScriptAction::Event(Event::Screenshot(path)) => {
+                    if let Some((w, h)) = board.render(&mut scratch) {
+                        let f = Frame { pixels: scratch.clone(), width: w, height: h, seq: 0 };
+                        match save_png(&path, &f) {
+                            Ok(()) => eprintln!("saved {}", path.display()),
+                            Err(e) => eprintln!("screenshot failed: {e}"),
+                        }
+                    }
+                }
+                ScriptAction::Event(_) => {}
+                ScriptAction::Quit => break ExitCode::SUCCESS,
+            }
+        }
         while let Ok(ev) = events.try_recv() {
             match ev {
                 Event::Key(code, down) => board.key(code, down),
@@ -270,8 +383,68 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                         Err(e) => eprintln!("screenshot failed: {e}"),
                     }
                 }
+                Event::Query(q, reply) => {
+                    let (cmd, rest) = q.split_once(' ').unwrap_or((q.as_str(), ""));
+                    let answer = match cmd {
+                        "screen" => text_screen(&mut board),
+                        "regs" => format_regs(&cpu),
+                        "status" => {
+                            let jit_insns = jit.as_mut().map_or(0, |j| j.instructions());
+                            let total = executed + jit_insns;
+                            let now = Instant::now();
+                            let (t, n) = last_status;
+                            let mips = total.saturating_sub(n) as f64 / now.duration_since(t).as_secs_f64() / 1e6;
+                            last_status = (now, total);
+                            let mode = if jit.is_some() && jit::supported(&cpu) { "jit" } else { "interp" };
+                            let mut out = format!(
+                                "time {:.1}s instructions {total} ({jit_insns} translated) mips {mips:.1} mode {mode} cpl {} halted {} paused {paused}\n{}",
+                                started.elapsed().as_secs_f64(),
+                                cpu.cpl(),
+                                cpu.halted,
+                                format_regs(&cpu)
+                            );
+                            if let Some(j) = jit.as_mut() {
+                                out += &format!("\n{}\n{:?}", j.debug_state(), j.stats);
+                            }
+                            out
+                        }
+                        "pause" => {
+                            paused = true;
+                            "paused".into()
+                        }
+                        "resume" => {
+                            paused = false;
+                            "resumed".into()
+                        }
+                        "mem" => {
+                            let mut it = rest.split_whitespace();
+                            let addr = it.next().and_then(|a| u32::from_str_radix(a.trim_start_matches("0x"), 16).ok());
+                            let len = it.next().and_then(|l| l.parse::<u32>().ok()).unwrap_or(64).min(4096);
+                            match addr {
+                                Some(a) => (0..len)
+                                    .map(|i| match x86::interp::translate(&mut cpu, &mut board, a + i, false) {
+                                        Ok(p) => format!("{:02x}", x86::bus::Bus::read8(&mut board, p)),
+                                        Err(_) => "??".into(),
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .chunks(16)
+                                    .enumerate()
+                                    .map(|(i, c)| format!("{:08x}: {}", a + 16 * i as u32, c.join(" ")))
+                                    .collect::<Vec<_>>()
+                                    .join("\n"),
+                                None => "usage: mem HEXADDR [LEN]".into(),
+                            }
+                        }
+                        _ => format!("unknown query {cmd:?}"),
+                    };
+                    let _ = reply.send(answer);
+                }
                 Event::Quit => break 'run ExitCode::SUCCESS,
             }
+        }
+        if paused {
+            std::thread::sleep(Duration::from_millis(5));
+            continue;
         }
         if let Some(i) = args.screenshots.iter().position(|(t, _)| started.elapsed().as_secs_f64() >= *t) {
             let (_, path) = args.screenshots.remove(i);
@@ -340,6 +513,99 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
     dump(&cpu);
     shared.done.store(true, Ordering::Relaxed);
     code
+}
+
+fn format_regs(cpu: &Cpu) -> String {
+    let r = &cpu.regs;
+    let s = &cpu.segs;
+    format!(
+        "eax={:08x} ecx={:08x} edx={:08x} ebx={:08x} esp={:08x} ebp={:08x} esi={:08x} edi={:08x}\n\
+         eip={:08x} eflags={:08x} cs={:04x} ss={:04x} ds={:04x} es={:04x} fs={:04x} cr0={:08x} cr3={:08x}",
+        r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7],
+        cpu.eip, cpu.eflags, s[1].selector, s[2].selector, s[3].selector, s[0].selector, s[4].selector, cpu.cr0, cpu.cr3
+    )
+}
+
+/// Serves the control socket: one command per line, the answer followed by a
+/// line containing a single `.`. Input commands are the same as on stdin.
+fn control_server(path: PathBuf, tx: Sender<Event>) {
+    use std::io::Write;
+    use std::os::unix::net::UnixListener;
+    let _ = std::fs::remove_file(&path);
+    let listener = match UnixListener::bind(&path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("cannot listen on {}: {e}", path.display());
+            return;
+        }
+    };
+    eprintln!("control socket at {}", path.display());
+    for conn in listener.incoming() {
+        let Ok(conn) = conn else { continue };
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut out = match conn.try_clone() {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            for line in std::io::BufReader::new(conn).lines() {
+                let Ok(line) = line else { break };
+                let line = line.trim().to_string();
+                if line.is_empty() {
+                    continue;
+                }
+                let cmd = line.split_whitespace().next().unwrap_or("");
+                let answer = if matches!(cmd, "screen" | "regs" | "status" | "pause" | "resume" | "mem") {
+                    let (rtx, rrx) = channel();
+                    if tx.send(Event::Query(line.clone(), rtx)).is_err() {
+                        break;
+                    }
+                    rrx.recv_timeout(Duration::from_secs(10)).unwrap_or_else(|_| "no answer".into())
+                } else {
+                    match command_event(&line) {
+                        Ok(evs) => {
+                            for e in evs {
+                                let _ = tx.send(e);
+                            }
+                            "ok".into()
+                        }
+                        Err(e) => e,
+                    }
+                };
+                if writeln!(out, "{answer}\n.").is_err() {
+                    break;
+                }
+            }
+        });
+    }
+}
+
+/// Parses an input command (`shot`, `type`, `key`, `mouse`, `quit`) into events.
+fn command_event(line: &str) -> Result<Vec<Event>, String> {
+    let (cmd, rest) = line.split_once(' ').unwrap_or((line, ""));
+    Ok(match cmd {
+        "shot" => vec![Event::Screenshot(PathBuf::from(if rest.is_empty() { "screen.png" } else { rest }))],
+        "type" => vec![Event::Type(rest.to_string())],
+        "key" => {
+            let codes: Option<Vec<u16>> = rest.split('+').map(keys::by_name).collect();
+            let codes = codes.ok_or_else(|| format!("unknown key in {rest}"))?;
+            let mut evs: Vec<Event> = codes.iter().map(|&c| Event::Key(c, true)).collect();
+            evs.extend(codes.iter().rev().map(|&c| Event::Key(c, false)));
+            evs
+        }
+        "mouse" => {
+            let v: Vec<i32> = rest.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+            match v.as_slice() {
+                [dx, dy] => vec![Event::Mouse(*dx, *dy, 0)],
+                [dx, dy, b] => vec![Event::Mouse(*dx, *dy, *b as u8)],
+                _ => return Err("usage: mouse DX DY [BUTTONS]".into()),
+            }
+        }
+        "quit" => vec![Event::Quit],
+        _ => {
+            return Err("commands: screen | status | regs | mem HEXADDR [LEN] | pause | resume | shot PATH | type TEXT | key NAME[+NAME] | mouse DX DY [BUTTONS] | quit".into());
+        }
+    })
 }
 
 fn stdin_commands(tx: Sender<Event>) {
@@ -472,11 +738,16 @@ fn main() -> ExitCode {
     });
     let (tx, rx) = channel();
     let headless = args.headless || !cfg!(feature = "window");
+    let control_path = args.control.clone();
     let emu_shared = shared.clone();
     let emu = std::thread::spawn(move || emulate(args, cfg, rx, emu_shared));
 
     let stdin_tx = tx.clone();
     std::thread::spawn(move || stdin_commands(stdin_tx));
+    if let Some(path) = control_path {
+        let ctl_tx = tx.clone();
+        std::thread::spawn(move || control_server(path, ctl_tx));
+    }
     #[cfg(feature = "window")]
     if !headless {
         window_loop(tx, shared);
