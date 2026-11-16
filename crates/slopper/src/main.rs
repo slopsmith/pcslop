@@ -21,10 +21,12 @@ struct Args {
     ram_mb: u32,
     max_instructions: Option<u64>,
     headless: bool,
+    jit: bool,
+    screenshots: Vec<(f64, PathBuf)>,
 }
 
 const USAGE: &str = "usage: slopper --bios <bios.bin> [--vgabios <vgabios.bin>] [--cdrom <iso>] [--hda <img>] \
-[--ram MiB] [--headless] [--max-instructions N]";
+[--ram MiB] [--headless] [--jit] [--screenshot SECONDS:PATH]... [--max-instructions N]";
 
 fn parse_args() -> Result<Args, String> {
     let mut args = Args {
@@ -35,6 +37,8 @@ fn parse_args() -> Result<Args, String> {
         ram_mb: 256,
         max_instructions: None,
         headless: false,
+        jit: false,
+        screenshots: Vec::new(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -49,6 +53,13 @@ fn parse_args() -> Result<Args, String> {
                 args.max_instructions = Some(value()?.parse().map_err(|_| "--max-instructions needs a number")?)
             }
             "--headless" => args.headless = true,
+            "--jit" => args.jit = true,
+            "--screenshot" => {
+                let v = value()?;
+                let (secs, path) = v.split_once(':').ok_or("--screenshot needs SECONDS:PATH")?;
+                let secs = secs.parse().map_err(|_| "--screenshot needs SECONDS:PATH")?;
+                args.screenshots.push((secs, PathBuf::from(path)));
+            }
             _ => return Err(format!("unknown argument {a}\n{USAGE}")),
         }
     }
@@ -138,7 +149,7 @@ impl KeyQueue {
     }
 }
 
-fn emulate(args: Args, board_cfg: Config, events: Receiver<Event>, shared: Arc<Shared>) -> ExitCode {
+fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: Arc<Shared>) -> ExitCode {
     let mut board = Board::new(board_cfg);
     if let Some(path) = &args.cdrom
         && let Err(e) = board.attach_cdrom(path)
@@ -152,6 +163,28 @@ fn emulate(args: Args, board_cfg: Config, events: Receiver<Event>, shared: Arc<S
         eprintln!("cannot open {path}: {e}");
         return ExitCode::FAILURE;
     }
+    let mut jit = if args.jit {
+        let (ptr, len) = board.ram_region();
+        match unsafe { jit::Jit::new(ptr, len) } {
+            Ok(j) => Some(j),
+            Err(e) => {
+                eprintln!("cannot start the VM: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(j) = &jit {
+        let kicker = j.kicker();
+        let shared = shared.clone();
+        std::thread::spawn(move || {
+            while !shared.done.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(1));
+                kicker.kick();
+            }
+        });
+    }
     let mut cpu = Cpu::new();
     let started = Instant::now();
     let mut executed: u64 = 0;
@@ -160,29 +193,55 @@ fn emulate(args: Args, board_cfg: Config, events: Receiver<Event>, shared: Arc<S
     let mut scratch = Vec::new();
 
     let code = 'run: loop {
-        for _ in 0..1024 {
-            match step(&mut cpu, &mut board) {
-                Exit::Continue => executed += 1,
-                Exit::Halted => {
-                    let wait = board.next_event_ns().min(1_000_000);
-                    std::thread::sleep(Duration::from_nanos(wait));
-                    break;
-                }
-                Exit::Shutdown => {
-                    eprintln!("triple fault after {executed} instructions; resetting");
-                    dump(&cpu);
-                    cpu.reset();
-                    board.reset();
-                    break;
-                }
-                Exit::Unimplemented { eip, what } => {
-                    eprintln!("unimplemented at {eip:#x}: {what} after {executed} instructions");
+        let mut outcome = None;
+        let irq_due = cpu.flag(x86::cpu::flags::IF) && board.pic.intr();
+        if let Some(j) = jit.as_mut()
+            && jit::supported(&cpu)
+            && !cpu.halted
+            && !irq_due
+        {
+            match j.run(&mut cpu, &mut board) {
+                Ok(jit::RunExit::Kicked) => {}
+                Ok(jit::RunExit::Interp(e)) => outcome = Some(e),
+                Err(e) => {
+                    eprintln!("VM error: {e}");
                     dump(&cpu);
                     break 'run ExitCode::FAILURE;
                 }
             }
+        } else {
+            for _ in 0..1024 {
+                let e = step(&mut cpu, &mut board);
+                if e != Exit::Continue {
+                    outcome = Some(e);
+                    break;
+                }
+                executed += 1;
+                if jit.is_some() && jit::supported(&cpu) {
+                    break;
+                }
+            }
         }
-        shared.instructions.store(executed, Ordering::Relaxed);
+        match outcome {
+            Some(Exit::Halted) => {
+                let wait = board.next_event_ns().min(1_000_000);
+                std::thread::sleep(Duration::from_nanos(wait));
+            }
+            Some(Exit::Shutdown) => {
+                eprintln!("triple fault after {executed} instructions; resetting");
+                dump(&cpu);
+                cpu.reset();
+                board.reset();
+            }
+            Some(Exit::Unimplemented { eip, what }) => {
+                eprintln!("unimplemented at {eip:#x}: {what} after {executed} instructions");
+                dump(&cpu);
+                break 'run ExitCode::FAILURE;
+            }
+            _ => {}
+        }
+        let jit_insns = jit.as_mut().map_or(0, |j| j.instructions());
+        shared.instructions.store(executed + jit_insns, Ordering::Relaxed);
         board.pic.set_irq(13, cpu.ferr_pending);
         board.tick();
         cpu.tsc = board.now_ns() * 28 / 10;
@@ -206,6 +265,16 @@ fn emulate(args: Args, board_cfg: Config, events: Receiver<Event>, shared: Arc<S
                 Event::Quit => break 'run ExitCode::SUCCESS,
             }
         }
+        if let Some(i) = args.screenshots.iter().position(|(t, _)| started.elapsed().as_secs_f64() >= *t) {
+            let (_, path) = args.screenshots.remove(i);
+            if let Some((w, h)) = board.render(&mut scratch) {
+                let f = Frame { pixels: scratch.clone(), width: w, height: h, seq: 0 };
+                match save_png(&path, &f) {
+                    Ok(()) => eprintln!("saved {}", path.display()),
+                    Err(e) => eprintln!("screenshot failed: {e}"),
+                }
+            }
+        }
         if Instant::now() >= next_frame {
             next_frame = Instant::now() + Duration::from_millis(16);
             if let Some((w, h)) = board.render(&mut scratch) {
@@ -216,12 +285,31 @@ fn emulate(args: Args, board_cfg: Config, events: Receiver<Event>, shared: Arc<S
                 f.seq += 1;
             }
         }
-        if args.max_instructions.is_some_and(|m| executed >= m) {
+        if args.max_instructions.is_some_and(|m| executed + jit_insns >= m) {
             break ExitCode::SUCCESS;
         }
     };
     let secs = started.elapsed().as_secs_f64();
-    eprintln!("ran {executed} instructions in {secs:.1}s ({:.1} MIPS)", executed as f64 / secs / 1e6);
+    let jit_insns = jit.as_mut().map_or(0, |j| j.instructions());
+    let total = executed + jit_insns;
+    let eip = cpu.eip;
+    if let Ok(phys) = x86::interp::translate(&mut cpu, &mut board, eip, false) {
+        let bytes: Vec<String> = (0..64).map(|i| format!("{:02x}", x86::bus::Bus::read8(&mut board, phys - 32 + i))).collect();
+        eprintln!("code at eip: {}", bytes.join(" "));
+    }
+    eprintln!(
+        "ran {total} instructions ({jit_insns} translated) in {secs:.1}s ({:.1} MIPS)",
+        total as f64 / secs / 1e6
+    );
+    if let Some(j) = &jit {
+        eprintln!("{:?}", j.stats);
+        if let Some(p) = &j.interp_profile {
+            let mut v: Vec<_> = p.iter().collect();
+            v.sort_by(|a, b| b.1.cmp(a.1));
+            let top: Vec<String> = v.iter().take(40).map(|(k, n)| format!("{k:04x}:{n}")).collect();
+            eprintln!("interpreter exits by opcode: {}", top.join(" "));
+        }
+    }
     dump(&cpu);
     shared.done.store(true, Ordering::Relaxed);
     code
