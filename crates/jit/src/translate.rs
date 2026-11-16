@@ -81,6 +81,8 @@ enum Step {
     Next,
     End,
     Unsupported,
+    /// STI: the next instruction must run before the dispatcher can take an interrupt.
+    Sti,
 }
 
 fn x86_cond(cc: u16) -> Option<Cond> {
@@ -133,6 +135,17 @@ impl Emit {
         }
         let off = self.branch_offset(self.dispatch_va);
         self.a.b_offset(off);
+    }
+
+    /// Drops the code from an STI on and leaves the STI to the interpreter,
+    /// which runs the instruction after it before taking interrupts.
+    fn back_to_sti(&mut self, (start, eip, insns, nb): (usize, u32, usize, usize), pc: &mut u32, n: &mut usize, boundaries: &mut Vec<(u32, u32)>) {
+        self.a.code.truncate(start);
+        self.chains.retain(|&(w, _)| (w as usize) < start);
+        boundaries.truncate(nb + 1);
+        *pc = eip;
+        *n = insns;
+        self.exit_interp(eip);
     }
 
     fn exit_interp(&mut self, eip: u32) {
@@ -769,8 +782,7 @@ impl Emit {
             0xfb => {
                 self.a.movz(Size::W, T_B, 1, 0);
                 self.a.str(Width::W, T_B, STATE, state::IF_FLAG as i32);
-                self.goto_dispatch(next);
-                return Step::End;
+                return Step::Sti;
             }
             0x98 if op32 => self.a.sxth(Size::W, guest_reg(0), guest_reg(0)),
             0x99 if op32 => self.a.asr_imm(Size::W, guest_reg(2), guest_reg(0), 31),
@@ -1130,11 +1142,14 @@ pub fn compile(
     let mut boundaries = Vec::new();
     let mut pc = eip;
     let mut insns = 0;
+    let mut sti: Option<(usize, u32, usize, usize)> = None;
     e.a.nop();
     loop {
         let insn = decode::<()>(true, |i| byte(pc.wrapping_add(i)).ok_or(()));
         let Ok(insn) = insn else {
-            if insns == 0 {
+            if let Some(at) = sti {
+                e.back_to_sti(at, &mut pc, &mut insns, &mut boundaries);
+            } else if insns == 0 {
                 e.exit_interp(pc);
             } else {
                 e.goto(pc);
@@ -1144,6 +1159,21 @@ pub fn compile(
         boundaries.push((e.a.pos() as u32, pc));
         let start = e.a.pos();
         match e.insn(&insn, pc) {
+            Step::Sti if sti.is_none() => {
+                sti = Some((start, pc, insns, boundaries.len() - 1));
+                insns += 1;
+                pc = pc.wrapping_add(insn.len as u32);
+                if insns >= MAX_INSNS || byte(pc).is_none() {
+                    e.back_to_sti(sti.unwrap(), &mut pc, &mut insns, &mut boundaries);
+                    break;
+                }
+            }
+            Step::Next if sti.is_some() => {
+                insns += 1;
+                pc = pc.wrapping_add(insn.len as u32);
+                e.goto_dispatch(pc);
+                break;
+            }
             Step::Next => {
                 insns += 1;
                 pc = pc.wrapping_add(insn.len as u32);
@@ -1156,10 +1186,14 @@ pub fn compile(
                 insns += 1;
                 break;
             }
-            Step::Unsupported => {
-                e.a.code.truncate(start);
-                e.chains.retain(|&(w, _)| (w as usize) < start);
-                e.exit_interp(pc);
+            Step::Unsupported | Step::Sti => {
+                if let Some(at) = sti {
+                    e.back_to_sti(at, &mut pc, &mut insns, &mut boundaries);
+                } else {
+                    e.a.code.truncate(start);
+                    e.chains.retain(|&(w, _)| (w as usize) < start);
+                    e.exit_interp(pc);
+                }
                 break;
             }
         }

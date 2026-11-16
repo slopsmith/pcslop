@@ -592,6 +592,12 @@ impl Jit {
     /// Runs translated code until the CPU needs the interpreter for more than
     /// single instructions, or until the vCPU is kicked.
     pub fn run<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B) -> hvf::Result<RunExit> {
+        if cpu.interrupt_shadow {
+            let e = self.step_interp(cpu, bus);
+            if e != interp::Exit::Continue || cpu.halted || !supported(cpu) {
+                return Ok(RunExit::Interp(e));
+            }
+        }
         for page in bus.take_written_code_pages() {
             self.invalidate_code_page(page << 12);
         }
@@ -659,10 +665,7 @@ impl Jit {
                             if self.interp_profile.is_some() {
                                 self.profile_interp(cpu, bus);
                             }
-                            let e = interp::step(cpu, bus);
-                            for page in bus.take_written_code_pages() {
-                                self.invalidate_code_page(page << 12);
-                            }
+                            let e = self.step_interp(cpu, bus);
                             if e != interp::Exit::Continue || cpu.halted || !supported(cpu) {
                                 return Ok(RunExit::Interp(e));
                             }
@@ -771,6 +774,19 @@ impl Jit {
         }
     }
 
+    /// Steps the interpreter, and once more while an STI, MOV SS or POP SS
+    /// holds off interrupts, since the dispatcher does not know about that.
+    fn step_interp<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B) -> interp::Exit {
+        let mut e = interp::step(cpu, bus);
+        while e == interp::Exit::Continue && cpu.interrupt_shadow && !cpu.halted {
+            e = interp::step(cpu, bus);
+        }
+        for page in bus.take_written_code_pages() {
+            self.invalidate_code_page(page << 12);
+        }
+        e
+    }
+
     fn on_miss<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B) {
         self.stats.miss_exits += 1;
         let eip = self.state().eip;
@@ -859,10 +875,7 @@ impl Jit {
         }
         self.store_state(cpu);
         self.stats.interp_exits += 1;
-        let e = interp::step(cpu, bus);
-        for page in bus.take_written_code_pages() {
-            self.invalidate_code_page(page << 12);
-        }
+        let e = self.step_interp(cpu, bus);
         if e != interp::Exit::Continue || cpu.halted || !supported(cpu) {
             return Ok(Some(Some(e)));
         }
