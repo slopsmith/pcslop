@@ -498,11 +498,117 @@ impl Emit {
         true
     }
 
+    /// MOVS/STOS/LODS/CMPS/SCAS with optional REP/REPE/REPNE. DF=1 falls
+    /// back to the interpreter at run time.
+    fn string_op(&mut self, insn: &Insn, eip: u32) -> bool {
+        let op = insn.op;
+        if !insn.addr32 || matches!(insn.seg_override, Some(4) | Some(5)) {
+            return false;
+        }
+        let w = Ow::of(op, insn.op32);
+        let n = match w {
+            Ow::B => 1,
+            Ow::H => 2,
+            Ow::D => 4,
+        };
+        let (esi, edi, ecx) = (guest_reg(6), guest_reg(7), guest_reg(1));
+        let rep = insn.rep != Rep::None;
+        let compares = matches!(op, 0xa6 | 0xa7 | 0xae | 0xaf);
+        let slow = self.a.label();
+        let done = self.a.label();
+        let top = self.a.label();
+        self.a.ldr(Width::W, T_D, STATE, state::DF as i32);
+        self.a.cbnz(Size::W, T_D, slow);
+        self.a.bind(top);
+        if rep {
+            self.a.cbz(Size::W, ecx, done);
+        }
+        match op {
+            0xa4 | 0xa5 => {
+                self.a.ldr(w.mem(), T_A, esi, 0);
+                self.a.str(w.mem(), T_A, edi, 0);
+                self.a.add_imm(Size::W, esi, esi, n);
+                self.a.add_imm(Size::W, edi, edi, n);
+            }
+            0xaa | 0xab => {
+                let v = self.read_gpr(w, 0, T_A);
+                self.a.str(w.mem(), v, edi, 0);
+                self.a.add_imm(Size::W, edi, edi, n);
+            }
+            0xac | 0xad => {
+                self.a.ldr(w.mem(), T_A, esi, 0);
+                self.write_gpr(w, 0, T_A);
+                self.a.add_imm(Size::W, esi, esi, n);
+            }
+            0xa6 | 0xa7 => {
+                self.a.ldr(w.mem(), T_A, esi, 0);
+                self.a.ldr(w.mem(), T_B, edi, 0);
+                self.a.add_imm(Size::W, esi, esi, n);
+                self.a.add_imm(Size::W, edi, edi, n);
+            }
+            _ => {
+                self.a.ldr(w.mem(), T_B, edi, 0);
+                self.a.add_imm(Size::W, edi, edi, n);
+            }
+        }
+        if rep {
+            self.a.sub_imm(Size::W, ecx, ecx, 1);
+        }
+        if compares {
+            let a = if matches!(op, 0xae | 0xaf) { self.read_gpr(w, 0, T_A) } else { T_A };
+            self.alu(7, w, a, T_B);
+            match insn.rep {
+                Rep::Rep => self.a.b_cond(Cond::Eq, top),
+                Rep::Repne => self.a.b_cond(Cond::Ne, top),
+                Rep::None => {}
+            }
+        } else if rep {
+            self.a.b(top);
+        }
+        self.a.b(done);
+        self.a.bind(slow);
+        self.exit_interp(eip);
+        self.a.bind(done);
+        true
+    }
+
+    /// 32-bit DIV/IDIV; division by zero and quotient overflow go to the
+    /// interpreter, which raises #DE.
+    fn div32(&mut self, insn: &Insn, eip: u32, signed: bool) -> bool {
+        let Some(d) = self.rm_w(insn, Ow::D, false) else { return false };
+        let (eax, edx) = (guest_reg(0), guest_reg(2));
+        let slow = self.a.label();
+        let done = self.a.label();
+        self.a.mov(Size::W, T_B, d);
+        self.a.cbz(Size::W, T_B, slow);
+        self.a.lsl_imm(Size::X, T_C, edx, 32);
+        self.a.orr(Size::X, T_C, T_C, eax);
+        if signed {
+            self.a.sxtw(T_B, T_B);
+            self.a.sdiv(Size::X, T_RES, T_C, T_B);
+            self.a.sxtw(T_D, T_RES);
+            self.a.eor(Size::X, T_D, T_D, T_RES);
+        } else {
+            self.a.udiv(Size::X, T_RES, T_C, T_B);
+            self.a.lsr_imm(Size::X, T_D, T_RES, 32);
+        }
+        self.a.cbnz(Size::X, T_D, slow);
+        self.a.msub(Size::X, T_D, T_RES, T_B, T_C);
+        self.a.mov(Size::W, eax, T_RES);
+        self.a.mov(Size::W, edx, T_D);
+        self.a.b(done);
+        self.a.bind(slow);
+        self.exit_interp(eip);
+        self.a.bind(done);
+        true
+    }
+
     fn insn(&mut self, insn: &Insn, eip: u32) -> Step {
         let next = eip.wrapping_add(insn.len as u32);
         let op = insn.op;
         let op32 = insn.op32;
-        if insn.lock || insn.rep != Rep::None && !(op == 0x90) {
+        let string = matches!(op, 0xa4..=0xa7 | 0xaa..=0xaf);
+        if insn.rep != Rep::None && !(op == 0x90 || string) {
             return Step::Unsupported;
         }
         match op {
@@ -621,6 +727,40 @@ impl Emit {
                     return Step::Unsupported;
                 }
                 self.a.mov(Size::W, guest_reg(insn.reg()), T_ADDR);
+            }
+            0xa4..=0xa7 | 0xaa..=0xaf => {
+                if !self.string_op(insn, eip) {
+                    return Step::Unsupported;
+                }
+            }
+            0xcb if op32 => {
+                let esp = guest_reg(4);
+                let slow = self.a.label();
+                self.a.mov(Size::W, T_ADDR, esp);
+                self.load(Width::W, T_A);
+                self.a.ldr(Width::H, T_B, esp, 4);
+                self.a.ldr(Width::W, T_C, STATE, state::CS_SEL as i32);
+                self.a.eor(Size::W, T_C, T_C, T_B);
+                self.a.cbnz(Size::W, T_C, slow);
+                self.a.add_imm(Size::W, esp, esp, 8);
+                self.goto_reg(T_A);
+                self.a.bind(slow);
+                self.exit_interp(eip);
+                return Step::End;
+            }
+            0xfe if insn.reg() < 2 => {
+                let Some(a) = self.rm_w(insn, Ow::B, true) else { return Step::Unsupported };
+                self.a.mov(Size::W, T_A, a);
+                self.a.movz(Size::W, T_B, 1, 0);
+                self.a.cset(Size::W, T_E, Cond::Hs);
+                self.alu_narrow(if insn.reg() == 0 { 0 } else { 5 }, T_A, T_B, 24);
+                self.a.rmif(T_E, 63, 0b0010);
+                self.write_rm(insn, Ow::B, T_RES);
+            }
+            0xfc => self.a.str(Width::W, ZR, STATE, state::DF as i32),
+            0xfd => {
+                self.a.movz(Size::W, T_B, 1, 0);
+                self.a.str(Width::W, T_B, STATE, state::DF as i32);
             }
             0xfa => self.a.str(Width::W, ZR, STATE, state::IF_FLAG as i32),
             0xfb => {
@@ -772,7 +912,17 @@ impl Emit {
                 self.a.mov_imm(Size::W, T_B, insn.imm as u64 & 0xff);
                 self.alu8(4, a, T_B);
             }
+            0xf7 if !op32 && insn.reg() == 0 => {
+                let Some(a) = self.rm_w(insn, Ow::H, false) else { return Step::Unsupported };
+                self.a.mov_imm(Size::W, T_B, insn.imm as u64 & 0xffff);
+                self.alu(4, Ow::H, a, T_B);
+            }
             0xf7 if op32 => match insn.reg() {
+                6 | 7 => {
+                    if !self.div32(insn, eip, insn.reg() == 7) {
+                        return Step::Unsupported;
+                    }
+                }
                 4 => {
                     let Some(b) = self.rm_w(insn, Ow::D, false) else { return Step::Unsupported };
                     self.a.umull(T_RES, guest_reg(0), b);

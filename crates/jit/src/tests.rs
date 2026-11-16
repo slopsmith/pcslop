@@ -181,7 +181,42 @@ fn random_insn(rng: &mut Rng, out: &mut Vec<u8>) {
         out.push(reg << 3 | 5);
         out.extend((0x3000 + slot * 4).to_le_bytes());
     };
-    match rng.below(30) {
+    match rng.below(34) {
+        30 => {
+            out.extend([0xbe]);
+            out.extend((0x3000 + rng.below(16)).to_le_bytes());
+            out.extend([0xbf]);
+            out.extend((0x3040 + rng.below(16)).to_le_bytes());
+            out.extend([0xb9]);
+            out.extend(rng.below(6).to_le_bytes());
+            let prefix = [0xf3, 0xf2, 0x90][rng.below(3) as usize];
+            let op = [0xa4, 0xa5, 0xaa, 0xab, 0xa6, 0xa7, 0xae, 0xaf, 0xac][rng.below(9) as usize];
+            out.extend([prefix, op]);
+        }
+        31 => {
+            out.extend([0x31, 0xd2]);
+            out.extend([0xbb]);
+            out.extend((rng.next() | 1).to_le_bytes());
+            out.extend([0xf7, 0xf3]);
+        }
+        32 => {
+            out.extend([0x99, 0xbb]);
+            out.extend(((rng.next() >> 1) | 1).to_le_bytes());
+            out.extend([0xf7, 0xfb]);
+        }
+        33 => match rng.below(4) {
+            0 => out.push([0xfc, 0xfd, 0xfc][rng.below(3) as usize]),
+            1 => out.extend([0xfe, modrm_rr(rng.below(2) as u8, rng.below(8) as u8)]),
+            2 => {
+                out.extend([0x66, 0xf7, modrm_rr(0, rng.reg())]);
+                out.extend((rng.next() as u16).to_le_bytes());
+            }
+            _ => {
+                out.extend([0xf0, 0x01]);
+                out.push(rng.reg() << 3 | 5);
+                out.extend((0x3000 + rng.below(4) * 4).to_le_bytes());
+            }
+        },
         20 => {
             let ops = [0x01, 0x03, 0x09, 0x0b, 0x11, 0x13, 0x19, 0x1b, 0x21, 0x23, 0x29, 0x2b, 0x31, 0x33, 0x39, 0x3b, 0x85, 0x89, 0x8b, 0x87];
             out.extend([0x66, ops[rng.below(ops.len() as u32) as usize], modrm_rr(rng.reg(), rng.reg())]);
@@ -333,6 +368,7 @@ fn random_programs_match_the_interpreter() {
             }
         }
     }
-    assert_eq!(interp_exits, 300, "only the final HLT should need the interpreter");
+    // Besides each final HLT, only string instructions running with DF=1 use the interpreter.
+    assert!(interp_exits < 360, "{interp_exits} interpreter exits");
     assert!(translated > 300 * 40);
 }

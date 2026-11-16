@@ -283,10 +283,12 @@ impl Board {
     }
 
     fn io_read8(&mut self, port: u16) -> u8 {
-        let now = self.now_ns();
         match port {
             0x20 | 0x21 | 0xa0 | 0xa1 | 0x4d0 | 0x4d1 => self.pic.io_read(port),
-            0x40..=0x43 | 0x61 => self.pit.read(port, now),
+            0x40..=0x43 | 0x61 => {
+                let now = self.now_ns();
+                self.pit.read(port, now)
+            }
             0x70 | 0x71 => self.rtc.read(port),
             0x92 => (self.a20 as u8) << 1,
             0x402 => 0xe9,
@@ -308,10 +310,12 @@ impl Board {
     }
 
     fn io_write8(&mut self, port: u16, v: u8) {
-        let now = self.now_ns();
         match port {
             0x20 | 0x21 | 0xa0 | 0xa1 | 0x4d0 | 0x4d1 => self.pic.io_write(port, v),
-            0x40..=0x43 | 0x61 => self.pit.write(port, v, now),
+            0x40..=0x43 | 0x61 => {
+                let now = self.now_ns();
+                self.pit.write(port, v, now)
+            }
             0x70 | 0x71 => self.rtc.write(port, v),
             0x80 => self.post_code = v,
             0x92 => {
@@ -461,9 +465,11 @@ impl Bus for Board {
     }
 
     fn io_read(&mut self, port: u16, size: u8) -> u32 {
-        let now = self.now_ns();
-        if let Some(v) = self.vga.io_read(port, size, now) {
-            return v;
+        if matches!(port, 0x1ce..=0x1cf | 0x3b0..=0x3df) {
+            let now = self.now_ns();
+            if let Some(v) = self.vga.io_read(port, size, now) {
+                return v;
+            }
         }
         self.ide.set_bus_master_base(self.pci[IDE].1.io_bar(4));
         if let Some(v) = self.ide.io_read(port, size) {

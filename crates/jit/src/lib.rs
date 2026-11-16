@@ -225,6 +225,8 @@ pub struct Jit {
     pub stats: Stats,
     /// Runs each block against the interpreter and stops at the first difference.
     pub verify: bool,
+    /// Measures time spent in the VM and per exit kind (SLOPPER_JIT_PROFILE).
+    timing: bool,
     /// Interpreter exits by opcode, when profiling is on.
     pub interp_profile: Option<HashMap<u16, u64>>,
     /// Declared last so it is dropped after the vCPU.
@@ -289,6 +291,7 @@ impl Jit {
             stats: Stats::default(),
             interp_profile: std::env::var_os("SLOPPER_JIT_PROFILE").map(|_| HashMap::new()),
             verify: std::env::var_os("SLOPPER_JIT_VERIFY").is_some(),
+            timing: std::env::var_os("SLOPPER_JIT_PROFILE").is_some(),
             _vm: vm,
         };
         jit.shadow.flush(jit.mem.as_mut_slice());
@@ -327,7 +330,9 @@ impl Jit {
         s.eip = cpu.eip;
         s.set_eflags(cpu.eflags);
         s.if_flag = cpu.flag(x86::cpu::flags::IF) as u32;
+        s.df = cpu.flag(x86::cpu::flags::DF) as u32;
         s.fs_base = cpu.segs[FS].base;
+        s.cs_sel = cpu.segs[CS].selector as u32;
         s.gs_base = cpu.segs[GS].base;
     }
 
@@ -335,9 +340,10 @@ impl Jit {
         let s = self.state();
         cpu.regs = s.regs;
         cpu.eip = s.eip;
-        let if_flag = s.if_flag != 0;
+        let (if_flag, df) = (s.if_flag != 0, s.df != 0);
         cpu.eflags = s.merge_eflags(cpu.eflags);
         cpu.set_flag(x86::cpu::flags::IF, if_flag);
+        cpu.set_flag(x86::cpu::flags::DF, df);
     }
 
     fn flush_shadow(&mut self) {
@@ -561,10 +567,12 @@ impl Jit {
             if self.verify && expected.is_none() {
                 self.state().budget = 0;
             }
-            let t0 = std::time::Instant::now();
+            let t0 = self.timing.then(std::time::Instant::now);
             let exit = self.vcpu.run()?;
-            let t1 = std::time::Instant::now();
-            self.stats.vm_ns += (t1 - t0).as_nanos() as u64;
+            let t1 = self.timing.then(std::time::Instant::now);
+            if let (Some(a), Some(b)) = (t0, t1) {
+                self.stats.vm_ns += (b - a).as_nanos() as u64;
+            }
             at_dispatch = true;
             let kind = match exit {
                 Exit::Exception { .. } if exit.ec() == Some(0x24) => 3,
@@ -576,7 +584,7 @@ impl Jit {
                 },
                 _ => 4,
             };
-            let _timer = ExitTimer { start: t1, slot: kind, stats: &mut self.stats as *mut Stats };
+            let _timer = t1.map(|start| ExitTimer { start, slot: kind, stats: &mut self.stats as *mut Stats });
             if let Some(exp) = expected {
                 let why = self.state().reason;
                 if exit.ec() == Some(0x16) && (why == reason::PENDING || why == reason::INTERP) {
@@ -594,6 +602,12 @@ impl Jit {
                     at_dispatch = false;
                 }
                 Exit::Exception { syndrome, ipa, .. } if exit.ec() == Some(0x24) => {
+                    if let Some(done) = self.finish_string_in_interp(cpu, bus)? {
+                        if let Some(e) = done {
+                            return Ok(RunExit::Interp(e));
+                        }
+                        continue;
+                    }
                     self.mmio(bus, syndrome, ipa as u32)?;
                     at_dispatch = false;
                 }
@@ -773,6 +787,51 @@ impl Jit {
                 self.state().resume = resume::DISPATCH;
             }
         }
+    }
+
+    /// Hands a REP string op that hit MMIO to the interpreter, avoiding one exit
+    /// per element. Some(Some(exit)) means the CPU must leave translated code.
+    fn finish_string_in_interp<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B) -> hvf::Result<Option<Option<interp::Exit>>> {
+        let pc = self.vcpu.reg(reg::PC)?;
+        let Some(eip) = self.eip_at(pc) else { return Ok(None) };
+        let Ok(phys) = interp::translate(&mut cpu.clone(), bus, eip, false) else { return Ok(None) };
+        let insn = x86::decode::decode::<()>(true, |i| Ok(bus.read8(phys.wrapping_add(i))));
+        let Ok(insn) = insn else { return Ok(None) };
+        if insn.rep == x86::decode::Rep::None || !matches!(insn.op, 0xa4..=0xa7 | 0xaa..=0xaf) {
+            return Ok(None);
+        }
+        let mut regs = [0u32; 8];
+        for (i, r) in regs.iter_mut().enumerate() {
+            *r = self.vcpu.reg(reg::X0 + 19 + i as u32)? as u32;
+        }
+        let nzcv = (self.vcpu.reg(reg::CPSR)? & 0xf000_0000) as u32;
+        let pf = self.vcpu.reg(reg::X0 + 27)? as u32;
+        let af = self.vcpu.reg(reg::X0 + 18)? as u32;
+        let icount = self.vcpu.reg(reg::X0 + 17)?;
+        {
+            let s = self.state();
+            s.regs = regs;
+            s.eip = eip;
+            s.nzcv = nzcv;
+            s.pf_result = pf;
+            s.af_aux = af;
+            s.icount = icount;
+        }
+        self.store_state(cpu);
+        self.stats.interp_exits += 1;
+        let e = interp::step(cpu, bus);
+        for page in bus.take_written_code_pages() {
+            self.invalidate_code_page(page << 12);
+        }
+        if e != interp::Exit::Continue || cpu.halted || !supported(cpu) {
+            return Ok(Some(Some(e)));
+        }
+        self.check_shadow(cpu, bus);
+        self.load_state(cpu);
+        self.state().irq = bus.intr() as u32;
+        self.vcpu.set_reg(reg::CPSR, 0x3c5)?;
+        self.vcpu.set_reg(reg::PC, layout::va(self.entries.resume))?;
+        Ok(Some(None))
     }
 
     fn mmio<B: Bus>(&mut self, bus: &mut B, syndrome: u64, addr: u32) -> hvf::Result<()> {
