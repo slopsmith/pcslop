@@ -176,6 +176,11 @@ const CASES: &[Case] = &[
     ("mrs x3, nzcv", |a| a.mrs(r(3), sysreg::NZCV)),
     ("msr tpidr_el0, x4", |a| a.msr(sysreg::TPIDR_EL0, r(4))),
     ("tlbi vae1, x5", |a| a.tlbi(0b000_0111_001, r(5))),
+    ("at s1e1r, x0", |a| a.at_s1e1r(r(0))),
+    ("ic iallu", |a| a.ic_iallu()),
+    ("tlbi vmalle1", |a| a.tlbi_vmalle1()),
+    ("tlbi vae1, x7", |a| a.tlbi_vae1(r(7))),
+    ("mrs x1, par_el1", |a| a.mrs(r(1), sysreg::PAR_EL1)),
 ];
 
 fn assemble(text: &str) -> Vec<u32> {

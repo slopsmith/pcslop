@@ -996,6 +996,30 @@ impl Asm {
         self.emit(0xd510_0000 | (sysreg as u32 & 0x7fff) << 5 | reg(rt))
     }
 
+    /// SYS instruction (AT, IC, DC, TLBI aliases).
+    pub fn sys(&mut self, op1: u32, crn: u32, crm: u32, op2: u32, rt: Reg) {
+        assert!(op1 < 8 && crn < 16 && crm < 16 && op2 < 8);
+        self.emit(0xd508_0000 | op1 << 16 | crn << 12 | crm << 8 | op2 << 5 | reg(rt))
+    }
+
+    /// Translates the address in `rt` as an EL1 read into PAR_EL1.
+    pub fn at_s1e1r(&mut self, rt: Reg) {
+        self.sys(0, 7, 8, 0, rt)
+    }
+
+    pub fn ic_iallu(&mut self) {
+        self.sys(0, 7, 5, 0, ZR)
+    }
+
+    pub fn tlbi_vmalle1(&mut self) {
+        self.sys(0, 8, 7, 0, ZR)
+    }
+
+    /// Invalidates EL1 TLB entries for the page whose VA >> 12 is in `rt`.
+    pub fn tlbi_vae1(&mut self, rt: Reg) {
+        self.sys(0, 8, 7, 1, rt)
+    }
+
     /// TLBI operation given as op1:CRm:op2 packed into 10 bits.
     pub fn tlbi(&mut self, op1_crm_op2: u32, rt: Reg) {
         self.emit(0xd508_8000 | op1_crm_op2 << 5 | reg(rt))
@@ -1012,6 +1036,7 @@ pub mod sysreg {
     pub const SP_EL0: u16 = 0xc208;
     pub const ESR_EL1: u16 = 0xc290;
     pub const FAR_EL1: u16 = 0xc300;
+    pub const PAR_EL1: u16 = 0xc3a0;
     pub const MAIR_EL1: u16 = 0xc510;
     pub const VBAR_EL1: u16 = 0xc600;
     pub const TPIDR_EL1: u16 = 0xc684;
