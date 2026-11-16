@@ -1,6 +1,7 @@
 //! An i440FX + PIIX3 PC: memory map, chipset registers and legacy devices.
 
 pub mod fw_cfg;
+pub mod i8042;
 pub mod pci;
 pub mod pic;
 pub mod pit;
@@ -27,6 +28,7 @@ pub struct Board {
     pub pit: pit::Pit,
     pub rtc: rtc::Rtc,
     pub fw_cfg: fw_cfg::FwCfg,
+    pub kbc: i8042::I8042,
     pub debugcon: Box<dyn Write + Send>,
     start: Instant,
     pub reset_requested: bool,
@@ -50,6 +52,7 @@ impl Board {
             pit: pit::Pit::default(),
             rtc: rtc::Rtc::default(),
             fw_cfg: fw_cfg::FwCfg::new(),
+            kbc: i8042::I8042::default(),
             debugcon: Box::new(std::io::stdout()),
             start: Instant::now(),
             reset_requested: false,
@@ -100,8 +103,32 @@ impl Board {
         self.pit.next_irq0_ns(now).unwrap_or(1_000_000).min(1_000_000)
     }
 
+    fn a20_enabled(&self) -> bool {
+        self.a20 || self.kbc.a20()
+    }
+
     fn mask_a20(&self, addr: u32) -> u32 {
-        if self.a20 { addr } else { addr & !(1 << 20) }
+        if self.a20_enabled() { addr } else { addr & !(1 << 20) }
+    }
+
+    fn sync_kbc(&mut self) {
+        let (kbd, aux) = self.kbc.irqs();
+        self.pic.set_irq(1, kbd);
+        self.pic.set_irq(12, aux);
+        if self.kbc.reset_requested {
+            self.kbc.reset_requested = false;
+            self.reset_requested = true;
+        }
+    }
+
+    pub fn key(&mut self, code: u16, pressed: bool) {
+        self.kbc.key(code, pressed);
+        self.sync_kbc();
+    }
+
+    pub fn mouse_motion(&mut self, dx: i32, dy: i32, buttons: u8) {
+        self.kbc.mouse_motion(dx, dy, buttons);
+        self.sync_kbc();
     }
 
     /// PAM attribute bits (bit 0 = read from RAM, bit 1 = write to RAM) for a
@@ -159,7 +186,7 @@ impl Board {
     #[inline]
     fn plain_ram(&self, addr: u32, len: u32) -> bool {
         let end = addr as u64 + len as u64;
-        self.a20 && end <= self.ram.len() as u64 && (end <= LEGACY_START as u64 || addr >= LEGACY_END)
+        self.a20_enabled() && end <= self.ram.len() as u64 && (end <= LEGACY_START as u64 || addr >= LEGACY_END)
     }
 
     fn pci_function(&mut self) -> Option<&mut ConfigSpace> {
@@ -181,7 +208,11 @@ impl Board {
             0x402 => 0xe9,
             0x510 => 0,
             0x511 => self.fw_cfg.read_data(),
-            0x64 => 0x1c,
+            0x60 | 0x64 => {
+                let v = self.kbc.read(port);
+                self.sync_kbc();
+                v
+            }
             _ => 0xff,
         }
     }
@@ -206,12 +237,17 @@ impl Board {
                 }
             }
             0xcf9 if v & 4 != 0 => self.reset_requested = true,
+            0x60 | 0x64 => {
+                self.kbc.write(port, v);
+                self.sync_kbc();
+            }
             _ => {}
         }
     }
 
     pub fn reset(&mut self) {
         self.a20 = true;
+        self.kbc = i8042::I8042::default();
         for r in PAM0..PAM0 + 7 {
             self.pci[0].1.data[r] = 0;
         }
