@@ -183,6 +183,7 @@ fn emulate(args: Args, board_cfg: Config, events: Receiver<Event>, shared: Arc<S
             }
         }
         shared.instructions.store(executed, Ordering::Relaxed);
+        board.pic.set_irq(13, cpu.ferr_pending);
         board.tick();
         cpu.tsc = board.now_ns() * 28 / 10;
         if board.reset_requested {
