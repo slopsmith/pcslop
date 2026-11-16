@@ -54,6 +54,10 @@ impl ConfigSpace {
         self.read(0x04, 2) as u16
     }
 
+    pub fn bus_master(&self) -> bool {
+        self.command() & 4 != 0
+    }
+
     /// Base of I/O BAR `n` when I/O decoding is enabled and the BAR is placed.
     pub fn io_bar(&self, n: usize) -> Option<u16> {
         let v = self.read(0x10 + 4 * n, 4);
@@ -155,6 +159,20 @@ pub fn pirq_route(reg: u8) -> Option<u8> {
     (reg & 0x80 == 0 && !matches!(irq, 0 | 1 | 2 | 8 | 13)).then_some(irq)
 }
 
+/// PIIX3 USB function (82371SB datasheet, section 2.4).
+pub fn piix3_uhci() -> ConfigSpace {
+    let mut c = ConfigSpace::new(usb::PCI_VENDOR, usb::PCI_DEVICE, usb::PCI_CLASS_CODE, 0x01, 0x00);
+    c.add_bar(4, BarKind::Io, 32);
+    c.writable[0x04] |= 0x04;
+    c.data[INTERRUPT_PIN] = 4;
+    // SBRN: USB 1.0.
+    c.data[0x60] = 0x10;
+    // LEGSUP: USB interrupts go to PIRQD. Like QEMU, the rest of the legacy
+    // keyboard emulation is not modelled.
+    c.set16(0xc0, 0x2000);
+    c
+}
+
 /// PAM register offsets in the i440FX host bridge (440FX datasheet, section 3.2).
 pub const PAM0: usize = 0x59;
 
@@ -188,6 +206,19 @@ mod tests {
             }
         }
         assert_eq!(pirq_for(1, 4), 3);
+    }
+
+    #[test]
+    fn uhci_config_space() {
+        let mut c = piix3_uhci();
+        assert_eq!(c.read(0, 4), 0x7020_8086);
+        assert_eq!(c.read(0x08, 4) >> 8, 0x0c_03_00);
+        c.write(0x20, 4, 0xffff_ffff);
+        assert_eq!(c.read(0x20, 4), 0xffff_ffe1);
+        assert_eq!(c.data[INTERRUPT_PIN], 4);
+        assert_eq!(pirq_for(1, c.data[INTERRUPT_PIN]), 3);
+        c.write(0x04, 2, 0xffff);
+        assert!(c.bus_master());
     }
 
     #[test]

@@ -8,5 +8,6 @@ publish.workspace = true
 
 [dependencies]
 ide = { path = "../ide" }
+usb = { path = "../usb" }
 vga = { path = "../vga" }
 x86 = { path = "../x86" }

@@ -62,6 +62,7 @@ pub struct Board {
     pub kbc: i8042::I8042,
     pub vga: vga::Vga,
     pub ide: ide::Ide,
+    pub uhci: usb::Uhci,
     vgabios: Vec<u8>,
     pub debugcon: Box<dyn Write + Send>,
     start: Instant,
@@ -73,6 +74,8 @@ const LEGACY_START: u32 = 0xa_0000;
 const PIIX3_ISA: usize = 1;
 const IDE: usize = 2;
 const DISPLAY: usize = 3;
+const UHCI: usize = 4;
+const UHCI_PORTS: u16 = 32;
 const LEGACY_END: u32 = 0x10_0000;
 
 impl Board {
@@ -100,6 +103,7 @@ impl Board {
             kbc: i8042::I8042::default(),
             vga: vga::Vga::new(),
             ide: ide::Ide::new(),
+            uhci: usb::Uhci::new(),
             vgabios: Vec::new(),
             debugcon: Box::new(std::io::stdout()),
             start: Instant::now(),
@@ -117,6 +121,8 @@ impl Board {
             b.vgabios.resize(size as usize, 0xff);
         }
         b.pci.push((Bdf { dev: 2, func: 0 }, display));
+        b.pci.push((Bdf { dev: 1, func: 2 }, pci::piix3_uhci()));
+        b.uhci.attach(0, Box::new(usb::Tablet::new()));
         b.setup_cmos(ram_bytes);
         b.fw_cfg.set(fw_cfg::key::RAM_SIZE, (ram_bytes as u64).to_le_bytes().to_vec());
         let e820 = fw_cfg::e820(&[(0, ram_bytes as u64, 1)]);
@@ -161,6 +167,9 @@ impl Board {
         if self.rtc.poll(now) {
             self.pic.pulse_irq(8);
         }
+        if self.pci[UHCI].1.bus_master() {
+            self.uhci.run(now, &mut RamDma(&mut self.ram[..], &mut self.code_watch));
+        }
         self.sync_pci_irqs();
     }
 
@@ -175,7 +184,8 @@ impl Board {
         if self.irq0_backlog > 0 && !self.pic.requested(0) {
             return 0;
         }
-        self.pit.next_irq0_ns(now).unwrap_or(1_000_000).min(1_000_000)
+        let usb = self.uhci.next_frame_ns().map(|t| t.saturating_sub(now));
+        self.pit.next_irq0_ns(now).unwrap_or(1_000_000).min(usb.unwrap_or(u64::MAX)).min(1_000_000)
     }
 
     fn a20_enabled(&self) -> bool {
@@ -204,6 +214,20 @@ impl Board {
     pub fn mouse_motion(&mut self, dx: i32, dy: i32, buttons: u8) {
         self.kbc.mouse_motion(dx, dy, buttons);
         self.sync_kbc();
+    }
+
+    fn tablet_mut(&mut self) -> &mut usb::Tablet {
+        self.uhci.device_mut(0).expect("the tablet sits on USB port 1")
+    }
+
+    /// Moves the USB tablet to (`x`, `y`), each 0..=`usb::MAX_COORD`.
+    pub fn tablet(&mut self, x: u16, y: u16, buttons: u8, wheel: i32) {
+        self.tablet_mut().input(x, y, buttons, wheel);
+    }
+
+    /// Whether the guest has a driver polling the USB tablet.
+    pub fn tablet_in_use(&self) -> bool {
+        self.uhci.running() && self.uhci.device::<usb::Tablet>(0).is_some_and(|t| t.in_use())
     }
 
     /// PAM attribute bits (bit 0 = read from RAM, bit 1 = write to RAM) for a
@@ -396,8 +420,7 @@ impl Board {
 
     /// Level of the INTx line of `self.pci[function]`.
     fn intx(&self, function: usize) -> bool {
-        let _ = function;
-        false
+        function == UHCI && self.uhci.irq()
     }
 
     /// Drives the PIC from the PCI interrupt lines through the PIIX3 PIRQ router.
@@ -440,6 +463,7 @@ impl Board {
         }
         self.pic = pic::Pic::default();
         self.pci_irqs = 0;
+        self.uhci.reset();
         self.pit = pit::Pit::default();
         self.fdc = fdc::Fdc::default();
         self.irq0_backlog = 0;
@@ -467,6 +491,16 @@ impl ide::DmaMemory for RamDma<'_> {
                 *slot = b;
             }
         }
+    }
+}
+
+impl usb::DmaMemory for RamDma<'_> {
+    fn read_phys(&mut self, addr: u32, buf: &mut [u8]) {
+        ide::DmaMemory::read_phys(self, addr, buf)
+    }
+
+    fn write_phys(&mut self, addr: u32, buf: &[u8]) {
+        ide::DmaMemory::write_phys(self, addr, buf)
     }
 }
 
@@ -543,6 +577,11 @@ impl Bus for Board {
                 return v;
             }
         }
+        if let Some(base) = self.pci[UHCI].1.io_bar(4)
+            && (base..base + UHCI_PORTS).contains(&port)
+        {
+            return self.uhci.read(port - base, size);
+        }
         self.ide.set_bus_master_base(self.pci[IDE].1.io_bar(4));
         if let Some(v) = self.ide.io_read(port, size) {
             self.sync_ide();
@@ -568,6 +607,14 @@ impl Bus for Board {
 
     fn io_write(&mut self, port: u16, size: u8, value: u32) {
         if self.vga.io_write(port, size, value) {
+            return;
+        }
+        if let Some(base) = self.pci[UHCI].1.io_bar(4)
+            && (base..base + UHCI_PORTS).contains(&port)
+        {
+            let now = self.now_ns();
+            self.uhci.write(port - base, size, value, now);
+            self.sync_pci_irqs();
             return;
         }
         self.ide.set_bus_master_base(self.pci[IDE].1.io_bar(4));

@@ -145,6 +145,11 @@ impl Uhci {
         p.sc |= PORT_CCS | PORT_CSC;
     }
 
+    pub fn device<T: UsbDevice>(&self, port: usize) -> Option<&T> {
+        let dev: &dyn std::any::Any = self.ports[port].dev.as_deref()?;
+        dev.downcast_ref()
+    }
+
     pub fn device_mut<T: UsbDevice>(&mut self, port: usize) -> Option<&mut T> {
         let dev: &mut dyn std::any::Any = self.ports[port].dev.as_deref_mut()?;
         dev.downcast_mut()

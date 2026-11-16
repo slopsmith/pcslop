@@ -389,6 +389,7 @@ name = "pc"
 version = "0.1.0"
 dependencies = [
  "ide",
+ "usb",
  "vga",
  "x86",
 ]
