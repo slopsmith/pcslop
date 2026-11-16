@@ -1104,15 +1104,20 @@ impl Jit {
             match size {
                 1 => bus.write8(addr, v as u8),
                 2 => bus.write16(addr, v as u16),
-                _ => bus.write32(addr, v as u32),
+                4 => bus.write32(addr, v as u32),
+                _ => {
+                    bus.write32(addr, v as u32);
+                    bus.write32(addr.wrapping_add(4), (v >> 32) as u32);
+                }
             }
         } else {
             let mut v = match size {
                 1 => bus.read8(addr) as u64,
                 2 => bus.read16(addr) as u64,
-                _ => bus.read32(addr) as u64,
+                4 => bus.read32(addr) as u64,
+                _ => bus.read32(addr) as u64 | (bus.read32(addr.wrapping_add(4)) as u64) << 32,
             };
-            if sign {
+            if sign && size < 8 {
                 let shift = 64 - 8 * size;
                 v = (((v << shift) as i64) >> shift) as u64;
             }
