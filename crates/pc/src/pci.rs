@@ -27,6 +27,54 @@ impl ConfigSpace {
         c
     }
 
+    fn set_mask32(&mut self, off: usize, mask: u32) {
+        self.writable[off..off + 4].copy_from_slice(&mask.to_le_bytes());
+    }
+
+    /// Declares BAR `n` with a power-of-two `size`. Sizing (writing all ones and
+    /// reading back) works through the writable mask.
+    pub fn add_bar(&mut self, n: usize, kind: BarKind, size: u32) {
+        assert!(size.is_power_of_two());
+        let off = 0x10 + 4 * n;
+        let (flags, mask) = match kind {
+            BarKind::Io => (1, !(size - 1) & 0xffff_fffc),
+            BarKind::Mem => (0, !(size - 1) & 0xffff_fff0),
+            BarKind::MemPrefetch => (8, !(size - 1) & 0xffff_fff0),
+        };
+        self.data[off..off + 4].copy_from_slice(&(flags as u32).to_le_bytes());
+        self.set_mask32(off, mask);
+    }
+
+    pub fn add_rom_bar(&mut self, size: u32) {
+        assert!(size.is_power_of_two());
+        self.set_mask32(0x30, !(size - 1) | 1);
+    }
+
+    fn command(&self) -> u16 {
+        self.read(0x04, 2) as u16
+    }
+
+    /// Base of I/O BAR `n` when I/O decoding is enabled and the BAR is placed.
+    pub fn io_bar(&self, n: usize) -> Option<u16> {
+        let v = self.read(0x10 + 4 * n, 4);
+        let base = (v & 0xffff_fffc) as u16;
+        (self.command() & 1 != 0 && v & 1 != 0 && base != 0).then_some(base)
+    }
+
+    /// Base of memory BAR `n` when memory decoding is enabled and the BAR is placed.
+    pub fn mem_bar(&self, n: usize) -> Option<u32> {
+        let v = self.read(0x10 + 4 * n, 4);
+        let base = v & 0xffff_fff0;
+        (self.command() & 2 != 0 && v & 1 == 0 && base != 0).then_some(base)
+    }
+
+    /// Base of the expansion ROM when it is enabled.
+    pub fn rom_bar(&self) -> Option<u32> {
+        let v = self.read(0x30, 4);
+        let base = v & 0xffff_f800;
+        (self.command() & 2 != 0 && v & 1 != 0 && base != 0).then_some(base)
+    }
+
     pub fn set16(&mut self, off: usize, v: u16) {
         self.data[off..off + 2].copy_from_slice(&v.to_le_bytes());
     }
@@ -46,6 +94,13 @@ impl ConfigSpace {
             self.data[o] = (self.data[o] & !m) | ((v >> (8 * i)) as u8 & m);
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BarKind {
+    Io,
+    Mem,
+    MemPrefetch,
 }
 
 /// Identifies a function on bus 0.
@@ -75,3 +130,25 @@ pub fn piix3_isa() -> ConfigSpace {
 
 /// PAM register offsets in the i440FX host bridge (440FX datasheet, section 3.2).
 pub const PAM0: usize = 0x59;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bar_sizing_and_decode() {
+        let mut c = ConfigSpace::new(0x1234, 0x1111, 0x03_00_00, 0, 0);
+        c.add_bar(0, BarKind::MemPrefetch, 16 << 20);
+        c.add_bar(4, BarKind::Io, 16);
+        c.write(0x10, 4, 0xffff_ffff);
+        assert_eq!(c.read(0x10, 4), 0xff00_0008);
+        c.write(0x20, 4, 0xffff_ffff);
+        assert_eq!(c.read(0x20, 4), 0xffff_fff1);
+        c.write(0x10, 4, 0xe000_0000);
+        c.write(0x20, 4, 0xc000);
+        assert_eq!(c.mem_bar(0), None);
+        c.write(0x04, 2, 3);
+        assert_eq!(c.mem_bar(0), Some(0xe000_0000));
+        assert_eq!(c.io_bar(4), Some(0xc000));
+    }
+}
