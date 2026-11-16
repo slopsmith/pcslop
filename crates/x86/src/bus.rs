@@ -43,4 +43,13 @@ pub trait Bus {
     fn inta(&mut self) -> u8 {
         0
     }
+
+    /// Asks the bus to report writes to the physical page containing `addr`,
+    /// because translated code was made from it.
+    fn watch_code_page(&mut self, _addr: u32) {}
+
+    /// Returns (and forgets) the watched pages written since the last call.
+    fn take_written_code_pages(&mut self) -> Vec<u32> {
+        Vec::new()
+    }
 }

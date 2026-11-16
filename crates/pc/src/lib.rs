@@ -20,8 +20,30 @@ pub struct Config {
     pub vgabios: Option<Vec<u8>>,
 }
 
+/// Physical pages holding translated code, and the ones written since the JIT last looked.
+#[derive(Default)]
+struct CodeWatch {
+    bits: Vec<u64>,
+    written: Vec<u32>,
+}
+
+impl CodeWatch {
+    #[inline]
+    fn note_write(&mut self, addr: u32) {
+        let page = (addr >> 12) as usize;
+        if let Some(word) = self.bits.get_mut(page >> 6) {
+            let bit = 1u64 << (page & 63);
+            if *word & bit != 0 {
+                *word &= !bit;
+                self.written.push(page as u32);
+            }
+        }
+    }
+}
+
 pub struct Board {
     ram: ram::Ram,
+    code_watch: CodeWatch,
     bios: Vec<u8>,
     a20: bool,
     pci_addr: u32,
@@ -51,6 +73,7 @@ impl Board {
         let ram_bytes = cfg.ram_bytes;
         let mut b = Board {
             ram: ram::Ram::new(ram_bytes as usize),
+            code_watch: CodeWatch { bits: vec![0; (ram_bytes as usize >> 12).div_ceil(64)], written: Vec::new() },
             bios: cfg.bios,
             a20: true,
             pci_addr: 0,
@@ -227,6 +250,7 @@ impl Board {
 
     fn write_slow(&mut self, addr: u32, v: u8) {
         let addr = self.mask_a20(addr);
+        self.code_watch.note_write(addr);
         if (LEGACY_START..LEGACY_END).contains(&addr) {
             if addr < 0xc_0000 {
                 self.vga.mem_write8(addr, v);
@@ -347,7 +371,7 @@ impl Board {
     }
 }
 
-struct RamDma<'a>(&'a mut [u8]);
+struct RamDma<'a>(&'a mut [u8], &'a mut CodeWatch);
 
 impl ide::DmaMemory for RamDma<'_> {
     fn read_phys(&mut self, addr: u32, buf: &mut [u8]) {
@@ -357,6 +381,11 @@ impl ide::DmaMemory for RamDma<'_> {
     }
 
     fn write_phys(&mut self, addr: u32, buf: &[u8]) {
+        let mut page = addr & !0xfff;
+        while page < addr.saturating_add(buf.len() as u32) {
+            self.1.note_write(page);
+            page += 0x1000;
+        }
         for (i, &b) in buf.iter().enumerate() {
             if let Some(slot) = self.0.get_mut(addr as usize + i) {
                 *slot = b;
@@ -377,6 +406,7 @@ impl Bus for Board {
     #[inline]
     fn write8(&mut self, addr: u32, value: u8) {
         if self.plain_ram(addr, 1) {
+            self.code_watch.note_write(addr);
             self.ram[addr as usize] = value;
             return;
         }
@@ -405,6 +435,8 @@ impl Bus for Board {
     #[inline]
     fn write16(&mut self, addr: u32, value: u16) {
         if self.plain_ram(addr, 2) {
+            self.code_watch.note_write(addr);
+            self.code_watch.note_write(addr + 1);
             let a = addr as usize;
             self.ram[a..a + 2].copy_from_slice(&value.to_le_bytes());
             return;
@@ -417,6 +449,8 @@ impl Bus for Board {
     #[inline]
     fn write32(&mut self, addr: u32, value: u32) {
         if self.plain_ram(addr, 4) {
+            self.code_watch.note_write(addr);
+            self.code_watch.note_write(addr + 3);
             let a = addr as usize;
             self.ram[a..a + 4].copy_from_slice(&value.to_le_bytes());
             return;
@@ -459,7 +493,7 @@ impl Bus for Board {
             return;
         }
         self.ide.set_bus_master_base(self.pci[IDE].1.io_bar(4));
-        if self.ide.io_write(port, size, value, &mut RamDma(&mut self.ram[..])) {
+        if self.ide.io_write(port, size, value, &mut RamDma(&mut self.ram[..], &mut self.code_watch)) {
             self.sync_ide();
             return;
         }
@@ -488,6 +522,17 @@ impl Bus for Board {
 
     fn intr(&mut self) -> bool {
         self.pic.intr()
+    }
+
+    fn watch_code_page(&mut self, addr: u32) {
+        let page = (addr >> 12) as usize;
+        if let Some(word) = self.code_watch.bits.get_mut(page >> 6) {
+            *word |= 1 << (page & 63);
+        }
+    }
+
+    fn take_written_code_pages(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.code_watch.written)
     }
 
     fn inta(&mut self) -> u8 {
