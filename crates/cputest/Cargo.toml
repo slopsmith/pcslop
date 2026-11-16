@@ -1,0 +1,11 @@
+[package]
+name = "cputest"
+description = "Runs hardware-generated CPU test suites against the interpreter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+flate2 = "1.1"
+x86 = { path = "../x86" }
