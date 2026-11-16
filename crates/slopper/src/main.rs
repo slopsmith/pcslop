@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::io::BufRead;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -77,6 +77,7 @@ struct Frame {
 struct Shared {
     frame: Mutex<Frame>,
     done: AtomicBool,
+    instructions: AtomicU64,
 }
 
 fn dump(cpu: &Cpu) {
@@ -181,6 +182,7 @@ fn emulate(args: Args, board_cfg: Config, events: Receiver<Event>, shared: Arc<S
                 }
             }
         }
+        shared.instructions.store(executed, Ordering::Relaxed);
         board.tick();
         cpu.tsc = board.now_ns() * 28 / 10;
         if board.reset_requested {
@@ -276,7 +278,15 @@ fn window_loop(tx: Sender<Event>, shared: Arc<Shared>) {
     let mut buf = Vec::new();
     let (mut w, mut h) = (720usize, 400usize);
     let mut last_mouse: Option<(f32, f32)> = None;
+    let mut rate_at = (Instant::now(), 0u64);
     while window.is_open() && !shared.done.load(Ordering::Relaxed) {
+        let elapsed = rate_at.0.elapsed();
+        if elapsed >= Duration::from_millis(500) {
+            let n = shared.instructions.load(Ordering::Relaxed);
+            let mips = n.saturating_sub(rate_at.1) as f64 / elapsed.as_secs_f64() / 1e6;
+            window.set_title(&format!("86slopper | {mips:.1} MIPS"));
+            rate_at = (Instant::now(), n);
+        }
         {
             let f = shared.frame.lock().unwrap();
             if f.seq != seq && f.width > 0 {
@@ -339,7 +349,11 @@ fn main() -> ExitCode {
         }
     };
     let cfg = Config { ram_bytes: args.ram_mb << 20, bios, vgabios };
-    let shared = Arc::new(Shared { frame: Mutex::new(Frame::default()), done: AtomicBool::new(false) });
+    let shared = Arc::new(Shared {
+        frame: Mutex::new(Frame::default()),
+        done: AtomicBool::new(false),
+        instructions: AtomicU64::new(0),
+    });
     let (tx, rx) = channel();
     let headless = args.headless || !cfg!(feature = "window");
     let emu_shared = shared.clone();
