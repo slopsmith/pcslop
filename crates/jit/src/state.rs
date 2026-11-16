@@ -54,6 +54,8 @@ pub struct State {
     pub if_flag: u32,
     /// x86 DF (0 or 1).
     pub df: u32,
+    /// 1 while running CPL 3 code; part of the block lookup key.
+    pub user: u32,
     pub fs_base: u32,
     /// Current CS selector, so a RETF to the same segment needs no exit.
     pub cs_sel: u32,
@@ -82,6 +84,7 @@ pub const PENDING: usize = offset_of!(State, pending);
 pub const IRQ: usize = offset_of!(State, irq);
 pub const IF_FLAG: usize = offset_of!(State, if_flag);
 pub const DF: usize = offset_of!(State, df);
+pub const USER: usize = offset_of!(State, user);
 pub const CS_SEL: usize = offset_of!(State, cs_sel);
 pub const FS_BASE: usize = offset_of!(State, fs_base);
 pub const GS_BASE: usize = offset_of!(State, gs_base);

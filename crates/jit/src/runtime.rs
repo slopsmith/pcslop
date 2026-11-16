@@ -40,7 +40,7 @@ fn ctl_maintenance(a: &mut Asm) {
     a.bind(no_all);
     a.tbz(r(1), 2, no_page);
     a.ldr(Width::X, r(2), STATE, state::TLBI_PAGE as i32);
-    a.tlbi_vae1(r(2));
+    a.tlbi_vaae1(r(2));
     a.bind(no_page);
     a.dsb(0xb);
     a.tbz(r(1), 1, no_ic);
@@ -143,6 +143,8 @@ pub fn build() -> (Vec<u32>, Entries) {
     a.ubfx(Size::X, r(1), r(1), 12, 36);
     a.lsl_imm(Size::X, r(1), r(1), 12);
     a.bfxil(Size::X, r(1), r(0), 0, 12);
+    a.ldr(Width::W, r(2), STATE, state::USER as i32);
+    a.logic_shift(Logic::Orr, false, Size::X, r(1), r(1), r(2), Shift::Lsl, 32);
     a.ldr(Width::X, r(2), STATE, state::LOOKUP as i32);
     a.logic_shift(Logic::Eor, false, Size::X, r(3), r(1), r(1), Shift::Lsr, 13);
     a.ubfx(Size::X, r(3), r(3), 0, layout::LOOKUP_ENTRIES.trailing_zeros());

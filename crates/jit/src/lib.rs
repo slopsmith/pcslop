@@ -163,7 +163,7 @@ struct Expected {
     cpu: Cpu,
     writes: HashMap<u32, u8>,
     eip: u32,
-    phys: u32,
+    key: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -205,23 +205,26 @@ pub struct Jit {
     vcpu: Vcpu,
     mem: GuestMemory,
     entries: Entries,
-    shadow: Shadow,
+    /// Shadow trees for CPL 0 and CPL 3 (only x86 user pages).
+    shadow: [Shadow; 2],
+    /// Which tree TTBR0 points at.
+    root: usize,
     shadow_key: Option<u64>,
     /// Whether the shadow tables were filled with x86 paging enabled.
     shadow_paged: bool,
     code_next: usize,
-    blocks: HashMap<u32, BlockInfo>,
-    by_va: BTreeMap<u64, u32>,
-    code_pages: HashMap<u32, Vec<u32>>,
+    blocks: HashMap<u64, BlockInfo>,
+    by_va: BTreeMap<u64, u64>,
+    code_pages: HashMap<u32, Vec<u64>>,
     pt_watch: PtWatch,
     /// Chain sites (code cache offsets) waiting for a block at a physical address.
-    chain_wanted: HashMap<u32, Vec<usize>>,
+    chain_wanted: HashMap<u64, Vec<usize>>,
     /// Chain sites patched to jump straight into the block at a physical address.
-    chain_in: HashMap<u32, Vec<usize>>,
+    chain_in: HashMap<u64, Vec<usize>>,
     /// Shadow leaf entries for non-global x86 mappings, cleared on CR3 loads.
-    nonglobal: Vec<usize>,
+    nonglobal: [Vec<usize>; 2],
     /// Linear pages mapped writable in the shadow tables, by physical page.
-    writable: HashMap<u32, Vec<u32>>,
+    writable: [HashMap<u32, Vec<u32>>; 2],
     pub stats: Stats,
     /// Runs each block against the interpreter and stops at the first difference.
     pub verify: bool,
@@ -233,15 +236,19 @@ pub struct Jit {
     _vm: Vm,
 }
 
-fn hash(pa: u32) -> usize {
-    let pa = pa as u64;
-    ((pa ^ (pa >> 13)) as usize) & (layout::LOOKUP_ENTRIES - 1)
+fn hash(key: u64) -> usize {
+    ((key ^ (key >> 13)) as usize) & (layout::LOOKUP_ENTRIES - 1)
+}
+
+/// Blocks are looked up by physical address plus whether they run at CPL 3.
+fn block_key(phys: u32, user: bool) -> u64 {
+    phys as u64 | (user as u64) << 32
 }
 
 /// True for CPU states whose code the translator can run: 32-bit protected
-/// mode at CPL 0 with flat CS, SS, DS and ES.
+/// mode at CPL 0 or 3 with flat CS, SS, DS and ES.
 pub fn supported(cpu: &Cpu) -> bool {
-    if !cpu.protected_mode() || cpu.v86_mode() || cpu.cpl() != 0 || !cpu.segs[CS].big() {
+    if !cpu.protected_mode() || cpu.v86_mode() || !matches!(cpu.cpl(), 0 | 3) || !cpu.segs[CS].big() {
         return false;
     }
     [CS, SS, DS, ES].iter().all(|&s| {
@@ -276,15 +283,19 @@ impl Jit {
             vcpu,
             mem: rt,
             entries,
-            shadow: Shadow::default(),
+            shadow: {
+                let mid = (layout::SHADOW_POOL + layout::SHADOW_POOL_END) / 2;
+                [Shadow::new(layout::SHADOW_POOL, mid), Shadow::new(mid, layout::SHADOW_POOL_END)]
+            },
+            root: 0,
             shadow_key: None,
             shadow_paged: false,
             code_next: layout::CODE_CACHE,
             blocks: HashMap::new(),
             by_va: BTreeMap::new(),
             code_pages: HashMap::new(),
-            writable: HashMap::new(),
-            nonglobal: Vec::new(),
+            writable: [HashMap::new(), HashMap::new()],
+            nonglobal: [Vec::new(), Vec::new()],
             pt_watch: PtWatch::default(),
             chain_wanted: HashMap::new(),
             chain_in: HashMap::new(),
@@ -294,11 +305,13 @@ impl Jit {
             timing: std::env::var_os("SLOPPER_JIT_PROFILE").is_some(),
             _vm: vm,
         };
-        jit.shadow.flush(jit.mem.as_mut_slice());
+        for t in &mut jit.shadow {
+            t.flush(jit.mem.as_mut_slice());
+        }
         let v = &jit.vcpu;
         v.set_sys_reg(sysreg::MAIR_EL1, 0xff)?;
         v.set_sys_reg(sysreg::TCR_EL1, tcr)?;
-        v.set_sys_reg(sysreg::TTBR0_EL1, jit.shadow.root_ipa())?;
+        v.set_sys_reg(sysreg::TTBR0_EL1, jit.shadow[0].root_ipa() | 1 << 48)?;
         v.set_sys_reg(sysreg::TTBR1_EL1, layout::ipa(layout::TTBR1_L1))?;
         v.set_sys_reg(sysreg::VBAR_EL1, layout::va(layout::VECTORS))?;
         v.set_sys_reg(sysreg::SP_EL1, layout::va(layout::STACK_TOP))?;
@@ -346,11 +359,26 @@ impl Jit {
         cpu.set_flag(x86::cpu::flags::DF, df);
     }
 
+    /// Points TTBR0 at the shadow tree for the current CPL, each with its own ASID.
+    fn set_root(&mut self, cpu: &Cpu) {
+        let r = (cpu.cpl() == 3) as usize;
+        if r != self.root {
+            self.root = r;
+            let ttbr = self.shadow[r].root_ipa() | (r as u64 + 1) << 48;
+            self.vcpu.set_sys_reg(sysreg::TTBR0_EL1, ttbr).expect("TTBR0 write");
+        }
+        self.state().user = r as u32;
+    }
+
     fn flush_shadow(&mut self) {
         self.pt_watch.clear();
-        self.shadow.flush(self.mem.as_mut_slice());
-        self.writable.clear();
-        self.nonglobal.clear();
+        for t in &mut self.shadow {
+            t.flush(self.mem.as_mut_slice());
+        }
+        for r in 0..2 {
+            self.writable[r].clear();
+            self.nonglobal[r].clear();
+        }
         self.state().ctl |= ctl::TLBI_ALL;
         self.stats.flushes += 1;
     }
@@ -371,12 +399,16 @@ impl Jit {
                 self.shadow_key = Some(key);
                 match cpu.tlb.last_flush {
                     FlushKind::Page(lin) => {
-                        self.shadow.unmap(self.mem.as_mut_slice(), lin);
+                        for t in &mut self.shadow {
+                            t.unmap(self.mem.as_mut_slice(), lin);
+                        }
                         self.tlbi_page(lin);
                     }
                     _ => {
-                        for off in std::mem::take(&mut self.nonglobal) {
-                            self.shadow.clear_leaf(self.mem.as_mut_slice(), off);
+                        for r in 0..2 {
+                            for off in std::mem::take(&mut self.nonglobal[r]) {
+                                self.shadow[r].clear_leaf(self.mem.as_mut_slice(), off);
+                            }
                         }
                         self.state().ctl |= ctl::TLBI_ALL;
                         self.stats.nonglobal_flushes += 1;
@@ -414,19 +446,20 @@ impl Jit {
             self.flush_shadow();
             self.pt_watch.watch(cpu, bus, lin);
         }
-        let leaf = match self.shadow.map(self.mem.as_mut_slice(), lin, phys, writable) {
+        let r = self.root;
+        let leaf = match self.shadow[r].map(self.mem.as_mut_slice(), lin, phys, writable) {
             Some(off) => off,
             None => {
                 self.stats.flush_pool += 1;
                 self.flush_shadow();
-                self.shadow.map(self.mem.as_mut_slice(), lin, phys, writable).expect("shadow pool smaller than one mapping")
+                self.shadow[r].map(self.mem.as_mut_slice(), lin, phys, writable).expect("shadow pool smaller than one mapping")
             }
         };
         if writable {
-            self.writable.entry(phys & !0xfff).or_default().push(lin & !0xfff);
+            self.writable[r].entry(phys & !0xfff).or_default().push(lin & !0xfff);
         }
         if !global {
-            self.nonglobal.push(leaf);
+            self.nonglobal[r].push(leaf);
         }
         self.stats.shadow_fills += 1;
     }
@@ -458,7 +491,7 @@ impl Jit {
             }
             let off = layout::LOOKUP + hash(pa) * 16;
             let slot = &mut self.mem.as_mut_slice()[off..off + 16];
-            if u64::from_le_bytes(slot[..8].try_into().unwrap()) == pa as u64 {
+            if u64::from_le_bytes(slot[..8].try_into().unwrap()) == pa {
                 slot.fill(0xff);
             }
         }
@@ -476,7 +509,8 @@ impl Jit {
         self.flush_shadow();
     }
 
-    fn translate_block<B: Bus>(&mut self, bus: &mut B, eip: u32, phys: u32) {
+    fn translate_block<B: Bus>(&mut self, bus: &mut B, eip: u32, phys: u32, user: bool) {
+        let key = block_key(phys, user);
         let page = phys & !0xfff;
         let lin_page = eip & !0xfff;
         let block_va = layout::va(self.code_next);
@@ -489,47 +523,50 @@ impl Jit {
             rt_va,
             &entries,
             !self.verify,
+            user,
         );
         let bytes = compiled.code.len() * 4;
         if self.code_next + bytes > layout::CODE_CACHE_END {
             self.reset_code_cache();
-            return self.translate_block(bus, eip, phys);
+            return self.translate_block(bus, eip, phys, user);
         }
         let code_off = self.code_next;
         self.mem.write_words(code_off, &compiled.code);
         self.code_next += bytes.next_multiple_of(16);
         for &(word, target) in &compiled.chains {
-            let target_pa = page | (target & 0xfff);
+            let target = block_key(page | (target & 0xfff), user);
             let site = code_off + word as usize * 4;
-            match self.blocks.get(&target_pa).map(|b| b.va) {
-                Some(va) if target_pa != phys => {
+            match self.blocks.get(&target).map(|b| b.va) {
+                Some(va) if target != key => {
                     self.patch_chain(site, Some(va));
-                    self.chain_in.entry(target_pa).or_default().push(site);
+                    self.chain_in.entry(target).or_default().push(site);
                 }
-                _ if target_pa == phys => {
+                _ if target == key => {
                     self.patch_chain(site, Some(block_va));
-                    self.chain_in.entry(phys).or_default().push(site);
+                    self.chain_in.entry(key).or_default().push(site);
                 }
-                _ => self.chain_wanted.entry(target_pa).or_default().push(site),
+                _ => self.chain_wanted.entry(target).or_default().push(site),
             }
         }
-        for site in self.chain_wanted.remove(&phys).unwrap_or_default() {
+        for site in self.chain_wanted.remove(&key).unwrap_or_default() {
             self.patch_chain(site, Some(block_va));
-            self.chain_in.entry(phys).or_default().push(site);
+            self.chain_in.entry(key).or_default().push(site);
         }
         if !self.verify {
-            self.insert_lookup(phys, block_va);
+            self.insert_lookup(key, block_va);
         }
-        self.blocks.insert(phys, BlockInfo { va: block_va, boundaries: compiled.boundaries, insns: compiled.insns, verified: 0 });
-        self.by_va.insert(block_va, phys);
+        self.blocks.insert(key, BlockInfo { va: block_va, boundaries: compiled.boundaries, insns: compiled.insns, verified: 0 });
+        self.by_va.insert(block_va, key);
         let pages = self.code_pages.entry(page).or_default();
         let new_page = pages.is_empty();
-        pages.push(phys);
+        pages.push(key);
         bus.watch_code_page(phys);
         if new_page {
-            for lin in self.writable.remove(&page).unwrap_or_default() {
-                if self.shadow.write_protect(self.mem.as_mut_slice(), lin, page) {
-                    self.tlbi_page(lin);
+            for r in 0..2 {
+                for lin in self.writable[r].remove(&page).unwrap_or_default() {
+                    if self.shadow[r].write_protect(self.mem.as_mut_slice(), lin, page) {
+                        self.tlbi_page(lin);
+                    }
                 }
             }
         }
@@ -538,16 +575,16 @@ impl Jit {
         self.state().ctl |= ctl::IC_IALLU;
     }
 
-    fn insert_lookup(&mut self, phys: u32, va: u64) {
-        let off = layout::LOOKUP + hash(phys) * 16;
+    fn insert_lookup(&mut self, key: u64, va: u64) {
+        let off = layout::LOOKUP + hash(key) * 16;
         let slot = &mut self.mem.as_mut_slice()[off..off + 16];
-        slot[..8].copy_from_slice(&(phys as u64).to_le_bytes());
+        slot[..8].copy_from_slice(&key.to_le_bytes());
         slot[8..].copy_from_slice(&va.to_le_bytes());
     }
 
     fn eip_at(&self, elr: u64) -> Option<u32> {
-        let (&va, &pa) = self.by_va.range(..=elr).next_back()?;
-        let b = &self.blocks[&pa];
+        let (&va, &key) = self.by_va.range(..=elr).next_back()?;
+        let b = &self.blocks[&key];
         let word = ((elr - va) / 4) as u32;
         b.boundaries.iter().rev().find(|(w, _)| *w <= word).map(|(_, e)| *e)
     }
@@ -560,6 +597,7 @@ impl Jit {
         }
         self.check_shadow(cpu, bus);
         self.load_state(cpu);
+        self.set_root(cpu);
         self.state().irq = bus.intr() as u32;
         let mut at_dispatch = true;
         loop {
@@ -621,11 +659,7 @@ impl Jit {
                             if self.interp_profile.is_some() {
                                 self.profile_interp(cpu, bus);
                             }
-                            let before = (cpu.eip, cpu.eflags);
                             let e = interp::step(cpu, bus);
-                            if before.0 == 0x801a_4540 {
-                                eprintln!("TRACE sti: before {:x?} after eip {:#x} eflags {:#x} e {:?}", before, cpu.eip, cpu.eflags, e);
-                            }
                             for page in bus.take_written_code_pages() {
                                 self.invalidate_code_page(page << 12);
                             }
@@ -634,6 +668,7 @@ impl Jit {
                             }
                             self.check_shadow(cpu, bus);
                             self.load_state(cpu);
+                            self.set_root(cpu);
                             self.state().irq = bus.intr() as u32;
                         }
                         reason::PENDING => {
@@ -664,7 +699,8 @@ impl Jit {
         let mut c = cpu.clone();
         self.store_state(&mut c);
         let phys = interp::translate(&mut c.clone(), bus, c.eip, false).ok()?;
-        let block = self.blocks.get(&phys)?;
+        let key = block_key(phys, self.root == 1);
+        let block = self.blocks.get(&key)?;
         if block.verified >= VERIFY_RUNS {
             return None;
         }
@@ -677,17 +713,17 @@ impl Jit {
             }
         }
         let writes = ov.writes;
-        self.insert_lookup(phys, va);
+        self.insert_lookup(key, va);
         self.state().budget = 2;
-        Some(Expected { cpu: c, writes, eip, phys })
+        Some(Expected { cpu: c, writes, eip, key })
     }
 
     fn check_block<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B, exp: Expected) {
         self.state().budget = 0;
-        if let Some(b) = self.blocks.get_mut(&exp.phys) {
+        if let Some(b) = self.blocks.get_mut(&exp.key) {
             b.verified += 1;
             if b.verified < VERIFY_RUNS {
-                let off = layout::LOOKUP + hash(exp.phys) * 16;
+                let off = layout::LOOKUP + hash(exp.key) * 16;
                 self.mem.as_mut_slice()[off..off + 16].fill(0xff);
             }
         }
@@ -741,14 +777,16 @@ impl Jit {
         match interp::translate_global(cpu, bus, eip, false) {
             Ok((phys, global)) => {
                 self.map_shadow(bus, cpu, eip, phys, false, global);
-                match self.blocks.get(&phys) {
+                let user = self.root == 1;
+                let key = block_key(phys, user);
+                match self.blocks.get(&key) {
                     Some(b) => {
                         if !self.verify || b.verified >= VERIFY_RUNS {
                             let va = b.va;
-                            self.insert_lookup(phys, va);
+                            self.insert_lookup(key, va);
                         }
                     }
-                    None => self.translate_block(bus, eip, phys),
+                    None => self.translate_block(bus, eip, phys, user),
                 }
             }
             Err(e) => {
@@ -756,6 +794,7 @@ impl Jit {
                 self.store_state(cpu);
                 let _ = interp::deliver_fault(cpu, bus, e);
                 self.load_state(cpu);
+                self.set_root(cpu);
             }
         }
     }
@@ -784,6 +823,7 @@ impl Jit {
                 self.store_state(cpu);
                 let _ = interp::deliver_fault(cpu, bus, e);
                 self.load_state(cpu);
+                self.set_root(cpu);
                 self.state().resume = resume::DISPATCH;
             }
         }
@@ -828,6 +868,7 @@ impl Jit {
         }
         self.check_shadow(cpu, bus);
         self.load_state(cpu);
+        self.set_root(cpu);
         self.state().irq = bus.intr() as u32;
         self.vcpu.set_reg(reg::CPSR, 0x3c5)?;
         self.vcpu.set_reg(reg::PC, layout::va(self.entries.resume))?;

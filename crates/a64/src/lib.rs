@@ -1020,6 +1020,11 @@ impl Asm {
         self.sys(0, 8, 7, 1, rt)
     }
 
+    /// Like `tlbi_vae1`, for every ASID.
+    pub fn tlbi_vaae1(&mut self, rt: Reg) {
+        self.sys(0, 8, 7, 3, rt)
+    }
+
     /// TLBI operation given as op1:CRm:op2 packed into 10 bits.
     pub fn tlbi(&mut self, op1_crm_op2: u32, rt: Reg) {
         self.emit(0xd508_8000 | op1_crm_op2 << 5 | reg(rt))

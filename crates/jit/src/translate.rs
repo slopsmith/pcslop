@@ -73,6 +73,8 @@ struct Emit {
     /// Linear page of the block start; jumps within it may be chained.
     page: Option<u32>,
     chains: Vec<(u32, u32)>,
+    /// Translating CPL 3 code: privileged instructions go to the interpreter.
+    user: bool,
 }
 
 enum Step {
@@ -762,6 +764,7 @@ impl Emit {
                 self.a.movz(Size::W, T_B, 1, 0);
                 self.a.str(Width::W, T_B, STATE, state::DF as i32);
             }
+            0xfa | 0xfb if self.user => return Step::Unsupported,
             0xfa => self.a.str(Width::W, ZR, STATE, state::IF_FLAG as i32),
             0xfb => {
                 self.a.movz(Size::W, T_B, 1, 0);
@@ -1113,6 +1116,7 @@ pub fn compile(
     rt_va: u64,
     rt: &Entries,
     chain: bool,
+    user: bool,
 ) -> Compiled {
     let mut e = Emit {
         a: Asm::new(),
@@ -1121,6 +1125,7 @@ pub fn compile(
         exit_va: rt_va + rt.exit as u64,
         page: chain.then_some(eip & !0xfff),
         chains: Vec::new(),
+        user,
     };
     let mut boundaries = Vec::new();
     let mut pc = eip;

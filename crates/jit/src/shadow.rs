@@ -11,6 +11,8 @@ const SH_INNER: u64 = 3 << 8;
 const AP_RO: u64 = 1 << 7;
 const PXN: u64 = 1 << 53;
 const UXN: u64 = 1 << 54;
+/// Not global: TLB entries are tagged with the ASID of the root.
+const NG: u64 = 1 << 11;
 
 const PAGE_SIZE: usize = 4096;
 
@@ -40,27 +42,27 @@ pub fn build_ttbr1(mem: &mut [u8]) {
     }
 }
 
-/// TTBR0 shadow tables, allocated from a pool in the runtime region.
+/// One TTBR0 shadow tree, allocated from its own slice of the runtime region.
 pub struct Shadow {
+    root: usize,
+    end: usize,
     next: usize,
 }
 
-impl Default for Shadow {
-    fn default() -> Self {
-        Shadow { next: layout::SHADOW_POOL + PAGE_SIZE }
-    }
-}
-
 impl Shadow {
+    /// A tree whose root and tables live in `start..end` (runtime-region offsets).
+    pub fn new(start: usize, end: usize) -> Self {
+        Shadow { root: start, end, next: start + PAGE_SIZE }
+    }
+
     pub fn root_ipa(&self) -> u64 {
-        layout::ipa(layout::SHADOW_POOL)
+        layout::ipa(self.root)
     }
 
     /// Drops every mapping. The caller must invalidate the TLB.
     pub fn flush(&mut self, mem: &mut [u8]) {
-        let root = layout::SHADOW_POOL;
-        mem[root..root + PAGE_SIZE].fill(0);
-        self.next = root + PAGE_SIZE;
+        mem[self.root..self.root + PAGE_SIZE].fill(0);
+        self.next = self.root + PAGE_SIZE;
     }
 
     fn table(&mut self, mem: &mut [u8], entry_off: usize) -> Option<usize> {
@@ -68,7 +70,7 @@ impl Shadow {
         if d & VALID != 0 {
             return Some((d & 0x0000_ffff_ffff_f000) as usize - layout::RUNTIME_IPA as usize);
         }
-        if self.next + PAGE_SIZE > layout::SHADOW_POOL_END {
+        if self.next + PAGE_SIZE > self.end {
             return None;
         }
         let t = self.next;
@@ -79,7 +81,7 @@ impl Shadow {
     }
 
     fn leaf(&self, mem: &[u8], lin: u32) -> Option<usize> {
-        let mut table = layout::SHADOW_POOL;
+        let mut table = self.root;
         for shift in [30, 21] {
             let d = read_desc(mem, table + (((lin >> shift) & 511) as usize) * 8);
             if d & VALID == 0 {
@@ -119,10 +121,9 @@ impl Shadow {
     /// flush and retry in that case.
     #[must_use]
     pub fn map(&mut self, mem: &mut [u8], lin: u32, phys: u32, writable: bool) -> Option<usize> {
-        let root = layout::SHADOW_POOL;
-        let l2 = self.table(mem, root + ((lin >> 30) as usize) * 8)?;
+        let l2 = self.table(mem, self.root + ((lin >> 30) as usize) * 8)?;
         let l3 = self.table(mem, l2 + (((lin >> 21) & 511) as usize) * 8)?;
-        let mut d = (phys as u64 & !0xfff) | AF | SH_INNER | PXN | UXN | PAGE | VALID;
+        let mut d = (phys as u64 & !0xfff) | AF | SH_INNER | PXN | UXN | NG | PAGE | VALID;
         if !writable {
             d |= AP_RO;
         }

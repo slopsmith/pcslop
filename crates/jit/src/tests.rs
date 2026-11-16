@@ -372,3 +372,33 @@ fn random_programs_match_the_interpreter() {
     assert!(interp_exits < 360, "{interp_exits} interpreter exits");
     assert!(translated > 300 * 40);
 }
+
+#[test]
+fn user_mode_code_matches_the_interpreter() {
+    let code = [
+        0xb8, 0x05, 0, 0, 0, // mov eax, 5
+        0x01, 0xc0, // add eax, eax
+        0x50, // push eax
+        0x5b, // pop ebx
+        0xfa, // cli: #GP at CPL 3 (IOPL 0), handled by the interpreter
+    ];
+    let mut a = flat_cpu(0x1000, 0x8000);
+    for seg in &mut a.segs {
+        seg.selector |= 3;
+        seg.attr |= 3 << 5;
+    }
+    let mut b = a.clone();
+    let mut bus_a = bus_with(0x1000, &code);
+    let mut bus_b = bus_with(0x1000, &code);
+    for _ in 0..5 {
+        interp::step(&mut a, &mut bus_a);
+    }
+    let _vm = VM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut jit = unsafe { Jit::new(bus_b.ram.as_ptr(), RAM).unwrap() };
+    assert!(supported(&b));
+    let exit = jit.run(&mut b, &mut bus_b).unwrap();
+    assert!(matches!(exit, RunExit::Interp(_)));
+    assert_eq!(a.regs, b.regs);
+    assert_eq!(a.eip, b.eip);
+    assert_eq!(jit.stats.translated_insns, 4);
+}

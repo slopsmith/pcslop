@@ -180,6 +180,7 @@ const CASES: &[Case] = &[
     ("ic iallu", |a| a.ic_iallu()),
     ("tlbi vmalle1", |a| a.tlbi_vmalle1()),
     ("tlbi vae1, x7", |a| a.tlbi_vae1(r(7))),
+    ("tlbi vaae1, x8", |a| a.tlbi_vaae1(r(8))),
     ("mrs x1, par_el1", |a| a.mrs(r(1), sysreg::PAR_EL1)),
 ];
 
