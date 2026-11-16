@@ -82,6 +82,11 @@ enum Event {
     Key(u16, bool),
     Type(String),
     Mouse(i32, i32, u8),
+    /// Host pointer: absolute position (0..=`usb::MAX_COORD` on each axis),
+    /// relative motion for PS/2, buttons and wheel detents.
+    Pointer { x: u16, y: u16, dx: i32, dy: i32, buttons: u8, wheel: i32 },
+    /// Tablet position in guest screen pixels, buttons and wheel detents.
+    Tablet(u32, u32, u8, i32),
     Screenshot(PathBuf),
     /// A control-socket query answered by the emulator thread.
     Query(String, Sender<String>),
@@ -386,6 +391,23 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                 Event::Key(code, down) => board.key(code, down),
                 Event::Type(text) => text.chars().for_each(|c| keyq.push_char(c)),
                 Event::Mouse(dx, dy, b) => board.mouse_motion(dx, dy, b),
+                // A guest with a USB tablet driver gets absolute positions only:
+                // feeding the same motion through PS/2 as well would move the
+                // cursor twice and send every click twice.
+                Event::Pointer { x, y, dx, dy, buttons, wheel } => {
+                    if board.tablet_in_use() {
+                        board.tablet(x, y, buttons, wheel);
+                    } else {
+                        board.mouse_motion(dx, dy, buttons);
+                    }
+                }
+                Event::Tablet(px, py, buttons, wheel) => {
+                    let (w, h) = {
+                        let f = shared.frame.lock().unwrap();
+                        (f.width, f.height)
+                    };
+                    board.tablet(pixel_to_tablet(px, w), pixel_to_tablet(py, h), buttons, wheel);
+                }
                 Event::Screenshot(path) => {
                     let f = shared.frame.lock().unwrap();
                     match save_png(&path, &f) {
@@ -574,6 +596,13 @@ struct HostTime {
     halted: Duration,
 }
 
+/// Tablet coordinate for the middle of pixel `p` on an axis `size` pixels long.
+fn pixel_to_tablet(p: u32, size: u32) -> u16 {
+    let size = size.max(1) as u64;
+    let range = usb::MAX_COORD as u64 + 1;
+    ((2 * p as u64 + 1) * range / (2 * size)).min(usb::MAX_COORD as u64) as u16
+}
+
 fn format_regs(cpu: &Cpu) -> String {
     let r = &cpu.regs;
     let s = &cpu.segs;
@@ -642,7 +671,7 @@ fn run_command(line: &str, tx: &Sender<Event>) -> Option<String> {
     })
 }
 
-/// Parses an input command (`shot`, `type`, `key`, `mouse`, `quit`) into events.
+/// Parses an input command (`shot`, `type`, `key`, `mouse`, `tablet`, `quit`) into events.
 fn command_event(line: &str) -> Result<Vec<Event>, String> {
     let (cmd, rest) = line.split_once(' ').unwrap_or((line, ""));
     Ok(match cmd {
@@ -663,9 +692,21 @@ fn command_event(line: &str) -> Result<Vec<Event>, String> {
                 _ => return Err("usage: mouse DX DY [BUTTONS]".into()),
             }
         }
+        "tablet" => {
+            let v: Vec<i64> = rest.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+            match v.as_slice() {
+                &[x, y, ref more @ ..] if x >= 0 && y >= 0 && more.len() <= 2 => {
+                    let buttons = more.first().copied().unwrap_or(0) as u8;
+                    let wheel = more.get(1).copied().unwrap_or(0) as i32;
+                    vec![Event::Tablet(x as u32, y as u32, buttons, wheel)]
+                }
+                _ => return Err("usage: tablet X Y [BUTTONS [WHEEL]] (guest screen pixels)".into()),
+            }
+        }
         "quit" => vec![Event::Quit],
         _ => {
-            return Err("commands: screen | status | regs | mem HEXADDR [LEN] | profile [on|off] | pause | resume | shot PATH | type TEXT | key NAME[+NAME] | mouse DX DY [BUTTONS] | quit".into());
+            return Err("commands: screen | status | regs | mem HEXADDR [LEN] | profile [on|off] | pause | resume | shot PATH | type TEXT | key NAME[+NAME] | mouse DX DY [BUTTONS] | tablet X Y [BUTTONS [WHEEL]] | quit\n\
+                 mouse sends relative PS/2 motion; tablet moves the USB tablet to guest screen pixel (X, Y)".into());
         }
     })
 }
@@ -697,7 +738,8 @@ fn window_loop(tx: Sender<Event>, shared: Arc<Shared>) {
     let mut seq = 0;
     let mut buf = Vec::new();
     let (mut w, mut h) = (720usize, 400usize);
-    let mut last_mouse: Option<(f32, f32)> = None;
+    let mut last_mouse: Option<(f32, f32, u8)> = None;
+    let mut wheel_acc = 0f32;
     let mut rate_at = (Instant::now(), 0u64);
     while window.is_open() && !shared.done.load(Ordering::Relaxed) {
         let elapsed = rate_at.0.elapsed();
@@ -730,19 +772,45 @@ fn window_loop(tx: Sender<Event>, shared: Arc<Shared>) {
                 let _ = tx.send(Event::Key(c, false));
             }
         }
-        if let Some((x, y)) = window.get_mouse_pos(MouseMode::Pass) {
+        if let Some((x, y)) = window.get_unscaled_mouse_pos(MouseMode::Discard) {
             let buttons = window.get_mouse_down(minifb::MouseButton::Left) as u8
                 | (window.get_mouse_down(minifb::MouseButton::Right) as u8) << 1
                 | (window.get_mouse_down(minifb::MouseButton::Middle) as u8) << 2;
-            if let Some((lx, ly)) = last_mouse
-                && (lx != x || ly != y || buttons != 0)
+            wheel_acc += window.get_scroll_wheel().map_or(0.0, |(_, sy)| sy);
+            let wheel = wheel_acc.trunc();
+            wheel_acc -= wheel;
+            if let Some((lx, ly, lb)) = last_mouse
+                && (lx != x || ly != y || lb != buttons || buttons != 0 || wheel != 0.0)
             {
-                let _ = tx.send(Event::Mouse((x - lx) as i32, (ly - y) as i32, buttons));
+                let (ax, ay) = picture_position(x, y, window.get_size(), (w, h));
+                let _ = tx.send(Event::Pointer {
+                    x: ax,
+                    y: ay,
+                    dx: (x - lx) as i32,
+                    dy: (ly - y) as i32,
+                    buttons,
+                    wheel: wheel as i32,
+                });
             }
-            last_mouse = Some((x, y));
+            last_mouse = Some((x, y, buttons));
         }
     }
     let _ = tx.send(Event::Quit);
+}
+
+/// Maps a point in the window to tablet coordinates in the picture, which
+/// `ScaleMode::AspectRatioStretch` letterboxes into the middle of the window.
+#[cfg(feature = "window")]
+fn picture_position(x: f32, y: f32, window: (usize, usize), picture: (usize, usize)) -> (u16, u16) {
+    let (ww, wh) = (window.0.max(1) as f32, window.1.max(1) as f32);
+    let (pw, ph) = (picture.0.max(1) as f32, picture.1.max(1) as f32);
+    let scale = (ww / pw).min(wh / ph);
+    let (ox, oy) = ((ww - pw * scale) / 2.0, (wh - ph * scale) / 2.0);
+    let to_tablet = |v: f32, origin: f32, len: f32| {
+        let f = ((v - origin) / (len * scale)).clamp(0.0, 1.0);
+        (f * (usb::MAX_COORD as f32 + 1.0)).min(usb::MAX_COORD as f32) as u16
+    };
+    (to_tablet(x, ox, pw), to_tablet(y, oy, ph))
 }
 
 fn main() -> ExitCode {
@@ -795,4 +863,32 @@ fn main() -> ExitCode {
     let code = emu.join().unwrap_or(ExitCode::FAILURE);
     let _ = std::fs::remove_file(&control_path);
     code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pixels_map_to_tablet_coordinates() {
+        assert_eq!(pixel_to_tablet(0, 800), 20);
+        assert_eq!(pixel_to_tablet(400, 800), 0x4014);
+        assert_eq!(pixel_to_tablet(799, 800), 0x7feb);
+        assert_eq!(pixel_to_tablet(5000, 800), usb::MAX_COORD);
+        // Windows scales the tablet's 0..=0x7fff to 0..=0xffff and then to pixels.
+        for p in [0, 1, 319, 640, 1023] {
+            assert_eq!(pixel_to_tablet(p, 1024) as u32 * 2 * 1024 / 0x10000, p);
+        }
+    }
+
+    #[cfg(feature = "window")]
+    #[test]
+    fn letterboxed_picture_position() {
+        assert_eq!(picture_position(0.0, 0.0, (800, 600), (800, 600)), (0, 0));
+        assert_eq!(picture_position(400.0, 300.0, (800, 600), (800, 600)), (0x4000, 0x4000));
+        // A 4:3 picture in a wide window has bars left and right.
+        assert_eq!(picture_position(200.0, 0.0, (1200, 600), (800, 600)), (0, 0));
+        assert_eq!(picture_position(600.0, 300.0, (1200, 600), (800, 600)), (0x4000, 0x4000));
+        assert_eq!(picture_position(1199.0, 650.0, (1200, 600), (800, 600)), (usb::MAX_COORD, usb::MAX_COORD));
+    }
 }

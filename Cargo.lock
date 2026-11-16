@@ -590,6 +590,7 @@ dependencies = [
  "minifb",
  "pc",
  "png",
+ "usb",
  "x86",
 ]
 

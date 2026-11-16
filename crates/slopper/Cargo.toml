@@ -14,5 +14,6 @@ window = ["dep:minifb"]
 minifb = { version = "0.29", optional = true }
 pc = { path = "../pc" }
 png = "0.18"
+usb = { path = "../usb" }
 jit = { path = "../jit" }
 x86 = { path = "../x86" }
