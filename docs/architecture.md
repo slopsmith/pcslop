@@ -72,9 +72,10 @@ A plain host-side interpreter comes first, for three reasons:
 - **Firmware:** SeaBIOS + SeaVGABIOS run as real firmware. We do not emulate BIOS calls at a high level. SeaBIOS is LGPLv3 and runs as a separate ROM image, so its license does not affect ours.
 - **Board:** i440FX + PIIX3/PIIX4, the board SeaBIOS knows best.
 - **Configuration:** goes through QEMU's `fw_cfg` interface (I/O ports `0x510`/`0x511`), so SeaBIOS can run its QEMU code path unchanged.
-- **ACPI:** current SeaBIOS no longer builds ACPI tables itself. It expects the VMM to pass them through `fw_cfg` (`etc/table-loader`). The plan:
-  - First boot XP with **no ACPI and no MP table** ("Standard PC" HAL, PIC + PIT). Our SeaBIOS build sets `CONFIG_MPTABLE=n`: with an MP table present, Setup would pick the MPS uniprocessor HAL, which needs a local APIC and an I/O APIC.
-  - Generate our own ACPI tables later, for the ACPI uniprocessor HAL and power-off.
+- **ACPI:** current SeaBIOS no longer builds ACPI tables itself. We build ACPI 1.0b tables (RSDP, RSDT, FADT, FACS and a DSDT encoded by a small AML builder in `crates/pc/src/acpi`) and pass them through `fw_cfg` as QEMU does: `etc/acpi/tables`, `etc/acpi/rsdp`, and the linker/loader script `etc/table-loader`. The DSDT has the PCI root with `_PRT` and PIRQ link devices, the ISA devices, a control-method power button on GPE0 bit 0, and `\_S5`.
+  - A PIIX4 power management function at 00:01.3 holds PM1 event and control, the PM timer and GPE0 at I/O 0x600 (where SeaBIOS puts them when a table loader exists), with the SCI on IRQ 9. Writing SLP_EN with the S5 sleep type ends the run, and the control socket's `power` presses the power button.
+  - XP was installed with **no ACPI and no MP table** ("Standard PC" HAL, PIC + PIT) and keeps that HAL. Our SeaBIOS build sets `CONFIG_MPTABLE=n`: with an MP table present, Setup would pick the MPS uniprocessor HAL, which needs a local APIC and an I/O APIC.
+  - There is no MADT yet. It belongs in `acpi::build`, as another `Builder::add_table` call next to the FADT.
 - **Serial:** COM1 is a 16550A UART at `0x3F8`, IRQ 4. `--serial PATH` (or `-` for stderr) logs what the guest sends, and the control socket's `serial LINE` types into it. Linux takes `console=ttyS0`.
 - **Hot MMIO and ports, handled inside the VM:** APIC TPR (if we move to an APIC HAL), PIC EOI, and PIT counter reads. Everything else exits to the host.
 
