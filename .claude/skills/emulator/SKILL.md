@@ -7,6 +7,7 @@ description: How to build, run, drive and debug the 86slopper emulator from an a
 
 ## Never block on a guest
 
+- **Never open an emulator window**, not even for a smoke test: the user works on this Mac and windows pop up in front of them. `scripts/vm start` runs headless; leave anything that needs a real window or mouse to the user as manual steps.
 - **Run every guest in the background** with `scripts/vm start`. Each tool call should come back within a minute or two. Don't use one long `sleep` or a `timeout` of 5+ minutes in the foreground.
 - **Check in with short calls:** `scripts/vm status`, `scripts/vm shot` or `scripts/vm wait-text` (bounded, 60 s by default). Repeat them as often as needed. A long install is many short check-ins, not one long call.
 - **Every wait loop needs a limit.** An `until [ -S sock ]` with no count hung for minutes once when the emulator failed to start.
