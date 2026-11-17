@@ -177,6 +177,9 @@ pub const SC_TOP_LEFT_C: u32 = 0x1c88;
 pub const SC_BOTTOM_RIGHT_C: u32 = 0x1c8c;
 pub const HOST_DATA0: u32 = 0x17c0;
 pub const HOST_DATA_LAST: u32 = 0x17e0;
+/// An undocumented HOST_DATA port after HOST_DATA_LAST. XP's ATI driver
+/// streams texture uploads through it.
+pub const HOST_DATA_PORT: u32 = 0x17e4;
 pub const RB2D_DSTCACHE_CTLSTAT: u32 = 0x342c;
 pub const DSTCACHE_CTLSTAT: u32 = 0x1714;
 pub const RB3D_DSTCACHE_CTLSTAT: u32 = 0x325c;
@@ -199,4 +202,10 @@ pub const I2C_DATA: u32 = 0x0098;
 /// Undocumented queue status registers that XP's ATI driver polls until the
 /// engine is idle: the low five bits of 0x790 read 2 and those of 0x7B0 read 8,
 /// then 0xA10's low half reads 0x3333.
+/// The IDCT and motion compensation engine (MPEG decode), from 0x1F80 to
+/// 0x1FBC. radeon_reg.h names only RUNS, LEVELS, AUTH_CONTROL, AUTH and
+/// CONTROL. XP's ATI driver polls 0x1FB4 until bit 31 is set before it
+/// changes the display mode, so we report the engine as idle there.
+pub const IDCT_STATUS: u32 = 0x1fb4;
+pub const IDCT_IDLE: u32 = 1 << 31;
 pub const IDLE_QUEUE_STATUS: [(u32, u32); 3] = [(0x0790, 0x02), (0x07b0, 0x08), (0x0a10, 0x3333)];

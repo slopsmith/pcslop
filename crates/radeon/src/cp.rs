@@ -144,7 +144,7 @@ impl Radeon {
         i
     }
 
-    fn cp_reg_write(&mut self, mem: &mut dyn BusMemory, reg: u32, v: u32) {
+    pub(crate) fn cp_reg_write(&mut self, mem: &mut dyn BusMemory, reg: u32, v: u32) {
         if reg >= crate::MMIO_SIZE {
             return;
         }

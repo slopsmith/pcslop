@@ -353,3 +353,97 @@ fn triangles_crossing_the_eye_plane_draw_only_their_visible_part() {
     assert_eq!(g.px(32, 30), 0xffff_0000);
     assert_eq!(g.px(32, 10), 0);
 }
+
+fn textured_sprite(g: &mut Gpu, unit: u32, logical_id: u32) {
+    for i in 0..16 {
+        g.put(TEXTURE as usize + i * 4, 0xff00_ff00);
+    }
+    g.w(GB_ENABLE, 1 | 1 << 16);
+    g.w(GA_POINT_SIZE, 32 << 16 | 32);
+    g.w(VAP_OUT_VTX_FMT_0, 1);
+    g.w(RS_IP_0, 1 << 16 | 4 << 19 | 5 << 22);
+    g.w(RS_INST_0, 1 << 3);
+    let u = 4 * unit;
+    g.w(TX_FILTER0_0 + u, logical_id << 28);
+    g.w(TX_FORMAT0_0 + u, 3 | 3 << 11);
+    g.w(TX_FORMAT1_0 + u, 0xa60c);
+    g.w(TX_OFFSET_0 + u, VRAM + TEXTURE);
+    g.w(TX_ENABLE, 1 << unit);
+    g.w(US_TEX_INST_0, 1 << 15);
+    g.fragment(&[PASS_COLOUR], 1);
+    g.draw(1, &[v(4.0, 4.0, RED)]);
+}
+
+#[test]
+fn the_fragment_program_finds_a_texture_map_by_its_logical_id() {
+    let mut g = Gpu::new();
+    textured_sprite(&mut g, 3, 0);
+    assert_eq!(g.px(4, 4), 0xff00_ff00);
+}
+
+#[test]
+fn a_texture_map_with_another_logical_id_reads_as_disabled() {
+    let mut g = Gpu::new();
+    textured_sprite(&mut g, 0, 3);
+    assert_eq!(g.px(4, 4), 0xff00_0000);
+}
+
+#[test]
+fn indx_buffer_streams_a_vertex_program_into_vector_memory() {
+    let mut g = Gpu::new();
+    g.constant(0, [2.0, 2.0, 1.0, 1.0]);
+    g.constant(1, [16.0, 8.0, 0.0, 0.0]);
+    let code = [pvs(4, 2, 0, [src(1, 0), src(2, 0), src(2, 1)]), pvs(3, 2, 1, [src(1, 1), ZERO, ZERO])];
+    let base = 0x8000;
+    for (i, d) in code.iter().flatten().enumerate() {
+        g.ram.0[base + 4 * i..][..4].copy_from_slice(&d.to_le_bytes());
+    }
+    g.w(VAP_PVS_VECTOR_INDX_REG, 0);
+    let one_reg = 1 << 31 | VAP_PVS_VECTOR_DATA_REG >> 2;
+    g.r.execute(&mut g.ram, &[pkt3(0x33, 3), one_reg, base as u32, 8]);
+    g.w(VAP_PVS_CODE_CNTL_0, 1 << 20);
+    g.draw(13, &quad(0.0, 0.0, 4.0, 4.0, RED));
+    assert_eq!(g.count(0xffff_0000), 64);
+    assert_eq!(g.px(16, 8), 0xffff_0000);
+}
+
+#[test]
+fn draw_128_takes_indices_when_its_walk_says_so() {
+    let mut g = Gpu::new();
+    let base = 0x8000;
+    for (i, d) in quad(0.0, 0.0, 8.0, 8.0, BLUE).iter().flatten().enumerate() {
+        g.ram.0[base + 4 * i..][..4].copy_from_slice(&f(*d).to_le_bytes());
+    }
+    let p = [pkt3(0x2f, 3), 1, 8 | 8 << 8, base as u32, pkt3(0x39, 4), 4 | 1 << 4 | 6 << 16, 1 << 16, 2, 2 | 3 << 16];
+    g.r.execute(&mut g.ram, &p);
+    assert_eq!(g.count(0xff00_00ff), 64);
+}
+
+#[test]
+fn a_dual_math_instruction_leaves_a_reciprocal_square_root_in_the_alternate_temporary() {
+    let mut g = Gpu::new();
+    g.constant(0, [4.0, 0.0, 0.0, 0.0]);
+    let mut add = pvs(3, 0, 1, [src(1, 1), ZERO, src(2, 0) | 3 << 27]);
+    add[0] |= 2 << 27;
+    let alt_w = 3 | 3 << 13 | 3 << 16 | 3 << 19 | 3 << 22;
+    let scale = pvs(2, 2, 1, [src(0, 1), alt_w, ZERO]);
+    g.vertex_program(&[pvs(3, 2, 0, [src(1, 0), ZERO, ZERO]), add, scale]);
+    g.draw(13, &quad(0.0, 0.0, 4.0, 4.0, RED));
+    let red = g.px(1, 1) >> 16 & 0xff;
+    assert!((0x7f..=0x80).contains(&red), "red {red:#x}");
+}
+
+#[test]
+fn lit_takes_its_dot_products_and_exponent_from_each_operands_w() {
+    let mut g = Gpu::new();
+    g.constant(0, [9.0, 9.0, 9.0, 0.5]);
+    g.constant(1, [9.0, 9.0, 9.0, 0.5]);
+    g.constant(2, [0.0, 0.0, 0.0, 2.0]);
+    let lit = pvs(4 | 1 << 6, 2, 1, [src(2, 0), src(2, 1), src(2, 2)]);
+    g.vertex_program(&[pvs(3, 2, 0, [src(1, 0), ZERO, ZERO]), lit]);
+    g.draw(13, &quad(0.0, 0.0, 4.0, 4.0, RED));
+    let p = g.px(1, 1);
+    assert_eq!(p >> 16 & 0xff, 0xff);
+    assert!((0x7f..=0x80).contains(&(p >> 8 & 0xff)));
+    assert!((0x3f..=0x40).contains(&(p & 0xff)));
+}

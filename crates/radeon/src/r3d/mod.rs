@@ -190,28 +190,25 @@ impl Radeon {
     pub(crate) fn packet_3d(&mut self, mem: &mut dyn BusMemory, opcode: u8, body: &[u32]) -> bool {
         let get = |i: usize| body.get(i).copied().unwrap_or(0);
         match opcode {
-            op::DRAW_IMMD => self.draw_3d(mem, get(1), Verts::Immediate(body.get(2..).unwrap_or(&[]))),
-            op::DRAW_IMMD_2 | op::DRAW_128 => self.draw_3d(mem, get(0), Verts::Immediate(body.get(1..).unwrap_or(&[]))),
-            op::DRAW_VBUF => self.draw_3d(mem, get(1), Verts::List),
-            op::DRAW_VBUF_2 => self.draw_3d(mem, get(0), Verts::List),
-            op::DRAW_INDX | op::DRAW_INDX_2 => {
-                let skip = if opcode == op::DRAW_INDX { 1 } else { 0 };
-                let vf = get(skip);
-                let words = body.get(skip + 1..).unwrap_or(&[]);
-                if words.is_empty() {
-                    self.r3d.pending_indx = Some(vf);
-                } else {
-                    let idx = self.indices(vf, words);
-                    self.draw_3d(mem, vf, Verts::Indices(idx));
-                }
+            op::DRAW_IMMD | op::DRAW_VBUF | op::DRAW_INDX => self.draw_packet(mem, get(1), body.get(2..).unwrap_or(&[])),
+            op::DRAW_IMMD_2 | op::DRAW_VBUF_2 | op::DRAW_INDX_2 | op::DRAW_128 => {
+                self.draw_packet(mem, get(0), body.get(1..).unwrap_or(&[]))
             }
             op::INDX_BUFFER => {
                 let skip = bits(get(0), 16, 3) as usize;
                 let size = (get(2) & 0x7f_ffff) as usize;
                 let words = self.mc_read_dwords(mem, get(1) & !3, size.min(1 << 22));
+                let words = words.get(skip..).unwrap_or(&[]);
+                let dest = (get(0) & 0x1fff) << 2;
                 if let Some(vf) = self.r3d.pending_indx.take() {
-                    let idx = self.indices(vf, words.get(skip..).unwrap_or(&[]));
+                    let idx = self.indices(vf, words);
                     self.draw_3d(mem, vf, Verts::Indices(idx));
+                } else {
+                    let one = get(0) & (1 << 31) != 0;
+                    for (k, &v) in words.iter().enumerate() {
+                        let reg = if one { dest } else { dest + 4 * k as u32 };
+                        self.cp_reg_write(mem, reg, v);
+                    }
                 }
             }
             op::LOAD_VBPNTR => {
@@ -233,6 +230,20 @@ impl Radeon {
             _ => return false,
         }
         true
+    }
+
+    /// Runs a draw packet's VAP_VF_CNTL and the dwords after it, which hold
+    /// indices, nothing or vertices as its PRIM_WALK field says.
+    fn draw_packet(&mut self, mem: &mut dyn BusMemory, vf: u32, words: &[u32]) {
+        match bits(vf, 4, 2) {
+            1 if words.is_empty() => self.r3d.pending_indx = Some(vf),
+            1 => {
+                let idx = self.indices(vf, words);
+                self.draw_3d(mem, vf, Verts::Indices(idx));
+            }
+            2 => self.draw_3d(mem, vf, Verts::List),
+            _ => self.draw_3d(mem, vf, Verts::Immediate(words)),
+        }
     }
 
     fn indices(&self, vf: u32, words: &[u32]) -> Vec<u32> {
@@ -435,6 +446,20 @@ impl Radeon {
         Some(t)
     }
 
+    /// The enabled texture maps by the logical id in their TX_FILTER0, which
+    /// is what the fragment program's TEX_ID names. Mesa gives every map its
+    /// own unit number as id; XP's ATI driver rotates the physical unit and
+    /// keeps id 0.
+    fn textures(&mut self, mem: &mut dyn BusMemory) -> [Option<Texture>; 16] {
+        let mut out: [Option<Texture>; 16] = Default::default();
+        for unit in (0..16).rev() {
+            if let Some(t) = self.texture(mem, unit) {
+                out[(self.reg(TX_FILTER0_0 + 4 * unit) >> 28) as usize] = Some(t);
+            }
+        }
+        out
+    }
+
     fn fragment_program(&self) -> us::Program {
         let config = self.reg(US_CONFIG);
         let levels = (config & 7) as usize + 1;
@@ -478,7 +503,7 @@ impl Radeon {
     }
 
     fn raster_state(&mut self, mem: &mut dyn BusMemory) -> Raster {
-        let textures = std::array::from_fn(|u| self.texture(mem, u as u32));
+        let textures = self.textures(mem);
         let offset = if self.reg(GB_TILE_CONFIG) & (1 << 16) != 0 { 1088 } else { 1440 };
         let f = |r: u32| f32::from_bits(self.reg(r));
         let multi = bits(self.reg(RB3D_CCTL), 5, 2) as usize + 1;
@@ -650,6 +675,9 @@ impl Radeon {
             _ => {}
         }
         self.regs[ZB_ZPASS_DATA as usize / 4] = r.zpass;
+        if self.trace.is_some() {
+            self.note(&format!("3d: {} pixels", r.pixels));
+        }
         if r.pixels > 0 {
             self.vga.touch();
         }

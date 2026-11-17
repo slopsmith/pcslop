@@ -211,6 +211,9 @@ impl Radeon {
             dt | (g >> 8 & 0xf) | (g >> 4 & 0xf) << 8 | (g >> 12 & 3) << 16 | (g >> 14 & 1) << 30;
         let mix = self.reg(DP_MIX) & !0x00ff_0700;
         self.regs[DP_MIX as usize / 4] = mix | (g & 0x00ff_0000) | (g >> 24 & 7) << 8;
+        // A GMC write also sets DP_CNTL's directions, as 86Box's Rage 128 model
+        // does after ATI's RAGE 128 PRO Register Reference Guide (DP_CNTL).
+        self.regs[DP_CNTL as usize / 4] |= DST_X_LEFT_TO_RIGHT | DST_Y_TOP_TO_BOTTOM;
         if g & GMC_SRC_PITCH_OFFSET_CNTL == 0 {
             self.engine.src = self.engine.default;
         }
@@ -277,7 +280,7 @@ impl Radeon {
                 self.line(from, to, mem);
                 self.engine.line = to;
             }
-            HOST_DATA0..=HOST_DATA_LAST => self.host_data(&[v], reg == HOST_DATA_LAST, mem),
+            HOST_DATA0..=HOST_DATA_PORT => self.host_data(&[v], reg == HOST_DATA_LAST, mem),
             _ => return false,
         }
         true

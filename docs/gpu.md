@@ -127,7 +127,13 @@ What it needs on the way:
 - Blits into system memory: it reads surfaces back, such as theme bitmaps before it alpha-blends them, by blitting them into PCI GART pages and reading those with the CPU.
 - AlphaBlend as a point sprite (`3D_DRAW_IMMD`, one vertex, `GA_POINT_SIZE` and stuffed texture coordinates) with a one-instruction fragment program and a premultiplied blend, clipped to the destination rectangle with `SC_CLIP_0` and `SC_CLIP_RULE`. Per-pixel alpha onto the screen uses a quad with two textures, the source and the destination itself, blended in the fragment program.
 
-dxdiag's Direct3D 7 test bugchecks the guest: after the mode set, the driver polls undocumented registers `0x1F84`, `0x1F9C`, `0x1FA8` and `0x1FB4` (next to `IDCT_LEVELS`) millions of times, gives up, reads the CP state and bugchecks.
+dxdiag's DirectDraw tests and its Direct3D 7, 8 and 9 tests pass. They needed:
+
+- **IDCT idle.** Before the test's mode switch the driver idles every engine, including the MPEG IDCT block at `0x1F80`-`0x1FBC`: it reads `0x1F84`, `0x1F9C` and `0x1FA8`, then waits for bit 31 of `0x1FB4`. We report that bit set.
+- **Packets the CPU path got wrong.** `3D_DRAW_128` carries indices or vertices as its `VAP_VF_CNTL` walk says. `INDX_BUFFER` can stream into any register: the driver uploads vertex programs into `VAP_PVS_VECTOR_DATA_REG` with it.
+- **Logical texture ids.** A fragment program's `TEX_ID` names the id in bits 31:28 of `TX_FILTER0`, not the physical map. The driver rotates the physical map every frame and keeps id 0.
+- **Texture uploads** through host data written to `0x17E4`, an undocumented port after `HOST_DATA_LAST`, with `DST_TILE` (`0x1700`) set. A `DP_GUI_MASTER_CNTL` write sets `DP_CNTL`'s directions, as on the Rage 128.
+- **Vertex lighting.** Fixed-function lighting compiles to vertex programs that use dual-math instructions, which Mesa never emits: a vector instruction with `PVS_DST_DUAL_MATH_OP` set also runs a math opcode (here reciprocal square root) on its third operand and writes alternate temporary 0. LIT takes N.H, N.L and the exponent from the w of its three operands.
 
 Its hottest MMIO polls: `CP_RB_RPTR` (about 900,000 reads while it waited on a fence that never came), then the DDC GPIOs (about 15,000 each).
 
@@ -135,9 +141,9 @@ Its hottest MMIO polls: `CP_RB_RPTR` (about 900,000 reads while it waited on a f
 
 `crates/radeon/src/r3d` runs the R300's 3D pipeline on the CPU while the packet executes, as a reference to check a Metal backend against:
 
-- **Packets:** `3D_DRAW_IMMD(_2)`, `3D_DRAW_VBUF(_2)`, `3D_DRAW_INDX(_2)`, `INDX_BUFFER`, `3D_LOAD_VBPNTR` and `3D_DRAW_128`.
+- **Packets:** `3D_DRAW_IMMD(_2)`, `3D_DRAW_VBUF(_2)`, `3D_DRAW_INDX(_2)`, `INDX_BUFFER` (indices or any register), `3D_LOAD_VBPNTR` and `3D_DRAW_128`.
 - **Vertex fetch:** a vertex's dwords come from the packet or from each array of structures in turn, and the PSC (`VAP_PROG_STREAM_CNTL*`) splits them into input vectors: floats, bytes, D3DCOLOR, shorts and packed 10/11-bit formats, with SIGNED and NORMALIZE.
-- **Vertex shader:** the PVS program in vector memory (code at 0, constants at 512), interpreted per vertex: every R3xx vector and math opcode, the macro MAD, relative addressing through A0, and saturation. `PVS_BYPASS` passes inputs through. Flow control (loops, JSR) is not implemented.
+- **Vertex shader:** the PVS program in vector memory (code at 0, constants at 512), interpreted per vertex: every R3xx vector and math opcode, the macro MAD, dual-math instructions, relative addressing through A0, and saturation. `PVS_BYPASS` passes inputs through. Flow control (loops, JSR) is not implemented.
 - **Setup:** `VAP_OUT_VTX_FMT_*` lays out position, point size, colours and texture coordinates. Triangles behind the w = 0 plane are clipped, then the VTE divides by w and applies the viewport (whose registers have a second address at 0x1D98). Points become sprites, lines become quads; quads, strips, fans and polygons become triangles. Culling follows `SU_CULL_MODE`; polygon offset `SU_POLY_OFFSET_*`.
 - **Rasterizer:** triangles are scan-converted in 1/16 pixel fixed point with a top-left fill rule, inside the scissor and the clip rectangles (offset by 1440 with 1/12 subpixels, 1088 with 1/16, as AMD's R5xx guide says for `GB_TILE_CONFIG`). Attributes are interpolated perspective-correctly; the RS instructions place colours and texture coordinates in the fragment shader's registers.
 - **Fragment shader:** the US program, interpreted on 2x2 quads so texture lookups can take their level of detail from neighbouring pixels: nodes, TEX/TXP/TXB/KIL, and every RGB and alpha ALU opcode with pre-subtract, swizzles, modifiers, output modifiers and clamping.

@@ -413,6 +413,7 @@ impl Radeon {
             CONFIG_REG_1_BASE => self.bars.mmio,
             CONFIG_REG_APER_SIZE => MMIO_SIZE,
             RBBM_STATUS => RBBM_FIFOCNT_IDLE,
+            IDCT_STATUS => self.reg(IDCT_STATUS) | IDCT_IDLE,
             MC_STATUS => self.reg(MC_STATUS) | MC_STATUS_IDLE,
             0x0f00..=0x0ffc => {
                 let i = (reg - 0x0f00) as usize;

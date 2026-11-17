@@ -378,3 +378,32 @@ fn destination_compare_keeps_pixels_of_the_reference_colour() {
     copy(&mut r, dt | NO_BRUSH | SRC_COLOR | FROM_VRAM | 0xcc << 16, 3, (0, 0), (0, 1), (2, 1));
     assert_eq!([px(&r, 4, 0, 1), px(&r, 4, 1, 1)], [5, 9]);
 }
+
+#[test]
+fn colour_host_data_also_arrives_through_the_port_after_host_data_last() {
+    let (mut r, dt) = engine(4);
+    w(&mut r, DP_GUI_MASTER_CNTL, dt | NO_BRUSH | SRC_COLOR | FROM_HOST | 0xcc << 16);
+    w(&mut r, DST_Y_X, 1 << 16 | 1);
+    w(&mut r, DST_HEIGHT_WIDTH, 2 << 16 | 2);
+    w(&mut r, HOST_DATA_PORT, 0x2222_1111);
+    w(&mut r, HOST_DATA_PORT, 0x4444_3333);
+    assert_eq!(
+        [(1, 1), (2, 1), (1, 2), (2, 2)].map(|(x, y)| px(&r, 2, x, y)),
+        [0x1111, 0x2222, 0x3333, 0x4444]
+    );
+}
+
+#[test]
+fn a_gmc_write_makes_the_next_host_blit_run_forwards() {
+    let (mut r, dt) = engine(4);
+    w(&mut r, DP_CNTL, 0);
+    w(&mut r, DP_GUI_MASTER_CNTL, dt | NO_BRUSH | SRC_COLOR | FROM_HOST | 0xcc << 16);
+    w(&mut r, DST_Y_X, 0);
+    w(&mut r, DST_HEIGHT_WIDTH, 2 << 16 | 2);
+    w(&mut r, HOST_DATA0, 0x2222_1111);
+    w(&mut r, HOST_DATA_LAST, 0x4444_3333);
+    assert_eq!(
+        [(0, 0), (1, 0), (0, 1), (1, 1)].map(|(x, y)| px(&r, 2, x, y)),
+        [0x1111, 0x2222, 0x3333, 0x4444]
+    );
+}

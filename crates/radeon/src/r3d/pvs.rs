@@ -3,7 +3,13 @@
 //! The instruction encoding and the meaning of each opcode follow Mesa's
 //! r300 driver: r300_reg.h and compiler/r3xx_vertprog.c (MIT license; Nicolai
 //! Hähnle, Ben Skeggs, Jerome Glisse, Corbin Simpson and others), and the
-//! older classic r300_vertprog.c for LIT's operand layout.
+//! older classic r300_vertprog.c for LIT.
+//!
+//! Dual-math instructions, which XP's ATI driver emits and Mesa does not,
+//! are decoded from that driver's programs: a vector instruction with
+//! PVS_DST_DUAL_MATH_OP set also runs a math opcode on the third operand's
+//! x. The opcode is DUAL_MATH_OP above the third operand's bits 25-26, and
+//! bits 27-28 pick the component of alternate temporary 0 it writes.
 
 use super::V4;
 
@@ -116,6 +122,13 @@ impl Machine<'_> {
         let d0 = d[0];
         let (a, b, c) = (self.read(Src(d[1])), self.read(Src(d[2])), self.read(Src(d[3])));
         let op = d0 & 0x3f;
+        let dual = (d0 >> 27) & 3;
+        let vector_op = d0 & (3 << 6) == 0;
+        let side = (vector_op && dual != 0).then(|| {
+            let x = self.read(Src(d[3] & !(0xf << 25)))[0];
+            let me_op = dual << 2 | (d[3] >> 25) & 3;
+            (math(me_op, [x; 4], [0.0; 4], [0.0; 4]), (d[3] >> 27) & 3)
+        });
         let v = if d0 & (1 << 6) != 0 {
             math(op, a, b, c)
         } else if d0 & (1 << 7) != 0 {
@@ -125,6 +138,9 @@ impl Machine<'_> {
         };
         if let Some(v) = v {
             self.write(d0, v);
+        }
+        if let Some((Some(m), comp)) = side {
+            self.alt[0][comp as usize] = m[0];
         }
     }
 }
@@ -169,8 +185,11 @@ fn vector(op: u32, a: V4, b: V4, c: V4) -> Option<V4> {
     })
 }
 
-fn lit(a: V4) -> V4 {
-    let (ndotl, exponent, ndoth) = (a[0], a[1].clamp(-128.0, 128.0), a[3]);
+/// LIT takes N.H from the first operand's w, N.L from the second's and the
+/// exponent from the third's. Mesa's classic driver rotated one vector into
+/// the three operands; XP's ATI driver passes three separate scalars.
+fn lit(a: V4, b: V4, c: V4) -> V4 {
+    let (ndoth, ndotl, exponent) = (a[3], b[3], c[3].clamp(-128.0, 128.0));
     let spec = if ndotl > 0.0 { ndoth.max(0.0).powf(exponent) } else { 0.0 };
     [1.0, ndotl.max(0.0), spec, 1.0]
 }
@@ -188,7 +207,7 @@ fn math(op: u32, a: V4, b: V4, c: V4) -> Option<V4> {
             return Some([f, x.abs() / f.exp2(), l, 1.0]);
         }
         3 => x.exp(),
-        4 => return Some(lit(a)),
+        4 => return Some(lit(a, b, c)),
         5 | 13 | 14 | 15 => x.powf(c[0]),
         6 | 7 | 19 => {
             if op == 7 && x == 0.0 { f32::MAX } else { 1.0 / x }

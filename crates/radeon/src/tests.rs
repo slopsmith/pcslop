@@ -347,3 +347,9 @@ fn queue_status_reads_idle_for_xps_wait_loop() {
     assert_eq!(r.mmio_read(0x07b0, 4) & 0x1f, 8);
     assert_eq!(r.mmio_read(0x0a10, 4) & 0xffff, 0x3333);
 }
+
+#[test]
+fn the_idct_engine_reads_idle_for_xps_mode_switch() {
+    let mut r = card();
+    assert_ne!(r.mmio_read(IDCT_STATUS, 4) & IDCT_IDLE, 0);
+}
