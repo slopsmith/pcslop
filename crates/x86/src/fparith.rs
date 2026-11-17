@@ -1,7 +1,7 @@
 //! IEEE arithmetic with x86 rounding control and exception flags, built on
-//! the host's round-to-nearest operations. Error-free transformations
-//! (TwoSum for addition, FMA residuals for the rest) give the exact sign of
-//! the rounding error, which decides directed rounding and the precision flag.
+//! the host's round-to-nearest operations. TwoSum for addition and exact
+//! integer products for the rest give the exact sign of the rounding error,
+//! which decides directed rounding and the precision flag.
 //!
 //! Approximations: tininess is judged on the rounded result, and the
 //! underflow flag is only raised for inexact tiny results (the masked rule).
@@ -23,7 +23,6 @@ pub trait Float:
     const BITS: u32;
     fn to_bits64(self) -> u64;
     fn from_bits64(b: u64) -> Self;
-    fn fma(self, b: Self, c: Self) -> Self;
     fn root(self) -> Self;
     fn nan(self) -> bool;
     fn infinite(self) -> bool;
@@ -70,9 +69,6 @@ macro_rules! impl_float {
             fn from_bits64(b: u64) -> Self {
                 <$t>::from_bits(b as $u)
             }
-            fn fma(self, b: Self, c: Self) -> Self {
-                self.mul_add(b, c)
-            }
             fn root(self) -> Self {
                 self.sqrt()
             }
@@ -108,6 +104,33 @@ pub enum Op {
     Mul,
     Div,
     Sqrt,
+}
+
+/// `m * 2^e` with the sign, exactly, for a finite `f64`.
+fn decompose(v: f64) -> (bool, u64, i32) {
+    let bits = v.to_bits();
+    let exp = ((bits >> 52) & 0x7ff) as i32;
+    let frac = bits & ((1 << 52) - 1);
+    if exp == 0 { (bits >> 63 != 0, frac, -1074) } else { (bits >> 63 != 0, frac | 1 << 52, exp - 1075) }
+}
+
+/// The exact order of `x * y` against `z` (finite values), where FMA
+/// residuals would underflow.
+fn product_cmp(x: f64, y: f64, z: f64) -> Ordering {
+    let (sx, mx, ex) = decompose(x);
+    let (sy, my, ey) = decompose(y);
+    let (sz, mz, ez) = decompose(z);
+    let (p, ep, sp) = (mx as u128 * my as u128, ex + ey, sx != sy);
+    let signum = |nonzero: bool, neg: bool| if !nonzero { 0 } else if neg { -1 } else { 1 };
+    let (left, right) = (signum(p != 0, sp), signum(mz != 0, sz));
+    if left != right || left == 0 {
+        return left.cmp(&right);
+    }
+    let z128 = mz as u128;
+    let top_p = 128 - p.leading_zeros() as i32 + ep;
+    let top_z = 128 - z128.leading_zeros() as i32 + ez;
+    let mag = top_p.cmp(&top_z).then_with(|| (p << p.leading_zeros()).cmp(&(z128 << z128.leading_zeros())));
+    if sp { mag.reverse() } else { mag }
 }
 
 fn sign_of<F: Float>(x: F) -> Ordering {
@@ -152,13 +175,13 @@ pub fn arith<F: Float>(op: Op, a: F, b: F, rc: u8) -> (F, u16) {
             let bb = r - a;
             sign_of((a - (r - bb)) + (b_eff - bb))
         }
-        Op::Mul => sign_of(a.fma(b, -r)),
+        Op::Mul => product_cmp(a.widen(), b.widen(), r.widen()),
         Op::Div if b.infinite() || a == F::ZERO => Ordering::Equal,
         Op::Div => {
-            let s = sign_of((-r).fma(b, a));
+            let s = product_cmp(r.widen(), b.widen(), a.widen()).reverse();
             if b.negative() { s.reverse() } else { s }
         }
-        Op::Sqrt => sign_of((-r).fma(r, a)),
+        Op::Sqrt => product_cmp(r.widen(), r.widen(), a.widen()).reverse(),
     };
     if err == Ordering::Equal {
         if matches!(op, Op::Add | Op::Sub) && r == F::ZERO && rc == rc::DOWN && (a.negative() || b_eff.negative()) {
@@ -223,6 +246,18 @@ mod tests {
         assert_eq!(arith(Op::Add, 1.0f64, 2.0, rc::UP), (3.0, 0));
         let (s, e) = arith(Op::Add, 1.0f64, 1e-30, rc::UP);
         assert_eq!((s, e), (1.0f64.next_up(), exc::PE));
+    }
+
+    #[test]
+    fn products_that_underflow_to_zero_are_inexact() {
+        let tiny = f64::from_bits(0x38f0_411b);
+        let (r, e) = arith(Op::Mul, tiny, 2.7e-307, rc::NEAREST);
+        assert_eq!(r, 0.0);
+        assert_eq!(e, exc::PE | exc::UE);
+        let (r, _) = arith(Op::Mul, tiny, 2.7e-307, rc::UP);
+        assert_eq!(r.to_bits(), 1);
+        let (r, e) = arith(Op::Div, tiny, 1.0e300, rc::DOWN);
+        assert_eq!((r, e), (0.0, exc::PE | exc::UE));
     }
 
     #[test]
