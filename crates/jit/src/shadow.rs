@@ -100,6 +100,13 @@ impl Shadow {
         Some(table + (((lin >> 12) & 511) as usize) * 8)
     }
 
+    /// The physical page `lin` maps to, if mapped.
+    pub fn phys(&self, mem: &[u8], lin: u32) -> Option<u32> {
+        let off = self.leaf(mem, lin)?;
+        let d = read_desc(mem, off);
+        (d & VALID != 0).then_some((d & 0xffff_f000) as u32)
+    }
+
     /// True if `lin` is mapped, and writable when `write` is set.
     pub fn maps(&self, mem: &[u8], lin: u32, write: bool) -> bool {
         let Some(off) = self.leaf(mem, lin) else { return false };

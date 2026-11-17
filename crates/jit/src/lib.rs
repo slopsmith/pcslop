@@ -231,6 +231,7 @@ pub struct Stats {
     pub mmio_exits: u64,
     pub smc_invalidations: u64,
     pub stale_blocks: u64,
+    pub vcache_bumps: u64,
     /// MISS exits for blocks that exist but had lost their lookup slot.
     pub lookup_misses: u64,
     /// Shadow entries filled inside the VM without an exit.
@@ -744,6 +745,7 @@ impl Jit {
 
     /// Invalidates every dispatcher cache entry.
     fn bump_vcache(&mut self) {
+        self.stats.vcache_bumps += 1;
         let s = self.state();
         s.vepoch = s.vepoch.wrapping_add(1);
     }
@@ -830,9 +832,11 @@ impl Jit {
         let r = self.root;
         // The TLB may hold the entry this replaces, possibly writable to a page
         // that is about to become code.
-        if self.shadow[r].maps(self.mem.as_slice(), lin, false) {
+        if let Some(old) = self.shadow[r].phys(self.mem.as_slice(), lin) {
             self.tlbi_page(lin);
-            self.bump_vcache();
+            if old != phys & !0xfff {
+                self.bump_vcache();
+            }
         }
         let leaf = match self.shadow[r].map(self.mem.as_mut_slice(), lin, phys, writable) {
             Some(off) => off,
