@@ -1045,7 +1045,7 @@ impl<B: Bus> Ctx<'_, B> {
                 if self.cpu.cr4 & cr4::TSD != 0 && self.cpu.protected_mode() && self.cpu.cpl() != 0 {
                     return gp(0);
                 }
-                let t = self.cpu.tsc;
+                let t = self.cpu.read_tsc();
                 self.cpu.regs[EAX] = t as u32;
                 self.cpu.regs[EDX] = (t >> 32) as u32;
             }
@@ -1247,7 +1247,7 @@ impl<B: Bus> Ctx<'_, B> {
 
     fn rdmsr(&mut self, msr: u32) -> Res<u64> {
         Ok(match msr {
-            0x10 => self.cpu.tsc,
+            0x10 => self.cpu.read_tsc(),
             0x1b => self.cpu.apic_base,
             0x17 | 0x8b => 0,
             0x174 => self.cpu.sysenter_cs as u64,
@@ -1259,7 +1259,7 @@ impl<B: Bus> Ctx<'_, B> {
 
     fn wrmsr(&mut self, msr: u32, v: u64) -> Res<()> {
         match msr {
-            0x10 => self.cpu.tsc = v,
+            0x10 => self.cpu.write_tsc(v),
             0x1b => self.cpu.apic_base = v,
             0x8b => {}
             0x174 => self.cpu.sysenter_cs = v as u32,

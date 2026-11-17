@@ -222,6 +222,10 @@ pub struct Cpu {
     pub cr4: u32,
     pub dr: [u32; 8],
     pub tsc: u64,
+    /// With `tsc_mul` set, the TSC counts host clock ticks since `tsc_origin`,
+    /// times `tsc_mul`; `tsc` is then unused.
+    pub tsc_origin: u64,
+    pub tsc_mul: u64,
     pub sysenter_cs: u32,
     pub sysenter_esp: u32,
     pub sysenter_eip: u32,
@@ -264,6 +268,8 @@ impl Cpu {
             cr4: 0,
             dr: [0; 8],
             tsc: 0,
+            tsc_origin: 0,
+            tsc_mul: 0,
             sysenter_cs: 0,
             sysenter_esp: 0,
             sysenter_eip: 0,
@@ -305,6 +311,7 @@ impl Cpu {
         self.cr4 = 0;
         self.dr = [0, 0, 0, 0, 0, 0, 0xffff_0ff0, 0x400];
         self.apic_base = 0xfee0_0000 | (1 << 11) | (1 << 8);
+        self.write_tsc(0);
         self.halted = false;
         self.interrupt_shadow = false;
         self.tlb.flush();
@@ -312,6 +319,27 @@ impl Cpu {
         self.xmm = [0; 8];
         self.mxcsr = mxcsr::RESET;
         self.ferr_pending = false;
+    }
+
+    /// Runs the TSC from the host clock at about 2.8 GHz.
+    pub fn start_host_tsc(&mut self) {
+        let ticks_per_sec = 1e9 * TIMEBASE.denom as f64 / TIMEBASE.numer as f64;
+        self.tsc_mul = (2.8e9 / ticks_per_sec).round().max(1.0) as u64;
+        self.write_tsc(0);
+    }
+
+    pub fn read_tsc(&self) -> u64 {
+        if self.tsc_mul == 0 {
+            return self.tsc;
+        }
+        host_ticks().wrapping_sub(self.tsc_origin).wrapping_mul(self.tsc_mul)
+    }
+
+    pub fn write_tsc(&mut self, v: u64) {
+        self.tsc = v;
+        if self.tsc_mul != 0 {
+            self.tsc_origin = host_ticks().wrapping_sub(v / self.tsc_mul);
+        }
     }
 
     pub fn protected_mode(&self) -> bool {
@@ -369,4 +397,27 @@ impl Cpu {
     pub fn set_reg16(&mut self, r: usize, v: u16) {
         self.regs[r] = (self.regs[r] & !0xffff) | v as u32;
     }
+}
+
+#[repr(C)]
+struct Timebase {
+    numer: u32,
+    denom: u32,
+}
+
+unsafe extern "C" {
+    fn mach_absolute_time() -> u64;
+    fn mach_timebase_info(info: *mut Timebase) -> i32;
+}
+
+static TIMEBASE: std::sync::LazyLock<Timebase> = std::sync::LazyLock::new(|| {
+    let mut t = Timebase { numer: 0, denom: 0 };
+    unsafe { mach_timebase_info(&mut t) };
+    t
+});
+
+/// The host's monotonic tick counter, which a Hypervisor.framework guest
+/// reads as CNTVCT_EL0 when the vCPU's virtual timer offset is 0.
+pub fn host_ticks() -> u64 {
+    unsafe { mach_absolute_time() }
 }

@@ -310,6 +310,7 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
         });
     }
     let mut cpu = Cpu::new();
+    cpu.start_host_tsc();
     let started = Instant::now();
     let mut executed: u64 = 0;
     let mut keyq = KeyQueue::default();
@@ -387,7 +388,6 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
         shared.instructions.store(executed + jit_insns, Ordering::Relaxed);
         board.pic.set_irq(13, cpu.ferr_pending);
         board.tick();
-        cpu.tsc = board.now_ns() * 28 / 10;
         if board.reset_requested {
             cpu.reset();
             board.reset();
