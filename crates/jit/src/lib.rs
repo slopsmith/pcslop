@@ -311,6 +311,9 @@ pub struct Jit {
     audit_seen: HashSet<(usize, u32, u32)>,
     /// Interpreter exits by opcode, when profiling is on.
     interp_profile: Option<HashMap<u16, u64>>,
+    /// Where the vCPU was at each kick while profiling: guest EIP of the
+    /// translated block, or a runtime offset (negative keys, 64-byte buckets).
+    pc_samples: HashMap<i64, u64>,
     /// Declared last so it is dropped after the vCPU.
     _vm: Vm,
 }
@@ -400,6 +403,7 @@ impl Jit {
             chain_in: HashMap::default(),
             stats: Stats::default(),
             interp_profile: std::env::var_os("SLOPPER_JIT_PROFILE").map(|_| HashMap::default()),
+            pc_samples: HashMap::default(),
             verify: std::env::var_os("SLOPPER_JIT_VERIFY").is_some(),
             vm_fill: std::env::var_os("SLOPPER_JIT_NO_VM_FILL").is_none(),
             afp: false,
@@ -507,6 +511,7 @@ impl Jit {
     pub fn set_profiling(&mut self, on: bool) {
         self.timing = on;
         self.interp_profile = on.then(HashMap::default);
+        self.pc_samples.clear();
         let s = &mut self.stats;
         (s.vm_ns, s.miss_ns, s.interp_ns, s.fault_ns, s.mmio_ns) = (0, 0, 0, 0, 0);
     }
@@ -519,15 +524,37 @@ impl Jit {
         let mut v: Vec<_> = p.iter().collect();
         v.sort_by(|a, b| b.1.cmp(a.1));
         let top: Vec<String> = v.iter().take(40).map(|(k, n)| format!("{k:04x}:{n}")).collect();
+        let total: u64 = self.pc_samples.values().sum();
+        let mut pcs: Vec<_> = self.pc_samples.iter().collect();
+        pcs.sort_by(|a, b| b.1.cmp(a.1));
+        let runtime: u64 = self.pc_samples.iter().filter(|(k, _)| **k < 0).map(|(_, n)| n).sum();
+        let hot: Vec<String> = pcs
+            .iter()
+            .take(30)
+            .map(|(k, n)| if **k < 0 { format!("rt+{:#x}:{n}", -**k - 1) } else { format!("{:#x}:{n}", **k) })
+            .collect();
         format!(
-            "ms in vm {:.0} miss {:.0} interp {:.0} fault {:.0} mmio {:.0}\ninterpreter exits by opcode: {}",
+            "ms in vm {:.0} miss {:.0} interp {:.0} fault {:.0} mmio {:.0}\ninterpreter exits by opcode: {}\n{total} samples, {runtime} in the runtime; hottest: {}",
             ms(s.vm_ns),
             ms(s.miss_ns),
             ms(s.interp_ns),
             ms(s.fault_ns),
             ms(s.mmio_ns),
-            top.join(" ")
+            top.join(" "),
+            hot.join(" ")
         )
+    }
+
+    fn sample_pc(&mut self) -> hvf::Result<()> {
+        let pc = self.vcpu.reg(reg::PC)?;
+        let code = layout::va(layout::CODE_CACHE)..layout::va(layout::CODE_CACHE_END);
+        let key = if code.contains(&pc) {
+            self.eip_at(pc).map_or(-1, |e| e as i64)
+        } else {
+            -((pc.wrapping_sub(layout::RUNTIME_VA) & !63) as i64) - 1
+        };
+        *self.pc_samples.entry(key).or_default() += 1;
+        Ok(())
     }
 
     /// x86 instructions retired by translated code so far.
@@ -1044,6 +1071,9 @@ impl Jit {
             }
             match exit {
                 Exit::Canceled => {
+                    if self.interp_profile.is_some() {
+                        self.sample_pc()?;
+                    }
                     // The vCPU may have stopped mid-block with guest state still in
                     // registers; let it run to the next dispatch, which saves it.
                     self.state().pending = 1;
