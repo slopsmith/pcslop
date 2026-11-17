@@ -837,6 +837,26 @@ mod against_metal {
     }
 
     #[test]
+    fn queued_draws_report_pending_writes_only_where_they_land() {
+        let mut g = Gpu::new();
+        if !g.r.use_metal() {
+            return;
+        }
+        g.draw(13, &quad(0.0, 0.0, 64.0, 64.0, RED));
+        let colour = COLOUR as usize..COLOUR as usize + PITCH * 64 * 4;
+        let m = g.r.metal.as_mut().unwrap();
+        assert!(!m.writes_pending(TEXTURE as usize, TEXTURE as usize + 4096));
+        g.r.gpu_sync();
+        assert!(!g.r.metal.as_mut().unwrap().writes_pending(colour.start, colour.end));
+        let mut g = Gpu::new();
+        g.r.use_metal();
+        g.draw(13, &quad(0.0, 0.0, 64.0, 64.0, RED));
+        let m = g.r.metal.as_mut().unwrap();
+        let pending = m.writes_pending(colour.start, colour.end);
+        assert!(pending || !m.busy(), "work still queued must be what writes the colour buffer");
+    }
+
+    #[test]
     fn colour_clears_through_the_z_buffer_match() {
         same(cbzb_clear, 0, 0);
     }

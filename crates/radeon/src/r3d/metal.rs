@@ -130,6 +130,8 @@ struct FillArgs {
 struct Arena {
     buf: Buffer,
     used: usize,
+    /// VRAM ranges the command buffer using this arena writes.
+    dirty: Vec<(usize, usize)>,
 }
 
 impl Arena {
@@ -181,6 +183,14 @@ pub(crate) struct MetalR3d {
 
 // The Metal objects are only touched while the card's owner holds it.
 unsafe impl Send for MetalR3d {}
+
+impl Drop for MetalR3d {
+    fn drop(&mut self) {
+        if let Some(enc) = self.batch.as_mut().and_then(|b| b.enc.take()) {
+            enc.endEncoding();
+        }
+    }
+}
 
 fn bytes_of<T>(v: &T) -> &[u8] {
     unsafe { std::slice::from_raw_parts((v as *const T).cast::<u8>(), size_of::<T>()) }
@@ -267,7 +277,7 @@ impl MetalR3d {
             return Some(a);
         }
         let buf = self.device.newBufferWithLength_options(ARENA_SIZE, MTLResourceOptions::StorageModeShared)?;
-        Some(Arena { buf, used: 0 })
+        Some(Arena { buf, used: 0, dirty: Vec::new() })
     }
 
     fn open(&mut self) -> Option<&mut Batch> {
@@ -371,6 +381,11 @@ impl MetalR3d {
             }
         }
         let Some(enc) = Self::encoder(batch) else { return };
+        for &w in &writes {
+            if batch.arena.dirty.last() != Some(&w) {
+                batch.arena.dirty.push(w);
+            }
+        }
         batch.written.extend(writes);
         let arena = batch.arena.buf.clone();
         enc.setRenderPipelineState(pipeline);
@@ -483,6 +498,7 @@ impl MetalR3d {
             enc.endEncoding();
         }
         let Some(enc) = batch.cmd.computeCommandEncoder() else { return false };
+        batch.arena.dirty.push((f.offset, f.offset + (f.rows.max(1) - 1) * f.stride + f.width));
         let args = FillArgs { offset: f.offset as u32, stride: f.stride as u32, bpp: bpp as u32, value };
         enc.setComputePipelineState(&pipeline);
         unsafe {
@@ -493,6 +509,13 @@ impl MetalR3d {
         enc.dispatchThreads_threadsPerThreadgroup(grid, MTLSize { width: 64, height: 1, depth: 1 });
         enc.endEncoding();
         true
+    }
+
+    /// True if queued or running work writes VRAM between `start` and `end`.
+    pub fn writes_pending(&mut self, start: usize, end: usize) -> bool {
+        self.completed();
+        let hit = |a: &Arena| a.dirty.iter().any(|&(s, e)| s < end && start < e);
+        self.batch.as_ref().is_some_and(|b| hit(&b.arena)) || self.inflight.iter().any(|(_, a, _)| hit(a))
     }
 
     /// True while draws are queued or running.
@@ -537,6 +560,7 @@ impl MetalR3d {
             eprintln!("radeon: Metal command buffer failed: {}", e.localizedDescription());
         }
         arena.used = 0;
+        arena.dirty.clear();
         if self.free.len() <= MAX_INFLIGHT {
             self.free.push(arena);
         }

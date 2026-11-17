@@ -91,12 +91,15 @@ impl Radeon {
     }
 
     pub(crate) fn render_extended(&mut self, out: &mut Vec<u32>) -> Option<(u32, u32)> {
-        self.gpu_sync();
         let ctl = self.reg(CRTC_GEN_CNTL);
         if ctl & CRTC_EN == 0 || self.reg(CRTC_EXT_CNTL) & CRTC_DISPLAY_DIS != 0 {
             return None;
         }
         let m = self.mode()?;
+        let shown = m.offset as usize..m.offset as usize + m.pitch as usize * m.height as usize;
+        if self.metal.as_mut().is_some_and(|g| g.writes_pending(shown.start, shown.end)) {
+            self.gpu_sync();
+        }
         let pal = if m.bits == 8 {
             self.vga.palette256()
         } else {
