@@ -168,6 +168,20 @@ mod host {
         unsafe {
             let send: extern "C" fn(*mut c_void, *mut c_void, Size) = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
             send(window, sel_registerName(c"setContentSize:".as_ptr()), Size { w, h });
+            // minifb refreshes the size it maps the mouse with only when a live resize ends.
+            let get: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+            let is_kind: extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> bool = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+            let end = sel_registerName(c"viewDidEndLiveResize".as_ptr());
+            let ask = sel_registerName(c"isKindOfClass:".as_ptr());
+            let frame_view = objc_getClass(c"OSXWindowFrameView".as_ptr());
+            let mut view = get(window, sel_registerName(c"contentView".as_ptr()));
+            while !view.is_null() && !frame_view.is_null() && !is_kind(view, ask, frame_view) {
+                view = get(view, sel_registerName(c"superview".as_ptr()));
+            }
+            if !view.is_null() && !frame_view.is_null() {
+                let call: extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+                call(view, end);
+            }
         }
     }
 
