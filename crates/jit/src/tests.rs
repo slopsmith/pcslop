@@ -714,12 +714,120 @@ fn random_mmx_programs_match_the_interpreter() {
         let mut bus_b = bus_with(0x1000, &code);
         bus_a.ram.as_mut_slice()[0x3000..0x3040].copy_from_slice(&mem);
         bus_b.ram.as_mut_slice()[0x3000..0x3040].copy_from_slice(&mem);
+        let hex: Vec<String> = code.iter().map(|b| format!("{b:02x}")).collect();
         run_interp(&mut a, &mut bus_a);
         let stats = run_jit(&mut b, &mut bus_b);
-        let hex: Vec<String> = code.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(a.regs, b.regs, "round {round} registers\ncode: {}", hex.join(" "));
         assert_eq!(a.fpu, b.fpu, "round {round} MMX state\ncode: {}", hex.join(" "));
         assert!(bus_a.ram.as_slice() == bus_b.ram.as_slice(), "round {round} memory\ncode: {}", hex.join(" "));
         assert!(stats.interp_exits <= 1, "round {round}: {} interpreter exits\ncode: {}", stats.interp_exits, hex.join(" "));
     }
+}
+
+/// A ModRM byte and disp32 for `[disp32]` with the given reg field.
+fn mem_abs(out: &mut Vec<u8>, op: u8, reg: u8, addr: u32) {
+    out.extend([op, reg << 3 | 5]);
+    out.extend(addr.to_le_bytes());
+}
+
+fn random_x87(rng: &mut Rng, out: &mut Vec<u8>) {
+    let i = rng.below(8) as u8;
+    let k = rng.below(8);
+    match rng.below(24) {
+        0 => mem_abs(out, 0xdd, 0, 0x3000 + 8 * k),
+        1 => mem_abs(out, 0xd9, 0, 0x3100 + 4 * k),
+        2 => mem_abs(out, 0xdb, 0, 0x3200 + 4 * k),
+        3 => mem_abs(out, [0xdf, 0xdf][k as usize % 2], [0, 5][k as usize % 2], 0x3300 + 8 * k),
+        4 | 5 => {
+            let op = [0xd8, 0xdc, 0xde][rng.below(3) as usize];
+            let reg = [0, 1, 4, 5, 6, 7][rng.below(6) as usize];
+            out.extend([op, 0xc0 | reg << 3 | i]);
+        }
+        6 => mem_abs(out, [0xdc, 0xd8, 0xda][rng.below(3) as usize], rng.below(8) as u8, 0x3000 + 8 * k),
+        7 => out.extend([0xd9, 0xc8 | i]),
+        8 => out.extend([0xd9, 0xc0 | i]),
+        9 => out.extend([0xdd, [0xd0, 0xd8][rng.below(2) as usize] | i]),
+        10 => out.extend([0xd9, [0xe0, 0xe1, 0xee, 0xe8, 0xfa, 0xfc, 0xe4][rng.below(7) as usize]]),
+        11 => out.extend([0xd8, 0xd0 | i]),
+        12 => out.extend([0xd8, 0xd8 | i]),
+        13 => out.extend([[0xde, 0xd9], [0xda, 0xe9]][rng.below(2) as usize]),
+        14 => out.extend([[0xdb, 0xdf][rng.below(2) as usize], [0xe8, 0xf0][rng.below(2) as usize] | i]),
+        15 => out.extend([0xdf, 0xe0]),
+        16 => out.extend([0xdd, 0xe0 | i]),
+        17 => mem_abs(out, 0xdd, [2, 3][rng.below(2) as usize], 0x3400 + 8 * k),
+        18 => mem_abs(out, 0xd9, [2, 3][rng.below(2) as usize], 0x3480 + 4 * k),
+        19 => {
+            let (op, reg) = [(0xdb, 2), (0xdb, 3), (0xdf, 2), (0xdf, 3), (0xdf, 7)][rng.below(5) as usize];
+            mem_abs(out, op, reg, 0x34c0 + 8 * k);
+        }
+        20 => mem_abs(out, 0xd9, 5, 0x3500 + 2 * (k % 5)),
+        21 => mem_abs(out, [0xd9, 0xdd][rng.below(2) as usize], 7, 0x3520 + 2 * k),
+        22 => out.push(0x9b),
+        _ => mem_abs(out, [0xd8, 0xdc][rng.below(2) as usize], [2, 3][rng.below(2) as usize], 0x3100 + 4 * k),
+    }
+}
+
+fn x87_memory(rng: &mut Rng) -> Vec<u8> {
+    let mut mem = vec![0u8; 0x600];
+    let pick = |rng: &mut Rng| -> f64 {
+        match rng.below(10) {
+            0 => 0.0,
+            1 => -0.0,
+            2 => 1.0e300,
+            3 => 1.0 / 3.0,
+            4 => (rng.next() as i32) as f64 * 1.0e-6,
+            _ => (rng.below(2001) as f64 - 1000.0) / 8.0,
+        }
+    };
+    for k in 0..8 {
+        let d = pick(rng);
+        mem[8 * k..8 * k + 8].copy_from_slice(&d.to_le_bytes());
+        let f = pick(rng) as f32;
+        mem[0x100 + 4 * k..0x104 + 4 * k].copy_from_slice(&f.to_le_bytes());
+        let n = rng.next() as i32 >> rng.below(31);
+        mem[0x200 + 4 * k..0x204 + 4 * k].copy_from_slice(&n.to_le_bytes());
+        let q = ((rng.next() as u64) << 32 | rng.next() as u64) as i64 >> rng.below(63);
+        mem[0x300 + 8 * k..0x308 + 8 * k].copy_from_slice(&q.to_le_bytes());
+    }
+    for (j, cw) in [0x37fu16, 0x27f, 0xf7f, 0x77f, 0xb7f].iter().enumerate() {
+        mem[0x500 + 2 * j..0x502 + 2 * j].copy_from_slice(&cw.to_le_bytes());
+    }
+    mem
+}
+
+#[test]
+fn random_x87_programs_match_the_interpreter() {
+    let mut rng = Rng(0x87_87);
+    let (mut exits, mut insns) = (0, 0);
+    for round in 0..400 {
+        let mut code = Vec::new();
+        for k in 0..4 {
+            mem_abs(&mut code, 0xdd, 0, 0x3000 + 8 * k);
+        }
+        let n = 30;
+        for _ in 0..n {
+            random_x87(&mut rng, &mut code);
+        }
+        code.push(0xf4);
+        let mem = x87_memory(&mut rng);
+        let mut a = flat_cpu(0x1000, 0x8000);
+        if round % 2 == 1 {
+            a.fpu.cw = 0x27f;
+        }
+        let mut b = a.clone();
+        let mut bus_a = bus_with(0x1000, &code);
+        let mut bus_b = bus_with(0x1000, &code);
+        bus_a.ram.as_mut_slice()[0x3000..0x3600].copy_from_slice(&mem);
+        bus_b.ram.as_mut_slice()[0x3000..0x3600].copy_from_slice(&mem);
+        let hex: Vec<String> = code.iter().map(|b| format!("{b:02x}")).collect();
+        run_interp(&mut a, &mut bus_a);
+        let stats = run_jit(&mut b, &mut bus_b);
+        assert_eq!(a.regs, b.regs, "round {round} registers\ncode: {}", hex.join(" "));
+        assert_eq!(a.eflags & ARITH_MASK, b.eflags & ARITH_MASK, "round {round} flags\ncode: {}", hex.join(" "));
+        assert_eq!(a.fpu, b.fpu, "round {round} x87 state\ncode: {}", hex.join(" "));
+        assert!(bus_a.ram.as_slice() == bus_b.ram.as_slice(), "round {round} memory\ncode: {}", hex.join(" "));
+        exits += stats.interp_exits;
+        insns += n + 4;
+    }
+    assert!(exits * 4 < insns, "{exits} interpreter exits for {insns} x87 instructions");
 }

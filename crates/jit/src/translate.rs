@@ -10,6 +10,8 @@ use x86::decode::{Insn, MemOperand, NO_REG, Rep, decode};
 use crate::runtime::{AF_AUX, Entries, ICOUNT, PF_RESULT, STATE, guest_reg};
 use crate::state::{self, reason};
 
+mod x87;
+
 const MAX_INSNS: usize = 64;
 
 const T_ADDR: Reg = Reg(9);
@@ -1321,6 +1323,12 @@ impl Emit {
                 self.a.movz(Size::W, T_B, if op == 0xf8 { 2 } else { 0 }, 0);
                 self.a.rmif(T_B, 0, 0b0010);
             }
+            0xd8..=0xdf => {
+                if !self.x87(insn, eip) {
+                    return Step::Unsupported;
+                }
+            }
+            0x9b => self.fwait(eip),
             0x118 if insn.mem.is_some() && insn.reg() < 4 => {}
             0x11f => {}
             0x160..=0x17f | 0x1d0..=0x1ff if !insn.opsize_prefix && insn.rep == Rep::None => {
@@ -1821,6 +1829,7 @@ fn is_recent(insn: &Insn) -> bool {
     match op {
         0x1c8..=0x1cf | 0xc0 | 0xd0 | 0xd2 | 0x9c | 0x9d | 0x1ba | 0xf5 | 0xf8 | 0xf9 | 0x118 | 0x11f | 0x12b => true,
         0x1c0 | 0x1c1 | 0x1b0 | 0x1b1 | 0x1c7 | 0x1a4 | 0x1a5 | 0x1ac | 0x1ad | 0xfb => true,
+        0xd8..=0xdf | 0x9b => true,
         0x160..=0x17f | 0x1d0..=0x1ff => !insn.opsize_prefix && insn.rep == Rep::None,
         0xc1 | 0xd1 | 0xd3 => !op32 || reg < 2,
         0xf6 | 0xf7 => matches!(reg, 2 | 3) && !(op == 0xf7 && op32),
