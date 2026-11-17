@@ -9,6 +9,10 @@ pub const ZR: Reg = Reg(31);
 /// Register 31 is the stack pointer in address bases and add/sub immediate.
 pub const SP: Reg = Reg(31);
 
+/// A SIMD&FP register (V0..V31).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct V(pub u8);
+
 pub const fn r(n: u8) -> Reg {
     Reg(n)
 }
@@ -1062,6 +1066,90 @@ pub mod sysreg {
     pub const FPSR: u16 = 0xda21;
     pub const TPIDR_EL0: u16 = 0xde82;
     pub const CNTVCT_EL0: u16 = 0xdf02;
+}
+
+/// Advanced SIMD. `q` selects the 128-bit form; `size` is the element size
+/// (0 = B, 1 = H, 2 = S, 3 = D).
+impl Asm {
+    pub fn ldr_d(&mut self, rt: V, rn: Reg, offset: i32) {
+        assert!(offset >= 0 && offset % 8 == 0 && offset < 8 << 12);
+        self.emit(0xfd40_0000 | ((offset / 8) as u32) << 10 | (rn.0 as u32) << 5 | rt.0 as u32);
+    }
+
+    pub fn str_d(&mut self, rt: V, rn: Reg, offset: i32) {
+        assert!(offset >= 0 && offset % 8 == 0 && offset < 8 << 12);
+        self.emit(0xfd00_0000 | ((offset / 8) as u32) << 10 | (rn.0 as u32) << 5 | rt.0 as u32);
+    }
+
+    pub fn fmov_dx(&mut self, rd: V, rn: Reg) {
+        self.emit(0x9e67_0000 | (rn.0 as u32) << 5 | rd.0 as u32);
+    }
+
+    pub fn fmov_xd(&mut self, rd: Reg, rn: V) {
+        self.emit(0x9e66_0000 | (rn.0 as u32) << 5 | rd.0 as u32);
+    }
+
+    /// The "three same" group: `opcode` and `u` pick ADD, UQADD, CMEQ, ...
+    pub fn vec3(&mut self, q: bool, u: bool, size: u32, opcode: u32, rd: V, rn: V, rm: V) {
+        self.emit(
+            0x0e20_0400 | (q as u32) << 30 | (u as u32) << 29 | size << 22 | (rm.0 as u32) << 16 | opcode << 11 | (rn.0 as u32) << 5 | rd.0 as u32,
+        );
+    }
+
+    /// ZIP1 (`second` false) or ZIP2.
+    pub fn zip(&mut self, q: bool, size: u32, second: bool, rd: V, rn: V, rm: V) {
+        self.emit(0x0e00_3800 | (q as u32) << 30 | size << 22 | (rm.0 as u32) << 16 | (second as u32) << 14 | (rn.0 as u32) << 5 | rd.0 as u32);
+    }
+
+    fn shift_imm_v(&mut self, q: bool, u: bool, opcode: u32, immhb: u32, rd: V, rn: V) {
+        self.emit(0x0f00_0400 | (q as u32) << 30 | (u as u32) << 29 | immhb << 16 | opcode << 11 | (rn.0 as u32) << 5 | rd.0 as u32);
+    }
+
+    /// SHL by `shift` (0..esize) on elements of `esize` bits.
+    pub fn shl_v(&mut self, q: bool, esize: u32, rd: V, rn: V, shift: u32) {
+        assert!(shift < esize);
+        self.shift_imm_v(q, false, 0b01010, esize + shift, rd, rn);
+    }
+
+    /// USHR (`signed` false) or SSHR by `shift` (1..=esize).
+    pub fn shr_v(&mut self, q: bool, signed: bool, esize: u32, rd: V, rn: V, shift: u32) {
+        assert!(shift >= 1 && shift <= esize);
+        self.shift_imm_v(q, !signed, 0, 2 * esize - shift, rd, rn);
+    }
+
+    /// SHRN: narrows elements of 2*`esize` bits to `esize` after shifting right.
+    pub fn shrn(&mut self, esize: u32, rd: V, rn: V, shift: u32) {
+        assert!(shift >= 1 && shift <= esize);
+        self.shift_imm_v(false, false, 0b10000, 2 * esize - shift, rd, rn);
+    }
+
+    /// INS Vd.D[1], Vn.D[0].
+    pub fn ins_d1(&mut self, rd: V, rn: V) {
+        self.emit(0x6e18_0400 | (rn.0 as u32) << 5 | rd.0 as u32);
+    }
+
+    /// SQXTUN, SQXTN or XTN of the lower half, from elements of `size` + 1.
+    pub fn narrow(&mut self, kind: Narrow, size: u32, rd: V, rn: V) {
+        let base = match kind {
+            Narrow::Xtn => 0x0e21_2800,
+            Narrow::Sqxtn => 0x0e21_4800,
+            Narrow::Sqxtun => 0x2e21_2800,
+        };
+        self.emit(base | size << 22 | (rn.0 as u32) << 5 | rd.0 as u32);
+    }
+
+    /// SMULL or UMULL of the lower halves, widening from `size`.
+    pub fn mull(&mut self, signed: bool, size: u32, rd: V, rn: V, rm: V) {
+        let base = if signed { 0x0e20_c000 } else { 0x2e20_c000 };
+        self.emit(base | size << 22 | (rm.0 as u32) << 16 | (rn.0 as u32) << 5 | rd.0 as u32);
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum Narrow {
+    Xtn,
+    Sqxtn,
+    Sqxtun,
 }
 
 #[cfg(test)]
