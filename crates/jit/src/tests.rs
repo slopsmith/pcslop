@@ -62,17 +62,44 @@ fn run_interp(cpu: &mut Cpu, bus: &mut FlatBus) {
 fn run_jit(cpu: &mut Cpu, bus: &mut FlatBus) -> Stats {
     let _vm = VM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut jit = unsafe { Jit::new(bus.ram.as_ptr(), RAM).unwrap() };
+    let kicker = jit.kicker();
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = done.clone();
+    let kicks = std::thread::spawn(move || {
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            kicker.kick();
+        }
+    });
+    let _join = scopeguard(move || {
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = kicks.join();
+    });
     for _ in 0..1000 {
         if !supported(cpu) || cpu.halted {
             break;
         }
         match jit.run(cpu, bus).unwrap() {
             RunExit::Interp(_) if cpu.halted => break,
+            RunExit::Interp(e) if std::env::var_os("DBG").is_some() => eprintln!("exit {e:?} eip {:#x} cr2 {:#x} esp {:#x} cs {:#x}", cpu.eip, cpu.cr2, cpu.regs[4], cpu.segs[1].selector),
             _ => {}
         }
     }
-    assert!(cpu.halted, "JIT run did not reach HLT; eip {:#x}", cpu.eip);
+    assert!(cpu.halted, "JIT run did not reach HLT; eip {:#x} {:?}", cpu.eip, jit.stats);
     jit.stats
+}
+
+/// Runs `f` when dropped, also while unwinding.
+fn scopeguard(f: impl FnOnce()) -> impl Drop {
+    struct Guard<F: FnOnce()>(Option<F>);
+    impl<F: FnOnce()> Drop for Guard<F> {
+        fn drop(&mut self) {
+            if let Some(f) = self.0.take() {
+                f();
+            }
+        }
+    }
+    Guard(Some(f))
 }
 
 const ARITH_MASK: u32 = x86::cpu::flags::ARITH | x86::cpu::flags::IF;
@@ -556,6 +583,62 @@ fn atomics_match_the_interpreter_when_the_compare_succeeds() {
             c.regs[5] = 0x5555_6666;
         });
     }
+}
+
+/// Identity-maps the first 4 MiB through a page table at 0x11000 (or one PSE
+/// page) and turns paging on, so shadow faults go through the in-VM walk.
+fn paged(cpu: &mut Cpu, bus: &mut FlatBus, big: bool) {
+    let mem = bus.ram.as_mut_slice();
+    let pde = if big { 0x87u32 } else { 0x11007 };
+    mem[0x10000..0x10004].copy_from_slice(&pde.to_le_bytes());
+    for i in 0..1024u32 {
+        let pte = (i << 12) | 7;
+        let at = 0x11000 + i as usize * 4;
+        mem[at..at + 4].copy_from_slice(&pte.to_le_bytes());
+    }
+    cpu.cr3 = 0x10000;
+    cpu.cr4 |= x86::cpu::cr4::PSE | x86::cpu::cr4::OSFXSR;
+    cpu.cr0 |= x86::cpu::cr0::PG | x86::cpu::cr0::WP;
+}
+
+#[test]
+fn random_programs_match_the_interpreter_with_paging() {
+    let mut rng = Rng(0x5ad0_77);
+    let mut fills = 0;
+    for round in 0..200 {
+        let mut code = Vec::new();
+        for _ in 0..40 {
+            random_insn(&mut rng, &mut code);
+        }
+        code.push(0xf4);
+        let regs: Vec<u32> = (0..8).map(|_| rng.next()).collect();
+        let big = round % 2 == 1;
+        let mut a = flat_cpu(0x1000, 0x8000);
+        for (i, v) in regs.iter().enumerate() {
+            if i != 4 {
+                a.regs[i] = *v;
+            }
+        }
+        let mut b = a.clone();
+        let mut bus_a = bus_with(0x1000, &code);
+        let mut bus_b = bus_with(0x1000, &code);
+        paged(&mut a, &mut bus_a, big);
+        paged(&mut b, &mut bus_b, big);
+        run_interp(&mut a, &mut bus_a);
+        if std::env::var_os("DBG").is_some() {
+            eprintln!("round {round} code at 0x4d: {:02x?} interp regs {:08x?}", &code[0x40..0x58], a.regs);
+        }
+        let stats = run_jit(&mut b, &mut bus_b);
+        fills += stats.vm_fills;
+        let hex: Vec<String> = code.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(a.regs, b.regs, "round {round} registers\ncode: {}", hex.join(" "));
+        assert_eq!(a.eflags & ARITH_MASK, b.eflags & ARITH_MASK, "round {round} flags");
+        let (ma, mb) = (bus_a.ram.as_slice(), bus_b.ram.as_slice());
+        if let Some(i) = (0..RAM).find(|&i| ma[i] != mb[i]) {
+            panic!("round {round}: memory differs at {i:#x}: interp {:#04x} jit {:#04x}\ncode: {}", ma[i], mb[i], hex.join(" "));
+        }
+    }
+    assert!(fills > 0, "the in-VM walk never ran");
 }
 
 #[test]

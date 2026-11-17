@@ -122,6 +122,8 @@ impl Drop for ExitTimer {
 struct PtWatch {
     key: Option<(u32, u32, u32)>,
     pages: HashMap<u32, Box<[u32; 1024]>>,
+    /// Set while shadow entries exist that no snapshot covers, so no flush may be skipped.
+    incomplete: bool,
 }
 
 /// Paging-structure pages watched before a full flush is cheaper than comparing.
@@ -133,9 +135,18 @@ impl PtWatch {
         (cpu.cr3 & !0xfff, cpu.cr0 & (cr0::PG | cr0::WP | cr0::PE), cpu.cr4 & (cr4::PSE | cr4::PGE | cr4::PAE))
     }
 
+    /// For an empty shadow tree.
     fn clear(&mut self) {
         self.key = None;
         self.pages.clear();
+        self.incomplete = false;
+    }
+
+    /// For a new address space whose shadow tree keeps entries from the old one.
+    fn forget(&mut self) {
+        self.key = None;
+        self.pages.clear();
+        self.incomplete = true;
     }
 
     fn snapshot<B: Bus>(&mut self, bus: &mut B, page: u32) -> bool {
@@ -153,40 +164,46 @@ impl PtWatch {
         true
     }
 
-    /// Takes in the Accessed/Dirty bits our walk just set. False means the
-    /// watch is full or for another CR3, and the caller must flush.
-    fn watch<B: Bus>(&mut self, cpu: &Cpu, bus: &mut B, lin: u32) -> bool {
+    /// Takes in the Accessed/Dirty bits our walk just set.
+    fn watch<B: Bus>(&mut self, cpu: &Cpu, bus: &mut B, lin: u32) {
+        let pde = bus.read32((cpu.cr3 & !0xfff) + (lin >> 22) * 4);
+        let big = pde & 0x80 != 0 && cpu.cr4 & x86::cpu::cr4::PSE != 0;
+        let pte = if pde & 1 != 0 && !big { bus.read32((pde & !0xfff) + ((lin >> 12) & 0x3ff) * 4) } else { 0 };
+        self.watch_logged(cpu, bus, lin, pde, pte, big || pde & 1 == 0);
+    }
+
+    /// Records that a shadow entry for `lin` was built from `pde` and `pte`
+    /// (unused for a big page).
+    fn watch_logged<B: Bus>(&mut self, cpu: &Cpu, bus: &mut B, lin: u32, pde: u32, pte: u32, big: bool) {
         let key = Self::cr_key(cpu);
-        match self.key {
-            None => self.key = Some(key),
-            Some(k) if k != key => return false,
-            _ => {}
+        if self.key != Some(key) {
+            if self.key.is_some() {
+                self.forget();
+            }
+            self.key = Some(key);
         }
         let pd = cpu.cr3 & !0xfff;
         if !self.snapshot(bus, pd) {
-            return false;
+            self.incomplete = true;
+            return;
         }
-        let pde = bus.read32(pd + (lin >> 22) * 4);
         if let Some(copy) = self.pages.get_mut(&pd) {
             copy[(lin >> 22) as usize] = pde;
         }
-        let big = pde & 0x80 != 0 && cpu.cr4 & x86::cpu::cr4::PSE != 0;
-        if pde & 1 != 0 && !big {
+        if !big {
             let pt = pde & !0xfff;
             if !self.snapshot(bus, pt) {
-                return false;
+                self.incomplete = true;
+                return;
             }
-            let i = ((lin >> 12) & 0x3ff) as usize;
-            let pte = bus.read32(pt + i as u32 * 4);
             if let Some(copy) = self.pages.get_mut(&pt) {
-                copy[i] = pte;
+                copy[((lin >> 12) & 0x3ff) as usize] = pte;
             }
         }
-        true
     }
 
     fn still_valid<B: Bus>(&self, cpu: &Cpu, bus: &mut B) -> bool {
-        if self.key != Some(Self::cr_key(cpu)) {
+        if self.incomplete || self.key != Some(Self::cr_key(cpu)) {
             return false;
         }
         self.pages.iter().all(|(&page, copy)| {
@@ -213,6 +230,8 @@ pub struct Stats {
     pub mmio_exits: u64,
     pub smc_invalidations: u64,
     pub stale_blocks: u64,
+    /// Shadow entries filled inside the VM without an exit.
+    pub vm_fills: u64,
     pub flushes: u64,
     pub flush_tlb_gen: u64,
     pub nonglobal_flushes: u64,
@@ -356,6 +375,9 @@ impl Jit {
         for t in &mut jit.shadow {
             t.flush(jit.mem.as_mut_slice());
         }
+        let root = jit.shadow[0].root_va();
+        jit.state().shadow_root = root;
+        jit.state().ram_size = ram_len as u32;
         let v = &jit.vcpu;
         v.set_sys_reg(sysreg::MAIR_EL1, 0xff)?;
         v.set_sys_reg(sysreg::TCR_EL1, tcr)?;
@@ -475,6 +497,24 @@ impl Jit {
         s.fs_base = cpu.segs[FS].base;
         s.cs_sel = cpu.segs[CS].selector as u32;
         s.gs_base = cpu.segs[GS].base;
+        {
+            use x86::cpu::{cr0, cr4};
+            let mut f = 0;
+            if cpu.cr0 & cr0::PG != 0 && cpu.cr4 & cr4::PAE == 0 {
+                f |= state::walk::ON;
+            }
+            if cpu.cr4 & cr4::PSE != 0 {
+                f |= state::walk::PSE;
+            }
+            if cpu.cr4 & cr4::PGE != 0 {
+                f |= state::walk::PGE;
+            }
+            if cpu.cr0 & cr0::WP != 0 {
+                f |= state::walk::WP;
+            }
+            s.walk_flags = f;
+            s.walk_cr3 = cpu.cr3 & !0xfff;
+        }
         let ts_em = x86::cpu::cr0::TS | x86::cpu::cr0::EM;
         s.sse_ok = (cpu.cr0 & ts_em == 0 && cpu.cr4 & x86::cpu::cr4::OSFXSR != 0) as u32;
         s.xmm = cpu.xmm;
@@ -498,6 +538,8 @@ impl Jit {
             self.root = r;
             let ttbr = self.shadow[r].root_ipa() | (r as u64 + 1) << 48;
             self.vcpu.set_sys_reg(sysreg::TTBR0_EL1, ttbr).expect("TTBR0 write");
+            let root = self.shadow[r].root_va();
+            self.state().shadow_root = root;
         }
         self.state().user = r as u32;
     }
@@ -537,6 +579,7 @@ impl Jit {
                         self.tlbi_page(lin);
                     }
                     _ => {
+                        self.pt_watch.forget();
                         for r in 0..2 {
                             for off in std::mem::take(&mut self.nonglobal[r]) {
                                 self.shadow[r].clear_leaf(self.mem.as_mut_slice(), off);
@@ -574,8 +617,7 @@ impl Jit {
     }
 
     fn map_shadow<B: Bus>(&mut self, bus: &mut B, cpu: &Cpu, lin: u32, phys: u32, writable: bool, global: bool) {
-        if cpu.cr0 & x86::cpu::cr0::PG != 0 && !self.pt_watch.watch(cpu, bus, lin) {
-            self.flush_shadow();
+        if cpu.cr0 & x86::cpu::cr0::PG != 0 {
             self.pt_watch.watch(cpu, bus, lin);
         }
         let r = self.root;
@@ -611,6 +653,7 @@ impl Jit {
 
     fn invalidate_code_page(&mut self, page: u32) {
         let Some(keys) = self.code_pages.remove(&page) else { return };
+        self.set_code_bit(page, false);
         for key in keys {
             self.remove_block(key);
         }
@@ -631,6 +674,10 @@ impl Jit {
         if let Some(b) = self.blocks.remove(&key) {
             self.by_va.remove(&b.va);
         }
+        self.clear_lookup(key);
+    }
+
+    fn clear_lookup(&mut self, key: u64) {
         let off = layout::LOOKUP + hash(key) * 16;
         let slot = &mut self.mem.as_mut_slice()[off..off + 16];
         if u64::from_le_bytes(slot[..8].try_into().unwrap()) == key {
@@ -644,6 +691,7 @@ impl Jit {
         self.blocks.clear();
         self.by_va.clear();
         self.code_pages.clear();
+        self.mem.as_mut_slice()[layout::CODE_BITMAP..layout::CODE_BITMAP_END].fill(0);
         self.code_next = layout::CODE_CACHE;
         self.mem.as_mut_slice()[layout::LOOKUP..layout::LOOKUP + layout::LOOKUP_ENTRIES * 16].fill(0xff);
         self.flush_shadow();
@@ -724,6 +772,9 @@ impl Jit {
         let pages = self.code_pages.entry(page).or_default();
         let new_page = pages.is_empty();
         pages.push(key);
+        if new_page {
+            self.set_code_bit(page, true);
+        }
         bus.watch_code_page(phys);
         if new_page {
             for r in 0..2 {
@@ -777,6 +828,7 @@ impl Jit {
             }
             let t0 = self.timing.then(std::time::Instant::now);
             let exit = self.vcpu.run()?;
+            self.take_fill_log(cpu, bus);
             let t1 = self.timing.then(std::time::Instant::now);
             if let (Some(a), Some(b)) = (t0, t1) {
                 self.stats.vm_ns += (b - a).as_nanos() as u64;
@@ -902,8 +954,7 @@ impl Jit {
         if let Some(b) = self.blocks.get_mut(&exp.key) {
             b.verified += 1;
             if b.verified < VERIFY_RUNS {
-                let off = layout::LOOKUP + hash(exp.key) * 16;
-                self.mem.as_mut_slice()[off..off + 16].fill(0xff);
+                self.clear_lookup(exp.key);
             }
         }
         let mut got = cpu.clone();
@@ -947,6 +998,37 @@ impl Jit {
                 i.op | if i.op32 { 0 } else { 0x4000 } | if i.rep != x86::decode::Rep::None { 0x2000 } else { 0 }
             };
             *p.entry(key).or_default() += 1;
+        }
+    }
+
+    /// Takes in the shadow fills the runtime did inside the VM since the last exit.
+    fn take_fill_log<B: Bus>(&mut self, cpu: &Cpu, bus: &mut B) {
+        let n = std::mem::take(&mut self.state().fill_count) as usize;
+        let r = self.root;
+        for i in 0..n {
+            let off = layout::FILL_LOG + i * 32;
+            let word = |j: usize| u32::from_le_bytes(self.mem.as_slice()[off + 4 * j..off + 4 * j + 4].try_into().unwrap());
+            let (leaf, lin, phys_flags, pde, pte) = (word(0) as usize, word(1), word(2), word(3), word(4));
+            let phys = phys_flags & !0xfff;
+            if phys_flags & state::fill::GLOBAL == 0 {
+                self.nonglobal[r].push(leaf);
+            }
+            if phys_flags & state::fill::WRITABLE != 0 {
+                self.writable[r].entry(phys).or_default().push(lin & !0xfff);
+            }
+            self.stats.vm_fills += 1;
+            self.pt_watch.watch_logged(cpu, bus, lin, pde, pte, phys_flags & state::fill::BIG != 0);
+        }
+    }
+
+    fn set_code_bit(&mut self, page: u32, on: bool) {
+        let i = layout::CODE_BITMAP + (page >> 15) as usize;
+        let bit = 1u8 << ((page >> 12) & 7);
+        let b = &mut self.mem.as_mut_slice()[i];
+        if on {
+            *b |= bit;
+        } else {
+            *b &= !bit;
         }
     }
 
@@ -1005,8 +1087,12 @@ impl Jit {
         let ec = esr >> 26;
         assert!(ec == 0x25, "unhandled fault in translated code: ESR {esr:#x} FAR {far:#x} ELR {elr:#x}");
         assert!(far >> 32 == 0, "translated code faulted outside the x86 address space: FAR {far:#x}");
-        let lin = far as u32;
         let write = esr & (1 << 6) != 0;
+        let mut lin = far as u32;
+        if self.shadow[self.root].maps(self.mem.as_slice(), lin, write) {
+            // FAR can name the start of an access that faulted on the following page.
+            lin = (lin | 0xfff).wrapping_add(1);
+        }
         match interp::translate_global(cpu, bus, lin, write) {
             Ok((phys, global)) => {
                 let page = phys & !0xfff;

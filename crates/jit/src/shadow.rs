@@ -16,6 +16,10 @@ const NG: u64 = 1 << 11;
 
 const PAGE_SIZE: usize = 4096;
 
+/// Attributes of a writable shadow leaf, without the output address.
+pub const LEAF_ATTRS: u64 = AF | SH_INNER | PXN | UXN | NG | PAGE | VALID;
+pub const LEAF_RO: u64 = AP_RO;
+
 fn write_desc(mem: &mut [u8], off: usize, desc: u64) {
     mem[off..off + 8].copy_from_slice(&desc.to_le_bytes());
 }
@@ -55,6 +59,10 @@ impl Shadow {
         Shadow { root: start, end, next: start + PAGE_SIZE }
     }
 
+    pub fn root_va(&self) -> u64 {
+        layout::va(self.root)
+    }
+
     pub fn root_ipa(&self) -> u64 {
         layout::ipa(self.root)
     }
@@ -90,6 +98,13 @@ impl Shadow {
             table = (d & 0x0000_ffff_ffff_f000) as usize - layout::RUNTIME_IPA as usize;
         }
         Some(table + (((lin >> 12) & 511) as usize) * 8)
+    }
+
+    /// True if `lin` is mapped, and writable when `write` is set.
+    pub fn maps(&self, mem: &[u8], lin: u32, write: bool) -> bool {
+        let Some(off) = self.leaf(mem, lin) else { return false };
+        let d = read_desc(mem, off);
+        d & VALID != 0 && (!write || d & AP_RO == 0)
     }
 
     /// Removes the mapping of one linear page. The caller must invalidate the TLB.
@@ -152,7 +167,7 @@ impl Shadow {
     pub fn map(&mut self, mem: &mut [u8], lin: u32, phys: u32, writable: bool) -> Option<usize> {
         let l2 = self.table(mem, self.root + ((lin >> 30) as usize) * 8)?;
         let l3 = self.table(mem, l2 + (((lin >> 21) & 511) as usize) * 8)?;
-        let mut d = (phys as u64 & !0xfff) | AF | SH_INNER | PXN | UXN | NG | PAGE | VALID;
+        let mut d = (phys as u64 & !0xfff) | LEAF_ATTRS;
         if !writable {
             d |= AP_RO;
         }

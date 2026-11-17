@@ -18,6 +18,12 @@ pub const TTBR1_L1: usize = 0x2_0000;
 pub const TTBR1_L2: usize = 0x2_1000;
 pub const LOOKUP: usize = 0x4_0000;
 pub const LOOKUP_ENTRIES: usize = 1 << 16;
+/// Shadow fills done inside the VM, for the host to account for (`FILL_LOG_ENTRIES` of 32 bytes).
+pub const FILL_LOG: usize = 0x14_0000;
+pub const FILL_LOG_ENTRIES: usize = 256;
+/// One bit per 4 KiB physical page that holds translated code, for the in-VM fill.
+pub const CODE_BITMAP: usize = 0x16_0000;
+pub const CODE_BITMAP_END: usize = 0x18_0000;
 pub const SHADOW_POOL: usize = 0x20_0000;
 pub const SHADOW_POOL_END: usize = 0x100_0000;
 pub const CODE_CACHE: usize = 0x100_0000;

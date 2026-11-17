@@ -25,6 +25,22 @@ pub mod ctl {
     pub const TLBI_PAGE: u32 = 4;
 }
 
+/// Bits of `State::walk_flags`.
+pub mod walk {
+    pub const PSE: u32 = 1;
+    pub const PGE: u32 = 2;
+    pub const WP: u32 = 4;
+    /// Non-PAE paging is on, so the in-VM fill may run.
+    pub const ON: u32 = 8;
+}
+
+/// Bits in the third word of a fill log entry, next to the physical page.
+pub mod fill {
+    pub const WRITABLE: u32 = 1;
+    pub const GLOBAL: u32 = 2;
+    pub const BIG: u32 = 4;
+}
+
 /// How the runtime continues after a FAULT exit (`State::resume`).
 pub mod resume {
     /// Re-execute the faulting ARM instruction.
@@ -74,6 +90,15 @@ pub struct State {
     pub info: [u64; 4],
     /// x0..x17 saved across FAULT exits.
     pub scratch: [u64; 18],
+    /// Virtual address of the root of the shadow tree TTBR0 points at.
+    pub shadow_root: u64,
+    /// CR3 page-directory address, for the in-VM fill.
+    pub walk_cr3: u32,
+    /// `walk` bits: what the in-VM fill may assume about x86 paging.
+    pub walk_flags: u32,
+    pub ram_size: u32,
+    /// Entries in `layout::FILL_LOG` the host has not taken in yet.
+    pub fill_count: u32,
     /// 1 when SSE instructions may run: CR0.TS and CR0.EM clear, CR4.OSFXSR set.
     pub sse_ok: u32,
     pub xmm: [u128; 8],
@@ -103,6 +128,11 @@ pub const BUDGET: usize = offset_of!(State, budget);
 pub const INFO: usize = offset_of!(State, info);
 pub const SCRATCH: usize = offset_of!(State, scratch);
 pub const SSE_OK: usize = offset_of!(State, sse_ok);
+pub const SHADOW_ROOT: usize = offset_of!(State, shadow_root);
+pub const WALK_CR3: usize = offset_of!(State, walk_cr3);
+pub const WALK_FLAGS: usize = offset_of!(State, walk_flags);
+pub const RAM_SIZE: usize = offset_of!(State, ram_size);
+pub const FILL_COUNT: usize = offset_of!(State, fill_count);
 pub const XMM: usize = offset_of!(State, xmm);
 
 const NZCV_N: u32 = 1 << 31;
