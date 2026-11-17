@@ -831,3 +831,132 @@ fn random_x87_programs_match_the_interpreter() {
     }
     assert!(exits * 4 < insns, "{exits} interpreter exits for {insns} x87 instructions");
 }
+
+fn sse_op(out: &mut Vec<u8>, pfx: u8, op: u8, reg: u8, rm: Option<u8>, addr: u32) {
+    if pfx != 0 {
+        out.push(pfx);
+    }
+    out.extend([0x0f, op]);
+    match rm {
+        Some(rm) => out.push(modrm_rr(reg, rm)),
+        None => {
+            out.push(reg << 3 | 5);
+            out.extend(addr.to_le_bytes());
+        }
+    }
+}
+
+fn random_sse(rng: &mut Rng, out: &mut Vec<u8>) {
+    let reg = rng.below(8) as u8;
+    let rm = if rng.below(3) == 0 { None } else { Some(rng.below(8) as u8) };
+    let slot = 0x3000 + 16 * rng.below(16);
+    let any_pfx = [0, 0x66, 0xf3, 0xf2][rng.below(4) as usize];
+    let packed_pfx = [0, 0x66][rng.below(2) as usize];
+    match rng.below(20) {
+        0 => sse_op(out, packed_pfx, [0x10, 0x11, 0x28, 0x29][rng.below(4) as usize], reg, rm, slot),
+        1 => sse_op(out, [0xf3, 0xf2][rng.below(2) as usize], [0x10, 0x11][rng.below(2) as usize], reg, rm, slot + 4 * rng.below(3)),
+        2 => {
+            let op = [0x12, 0x13, 0x16, 0x17][rng.below(4) as usize];
+            let rm = if op & 1 == 1 || packed_pfx == 0x66 { None } else { rm };
+            sse_op(out, packed_pfx, op, reg, rm, slot + 8 * rng.below(2));
+        }
+        3 => sse_op(out, packed_pfx, [0x14, 0x15, 0x54, 0x55, 0x56, 0x57][rng.below(6) as usize], reg, rm, slot),
+        4 => sse_op(out, 0x66, [0xdb, 0xdf, 0xeb, 0xef][rng.below(4) as usize], reg, rm, slot),
+        5 => {
+            if rng.below(2) == 0 {
+                sse_op(out, packed_pfx, 0xc6, reg, rm, slot);
+            } else {
+                sse_op(out, 0x66, 0x70, reg, rm, slot);
+            }
+            out.push(rng.next() as u8);
+        }
+        6 => match rng.below(4) {
+            0 => sse_op(out, 0x66, 0x6e, reg, rm.map(|_| rng.reg()), slot + 4 * rng.below(4)),
+            1 => sse_op(out, 0x66, 0x7e, reg, rm.map(|_| rng.reg()), slot + 4 * rng.below(4)),
+            2 => sse_op(out, 0xf3, 0x7e, reg, rm, slot + 8 * rng.below(2)),
+            _ => sse_op(out, 0x66, 0xd6, reg, rm, slot + 8 * rng.below(2)),
+        },
+        7 => sse_op(out, [0x66, 0xf3][rng.below(2) as usize], [0x6f, 0x7f][rng.below(2) as usize], reg, rm, slot),
+        8..=11 => sse_op(out, any_pfx, [0x58, 0x59, 0x5c, 0x5e, 0x5d, 0x5f, 0x51][rng.below(7) as usize], reg, rm, slot),
+        12 | 13 => {
+            sse_op(out, any_pfx, 0xc2, reg, rm, slot);
+            out.push(rng.below(8) as u8);
+        }
+        14 => sse_op(out, packed_pfx, [0x2e, 0x2f][rng.below(2) as usize], reg, rm, slot),
+        15 => sse_op(out, [0xf3, 0xf2][rng.below(2) as usize], 0x2a, reg, rm.map(|_| rng.reg()), slot + 4 * rng.below(4)),
+        16 => sse_op(out, [0xf3, 0xf2][rng.below(2) as usize], [0x2c, 0x2d][rng.below(2) as usize], rng.reg(), rm, slot),
+        17 => sse_op(out, [0xf3, 0xf2][rng.below(2) as usize], 0x5a, reg, rm, slot),
+        18 => {
+            out.extend([0x0f, 0xae, 2 << 3 | 5]);
+            out.extend((0x3100 + 4 * rng.below(6)).to_le_bytes());
+        }
+        _ => sse_op(out, any_pfx, [0x58, 0x59][rng.below(2) as usize], reg, rm, slot),
+    }
+}
+
+fn sse_value(rng: &mut Rng) -> u32 {
+    match rng.below(12) {
+        0 => 0,
+        1 => 0x8000_0000,
+        2 => 0x7f80_0000,
+        3 => 0xff80_0000,
+        4 => 0x7fc0_0000 | rng.below(0x1000),
+        5 => 0x7f80_0001 | rng.below(0x1000),
+        6 => rng.below(0x80_0000) | (rng.below(2) << 31),
+        7 => rng.next(),
+        _ => (rng.next() & 0x87ff_ffff) | 0x3800_0000,
+    }
+}
+
+#[test]
+fn random_sse_programs_match_the_interpreter() {
+    let mut rng = Rng(0x55e2);
+    let (mut exits, mut insns) = (0, 0);
+    for round in 0..400 {
+        let mut code = Vec::new();
+        let n = 30;
+        for _ in 0..n {
+            random_sse(&mut rng, &mut code);
+        }
+        code.push(0xf4);
+        let mut mem = vec![0u8; 0x200];
+        for k in 0..64 {
+            let v = if rng.below(3) == 0 {
+                (rng.next() as u64) << 32 | rng.next() as u64
+            } else {
+                sse_value(&mut rng) as u64
+            };
+            mem[4 * k..4 * k + 4].copy_from_slice(&(v as u32).to_le_bytes());
+        }
+        for (j, csr) in [0x1f80u32, 0x3f80, 0x5f80, 0x7f80, 0x9f80, 0x1fc0].iter().enumerate() {
+            mem[0x100 + 4 * j..0x104 + 4 * j].copy_from_slice(&csr.to_le_bytes());
+        }
+        let mut a = flat_cpu(0x1000, 0x8000);
+        a.cr4 |= x86::cpu::cr4::OSFXSR;
+        for i in 0..8 {
+            a.xmm[i] = (0..4).fold(0u128, |v, k| v | (sse_value(&mut rng) as u128) << (32 * k));
+            if i != 4 {
+                a.regs[i] = rng.next() >> rng.below(32);
+            }
+        }
+        let mut b = a.clone();
+        let mut bus_a = bus_with(0x1000, &code);
+        let mut bus_b = bus_with(0x1000, &code);
+        bus_a.ram.as_mut_slice()[0x3000..0x3200].copy_from_slice(&mem);
+        bus_b.ram.as_mut_slice()[0x3000..0x3200].copy_from_slice(&mem);
+        let hex: Vec<String> = code.iter().map(|b| format!("{b:02x}")).collect();
+        run_interp(&mut a, &mut bus_a);
+        let stats = run_jit(&mut b, &mut bus_b);
+        assert_eq!(a.regs, b.regs, "round {round} registers\ncode: {}", hex.join(" "));
+        assert_eq!(a.eflags & ARITH_MASK, b.eflags & ARITH_MASK, "round {round} flags\ncode: {}", hex.join(" "));
+        for i in 0..8 {
+            assert_eq!(a.xmm[i], b.xmm[i], "round {round} xmm{i}\ncode: {}", hex.join(" "));
+        }
+        let de = x86::fpu::exc::DE as u32;
+        assert_eq!(a.mxcsr | de, b.mxcsr | de, "round {round} mxcsr\ncode: {}", hex.join(" "));
+        assert!(bus_a.ram.as_slice() == bus_b.ram.as_slice(), "round {round} memory\ncode: {}", hex.join(" "));
+        exits += stats.interp_exits;
+        insns += n;
+    }
+    assert!(exits * 3 < insns, "{exits} interpreter exits for {insns} SSE instructions");
+}
