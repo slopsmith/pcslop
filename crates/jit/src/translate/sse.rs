@@ -7,7 +7,7 @@
 use a64::{Fcm, Label, Logic, Size, V, Width};
 use x86::decode::{Insn, Rep};
 
-use super::{Emit, T_A, T_ADDR, T_B};
+use super::{Emit, T_A, T_ADDR, T_B, simd_three};
 use crate::runtime::{AF_AUX, PF_RESULT, STATE, guest_reg};
 use crate::state;
 
@@ -50,6 +50,12 @@ pub(super) fn is_sse(insn: &Insn) -> bool {
         0x16e | 0x1d6 | 0x170 | 0x1db | 0x1df | 0x1eb | 0x1ef => pfx == P66,
         0x17e => pfx == P66 || pfx == F3,
         0x1e7 => pfx == P66 && mem,
+        0x160..=0x16d | 0x1d4 | 0x1fb | 0x1e4 | 0x1e5 | 0x1f4..=0x1f6 => pfx == P66,
+        op if simd_three(op).is_some() => pfx == P66,
+        0x171 | 0x172 => pfx == P66 && !mem && matches!(insn.reg(), 2 | 4 | 6),
+        0x173 => pfx == P66 && !mem && matches!(insn.reg(), 2 | 3 | 6 | 7),
+        0x1c4 => pfx == P66,
+        0x1c5 | 0x1d7 => pfx == P66 && !mem,
         _ => false,
     }
 }
@@ -163,6 +169,60 @@ impl Emit {
                 }
                 self.a.str_q(XR, STATE, xmm(reg));
             }
+            (0x171..=0x173, _) => {
+                self.a.ldr_q(XA, STATE, xmm(rm));
+                let n = insn.imm & 0xff;
+                let esize = match op {
+                    0x171 => 16,
+                    0x172 => 32,
+                    _ => 64,
+                };
+                match (op, reg) {
+                    (0x173, 3 | 7) if n >= 16 => self.a.vec3(true, true, 0, 0b00011, XA, XA, XA),
+                    (0x173, 3 | 7) if n > 0 => {
+                        self.a.vec3(true, true, 0, 0b00011, XT, XT, XT);
+                        if reg == 3 { self.a.ext(XA, XA, XT, n) } else { self.a.ext(XA, XT, XA, 16 - n) }
+                    }
+                    (_, 2 | 6) if n >= esize => self.a.vec3(true, true, 0, 0b00011, XA, XA, XA),
+                    (_, 6) if n > 0 => self.a.shl_v(true, esize, XA, XA, n),
+                    (_, 2) if n > 0 => self.a.shr_v(true, false, esize, XA, XA, n),
+                    (_, 4) if n > 0 => self.a.shr_v(true, true, esize, XA, XA, n.min(esize)),
+                    _ => {}
+                }
+                self.a.str_q(XA, STATE, xmm(rm));
+            }
+            (0x1c4, _) => {
+                self.a.ldr_q(XA, STATE, xmm(reg));
+                match insn.mem {
+                    Some(_) => self.a.ldr(Width::H, T_A, T_ADDR, 0),
+                    None => self.a.mov(Size::W, T_A, guest_reg(rm)),
+                }
+                self.a.ins_h(XA, insn.imm & 7, T_A);
+                self.a.str_q(XA, STATE, xmm(reg));
+            }
+            (0x1c5, _) => {
+                self.a.ldr_q(XB, STATE, xmm(rm));
+                self.a.umov_h(guest_reg(reg), XB, insn.imm & 7);
+            }
+            (0x1d7, _) => {
+                // The shift-and-accumulate mask gathering of sse2neon's
+                // _mm_movemask_epi8 (sse2neon contributors, MIT licence).
+                self.a.ldr_q(XB, STATE, xmm(rm));
+                self.a.shr_v(true, false, 8, XR, XB, 7);
+                self.a.usra(true, 16, XR, XR, 7);
+                self.a.usra(true, 32, XR, XR, 14);
+                self.a.usra(true, 64, XR, XR, 28);
+                self.a.umov_b(T_A, XR, 0);
+                self.a.umov_b(T_B, XR, 8);
+                self.a.logic_shift(Logic::Orr, false, Size::W, T_A, T_A, T_B, a64::Shift::Lsl, 8);
+                self.a.mov(Size::W, guest_reg(reg), T_A);
+            }
+            (_, P66) if matches!(op, 0x160..=0x16d | 0x1d4 | 0x1fb | 0x1e4 | 0x1e5 | 0x1f4..=0x1f6) || simd_three(op).is_some() => {
+                self.a.ldr_q(XA, STATE, xmm(reg));
+                self.src(insn, 16, true, XB, bail);
+                self.sse_int(op);
+                self.a.str_q(XR, STATE, xmm(reg));
+            }
             (0x16e, _) => {
                 match insn.mem {
                     Some(_) => self.a.ldr_s(XR, T_ADDR, 0),
@@ -264,6 +324,53 @@ impl Emit {
         self.exit_interp(eip);
         self.a.bind(done);
         true
+    }
+
+    /// A 128-bit integer operation on XA and XB into XR.
+    fn sse_int(&mut self, op: u16) {
+        use a64::Narrow;
+        match op {
+            0x160..=0x162 => self.a.zip(true, (op - 0x160) as u32, false, XR, XA, XB),
+            0x16c => self.a.zip(true, 3, false, XR, XA, XB),
+            0x168..=0x16a => self.a.zip(true, (op - 0x168) as u32, true, XR, XA, XB),
+            0x16d => self.a.zip(true, 3, true, XR, XA, XB),
+            0x163 | 0x167 | 0x16b => {
+                let (kind, size) = match op {
+                    0x163 => (Narrow::Sqxtn, 0),
+                    0x167 => (Narrow::Sqxtun, 0),
+                    _ => (Narrow::Sqxtn, 1),
+                };
+                self.a.narrow(kind, size, XR, XA);
+                self.a.narrow_hi(kind, size, XR, XB);
+            }
+            0x1d4 => self.a.vec3(true, false, 3, 0b10000, XR, XA, XB),
+            0x1fb => self.a.vec3(true, true, 3, 0b10000, XR, XA, XB),
+            0x1e4 | 0x1e5 => {
+                self.a.mull(op == 0x1e5, 1, XR, XA, XB);
+                self.a.mull_hi(op == 0x1e5, 1, XT, XA, XB);
+                self.a.uzp(true, 1, true, XR, XR, XT);
+            }
+            0x1f5 => {
+                self.a.mull(true, 1, XR, XA, XB);
+                self.a.mull_hi(true, 1, XT, XA, XB);
+                self.a.vec3(true, false, 2, 0b10111, XR, XR, XT);
+            }
+            0x1f4 => {
+                self.a.narrow(Narrow::Xtn, 2, XR, XA);
+                self.a.narrow(Narrow::Xtn, 2, XT, XB);
+                self.a.mull(false, 2, XR, XR, XT);
+            }
+            0x1f6 => {
+                self.a.vec3(true, true, 0, 0b01110, XR, XA, XB);
+                self.a.uaddlp(true, 0, XR, XR);
+                self.a.uaddlp(true, 1, XR, XR);
+                self.a.uaddlp(true, 2, XR, XR);
+            }
+            _ => {
+                let (u, size, opcode) = simd_three(op).expect("checked by is_sse");
+                self.a.vec3(true, u, size, opcode, XR, XA, XB);
+            }
+        }
     }
 
     /// The `rm` operand into `dst`: `n` bytes from memory (zero-extended), or

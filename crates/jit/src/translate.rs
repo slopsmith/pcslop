@@ -1563,38 +1563,7 @@ impl Emit {
         const VA: V = V(16);
         const VB: V = V(17);
         let (op, reg, rm) = (insn.op, insn.reg(), insn.rm());
-        let three = |op: u16| -> Option<(bool, u32, u32)> {
-            Some(match op {
-                0x1fc => (false, 0, 0b10000),
-                0x1fd => (false, 1, 0b10000),
-                0x1fe => (false, 2, 0b10000),
-                0x1f8 => (true, 0, 0b10000),
-                0x1f9 => (true, 1, 0b10000),
-                0x1fa => (true, 2, 0b10000),
-                0x1ec => (false, 0, 0b00001),
-                0x1ed => (false, 1, 0b00001),
-                0x1dc => (true, 0, 0b00001),
-                0x1dd => (true, 1, 0b00001),
-                0x1e8 => (false, 0, 0b00101),
-                0x1e9 => (false, 1, 0b00101),
-                0x1d8 => (true, 0, 0b00101),
-                0x1d9 => (true, 1, 0b00101),
-                0x174 => (true, 0, 0b10001),
-                0x175 => (true, 1, 0b10001),
-                0x176 => (true, 2, 0b10001),
-                0x164 => (false, 0, 0b00110),
-                0x165 => (false, 1, 0b00110),
-                0x166 => (false, 2, 0b00110),
-                0x1d5 => (false, 1, 0b10011),
-                0x1e0 => (true, 0, 0b00010),
-                0x1e3 => (true, 1, 0b00010),
-                0x1da => (true, 0, 0b01101),
-                0x1de => (true, 0, 0b01100),
-                0x1ea => (false, 1, 0b01101),
-                0x1ee => (false, 1, 0b01100),
-                _ => return None,
-            })
-        };
+        let three = simd_three;
         let supported = matches!(op, 0x16e | 0x17e | 0x16f | 0x17f | 0x1db | 0x1df | 0x1eb | 0x1ef | 0x1d4 | 0x1fb)
             || three(op).is_some()
             || matches!(op, 0x160..=0x163 | 0x167..=0x16b | 0x1e4 | 0x1e5 | 0x1f5)
@@ -1827,20 +1796,54 @@ impl Emit {
     }
 }
 
+/// The NEON three-same op (U bit, size, opcode) for an MMX or SSE2 integer opcode.
+fn simd_three(op: u16) -> Option<(bool, u32, u32)> {
+    Some(match op {
+        0x1fc => (false, 0, 0b10000),
+        0x1fd => (false, 1, 0b10000),
+        0x1fe => (false, 2, 0b10000),
+        0x1f8 => (true, 0, 0b10000),
+        0x1f9 => (true, 1, 0b10000),
+        0x1fa => (true, 2, 0b10000),
+        0x1ec => (false, 0, 0b00001),
+        0x1ed => (false, 1, 0b00001),
+        0x1dc => (true, 0, 0b00001),
+        0x1dd => (true, 1, 0b00001),
+        0x1e8 => (false, 0, 0b00101),
+        0x1e9 => (false, 1, 0b00101),
+        0x1d8 => (true, 0, 0b00101),
+        0x1d9 => (true, 1, 0b00101),
+        0x174 => (true, 0, 0b10001),
+        0x175 => (true, 1, 0b10001),
+        0x176 => (true, 2, 0b10001),
+        0x164 => (false, 0, 0b00110),
+        0x165 => (false, 1, 0b00110),
+        0x166 => (false, 2, 0b00110),
+        0x1d5 => (false, 1, 0b10011),
+        0x1e0 => (true, 0, 0b00010),
+        0x1e3 => (true, 1, 0b00010),
+        0x1da => (true, 0, 0b01101),
+        0x1de => (true, 0, 0b01100),
+        0x1ea => (false, 1, 0b01101),
+        0x1ee => (false, 1, 0b01100),
+        _ => return None,
+    })
+}
+
 /// Instructions whose translations are new enough to verify on their own.
 fn is_recent(insn: &Insn) -> bool {
     let (op, reg, op32) = (insn.op, insn.reg(), insn.op32);
     match op {
-        0x1c8..=0x1cf | 0xc0 | 0xd0 | 0xd2 | 0x9c | 0x9d | 0x1ba | 0xf5 | 0xf8 | 0xf9 | 0x118 | 0x11f | 0x12b => true,
-        0x1c0 | 0x1c1 | 0x1b0 | 0x1b1 | 0x1c7 | 0x1a4 | 0x1a5 | 0x1ac | 0x1ad | 0xfb => true,
-        0xd8..=0xdf | 0x9b => true,
-        _ if sse::is_sse(insn) => true,
-        0x160..=0x17f | 0x1d0..=0x1ff => !insn.opsize_prefix && insn.rep == Rep::None,
-        0xc1 | 0xd1 | 0xd3 => !op32 || reg < 2,
-        0xf6 | 0xf7 => matches!(reg, 2 | 3) && !(op == 0xf7 && op32),
-        0x40..=0x4f => !op32,
-        0xff => reg < 2 && !op32,
-        _ => false,
+    0x1c8..=0x1cf | 0xc0 | 0xd0 | 0xd2 | 0x9c | 0x9d | 0x1ba | 0xf5 | 0xf8 | 0xf9 | 0x118 | 0x11f | 0x12b => true,
+    0x1c0 | 0x1c1 | 0x1b0 | 0x1b1 | 0x1c7 | 0x1a4 | 0x1a5 | 0x1ac | 0x1ad | 0xfb => true,
+    0xd8..=0xdf | 0x9b => true,
+    _ if sse::is_sse(insn) => true,
+    0x160..=0x17f | 0x1d0..=0x1ff => !insn.opsize_prefix && insn.rep == Rep::None,
+    0xc1 | 0xd1 | 0xd3 => !op32 || reg < 2,
+    0xf6 | 0xf7 => matches!(reg, 2 | 3) && !(op == 0xf7 && op32),
+    0x40..=0x4f => !op32,
+    0xff => reg < 2 && !op32,
+    _ => false,
     }
 }
 

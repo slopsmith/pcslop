@@ -852,7 +852,26 @@ fn random_sse(rng: &mut Rng, out: &mut Vec<u8>) {
     let slot = 0x3000 + 16 * rng.below(16);
     let any_pfx = [0, 0x66, 0xf3, 0xf2][rng.below(4) as usize];
     let packed_pfx = [0, 0x66][rng.below(2) as usize];
-    match rng.below(20) {
+    const INT_OPS: [u8; 46] = [
+        0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x74, 0x75, 0x76, 0xd4, 0xd5, 0xd8, 0xd9,
+        0xda, 0xdc, 0xdd, 0xde, 0xe0, 0xe3, 0xe4, 0xe5, 0xe8, 0xe9, 0xea, 0xec, 0xed, 0xee, 0xf4, 0xf5, 0xf6, 0xf8, 0xf9, 0xfa, 0xfb,
+        0xfc, 0xfd, 0xfe, 0xdb,
+    ];
+    match rng.below(24) {
+        20 | 21 => sse_op(out, 0x66, INT_OPS[rng.below(INT_OPS.len() as u32) as usize], reg, rm, slot),
+        22 => {
+            let (op, sub) = [(0x71, 2), (0x71, 4), (0x71, 6), (0x72, 2), (0x72, 4), (0x72, 6), (0x73, 2), (0x73, 3), (0x73, 6), (0x73, 7)]
+                [rng.below(10) as usize];
+            out.extend([0x66, 0x0f, op, modrm_rr(sub, reg), rng.below(70) as u8]);
+        }
+        23 => match rng.below(3) {
+            0 => {
+                sse_op(out, 0x66, 0xc4, reg, rm.map(|_| rng.reg()), slot + 2 * rng.below(8));
+                out.push(rng.next() as u8);
+            }
+            1 => out.extend([0x66, 0x0f, 0xc5, modrm_rr(rng.reg(), reg), rng.next() as u8]),
+            _ => out.extend([0x66, 0x0f, 0xd7, modrm_rr(rng.reg(), reg)]),
+        },
         0 => sse_op(out, packed_pfx, [0x10, 0x11, 0x28, 0x29][rng.below(4) as usize], reg, rm, slot),
         1 => sse_op(out, [0xf3, 0xf2][rng.below(2) as usize], [0x10, 0x11][rng.below(2) as usize], reg, rm, slot + 4 * rng.below(3)),
         2 => {
