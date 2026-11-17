@@ -171,6 +171,15 @@ impl Vga {
         self.ext_window = w;
     }
 
+    /// CRTC register `index`, and the index register's current value.
+    pub fn crtc(&self, index: u8) -> u8 {
+        self.crtc[index as usize]
+    }
+
+    pub fn crtc_index(&self) -> u8 {
+        self.crtc_index
+    }
+
     /// Marks the picture as changed, for VRAM or registers that live outside the VGA.
     pub fn touch(&mut self) {
         self.changed = true;

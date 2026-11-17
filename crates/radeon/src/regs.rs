@@ -57,3 +57,8 @@ pub const GPIO_Y_0: u32 = 1 << 8;
 pub const GPIO_Y_1: u32 = 1 << 9;
 pub const GPIO_EN_0: u32 = 1 << 16;
 pub const GPIO_EN_1: u32 = 1 << 17;
+pub const MC_STATUS: u32 = 0x0150;
+/// MC_STATUS idle bits: MC_IDLE for R100 to R200, R300_MC_IDLE from R300 on.
+pub const MC_STATUS_IDLE: u32 = 1 << 2 | 1 << 4;
+pub const MC_FB_LOCATION: u32 = 0x0148;
+pub const DISPLAY_BASE_ADDR: u32 = 0x023c;

@@ -202,3 +202,26 @@ fn dac_compare_finds_a_monitor() {
     r.mmio_write(DAC_CNTL, 4, 0x02);
     assert_eq!(r.mmio_read(DAC_CNTL, 1) & DAC_CMP_OUTPUT, 0);
 }
+
+#[test]
+fn vga_crtc_writes_reach_the_extended_timings() {
+    let mut r = card();
+    r.vga_io_write(0x3c2, 1, 0x67);
+    r.mmio_write(CRTC_V_TOTAL_DISP, 4, 0x01df_020c);
+    r.vga_io_write(0x3d4, 2, 0x1f07);
+    r.vga_io_write(0x3d4, 2, 0xde12);
+    assert_eq!(r.mmio_read(CRTC_V_TOTAL_DISP + 2, 1), 0xde);
+    r.vga_io_write(0x3d4, 1, 0x01);
+    r.vga_io_write(0x3d5, 1, 0x4f);
+    assert_eq!(r.mmio_read(CRTC_H_TOTAL_DISP, 4) >> 16, 0x4f);
+}
+
+#[test]
+fn scanout_counts_from_display_base_addr() {
+    let mut r = card();
+    set_640x480x16(&mut r);
+    r.mmio_write(MC_FB_LOCATION, 4, 0xf7ff_f000);
+    r.mmio_write(DISPLAY_BASE_ADDR, 4, 0xf000_0000);
+    assert_eq!(r.mode().unwrap().offset, 0x1000);
+    assert_ne!(r.mmio_read(MC_STATUS, 4) & 1 << 4, 0);
+}

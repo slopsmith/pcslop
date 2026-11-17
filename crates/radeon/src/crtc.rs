@@ -47,9 +47,17 @@ impl Radeon {
         }
         let bytes = bits.div_ceil(8);
         let pitch = (self.reg(CRTC_PITCH) & 0x7ff) * 8 * bytes;
-        let offset = self.reg(CRTC_OFFSET) & 0x07ff_ffff;
+        let offset = self.vram_offset(self.reg(CRTC_OFFSET));
         (width <= MAX_DIM && height <= MAX_DIM && height > 0)
             .then_some(Mode { width, height, bits, pitch, offset, double_scan })
+    }
+
+    /// VRAM offset of a CRTC or cursor offset, which count from
+    /// DISPLAY_BASE_ADDR in the memory controller's address space.
+    fn vram_offset(&self, off: u32) -> u32 {
+        let fb_start = (self.reg(MC_FB_LOCATION) & 0xffff) << 16;
+        let mc = self.reg(DISPLAY_BASE_ADDR).wrapping_add(off & 0x07ff_ffff);
+        mc.wrapping_sub(fb_start) % crate::VRAM_SIZE as u32
     }
 
     /// Scanline the CRTC is on now, from its vertical total and a 60 Hz frame.
@@ -130,7 +138,7 @@ impl Radeon {
         let hot = self.reg(CUR_HORZ_VERT_OFF);
         let (x0, y0) = ((posn >> 16) & 0x3fff, posn & 0xfff);
         let (skip_x, skip_y) = ((hot >> 16) & 0x3f, hot & 0x3f);
-        let base = (self.reg(CUR_OFFSET) & 0x07ff_ffff) as usize;
+        let base = self.vram_offset(self.reg(CUR_OFFSET)) as usize;
         let vram = self.vga.vram();
         for j in 0..64 - skip_y {
             let y = y0 + j;

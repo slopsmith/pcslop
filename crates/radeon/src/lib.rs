@@ -161,7 +161,45 @@ impl Radeon {
         if ours && let Some(t) = &mut self.trace {
             t.line(format!("vga W{size} {port:#05x} = {v:#x}"));
         }
+        if ours && port & 0xfff0 == if self.vga_mono() { 0x3b0 } else { 0x3d0 } {
+            let data = matches!((port & 0xf, size), (4, 2..) | (5, _));
+            if data {
+                self.shadow_vga_crtc(self.vga.crtc_index());
+            }
+        }
         ours
+    }
+
+    fn vga_mono(&mut self) -> bool {
+        self.vga.io_read(0x3cc, 1, self.now_ns).is_some_and(|m| m & 1 == 0)
+    }
+
+    // The ROM's mode set writes CR12 and checks that CRTC_V_TOTAL_DISP follows,
+    // or it never clears CRTC_EXT_DISP_EN again.
+    fn shadow_vga_crtc(&mut self, index: u8) {
+        let cr = |i: u8| self.vga.crtc(i) as u32;
+        let ov = cr(7);
+        let field = |reg: u32, shift: u32, bits: u32, v: u32| {
+            let mask = ((1u32 << bits) - 1) << shift;
+            (reg & !mask) | ((v << shift) & mask)
+        };
+        match index {
+            0 => {
+                let r = field(self.reg(CRTC_H_TOTAL_DISP), 0, 10, cr(0) + 4);
+                self.regs[CRTC_H_TOTAL_DISP as usize / 4] = r;
+            }
+            1 => {
+                let r = field(self.reg(CRTC_H_TOTAL_DISP), 16, 9, cr(1));
+                self.regs[CRTC_H_TOTAL_DISP as usize / 4] = r;
+            }
+            6 | 7 | 0x12 => {
+                let total = cr(6) | (ov & 1) << 8 | (ov & 0x20) << 4;
+                let disp = cr(0x12) | (ov & 2) << 7 | (ov & 0x40) << 3;
+                let r = field(self.reg(CRTC_V_TOTAL_DISP), 0, 11, total + 1);
+                self.regs[CRTC_V_TOTAL_DISP as usize / 4] = field(r, 16, 11, disp);
+            }
+            _ => {}
+        }
     }
 
     /// Reads or writes `size` bytes of the register file at byte offset `off`.
@@ -290,6 +328,7 @@ impl Radeon {
             CONFIG_REG_1_BASE => self.bars.mmio,
             CONFIG_REG_APER_SIZE => MMIO_SIZE,
             RBBM_STATUS => RBBM_FIFOCNT_IDLE,
+            MC_STATUS => self.reg(MC_STATUS) | MC_STATUS_IDLE,
             0x0f00..=0x0ffc => {
                 let i = (reg - 0x0f00) as usize;
                 u32::from_le_bytes(self.config[i..i + 4].try_into().unwrap())
