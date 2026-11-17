@@ -320,6 +320,7 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
     let mut time = HostTime::default();
     let mut last_time = HostTime::default();
     let mut last_stats = jit::Stats::default();
+    let mut last_apic = pc::apic::Stats::default();
     let mut script = match args.script.as_ref().map(Script::load).transpose() {
         Ok(s) => s,
         Err(e) => {
@@ -485,6 +486,20 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                                 sl.1,
                                 sl.2
                             );
+                            if let Some(l) = &board.lapic {
+                                let (a, b) = (l.stats, last_apic);
+                                let r = |x: u64, y: u64| (x - y) as f64 / span;
+                                out += &format!(
+                                    "\napic/s: reads {:.0} writes {:.0} tpr reads {:.0} tpr writes {:.0} eoi {:.0} | ppr {:02x}",
+                                    r(a.reads, b.reads),
+                                    r(a.writes, b.writes),
+                                    r(a.tpr_reads, b.tpr_reads),
+                                    r(a.tpr_writes, b.tpr_writes),
+                                    r(a.eois, b.eois),
+                                    l.ppr()
+                                );
+                                last_apic = a;
+                            }
                             if let Some(j) = jit.as_mut() {
                                 let (a, b) = (j.stats, last_stats);
                                 let r = |x: u64, y: u64| (x - y) as f64 / span;
