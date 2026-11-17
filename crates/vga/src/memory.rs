@@ -64,7 +64,17 @@ impl Vga {
         Some((off < 0x1_0000).then(|| (self.vbe.bank_offset + off) as usize % self.vram.len()))
     }
 
+    /// VRAM offset that a banked access lands on, if a bank window is set.
+    fn bank_window(&self, addr: u32, banks: [u32; 2]) -> Option<usize> {
+        let off = addr.checked_sub(0xa_0000).filter(|&o| o < 0x1_0000)?;
+        let base = banks[(off >> 15) as usize] as usize;
+        Some((base + (off & 0x7fff) as usize) % self.vram.len())
+    }
+
     pub fn mem_read8(&mut self, addr: u32) -> u8 {
+        if let Some(w) = self.ext_window {
+            return self.bank_window(addr, w.read).map_or(0xff, |i| self.vram[i]);
+        }
         if let Some(lin) = self.linear_window(addr) {
             return lin.map_or(0xff, |i| self.vram[i]);
         }
@@ -90,6 +100,12 @@ impl Vga {
 
     pub fn mem_write8(&mut self, addr: u32, v: u8) {
         self.changed = true;
+        if let Some(w) = self.ext_window {
+            if let Some(i) = self.bank_window(addr, w.write) {
+                self.vram[i] = v;
+            }
+            return;
+        }
         if let Some(lin) = self.linear_window(addr) {
             if let Some(i) = lin {
                 self.vram[i] = v;

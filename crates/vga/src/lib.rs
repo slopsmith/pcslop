@@ -26,8 +26,17 @@ pub const VRAM_SIZE: usize = 16 << 20;
 const SEQ_MASK: [u8; 8] = [0x03, 0x3d, 0x0f, 0x3f, 0x0e, 0x00, 0x00, 0xff];
 const GFX_MASK: [u8; 16] = [0x0f, 0x0f, 0x0f, 0x1f, 0x03, 0x7b, 0x0f, 0x0f, 0xff, 0, 0, 0, 0, 0, 0, 0];
 
+/// A packed-pixel window at 0xA0000..0xB0000 in two 32 KiB halves, each
+/// mapped at its own VRAM offset for reads and for writes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct BankWindow {
+    pub read: [u32; 2],
+    pub write: [u32; 2],
+}
+
 pub struct Vga {
     vram: vram::Vram,
+    ext_window: Option<BankWindow>,
     misc: u8,
     feature: u8,
     subsys: u8,
@@ -74,6 +83,7 @@ impl Vga {
     pub fn with_vram(vram_size: usize, dispi: bool) -> Self {
         Vga {
             vram: vram::Vram::new(vram_size),
+            ext_window: None,
             misc: 0,
             feature: 0,
             subsys: 0,
@@ -154,6 +164,11 @@ impl Vga {
             self.dac_8bit = on;
             self.changed = true;
         }
+    }
+
+    /// Replaces planar VGA decoding of 0xA0000..0xB0000 with a bank window, or restores it.
+    pub fn set_bank_window(&mut self, w: Option<BankWindow>) {
+        self.ext_window = w;
     }
 
     /// Marks the picture as changed, for VRAM or registers that live outside the VGA.
