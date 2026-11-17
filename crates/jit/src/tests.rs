@@ -1892,3 +1892,12 @@ fn code_rewritten_through_the_aperture_is_translated_again() {
     });
     assert_eq!((cpu.regs[2], cpu.regs[0]), (1, 2));
 }
+
+#[test]
+#[ignore]
+fn dump_runtime_code() {
+    let (code, e) = crate::runtime::build();
+    let bytes: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
+    std::fs::write(std::env::var("RT_OUT").unwrap(), bytes).unwrap();
+    eprintln!("resume {:#x} dispatch {:#x} exit {:#x}", e.resume, e.dispatch, e.exit);
+}

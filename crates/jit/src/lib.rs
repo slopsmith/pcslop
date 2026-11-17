@@ -332,6 +332,8 @@ pub struct Jit {
     /// Where the vCPU was at each kick while profiling: guest EIP of the
     /// translated block, or a runtime offset (negative keys, 64-byte buckets).
     pc_samples: HashMap<i64, u64>,
+    /// Profile samples per block key.
+    block_samples: HashMap<u64, u64>,
     /// Declared last so it is dropped after the vCPU.
     vm: Vm,
     fb: Option<Framebuffer>,
@@ -444,6 +446,7 @@ impl Jit {
             stats: Stats::default(),
             interp_profile: std::env::var_os("SLOPPER_JIT_PROFILE").map(|_| HashMap::default()),
             pc_samples: HashMap::default(),
+            block_samples: HashMap::default(),
             verify: std::env::var_os("SLOPPER_JIT_VERIFY").is_some(),
             vm_fill: std::env::var_os("SLOPPER_JIT_NO_VM_FILL").is_none(),
             afp: false,
@@ -559,6 +562,7 @@ impl Jit {
         self.timing = on;
         self.interp_profile = on.then(HashMap::default);
         self.pc_samples.clear();
+        self.block_samples.clear();
         let s = &mut self.stats;
         (s.vm_ns, s.miss_ns, s.interp_ns, s.fault_ns, s.mmio_ns) = (0, 0, 0, 0, 0);
     }
@@ -590,6 +594,41 @@ impl Jit {
             top.join(" "),
             hot.join(" ")
         )
+    }
+
+    /// Writes the `n` blocks with the most profile samples into `dir`: for
+    /// each, `NN.x86` (guest code from the block's first instruction) and
+    /// `NN.a64` (its translation), plus `index.txt` listing rank, samples,
+    /// guest address, instruction count and host size. `scripts/jit-blocks`
+    /// disassembles them side by side.
+    pub fn dump_hot_blocks<B: Bus>(&self, bus: &mut B, dir: &std::path::Path, n: usize) -> std::io::Result<String> {
+        std::fs::create_dir_all(dir)?;
+        let mut hot: Vec<(u64, u64)> = self.block_samples.iter().map(|(k, n)| (*k, *n)).collect();
+        hot.sort_by(|a, b| b.1.cmp(&a.1));
+        let total: u64 = self.pc_samples.values().sum();
+        let mut index = format!("# rank samples share eip phys user insns host_bytes (of {total} samples)\n");
+        for (rank, (key, samples)) in hot.iter().take(n).enumerate() {
+            let Some(b) = self.blocks.get(key) else { continue };
+            let end = self.by_va.range(b.va + 1..).next().map_or(layout::va(self.code_next), |(va, _)| *va);
+            let off = (b.va - layout::RUNTIME_VA) as usize;
+            let host = &self.mem.as_slice()[off..off + (end - b.va) as usize];
+            let phys = *key as u32;
+            let first = b.boundaries.first().map_or(0, |(_, e)| *e);
+            let last = b.boundaries.last().map_or(first, |(_, e)| *e);
+            let len = (last.wrapping_sub(first) + 16).min(4096);
+            let guest: Vec<u8> = (0..len).map(|i| bus.read8(phys.wrapping_add(i))).collect();
+            std::fs::write(dir.join(format!("{rank:02}.x86")), &guest)?;
+            std::fs::write(dir.join(format!("{rank:02}.a64")), host)?;
+            index += &format!(
+                "{rank:02} {samples} {:.1}% {first:08x} {phys:08x} {} {} {}\n",
+                *samples as f64 * 100.0 / total.max(1) as f64,
+                (key >> 32) & 1,
+                b.insns,
+                host.len()
+            );
+        }
+        std::fs::write(dir.join("index.txt"), &index)?;
+        Ok(index)
     }
 
     /// Writes back the x87 state held in registers at the boundary before `pc`
@@ -632,6 +671,9 @@ impl Jit {
         let pc = self.vcpu.reg(reg::PC)?;
         let code = layout::va(layout::CODE_CACHE)..layout::va(layout::CODE_CACHE_END);
         let key = if code.contains(&pc) {
+            if let Some((_, &block)) = self.by_va.range(..=pc).next_back() {
+                *self.block_samples.entry(block).or_default() += 1;
+            }
             self.eip_at(pc).map_or(-1, |e| e as i64)
         } else {
             -((pc.wrapping_sub(layout::RUNTIME_VA) & !63) as i64) - 1

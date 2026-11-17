@@ -860,6 +860,12 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                                 j.set_profiling(rest == "on");
                                 format!("profiling {rest}")
                             }
+                            (Some(j), r) if r.starts_with("blocks ") => {
+                                let mut words = r["blocks ".len()..].split_whitespace();
+                                let dir = words.next().unwrap_or(".");
+                                let n = words.next().and_then(|w| w.parse().ok()).unwrap_or(30);
+                                j.dump_hot_blocks(&mut board, Path::new(dir), n).unwrap_or_else(|e| format!("cannot write {dir}: {e}"))
+                            }
                             (Some(j), _) => j.profile_report(),
                         },
                         "save" if !rest.is_empty() => savestate::save(Path::new(rest), &cpu, &mut board, &media).unwrap_or_else(|e| e),

@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Disassembles the blocks `profile blocks DIR` wrote: the x86 code and its
+# A64 translation, hottest first. Usage: scripts/jit-blocks DIR [COUNT]
+set -euo pipefail
+dir=${1:?usage: scripts/jit-blocks DIR [COUNT]}
+count=${2:-1000}
+nix shell nixpkgs#nasm nixpkgs#llvm -c bash -s "$dir" "$count" <<'EOF'
+dir=$1
+count=$2
+grep -v '^#' "$dir/index.txt" | head -n "$count" | while read -r rank samples share eip phys user insns bytes; do
+	echo "=== #$rank  $samples samples ($share)  eip $eip  phys $phys  user $user  $insns x86 insns -> $bytes host bytes"
+	echo "--- x86"
+	ndisasm -b32 -o "0x$eip" "$dir/$rank.x86" | head -n "$insns"
+	echo "--- a64"
+	xxd -p -c 4 "$dir/$rank.a64" | sed 's/\(..\)\(..\)\(..\)\(..\)/0x\1 0x\2 0x\3 0x\4/' |
+		llvm-mc --disassemble -triple=aarch64 2>/dev/null | grep -v '^\s*\.text'
+	echo
+done
+EOF
