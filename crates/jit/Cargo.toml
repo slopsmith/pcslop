@@ -10,3 +10,6 @@ publish.workspace = true
 a64 = { path = "../a64" }
 hvf = { path = "../hvf" }
 x86 = { path = "../x86" }
+
+[dev-dependencies]
+snapshot = { path = "../snapshot" }

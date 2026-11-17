@@ -678,6 +678,18 @@ impl Jit {
         Ok(true)
     }
 
+    /// Drops every translation and shadow mapping, for when guest memory
+    /// and CPU state were replaced wholesale, as by restoring a snapshot.
+    pub fn forget_guest(&mut self) {
+        self.reset_code_cache();
+        self.ahead_cache.clear();
+        self.smc_counts.clear();
+        self.self_check.clear();
+        self.shadow_key = None;
+        self.shadow_paged = false;
+        self.state().ctl |= ctl::IC_IALLU;
+    }
+
     /// x86 instructions retired by translated code so far.
     pub fn instructions(&mut self) -> u64 {
         self.state().icount

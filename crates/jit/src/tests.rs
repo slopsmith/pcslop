@@ -1540,3 +1540,77 @@ fn decodes_the_loads_and_stores_translated_code_makes() {
     let acc = |load, size, sign, rt| Some(Access { load, size, sign, rt });
     assert_eq!(got, [acc(true, 4, false, 22), acc(false, 4, false, 20), acc(true, 2, true, 3), acc(false, 1, false, 4), None, None]);
 }
+
+/// Counts down ECX from 2,000,000, storing to a 64 KiB buffer and summing
+/// into XMM0 on every pass.
+const LONG_LOOP: &[u8] = &[
+    0xb9, 0x80, 0x84, 0x1e, 0x00, // mov ecx, 2000000
+    0x01, 0xc8, // add eax, ecx
+    0x69, 0xd8, 0x03, 0x00, 0x00, 0x00, // imul ebx, eax, 3
+    0x89, 0xca, // mov edx, ecx
+    0x81, 0xe2, 0xff, 0x3f, 0x00, 0x00, // and edx, 0x3fff
+    0x89, 0x1c, 0x95, 0x00, 0x00, 0x20, 0x00, // mov [edx*4 + 0x200000], ebx
+    0x66, 0x0f, 0x6e, 0xc8, // movd xmm1, eax
+    0x66, 0x0f, 0xfe, 0xc1, // paddd xmm0, xmm1
+    0x49, // dec ecx
+    0x75, 0xde, // jnz back to the add
+    0xf4, // hlt
+];
+
+#[test]
+fn a_snapshot_taken_mid_run_resumes_to_the_same_result() {
+    use snapshot::{Reader, Snap, Writer};
+    let mut cpu = flat_cpu(0x1000, 0x8000);
+    let mut bus = bus_with(0x1000, LONG_LOOP);
+    paged(&mut cpu, &mut bus, false);
+    let mut snap: Option<(Vec<u8>, Vec<u8>)> = None;
+    let mut resumed = None;
+    let reference = {
+        let mut c = cpu.clone();
+        let mut b = bus_with(0x1000, LONG_LOOP);
+        paged(&mut c, &mut b, false);
+        run_jit(&mut c, &mut b);
+        (c, b.ram.as_slice().to_vec())
+    };
+    let _vm = VM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut jit = unsafe { Jit::new(bus.ram.as_ptr(), RAM).unwrap() };
+    let kicker = jit.kicker();
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = done.clone();
+    let kicks = std::thread::spawn(move || {
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_micros(200));
+            kicker.kick();
+        }
+    });
+    let _join = scopeguard(move || {
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = kicks.join();
+    });
+    for _ in 0..100_000 {
+        if cpu.halted {
+            break;
+        }
+        if snap.is_none() && cpu.regs[1] != 0 && cpu.regs[1] < 1_500_000 {
+            let mut w = Writer::new();
+            cpu.save(&mut w);
+            snap = Some((w.buf, bus.ram.as_slice().to_vec()));
+            bus.ram.as_mut_slice().fill(0x55);
+            cpu = flat_cpu(0, 0);
+            let (state, ram) = snap.as_ref().unwrap();
+            cpu.load(&mut Reader::new(state)).unwrap();
+            bus.ram.as_mut_slice().copy_from_slice(ram);
+            jit.forget_guest();
+            resumed = Some(cpu.regs[1]);
+        }
+        jit.run(&mut cpu, &mut bus).unwrap();
+    }
+    assert!(cpu.halted, "the resumed run did not reach HLT");
+    let at = resumed.expect("no kick landed in the middle of the loop");
+    assert!(at > 0 && at < 2_000_000, "snapshot at ECX {at}");
+    let (want, want_ram) = reference;
+    assert_eq!(cpu.regs, want.regs);
+    assert_eq!(cpu.xmm, want.xmm);
+    assert_eq!(cpu.eflags & ARITH_MASK, want.eflags & ARITH_MASK);
+    assert!(bus.ram.as_slice() == &want_ram[..], "memory differs");
+}
