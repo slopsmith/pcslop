@@ -7,6 +7,7 @@
 //! of VRAM, as QEMU's stdvga and ati-vga do.
 
 mod crtc;
+mod ddc;
 mod names;
 pub mod regs;
 mod trace;
@@ -63,6 +64,8 @@ pub struct Radeon {
     now_ns: u64,
     /// Frames whose vertical blank CRTC_STATUS and GEN_INT_STATUS have been acknowledged up to.
     vblank_acked: [u64; 2],
+    /// The monitor on the VGA connector's DDC lines.
+    monitor: ddc::Ddc,
     trace: Option<Trace>,
 }
 
@@ -77,6 +80,7 @@ impl Radeon {
             config: [0; 256],
             now_ns: 0,
             vblank_acked: [0; 2],
+            monitor: ddc::Ddc::default(),
             trace: None,
         };
         r.reset();
@@ -88,6 +92,7 @@ impl Radeon {
         self.regs.fill(0);
         self.pll = [0; 64];
         self.vga.set_bank_window(None);
+        self.monitor = ddc::Ddc::default();
     }
 
     pub fn set_trace(&mut self, out: Box<dyn Write + Send>) {
@@ -255,6 +260,18 @@ impl Radeon {
                 let v = self.reg(GEN_INT_STATUS) & !VSYNC_INT;
                 v | if self.frame() > self.vblank_acked[1] { VSYNC_INT } else { 0 }
             }
+            DAC_CNTL => {
+                let v = self.reg(DAC_CNTL);
+                if v & DAC_CMP_EN != 0 { v | DAC_CMP_OUTPUT } else { v & !DAC_CMP_OUTPUT }
+            }
+            GPIO_VGA_DDC | GPIO_DVI_DDC | GPIO_MONID | GPIO_CRT2_DDC => {
+                let v = self.reg(reg);
+                let (scl, mut sda) = gpio_lines(v);
+                if reg == GPIO_VGA_DDC {
+                    sda &= self.monitor.sda_line();
+                }
+                (v & !(GPIO_Y_0 | GPIO_Y_1)) | ((sda as u32) * GPIO_Y_0) | ((scl as u32) * GPIO_Y_1)
+            }
             CRTC_VLINE_CRNT_VLINE => self.vline() << 16,
             CRTC_CRNT_FRAME => self.frame() as u32 & 0x1f_ffff,
             PALETTE_DATA | PALETTE_30_DATA => {
@@ -313,6 +330,10 @@ impl Radeon {
         self.regs[reg as usize / 4] = new;
         match reg {
             DAC_CNTL => self.vga.set_dac_8bit(new & DAC_8BIT_EN != 0),
+            GPIO_VGA_DDC => {
+                let (scl, sda) = gpio_lines(new);
+                self.monitor.drive(scl, sda);
+            }
             CRTC_GEN_CNTL | CRTC_EXT_CNTL | MEM_VGA_WP_SEL | MEM_VGA_RP_SEL => {
                 self.update_bank_window();
                 self.vga.touch();
@@ -360,4 +381,11 @@ impl Radeon {
     pub fn take_changed(&mut self) -> bool {
         self.vga.take_changed()
     }
+}
+
+/// SCL and SDA as the card drives them: a line is low only while its output is
+/// enabled with a 0 (A_1 and EN_1 are SCL, A_0 and EN_0 are SDA).
+fn gpio_lines(v: u32) -> (bool, bool) {
+    let low = |a: u32, en: u32| v & en != 0 && v & a == 0;
+    (!low(GPIO_A_1, GPIO_EN_1), !low(GPIO_A_0, GPIO_EN_0))
 }
