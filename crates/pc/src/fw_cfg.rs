@@ -16,6 +16,7 @@ pub mod key {
     pub const MAX_CPUS: u16 = 0x0f;
     pub const FILE_DIR: u16 = 0x19;
     pub const FILE_FIRST: u16 = 0x20;
+    pub const SMBIOS_ENTRIES: u16 = 0x8001;
 }
 
 #[derive(Default)]
@@ -82,6 +83,22 @@ pub fn e820(entries: &[(u64, u64, u32)]) -> Vec<u8> {
         out.extend(base.to_le_bytes());
         out.extend(len.to_le_bytes());
         out.extend(typ.to_le_bytes());
+    }
+    out
+}
+
+/// Builds QEMU's legacy SMBIOS entry list, one string override per field:
+/// (structure type, byte offset of the field in the structure, string).
+/// SeaBIOS reads it in `qemu_cfg_legacy` (`src/fw/paravirt.c`, Kevin O'Connor
+/// and the SeaBIOS authors); the layout matches QEMU's `hw/smbios/smbios.c`.
+pub fn smbios_fields(fields: &[(u8, u16, &str)]) -> Vec<u8> {
+    let mut out = (fields.len() as u16).to_le_bytes().to_vec();
+    for &(table, offset, text) in fields {
+        out.extend((6 + text.len() as u16 + 1).to_le_bytes());
+        out.extend([0, table]);
+        out.extend(offset.to_le_bytes());
+        out.extend(text.as_bytes());
+        out.push(0);
     }
     out
 }

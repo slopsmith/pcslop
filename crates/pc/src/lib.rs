@@ -77,6 +77,18 @@ const DISPLAY: usize = 3;
 const UHCI: usize = 4;
 const UHCI_PORTS: u16 = 32;
 const LEGACY_END: u32 = 0x10_0000;
+/// SMBIOS strings by (structure type, field offset within the structure).
+const SMBIOS: &[(u8, u16, &str)] = &[
+    (0, 4, "86slopper"),
+    (0, 5, "SeaBIOS on Hypervisor.framework"),
+    (0, 8, "11/17/2026"),
+    (1, 4, "86slopper"),
+    (1, 5, "Slop Station 86"),
+    (1, 6, "Apple Silicon Edition"),
+    (1, 26, "Totally Real PC"),
+    (3, 4, "86slopper"),
+    (4, 7, "86slopper"),
+];
 
 impl Board {
     pub fn new(cfg: Config) -> Self {
@@ -127,6 +139,7 @@ impl Board {
         b.fw_cfg.set(fw_cfg::key::RAM_SIZE, (ram_bytes as u64).to_le_bytes().to_vec());
         let e820 = fw_cfg::e820(&[(0, ram_bytes as u64, 1)]);
         b.fw_cfg.add_file("etc/e820", e820);
+        b.fw_cfg.set(fw_cfg::key::SMBIOS_ENTRIES, fw_cfg::smbios_fields(SMBIOS));
         b
     }
 
