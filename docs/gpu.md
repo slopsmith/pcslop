@@ -11,7 +11,7 @@ Why this card:
 - **Vendor documentation.** AMD published register references and programming guides for R3xx to R5xx through X.org in 2008. For Nvidia cards of the same era there are only reverse-engineered notes.
 - **Complete open drivers.** The Linux `radeon` DRM driver, Mesa's `r300` gallium driver and xf86-video-ati cover every block we need. When a guest driver misbehaves on Linux, we can read the exact code path.
 - **DirectX 9 and Shader Model 2.0.** Enough for dxdiag and games of the XP era. DXT textures map directly to Metal's BC formats.
-- **Same era as our CPU.** It is from 2002, like the Northwood Pentium 4 we report in CPUID. Catalyst 9.3 is the last release for R300 to R500 on XP; confirm against its INF.
+- **Same era as our CPU.** It is from 2002, like the Northwood Pentium 4 we report in CPUID. Catalyst 10.2 legacy is the last release for R300 to R500 on XP; its INF lists the 9700 Pro (`4E44`).
 - **Its speed does not matter.** We only borrow its feature set. Metal does the drawing.
 
 R300 and R420 share the command processor, 2D engine, memory controller and legacy display. R5xx replaces the display with AVIVO. A later R4xx card would reuse almost everything.
@@ -137,6 +137,29 @@ dxdiag's DirectDraw tests and its Direct3D 7, 8 and 9 tests pass. They needed:
 
 Its hottest MMIO polls: `CP_RB_RPTR` (about 900,000 reads while it waited on a fence that never came), then the DDC GPIOs (about 15,000 each).
 
+## Catalyst 10.2 on Windows XP
+
+The installer (`10-2_legacy_xp32-64_dd_ccc.exe`) installs the display driver and Catalyst Control Center. Run it on the ACPI-HAL XP after XP's own ATI driver has taken the card, and restart. After that, XP comes up at 1440x900 in 32 bits on Catalyst's driver: ati2dvag.dll 6.14.10.6925, ati2mtag.sys, DDI 9, with DirectDraw, Direct3D and AGP texture acceleration on. dxdiag's DirectDraw tests and its Direct3D 7, 8 and 9 tests pass, and the OpenGL driver (atioglxx.dll) draws XP's 3D Pipes screen saver. CCC needs .NET 2.0, which our XP image lacks: at each logon it says so and quits.
+
+What it needed:
+
+- **IA32_DEBUGCTL and the branch records.** As ati2mtag.sys starts, it sets `IA32_DEBUGCTL.LBR` and later reads the last branch record stack, through self-modifying code that patches RDMSR and WRMSR into place. On a family 15 model 2 CPU those are `MSR_LASTBRANCH_TOS` (0x1DA) and `MSR_LASTBRANCH_0..3` (0x1DB to 0x1DE). Each raised #GP, which bugchecked XP with 0x8E in ati2mtag.sys. The CPU now keeps DEBUGCTL's bits and reads the branch records as empty.
+- **Fast Z clears.** The OpenGL driver clears depth only with `3D_CLEAR_ZMASK`, which zeroes the Z compression mask; with `ZB_BW_CNTL.FAST_FILL` the card then reads `ZB_DEPTHCLEARVALUE` for those tiles and never touches the Z buffer. We keep the mask (2 x 4096 dwords, one per 32x16 pixels on R300's two Z pipes, as Mesa's r300 driver lays it out) and, before the next draw that reads Z with FAST_FILL, write the clear value into the blocks it marks as cleared: with a Metal compute fill queued behind the draws, or on the CPU. Without this the stale Z buffer failed every pixel and 3D Pipes drew nothing.
+
+How it drives the card, compared with XP's own driver:
+
+- It reprograms the memory controller at start: `MC_FB_LOCATION` = 0xF7FFF000, so VRAM sits at 0xF0000000 in the card's address space, with `DISPLAY_BASE_ADDR` there too.
+- Its ring and indirect buffers are in the PCI GART. Fences are the same `CP_RESYNC_ADDR`/`CP_RESYNC_DATA` pair, followed by a write of a GART address to the undocumented `0x780`, which we ignore.
+- Each indirect buffer starts with a one-dword type-3 packet `0x20` (`0x01000002`) after `WAIT_UNTIL`. We skip it.
+- Flips are `CRTC_OFFSET` writes in the ring, behind the frame's draws. OpenGL renders to a tiled back buffer and presents it with a full-screen point sprite into one of two front buffers before the flip.
+- Colour and depth buffers are macro- and micro-tiled. We keep them linear, as everywhere else.
+
+To install it:
+
+1. Boot a fresh `~/xp-acpi.img` clone with `--gpu radeon --vga-rom ROM`, let XP install its ATI and AGP drivers, and click Yes on the restart prompt.
+2. At the 1440x900 desktop, `cdrom ISO` on the control socket, run the installer, choose Custom (display driver and CCC), click Continue Anyway on the logo warning, then Finish with "restart now".
+3. Take a save state before the restart. Killing the guest during the install can break its AGP driver.
+
 ## 3D engine
 
 `crates/radeon/src/r3d` runs the R300's 3D pipeline. Its CPU path draws while the packet executes and is the reference for the Metal backend, which draws the pixels by default (see [Metal backend](#metal-backend)):
@@ -152,7 +175,7 @@ Its hottest MMIO polls: `CP_RB_RPTR` (about 900,000 reads while it waited on a f
 - **Tiling:** like the 2D engine, it treats every surface as linear, so what it draws stays consistent with the CRTC and the 2D engine.
 - **Sync:** on the CPU path, drawing finishes before the next packet, so fences, scratch writebacks, `WAIT_UNTIL` and CPU reads of a surface always see finished pixels.
 
-Still missing: the vertex shader on the GPU, the 3D engine's HiZ, Z compression and fast clears (`3D_CLEAR_ZMASK`, `3D_CLEAR_HIZ` do nothing), cube and volume textures, fog, MSAA and the R5xx-only opcodes.
+Still missing: the vertex shader on the GPU, HiZ (`3D_CLEAR_HIZ` does nothing, which only costs speed), Z compression beyond fast clears (see [Catalyst](#catalyst-102-on-windows-xp)), cube and volume textures, fog, MSAA and the R5xx-only opcodes.
 
 ### Metal backend
 
@@ -169,7 +192,7 @@ Still missing: the vertex shader on the GPU, the 3D engine's HiZ, Z compression 
 
 ## Open questions
 
-- **Catalyst on the 440BX.** See [Bus](#bus-agp-on-a-440bx). Check early, with Catalyst 2D, that it accepts our AGP setup before building much of the CP.
+- **CCC.** Catalyst Control Center needs .NET 2.0. With it installed, check that CCC opens and lists the card's settings.
 - **Fixed-function Direct3D.** We expect Catalyst to turn fixed-function state into vertex and fragment programs, since R300 runs all transform, lighting and texture combining through its shader units. Logging what the driver sends confirms it.
 - **Guest reads of VRAM without a fence.** See the Metal backend's sync. Write-protecting rendered pages through HVF would catch them, at a fault per page.
 - **The vertex shader on Metal.** PVS programs still run on the CPU; in glxgears they take about 2% of the vCPU thread, so it waits until a workload needs it.
