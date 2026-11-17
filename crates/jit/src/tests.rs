@@ -538,3 +538,22 @@ fn code_rewritten_every_iteration_matches_the_interpreter() {
     let stats = compare(&code, |c| c.regs[3] = 0);
     assert!(stats.stale_blocks > 0, "the page should have switched to self-checking blocks: {stats:?}");
 }
+
+#[test]
+fn atomics_match_the_interpreter_when_the_compare_succeeds() {
+    let programs: [&[u8]; 6] = [
+        &[0xa1, 0, 0x30, 0, 0, 0xf0, 0x0f, 0xb1, 0x0d, 0, 0x30, 0, 0, 0xf4],
+        &[0xa0, 0, 0x30, 0, 0, 0xf0, 0x0f, 0xb0, 0x2d, 0, 0x30, 0, 0, 0xf4],
+        &[0x8b, 0x05, 0, 0x30, 0, 0, 0x8b, 0x15, 4, 0x30, 0, 0, 0xf0, 0x0f, 0xc7, 0x0d, 0, 0x30, 0, 0, 0xf4],
+        &[0xf0, 0x0f, 0xc1, 0x1d, 0, 0x30, 0, 0, 0xf4],
+        &[0x89, 0xc1, 0x0f, 0xb1, 0xc8, 0xf4],
+        &[0x0f, 0xb1, 0xc0, 0xf4],
+    ];
+    for code in programs {
+        compare(code, |c| {
+            c.regs[1] = 0x1111_2222;
+            c.regs[3] = 0x3333_4444;
+            c.regs[5] = 0x5555_6666;
+        });
+    }
+}
