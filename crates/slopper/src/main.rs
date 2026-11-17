@@ -37,9 +37,12 @@ struct Args {
     control: Option<PathBuf>,
     vnc: Option<String>,
     audio: bool,
+    /// The user asked for sound explicitly, so failing to start it is an error.
+    audio_asked: bool,
     audio_wav: Option<PathBuf>,
     audio_silent: bool,
     net: Option<net::user::UserNet>,
+    net_asked: bool,
     battery: BatterySource,
 }
 
@@ -87,106 +90,149 @@ fn describe_power(p: &Power) -> String {
     )
 }
 
-const USAGE: &str = "usage: slopper --bios <bios.bin> [--vgabios <vgabios.bin>] [--board fx|bx] \
-[--gpu stdvga|radeon --vga-rom <rom> [--gpu-trace PATH]] [--cdrom <iso>] [--hda <img>] \
-[--serial PATH|-] [--ram MiB] [--headless] [--jit] [--screenshot SECONDS:PATH]... [--exit-on-text TEXT] [--script FILE] [--control SOCKET] [--vnc [ADDR:]PORT] \
-[--audio ac97 [--audio-wav PATH] [--audio-silent]] [--net user[,hostfwd=tcp::HOSTPORT-:GUESTPORT]...] [--battery host|off|PERCENT[:ac]] [--max-instructions N]";
+/// An x86 PC for Windows XP and Linux guests, on Hypervisor.framework.
+#[derive(clap::Parser)]
+#[command(name = "slopper", version)]
+struct Cli {
+    /// SeaBIOS image.
+    #[arg(long, value_name = "FILE")]
+    bios: String,
+    /// VGA BIOS for the stdvga display.
+    #[arg(long, value_name = "FILE")]
+    vgabios: Option<String>,
+    /// Chipset: fx (440FX) or bx (440BX with AGP).
+    #[arg(long, value_name = "fx|bx", value_parser = parse_board)]
+    board: Option<pc::Chipset>,
+    /// Display card: stdvga or radeon (a Radeon 9700 on the 440BX's AGP bus).
+    #[arg(long, value_name = "stdvga|radeon", default_value = "stdvga", value_parser = ["stdvga", "radeon"])]
+    gpu: String,
+    /// The Radeon's video BIOS, which you supply.
+    #[arg(long, value_name = "FILE")]
+    vga_rom: Option<String>,
+    /// Log the Radeon's register accesses to FILE.
+    #[arg(long, value_name = "FILE")]
+    gpu_trace: Option<String>,
+    /// CD-ROM image on the secondary master.
+    #[arg(long, value_name = "ISO")]
+    cdrom: Option<String>,
+    /// Raw disk image on the primary master.
+    #[arg(long, value_name = "IMG")]
+    hda: Option<String>,
+    /// Write COM1 to FILE, or to stderr with `-`.
+    #[arg(long, value_name = "FILE|-")]
+    serial: Option<String>,
+    /// Guest RAM in MiB.
+    #[arg(long = "ram", value_name = "MiB", default_value_t = 256)]
+    ram_mb: u32,
+    /// Stop after N instructions.
+    #[arg(long, value_name = "N")]
+    max_instructions: Option<u64>,
+    /// Run without a window.
+    #[arg(long)]
+    headless: bool,
+    /// Interpret every instruction instead of running translated code in the VM.
+    #[arg(long)]
+    no_jit: bool,
+    #[arg(long, hide = true)]
+    jit: bool,
+    /// Save a screenshot at SECONDS after start; may repeat.
+    #[arg(long = "screenshot", value_name = "SECONDS:PATH", value_parser = parse_screenshot)]
+    screenshots: Vec<(f64, PathBuf)>,
+    /// Exit successfully once TEXT appears on a text-mode screen.
+    #[arg(long, value_name = "TEXT")]
+    exit_on_text: Option<String>,
+    /// Run the input steps in FILE.
+    #[arg(long, value_name = "FILE")]
+    script: Option<PathBuf>,
+    /// Listen for control commands on this Unix socket.
+    #[arg(long, value_name = "SOCKET")]
+    control: Option<PathBuf>,
+    /// Serve the screen over VNC.
+    #[arg(long, value_name = "[ADDR:]PORT", value_parser = vnc::parse_addr)]
+    vnc: Option<String>,
+    /// Leave out the AC'97 sound card.
+    #[arg(long, conflicts_with_all = ["audio_wav", "audio_silent"])]
+    no_audio: bool,
+    #[arg(long, hide = true, value_parser = ["ac97"])]
+    audio: Option<String>,
+    /// Also record what the guest plays to a WAV file.
+    #[arg(long, value_name = "PATH")]
+    audio_wav: Option<PathBuf>,
+    /// Keep the sound card in real time but play nothing on the Mac.
+    #[arg(long)]
+    audio_silent: bool,
+    /// Leave out the network card.
+    #[arg(long, conflicts_with = "net")]
+    no_net: bool,
+    /// User-mode network options, e.g. user,hostfwd=tcp::2222-:22.
+    #[arg(long, value_name = "user[,hostfwd=...]", value_parser = net::user::UserNet::parse)]
+    net: Option<net::user::UserNet>,
+    /// Battery the guest sees: host mirrors the Mac, or a fixed PERCENT[:ac].
+    #[arg(long, value_name = BATTERY_USAGE, value_parser = parse_battery, conflicts_with = "no_battery")]
+    battery: Option<BatterySource>,
+    /// No battery: the guest runs on AC power.
+    #[arg(long)]
+    no_battery: bool,
+}
+
+fn parse_board(v: &str) -> Result<pc::Chipset, String> {
+    match v {
+        "fx" => Ok(pc::Chipset::I440fx),
+        "bx" => Ok(pc::Chipset::I440bx),
+        _ => Err("expected fx or bx".into()),
+    }
+}
+
+fn parse_screenshot(v: &str) -> Result<(f64, PathBuf), String> {
+    let (secs, path) = v.split_once(':').ok_or("expected SECONDS:PATH")?;
+    Ok((secs.parse().map_err(|_| "expected SECONDS:PATH")?, PathBuf::from(path)))
+}
 
 fn parse_args() -> Result<Args, String> {
-    let mut args = Args {
-        bios: String::new(),
-        vgabios: None,
-        board: None,
-        radeon: false,
-        vga_rom: None,
-        gpu_trace: None,
-        cdrom: None,
-        hda: None,
-        serial: None,
-        ram_mb: 256,
-        max_instructions: None,
-        headless: false,
-        jit: false,
-        screenshots: Vec::new(),
-        exit_on_text: None,
-        script: None,
-        control: None,
-        battery: BatterySource::Host,
-        vnc: None,
-        audio: false,
-        audio_wav: None,
-        audio_silent: false,
-        net: None,
-    };
-    let mut it = std::env::args().skip(1);
-    while let Some(a) = it.next() {
-        let mut value = || it.next().ok_or(format!("{a} needs a value"));
-        match a.as_str() {
-            "--bios" => args.bios = value()?,
-            "--vgabios" => args.vgabios = Some(value()?),
-            "--board" => {
-                args.board = Some(match value()?.as_str() {
-                    "fx" => pc::Chipset::I440fx,
-                    "bx" => pc::Chipset::I440bx,
-                    _ => return Err("--board takes fx or bx".into()),
-                })
-            }
-            "--gpu" => {
-                args.radeon = match value()?.as_str() {
-                    "stdvga" => false,
-                    "radeon" => true,
-                    _ => return Err("--gpu takes stdvga or radeon".into()),
-                }
-            }
-            "--vga-rom" => args.vga_rom = Some(value()?),
-            "--gpu-trace" => args.gpu_trace = Some(value()?),
-            "--cdrom" => args.cdrom = Some(value()?),
-            "--hda" => args.hda = Some(value()?),
-            "--serial" => args.serial = Some(value()?),
-            "--ram" => args.ram_mb = value()?.parse().map_err(|_| "--ram needs a size in MiB")?,
-            "--max-instructions" => {
-                args.max_instructions = Some(value()?.parse().map_err(|_| "--max-instructions needs a number")?)
-            }
-            "--headless" => args.headless = true,
-            "--jit" => args.jit = true,
-            "--exit-on-text" => args.exit_on_text = Some(value()?),
-            "--script" => args.script = Some(PathBuf::from(value()?)),
-            "--control" => args.control = Some(PathBuf::from(value()?)),
-            "--battery" => args.battery = parse_battery(&value()?)?,
-            "--vnc" => args.vnc = Some(vnc::parse_addr(&value()?)?),
-            "--audio" => match value()?.as_str() {
-                "ac97" => args.audio = true,
-                other => return Err(format!("unknown sound card {other:?}; the only one is ac97")),
-            },
-            "--audio-wav" => args.audio_wav = Some(PathBuf::from(value()?)),
-            "--audio-silent" => args.audio_silent = true,
-            "--net" => args.net = Some(net::user::UserNet::parse(&value()?)?),
-            "--screenshot" => {
-                let v = value()?;
-                let (secs, path) = v.split_once(':').ok_or("--screenshot needs SECONDS:PATH")?;
-                let secs = secs.parse().map_err(|_| "--screenshot needs SECONDS:PATH")?;
-                args.screenshots.push((secs, PathBuf::from(path)));
-            }
-            _ => return Err(format!("unknown argument {a}\n{USAGE}")),
-        }
-    }
-    if args.bios.is_empty() {
-        return Err(USAGE.into());
-    }
-    if !args.audio && (args.audio_wav.is_some() || args.audio_silent) {
-        return Err("--audio-wav and --audio-silent need --audio ac97".into());
-    }
-    if args.radeon {
-        if args.board == Some(pc::Chipset::I440fx) {
+    let cli = <Cli as clap::Parser>::parse();
+    let radeon = cli.gpu == "radeon";
+    if radeon {
+        if cli.board == Some(pc::Chipset::I440fx) {
             return Err("--gpu radeon needs the 440BX's AGP bus, so it cannot go with --board fx".into());
         }
-        if args.vga_rom.is_none() {
+        if cli.vga_rom.is_none() {
             return Err("--gpu radeon needs --vga-rom with the card's video BIOS".into());
         }
-    } else if args.vga_rom.is_some() || args.gpu_trace.is_some() {
+    } else if cli.vga_rom.is_some() || cli.gpu_trace.is_some() {
         return Err("--vga-rom and --gpu-trace go with --gpu radeon".into());
     }
-    Ok(args)
+    let net_asked = cli.net.is_some();
+    Ok(Args {
+        bios: cli.bios,
+        vgabios: cli.vgabios,
+        board: cli.board,
+        radeon,
+        vga_rom: cli.vga_rom,
+        gpu_trace: cli.gpu_trace,
+        cdrom: cli.cdrom,
+        hda: cli.hda,
+        serial: cli.serial,
+        ram_mb: cli.ram_mb,
+        max_instructions: cli.max_instructions,
+        headless: cli.headless,
+        jit: !cli.no_jit,
+        screenshots: cli.screenshots,
+        exit_on_text: cli.exit_on_text,
+        script: cli.script,
+        control: cli.control,
+        vnc: cli.vnc,
+        audio: !cli.no_audio,
+        audio_asked: cli.audio.is_some() || cli.audio_wav.is_some() || cli.audio_silent,
+        audio_wav: cli.audio_wav,
+        audio_silent: cli.audio_silent,
+        net: (!cli.no_net).then(|| cli.net.unwrap_or_default()),
+        net_asked,
+        battery: if cli.no_battery {
+            BatterySource::Fixed(Power::default())
+        } else {
+            cli.battery.unwrap_or(BatterySource::Host)
+        },
+    })
 }
 
 enum Event {
@@ -377,10 +423,11 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
     if args.audio {
         match audio::HostAudio::new(!args.audio_silent, args.audio_wav.as_deref()) {
             Ok(out) => board.add_ac97(Box::new(out)),
-            Err(e) => {
-                eprintln!("cannot record audio: {e}");
+            Err(e) if args.audio_asked => {
+                eprintln!("cannot start audio: {e}");
                 return ExitCode::FAILURE;
             }
+            Err(e) => eprintln!("no sound card: {e}"),
         }
     }
     if let Some(path) = &args.hda
@@ -436,10 +483,11 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
         };
         match net::start_user_network(cfg, Box::new(wake)) {
             Ok(backend) => board.attach_nic(net::DEFAULT_MAC, backend),
-            Err(e) => {
+            Err(e) if args.net_asked => {
                 eprintln!("cannot start the network: {e}");
                 return ExitCode::FAILURE;
             }
+            Err(e) => eprintln!("no network card: {e}"),
         }
     }
     let mut cpu = Cpu::new();
@@ -828,6 +876,9 @@ fn format_regs(cpu: &Cpu) -> String {
     )
 }
 
+/// The inode of the control socket this process bound.
+static CONTROL_INODE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
 /// Serves the control socket: one command per line, the answer followed by a
 /// line containing a single `.`. Input commands are the same as on stdin.
 fn control_server(path: PathBuf, tx: Sender<Event>) {
@@ -841,6 +892,9 @@ fn control_server(path: PathBuf, tx: Sender<Event>) {
             return;
         }
     };
+    if let Ok(m) = std::fs::metadata(&path) {
+        let _ = CONTROL_INODE.set(std::os::unix::fs::MetadataExt::ino(&m));
+    }
     eprintln!("control socket at {}", path.display());
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
@@ -944,15 +998,15 @@ fn stdin_commands(tx: Sender<Event>) {
 #[cfg(feature = "window")]
 fn window_loop(tx: Sender<Event>, shared: Arc<Shared>) {
     use minifb::{KeyRepeat, MouseMode, Window, WindowOptions};
-    let opts = WindowOptions { resize: true, scale_mode: minifb::ScaleMode::AspectRatioStretch, ..Default::default() };
-    let mut window = match Window::new("86slopper", 720, 400, opts) {
-        Ok(w) => w,
-        Err(e) => {
-            eprintln!("cannot open window: {e}");
-            return;
-        }
+    let open = |w: usize, h: usize| {
+        let opts = WindowOptions { resize: true, scale_mode: minifb::ScaleMode::AspectRatioStretch, ..Default::default() };
+        let (ww, wh) = window_size_for(w, h);
+        let mut window = Window::new("86slopper", ww, wh, opts).map_err(|e| eprintln!("cannot open window: {e}")).ok()?;
+        window.set_target_fps(60);
+        Some(window)
     };
-    window.set_target_fps(60);
+    let Some(mut window) = open(720, 400) else { return };
+    let mut window_for = (720usize, 400usize);
     let mut seq = 0;
     let mut buf = Vec::new();
     let (mut w, mut h) = (720usize, 400usize);
@@ -974,6 +1028,12 @@ fn window_loop(tx: Sender<Event>, shared: Arc<Shared>) {
                 buf.clone_from(&f.pixels);
                 (w, h) = (f.width as usize, f.height as usize);
             }
+        }
+        if (w, h) != window_for && w >= 320 && h >= 200 {
+            window_for = (w, h);
+            let Some(new) = open(w, h) else { break };
+            window = new;
+            last_mouse = None;
         }
         if buf.len() == w * h && !buf.is_empty() {
             let _ = window.update_with_buffer(&buf, w, h);
@@ -1014,6 +1074,27 @@ fn window_loop(tx: Sender<Event>, shared: Arc<Shared>) {
         }
     }
     let _ = tx.send(Event::Quit);
+}
+
+/// A window size for a `w` x `h` picture: the picture's own size, scaled
+/// down to fit the main display if it is larger.
+#[cfg(feature = "window")]
+fn window_size_for(w: usize, h: usize) -> (usize, usize) {
+    #[repr(C)]
+    struct Rect {
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+    }
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGMainDisplayID() -> u32;
+        fn CGDisplayBounds(display: u32) -> Rect;
+    }
+    let screen = unsafe { CGDisplayBounds(CGMainDisplayID()) };
+    let scale = (screen.w * 0.95 / w as f64).min(screen.h * 0.9 / h as f64).min(1.0);
+    ((w as f64 * scale) as usize, (h as f64 * scale) as usize)
 }
 
 /// Maps a point in the window to tablet coordinates in the picture, which
@@ -1126,7 +1207,9 @@ fn main() -> ExitCode {
     let _ = (tx, shared);
     let _ = headless;
     let code = emu.join().unwrap_or(ExitCode::FAILURE);
-    let _ = std::fs::remove_file(&control_path);
+    if std::fs::metadata(&control_path).is_ok_and(|m| CONTROL_INODE.get() == Some(&std::os::unix::fs::MetadataExt::ino(&m))) {
+        let _ = std::fs::remove_file(&control_path);
+    }
     code
 }
 
