@@ -117,9 +117,7 @@ impl Board {
 
     /// Writes every device's state. Guest RAM and VRAM are left to the caller.
     pub fn save_devices(&mut self, w: &mut Writer) -> Result<()> {
-        if let Display::Radeon(card) = &mut self.display {
-            card.gpu_sync();
-        }
+        self.radeon_write(|card, bus| card.gpu_finish(bus));
         w.u64(self.now_ns());
         w.put(&self.a20);
         w.put(&self.pci_addr);

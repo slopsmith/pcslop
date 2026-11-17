@@ -768,4 +768,41 @@ mod against_metal {
         }
         assert_eq!(counts[0], counts[1]);
     }
+
+    fn scratch_in_memory(g: &Gpu) -> u32 {
+        u32::from_le_bytes(g.ram.0[0x9000..0x9004].try_into().unwrap())
+    }
+
+    #[test]
+    fn a_fence_after_draws_lands_only_once_their_pixels_have() {
+        let mut g = Gpu::new();
+        if !g.r.use_metal() {
+            return;
+        }
+        g.w(SCRATCH_ADDR, 0x9000);
+        g.w(SCRATCH_UMSK, 1);
+        g.draw(13, &quad(0.0, 0.0, 64.0, 64.0, RED));
+        g.w(SCRATCH_REG0, 7);
+        assert_eq!(scratch_in_memory(&g), 0);
+        let start = std::time::Instant::now();
+        while scratch_in_memory(&g) != 7 {
+            assert!(start.elapsed().as_secs() < 5, "the fence never arrived");
+            g.r.poll_fences(&mut g.ram);
+        }
+        assert_eq!(g.r.mmio_read(SCRATCH_REG0, 4), 7);
+        assert_eq!(g.px(63, 63), 0xffff_0000);
+    }
+
+    #[test]
+    fn a_fence_with_nothing_queued_lands_at_once() {
+        let mut g = Gpu::new();
+        if !g.r.use_metal() {
+            return;
+        }
+        g.w(SCRATCH_ADDR, 0x9000);
+        g.w(SCRATCH_UMSK, 1);
+        g.w(SCRATCH_REG0, 9);
+        assert_eq!(scratch_in_memory(&g), 9);
+    }
 }
+

@@ -124,7 +124,10 @@ pub(crate) struct MetalR3d {
     counter: Buffer,
     pipelines: HashMap<Vec<u32>, Option<Pipeline>>,
     batch: Option<Batch>,
-    inflight: Vec<(Retained<ProtocolObject<dyn MTLCommandBuffer>>, Arena)>,
+    /// Committed command buffers, oldest first, with their serial numbers.
+    inflight: std::collections::VecDeque<(Retained<ProtocolObject<dyn MTLCommandBuffer>>, Arena, u64)>,
+    committed: u64,
+    completed: u64,
     free: Vec<Arena>,
     draws: u64,
     fallbacks: u64,
@@ -159,7 +162,9 @@ impl MetalR3d {
             counter,
             pipelines: HashMap::new(),
             batch: None,
-            inflight: Vec::new(),
+            inflight: Default::default(),
+            committed: 0,
+            completed: 0,
             free: Vec::new(),
             draws: 0,
             fallbacks: 0,
@@ -398,18 +403,49 @@ impl MetalR3d {
         u
     }
 
+    /// True while draws are queued or running.
+    pub fn busy(&self) -> bool {
+        self.batch.is_some() || !self.inflight.is_empty()
+    }
+
     pub fn stats(&self) -> (u64, u64, u64) {
         (self.draws, self.fallbacks, self.waits)
     }
 
-    /// Submits the queued draws without waiting for them.
-    pub fn kick(&mut self) {
-        let Some(mut b) = self.batch.take() else { return };
-        if let Some(enc) = b.enc.take() {
-            enc.endEncoding();
+    /// Submits the queued draws without waiting for them and returns the
+    /// serial number of the last command buffer submitted.
+    pub fn kick(&mut self) -> u64 {
+        if let Some(mut b) = self.batch.take() {
+            if let Some(enc) = b.enc.take() {
+                enc.endEncoding();
+            }
+            b.cmd.commit();
+            self.committed += 1;
+            self.inflight.push_back((b.cmd, b.arena, self.committed));
         }
-        b.cmd.commit();
-        self.inflight.push((b.cmd, b.arena));
+        self.committed
+    }
+
+    fn retire(&mut self, cmd: &ProtocolObject<dyn MTLCommandBuffer>, mut arena: Arena, serial: u64) {
+        if let Some(e) = cmd.error() {
+            eprintln!("radeon: Metal command buffer failed: {}", e.localizedDescription());
+        }
+        arena.used = 0;
+        self.free.push(arena);
+        self.completed = serial;
+    }
+
+    /// The serial number of the last command buffer that has finished,
+    /// without waiting.
+    pub fn completed(&mut self) -> u64 {
+        while let Some((cmd, _, _)) = self.inflight.front() {
+            if !matches!(cmd.status(), MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error) {
+                break;
+            }
+            let (cmd, arena, serial) = self.inflight.pop_front().unwrap();
+            self.retire(&cmd, arena, serial);
+        }
+        self.completed
     }
 
     /// Submits the queued draws, waits for every draw to finish, and returns
@@ -421,13 +457,9 @@ impl MetalR3d {
             return 0;
         }
         self.waits += 1;
-        for (cmd, mut arena) in self.inflight.drain(..) {
+        while let Some((cmd, arena, serial)) = self.inflight.pop_front() {
             cmd.waitUntilCompleted();
-            if let Some(e) = cmd.error() {
-                eprintln!("radeon: Metal command buffer failed: {}", e.localizedDescription());
-            }
-            arena.used = 0;
-            self.free.push(arena);
+            self.retire(&cmd, arena, serial);
         }
         unsafe {
             let p = self.counter.contents().as_ptr().cast::<u32>();

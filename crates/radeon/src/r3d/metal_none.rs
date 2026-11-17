@@ -17,7 +17,17 @@ impl MetalR3d {
 
     pub fn draw(&mut self, _r: &Raster, _cap: &Captured, _p: &Pipeline) {}
 
-    pub fn kick(&mut self) {}
+    pub fn kick(&mut self) -> u64 {
+        0
+    }
+
+    pub fn completed(&mut self) -> u64 {
+        0
+    }
+
+    pub fn busy(&self) -> bool {
+        false
+    }
 
     pub fn stats(&self) -> (u64, u64, u64) {
         (0, 0, 0)

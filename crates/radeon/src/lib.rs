@@ -93,6 +93,8 @@ pub struct Radeon {
     trace: Option<Trace>,
     #[snap(skip)]
     metal: Option<Box<r3d::metal::MetalR3d>>,
+    #[snap(skip)]
+    fences: r3d::Fences,
 }
 
 impl Radeon {
@@ -114,6 +116,7 @@ impl Radeon {
             monitor: ddc::Ddc::default(),
             trace: None,
             metal: None,
+            fences: r3d::Fences::default(),
         };
         r.reset();
         r
@@ -364,6 +367,9 @@ impl Radeon {
     fn read_reg(&mut self, reg: u32) -> u32 {
         if idle_polled(reg) {
             self.gpu_sync();
+        } else if (SCRATCH_REG0..=SCRATCH_REG7).contains(&reg) && !self.fences.is_empty() {
+            let done = self.metal.as_mut().map_or(u64::MAX, |m| m.completed());
+            self.retire_fences(done);
         }
         match reg {
             CRTC_STATUS => {
@@ -433,7 +439,18 @@ impl Radeon {
         if fence_written(reg, v & mask) {
             self.gpu_sync();
         }
+        self.poll_fences(mem);
         let old = self.reg(reg);
+        let scratch = match reg {
+            SCRATCH_REG0..=SCRATCH_REG7 => Some((reg - SCRATCH_REG0) / 4),
+            CP_RESYNC_DATA => Some(self.reg(CP_RESYNC_ADDR) & 7),
+            _ => None,
+        };
+        if let Some(n) = scratch
+            && self.defer_fence(n, (old & !mask) | (v & mask))
+        {
+            return;
+        }
         let new = (old & !mask) | (v & mask);
         match reg {
             CRTC_STATUS => {
@@ -581,11 +598,13 @@ fn gpio_lines(v: u32) -> (bool, bool) {
     (!low(GPIO_A_1, GPIO_EN_1), !low(GPIO_A_0, GPIO_EN_0))
 }
 
-/// Writes that tell the guest its earlier drawing finished: scratch
-/// registers and fences, software interrupts, WAIT_UNTIL and the occlusion
-/// counter.
+/// Writes after which the guest may look at finished pixels at once:
+/// software interrupts and the occlusion counter. Scratch registers and
+/// CP_RESYNC wait in `defer_fence` instead. WAIT_UNTIL needs no wait of its
+/// own: Metal runs draws in order, and everything else that touches VRAM
+/// waits for Metal first.
 fn fence_written(reg: u32, v: u32) -> bool {
-    matches!(reg, SCRATCH_REG0..=SCRATCH_REG7 | CP_RESYNC_DATA | WAIT_UNTIL | r3d::regs::ZB_ZPASS_DATA | r3d::regs::ZB_ZPASS_ADDR)
+    matches!(reg, r3d::regs::ZB_ZPASS_DATA | r3d::regs::ZB_ZPASS_ADDR)
         || (reg == GEN_INT_STATUS && v & SW_INT_FIRE != 0)
 }
 

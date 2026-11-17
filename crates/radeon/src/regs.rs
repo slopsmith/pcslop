@@ -108,7 +108,6 @@ pub const CP_RESYNC_ADDR: u32 = 0x0778;
 pub const CP_RESYNC_DATA: u32 = 0x077c;
 pub const SCRATCH_ADDR: u32 = 0x0774;
 pub const CP_STAT: u32 = 0x07c0;
-pub const WAIT_UNTIL: u32 = 0x1720;
 pub const CP_CSQ_STAT: u32 = 0x07f8;
 pub const SCRATCH_REG0: u32 = 0x15e0;
 pub const SCRATCH_REG7: u32 = 0x15fc;

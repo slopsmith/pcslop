@@ -122,6 +122,20 @@ pub(crate) mod op {
 const VECMEM_DWORDS: usize = 2048 * 4;
 const MAX_VERTICES: usize = 1 << 20;
 
+/// Scratch register writes waiting for Metal: (command buffer serial,
+/// register, value), and registers whose writeback is due.
+#[derive(Default)]
+pub(crate) struct Fences {
+    queue: std::collections::VecDeque<(u64, u32, u32)>,
+    writebacks: Vec<u32>,
+}
+
+impl Fences {
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+}
+
 #[derive(snapshot::Snap)]
 pub(crate) struct ThreeD {
     /// The VAP's vector memory: vertex program code and constants.
@@ -180,6 +194,62 @@ impl Radeon {
             let passed = m.sync();
             let r = &mut self.regs[ZB_ZPASS_DATA as usize / 4];
             *r = r.wrapping_add(passed);
+            self.retire_fences(u64::MAX);
+        }
+    }
+
+    /// Like `gpu_sync`, and also writes back the scratch registers.
+    pub fn gpu_finish(&mut self, mem: &mut dyn BusMemory) {
+        self.gpu_sync();
+        self.flush_writebacks(mem);
+    }
+
+    /// Holds back scratch register `n`'s new value `v`, and its writeback,
+    /// until the draws queued so far have finished, as the card's fences
+    /// arrive only once the pipeline drains. False if nothing is queued and
+    /// the write can happen now.
+    pub(crate) fn defer_fence(&mut self, n: u32, v: u32) -> bool {
+        let Some(m) = self.metal.as_mut() else { return false };
+        if !m.busy() && self.fences.queue.is_empty() {
+            return false;
+        }
+        let serial = m.kick();
+        self.fences.queue.push_back((serial, n, v));
+        true
+    }
+
+    /// True while fences wait for Metal or for their writeback.
+    pub fn fences_pending(&self) -> bool {
+        !self.fences.queue.is_empty() || !self.fences.writebacks.is_empty()
+    }
+
+    /// Applies the fences whose draws have finished by now, and writes back
+    /// the scratch registers they changed.
+    pub fn poll_fences(&mut self, mem: &mut dyn BusMemory) {
+        if self.fences.queue.is_empty() && self.fences.writebacks.is_empty() {
+            return;
+        }
+        let done = self.metal.as_mut().map_or(u64::MAX, |m| m.completed());
+        self.retire_fences(done);
+        self.flush_writebacks(mem);
+    }
+
+    pub(crate) fn retire_fences(&mut self, done: u64) {
+        while let Some(&(serial, n, v)) = self.fences.queue.front() {
+            if serial > done {
+                break;
+            }
+            self.fences.queue.pop_front();
+            self.regs[(crate::regs::SCRATCH_REG0 / 4 + n) as usize] = v;
+            if !self.fences.writebacks.contains(&n) {
+                self.fences.writebacks.push(n);
+            }
+        }
+    }
+
+    fn flush_writebacks(&mut self, mem: &mut dyn BusMemory) {
+        for n in std::mem::take(&mut self.fences.writebacks) {
+            self.scratch_written(n, mem);
         }
     }
 

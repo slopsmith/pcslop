@@ -403,6 +403,9 @@ impl Board {
         }
         if let Display::Radeon(r) = &mut self.display {
             r.set_time(now);
+            if r.fences_pending() {
+                self.radeon_write(|r, bus| r.poll_fences(bus));
+            }
         }
         self.sync_sci();
     }
@@ -937,7 +940,7 @@ impl Board {
     }
 
     /// Writes a Radeon register, letting the card reach memory and raise INTA.
-    fn radeon_write(&mut self, f: impl FnOnce(&mut radeon::Radeon, &mut CardBus)) {
+    pub(crate) fn radeon_write(&mut self, f: impl FnOnce(&mut radeon::Radeon, &mut CardBus)) {
         let aperture = self.aperture();
         let master = self.pci[DISPLAY].1.bus_master();
         if let Display::Radeon(r) = &mut self.display {

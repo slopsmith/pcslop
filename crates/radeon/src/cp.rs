@@ -188,7 +188,7 @@ impl Radeon {
         }
     }
 
-    fn scratch_written(&mut self, n: u32, mem: &mut dyn BusMemory) {
+    pub(crate) fn scratch_written(&mut self, n: u32, mem: &mut dyn BusMemory) {
         if self.reg(SCRATCH_UMSK) & 1 << n != 0 {
             let addr = (self.reg(SCRATCH_ADDR) & !3).wrapping_add(4 * n);
             let v = self.reg(SCRATCH_REG0 + 4 * n);
