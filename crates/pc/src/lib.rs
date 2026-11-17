@@ -257,7 +257,8 @@ impl Board {
     /// True while the last timer interrupt still waits to be taken, on
     /// whichever interrupt controller the guest lets it through.
     fn irq0_waiting(&self) -> bool {
-        let pic = self.pic.requested(0) && self.pic.registers()[0].2 & 1 == 0;
+        let pic_reaches_cpu = self.lapic.as_ref().is_none_or(|l| l.accepts_pic());
+        let pic = pic_reaches_cpu && self.pic.requested(0) && self.pic.registers()[0].2 & 1 == 0;
         let e = self.ioapic.entry(IRQ0_PIN as usize);
         let ioapic = e & ioapic::redir::MASKED == 0 && self.lapic.as_ref().is_some_and(|l| l.requested(e as u8));
         pic || ioapic
@@ -909,5 +910,61 @@ impl Bus for Board {
             return l.ack();
         }
         self.pic.inta()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn board() -> Board {
+        Board::new(Config { ram_bytes: 1 << 20, bios: vec![0; 0x2_0000], vgabios: None, apic: true })
+    }
+
+    #[test]
+    fn timer_through_io_apic_is_not_held_back_by_an_unreachable_pic() {
+        let mut b = board();
+        for (port, v) in [(0x20, 0x11), (0x21, 0x08), (0x21, 0x04), (0x21, 0x01), (0x21, 0x00)] {
+            b.io_write(port, 1, v);
+        }
+        b.write32(apic::DEFAULT_BASE + apic::reg::SVR, 0x1ff);
+        b.write32(ioapic::BASE, 0x10 + 2 * IRQ0_PIN as u32);
+        b.write32(ioapic::BASE + 0x10, 0x30);
+        b.pulse_irq(0);
+        assert!(b.irq0_waiting());
+        assert!(b.intr());
+        assert_eq!(b.inta(), 0x30);
+        assert!(b.pic.requested(0), "the 8259 latched IRQ 0 but LINT0 is masked");
+        assert!(!b.irq0_waiting());
+    }
+
+    #[test]
+    fn pic_reaches_the_cpu_through_lint0_as_extint() {
+        let mut b = board();
+        for (port, v) in [(0x20, 0x11), (0x21, 0x08), (0x21, 0x04), (0x21, 0x01), (0x21, 0x00)] {
+            b.io_write(port, 1, v);
+        }
+        b.pulse_irq(1);
+        assert!(!b.intr());
+        b.write32(apic::DEFAULT_BASE + apic::reg::SVR, 0x1ff);
+        b.write32(apic::DEFAULT_BASE + apic::reg::LVT_LINT0, 0x8700);
+        assert!(b.intr());
+        assert_eq!(b.inta(), 0x09);
+    }
+
+    #[test]
+    fn level_triggered_pci_interrupt_repeats_after_eoi_while_asserted() {
+        let mut b = board();
+        b.write32(apic::DEFAULT_BASE + apic::reg::SVR, 0x1ff);
+        b.write32(ioapic::BASE, 0x10 + 2 * 11);
+        b.write32(ioapic::BASE + 0x10, 0x8000 | 0x41);
+        b.set_irq(11, true);
+        assert_eq!(b.inta(), 0x41);
+        assert!(!b.intr());
+        b.write32(apic::DEFAULT_BASE + apic::reg::EOI, 0);
+        assert_eq!(b.inta(), 0x41);
+        b.set_irq(11, false);
+        b.write32(apic::DEFAULT_BASE + apic::reg::EOI, 0);
+        assert!(!b.intr());
     }
 }
