@@ -4,6 +4,8 @@ mod host_power;
 mod keys;
 mod savestate;
 mod vnc;
+#[cfg(feature = "window")]
+mod window;
 
 use std::collections::VecDeque;
 use std::io::BufRead;
@@ -304,6 +306,16 @@ struct Shared {
     /// The guest gets relative PS/2 motion only and tablet input is dropped.
     mouse_captured: AtomicBool,
     tablet_in_use: AtomicBool,
+    /// Wakes the window when a frame, the capture state or `done` changes.
+    wake: Mutex<Option<Box<dyn Fn() + Send>>>,
+}
+
+impl Shared {
+    fn wake(&self) {
+        if let Some(wake) = &*self.wake.lock().unwrap() {
+            wake();
+        }
+    }
 }
 
 fn dump(cpu: &Cpu) {
@@ -879,6 +891,7 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                             };
                             if let Some(v) = set {
                                 c.store(v, Ordering::Relaxed);
+                                shared.wake();
                             }
                             if set.is_none() {
                                 "usage: capture [on|off|toggle]".into()
@@ -988,6 +1001,8 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                 f.width = w;
                 f.height = h;
                 f.seq += 1;
+                drop(f);
+                shared.wake();
             }
         }
         if args.max_instructions.is_some_and(|m| executed + jit_insns >= m) {
@@ -1026,6 +1041,7 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
     }
     dump(&cpu);
     shared.done.store(true, Ordering::Relaxed);
+    shared.wake();
     code
 }
 
@@ -1185,200 +1201,6 @@ fn stdin_commands(tx: Sender<Event>) {
     }
 }
 
-#[cfg(feature = "window")]
-const RELEASE_HINT: &str = "mouse captured, Ctrl+Option+G releases";
-
-#[cfg(feature = "window")]
-fn window_loop(tx: Sender<Event>, shared: Arc<Shared>, capture_mode: capture::CaptureMode) {
-    use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
-    let open = |w: usize, h: usize| {
-        let opts = WindowOptions { resize: true, scale_mode: minifb::ScaleMode::AspectRatioStretch, ..Default::default() };
-        let (ww, wh) = window_size_for(w, h);
-        let mut window = Window::new("86slopper", ww, wh, opts).map_err(|e| eprintln!("cannot open window: {e}")).ok()?;
-        window.set_target_fps(60);
-        Some(window)
-    };
-    let Some(mut window) = open(720, 400) else { return };
-    let mut window_for = (720usize, 400usize);
-    let mut seq = 0;
-    let mut buf = Vec::new();
-    let (mut w, mut h) = (720usize, 400usize);
-    let mut last_mouse: Option<(f32, f32, u8)> = None;
-    let mut wheel_acc = 0f32;
-    let mut rate_at = (Instant::now(), 0u64);
-    let mut mips = 0.0;
-    let mut grab = capture::Grab::default();
-    let mut motion = capture::Accumulator::default();
-    let mut swallow_g = false;
-    let mut swallow_click = false;
-    let mut last_buttons = 0u8;
-    while window.is_open() && !shared.done.load(Ordering::Relaxed) {
-        let elapsed = rate_at.0.elapsed();
-        let mut retitle = false;
-        if elapsed >= Duration::from_millis(500) {
-            let n = shared.instructions.load(Ordering::Relaxed);
-            mips = n.saturating_sub(rate_at.1) as f64 / elapsed.as_secs_f64() / 1e6;
-            rate_at = (Instant::now(), n);
-            retitle = true;
-        }
-        {
-            let f = shared.frame.lock().unwrap();
-            if f.seq != seq && f.width > 0 {
-                seq = f.seq;
-                buf.clone_from(&f.pixels);
-                (w, h) = (f.width as usize, f.height as usize);
-            }
-        }
-        if (w, h) != window_for && w >= 320 && h >= 200 {
-            window_for = (w, h);
-            let (ww, wh) = window_size_for(w, h);
-            let at = window.get_position();
-            capture::set_content_size(window.get_window_handle(), ww as f64, wh as f64);
-            window.set_position(at.0, at.1);
-            last_mouse = None;
-        }
-        if buf.len() == w * h && !buf.is_empty() {
-            let _ = window.update_with_buffer(&buf, w, h);
-        } else {
-            window.update();
-        }
-
-        let held = |a: Key, b: Key| window.is_key_down(a) || window.is_key_down(b);
-        let hot_mods = held(Key::LeftCtrl, Key::RightCtrl) && held(Key::LeftAlt, Key::RightAlt);
-        let mut toggle = false;
-        for k in window.get_keys_pressed(KeyRepeat::No) {
-            if k == Key::G && hot_mods {
-                swallow_g = true;
-                toggle = true;
-            } else if let Some(c) = keys::from_minifb(k) {
-                let _ = tx.send(Event::Key(c, true));
-            }
-        }
-        for k in window.get_keys_released() {
-            if k == Key::G && std::mem::take(&mut swallow_g) {
-                continue;
-            }
-            if let Some(c) = keys::from_minifb(k) {
-                let _ = tx.send(Event::Key(c, false));
-            }
-        }
-
-        let buttons = window.get_mouse_down(MouseButton::Left) as u8
-            | (window.get_mouse_down(MouseButton::Right) as u8) << 1
-            | (window.get_mouse_down(MouseButton::Middle) as u8) << 2;
-        let clicked = buttons & 1 != 0 && last_buttons & 1 == 0;
-        last_buttons = buttons;
-        let focused = capture::app_active();
-        let mut want = shared.mouse_captured.load(Ordering::Relaxed);
-        if toggle {
-            want = !want;
-        }
-        let click_captures = match capture_mode {
-            capture::CaptureMode::Key => false,
-            capture::CaptureMode::Click => true,
-            capture::CaptureMode::Auto => !shared.tablet_in_use.load(Ordering::Relaxed),
-        };
-        if !want && clicked && click_captures && focused && window.get_mouse_pos(MouseMode::Discard).is_some() {
-            want = true;
-            swallow_click = true;
-        }
-        if !focused {
-            want = false;
-        }
-        shared.mouse_captured.store(want, Ordering::Relaxed);
-        if want != grab.is_on() {
-            if want {
-                let (x, y) = window.get_position();
-                let (ww, wh) = window.get_size();
-                grab.engage((x as f64 + ww as f64 / 2.0, y as f64 + TITLE_BAR + wh as f64 / 2.0));
-                motion.clear();
-            } else {
-                grab.release();
-                last_mouse = None;
-            }
-            retitle = true;
-        }
-        if retitle {
-            let state = if grab.is_on() { format!(" | {RELEASE_HINT}") } else { String::new() };
-            window.set_title(&format!("86slopper | {mips:.1} MIPS{state}"));
-        }
-
-        wheel_acc += window.get_scroll_wheel().map_or(0.0, |(_, sy)| sy);
-        let wheel = wheel_acc.trunc();
-        wheel_acc -= wheel;
-        if grab.is_on() {
-            if swallow_click && buttons & 1 == 0 {
-                swallow_click = false;
-            }
-            let buttons = if swallow_click { buttons & !1 } else { buttons };
-            let (hx, hy) = grab.take_motion();
-            let (dx, dy) = motion.add(hx, hy);
-            if dx != 0 || dy != 0 || wheel != 0.0 || Some(buttons) != last_mouse.map(|m| m.2) {
-                let _ = tx.send(Event::Mouse(dx, -dy, wheel as i32, buttons));
-            }
-            last_mouse = Some((0.0, 0.0, buttons));
-            continue;
-        }
-        if let Some((x, y)) = window.get_unscaled_mouse_pos(MouseMode::Discard) {
-            if let Some((lx, ly, lb)) = last_mouse
-                && (lx != x || ly != y || lb != buttons || buttons != 0 || wheel != 0.0)
-            {
-                let (ax, ay) = picture_position(x, y, window.get_size(), (w, h));
-                let _ = tx.send(Event::Pointer {
-                    x: ax,
-                    y: ay,
-                    dx: (x - lx) as i32,
-                    dy: (ly - y) as i32,
-                    buttons,
-                    wheel: wheel as i32,
-                });
-            }
-            last_mouse = Some((x, y, buttons));
-        }
-    }
-    let _ = tx.send(Event::Quit);
-}
-
-/// Height of a standard macOS title bar, in points.
-#[cfg(feature = "window")]
-const TITLE_BAR: f64 = 28.0;
-
-/// A window size for a `w` x `h` picture: the picture's own size, scaled
-/// down to fit the main display if it is larger.
-#[cfg(feature = "window")]
-fn window_size_for(w: usize, h: usize) -> (usize, usize) {
-    #[repr(C)]
-    struct Rect {
-        x: f64,
-        y: f64,
-        w: f64,
-        h: f64,
-    }
-    #[link(name = "CoreGraphics", kind = "framework")]
-    unsafe extern "C" {
-        fn CGMainDisplayID() -> u32;
-        fn CGDisplayBounds(display: u32) -> Rect;
-    }
-    let screen = unsafe { CGDisplayBounds(CGMainDisplayID()) };
-    let scale = (screen.w * 0.95 / w as f64).min(screen.h * 0.9 / h as f64).min(1.0);
-    ((w as f64 * scale) as usize, (h as f64 * scale) as usize)
-}
-
-/// Maps a point in the window to tablet coordinates in the picture, which
-/// `ScaleMode::AspectRatioStretch` letterboxes into the middle of the window.
-#[cfg(feature = "window")]
-fn picture_position(x: f32, y: f32, window: (usize, usize), picture: (usize, usize)) -> (u16, u16) {
-    let (ww, wh) = (window.0.max(1) as f32, window.1.max(1) as f32);
-    let (pw, ph) = (picture.0.max(1) as f32, picture.1.max(1) as f32);
-    let scale = (ww / pw).min(wh / ph);
-    let (ox, oy) = ((ww - pw * scale) / 2.0, (wh - ph * scale) / 2.0);
-    let to_tablet = |v: f32, origin: f32, len: f32| {
-        let f = ((v - origin) / (len * scale)).clamp(0.0, 1.0);
-        (f * (usb::MAX_COORD as f32 + 1.0)).min(usb::MAX_COORD as f32) as u16
-    };
-    (to_tablet(x, ox, pw), to_tablet(y, oy, ph))
-}
-
 const HOST_POWER_INTERVAL: Duration = Duration::from_secs(2);
 
 fn main() -> ExitCode {
@@ -1465,10 +1287,10 @@ fn main() -> ExitCode {
     std::thread::spawn(move || control_server(ctl_path, ctl_tx));
     #[cfg(feature = "window")]
     if !headless {
-        window_loop(tx, shared, capture_mode);
+        window::run(tx, shared, capture_mode);
     }
     #[cfg(not(feature = "window"))]
-    let _ = (tx, shared);
+    let _ = (tx, shared, capture_mode);
     let _ = headless;
     let code = emu.join().unwrap_or(ExitCode::FAILURE);
     if std::fs::metadata(&control_path).is_ok_and(|m| CONTROL_INODE.get() == Some(&std::os::unix::fs::MetadataExt::ino(&m))) {
@@ -1524,16 +1346,5 @@ mod tests {
         for p in [0, 1, 319, 640, 1023] {
             assert_eq!(pixel_to_tablet(p, 1024) as u32 * 2 * 1024 / 0x10000, p);
         }
-    }
-
-    #[cfg(feature = "window")]
-    #[test]
-    fn letterboxed_picture_position() {
-        assert_eq!(picture_position(0.0, 0.0, (800, 600), (800, 600)), (0, 0));
-        assert_eq!(picture_position(400.0, 300.0, (800, 600), (800, 600)), (0x4000, 0x4000));
-        // A 4:3 picture in a wide window has bars left and right.
-        assert_eq!(picture_position(200.0, 0.0, (1200, 600), (800, 600)), (0, 0));
-        assert_eq!(picture_position(600.0, 300.0, (1200, 600), (800, 600)), (0x4000, 0x4000));
-        assert_eq!(picture_position(1199.0, 650.0, (1200, 600), (800, 600)), (usb::MAX_COORD, usb::MAX_COORD));
     }
 }

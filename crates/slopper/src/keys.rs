@@ -1,4 +1,4 @@
-//! Key names and minifb keys to PS/2 set-1 scancodes (0xE0xx for extended keys).
+//! Key names and host key codes to PS/2 set-1 scancodes (0xE0xx for extended keys).
 
 pub fn by_name(name: &str) -> Option<u16> {
     let n = name.to_ascii_lowercase();
@@ -80,46 +80,47 @@ pub fn char_key(c: char) -> Option<(u16, bool)> {
     None
 }
 
+/// The scancode for the key at `code`'s position on a US keyboard. Cmd is the Windows key.
 #[cfg(feature = "window")]
-pub fn from_minifb(k: minifb::Key) -> Option<u16> {
-    use minifb::Key::*;
-    Some(match k {
-        Key0 => 0x0b,
-        Key1 => 0x02,
-        Key2 => 0x03,
-        Key3 => 0x04,
-        Key4 => 0x05,
-        Key5 => 0x06,
-        Key6 => 0x07,
-        Key7 => 0x08,
-        Key8 => 0x09,
-        Key9 => 0x0a,
-        A => 0x1e,
-        B => 0x30,
-        C => 0x2e,
-        D => 0x20,
-        E => 0x12,
-        F => 0x21,
-        G => 0x22,
-        H => 0x23,
-        I => 0x17,
-        J => 0x24,
-        K => 0x25,
-        L => 0x26,
-        M => 0x32,
-        N => 0x31,
-        O => 0x18,
-        P => 0x19,
-        Q => 0x10,
-        R => 0x13,
-        S => 0x1f,
-        T => 0x14,
-        U => 0x16,
-        V => 0x2f,
-        W => 0x11,
-        X => 0x2d,
-        Y => 0x15,
-        Z => 0x2c,
+pub fn from_keycode(code: winit::keyboard::KeyCode) -> Option<u16> {
+    use winit::keyboard::KeyCode::*;
+    Some(match code {
+        Digit0 => 0x0b,
+        Digit1 => 0x02,
+        Digit2 => 0x03,
+        Digit3 => 0x04,
+        Digit4 => 0x05,
+        Digit5 => 0x06,
+        Digit6 => 0x07,
+        Digit7 => 0x08,
+        Digit8 => 0x09,
+        Digit9 => 0x0a,
+        KeyA => 0x1e,
+        KeyB => 0x30,
+        KeyC => 0x2e,
+        KeyD => 0x20,
+        KeyE => 0x12,
+        KeyF => 0x21,
+        KeyG => 0x22,
+        KeyH => 0x23,
+        KeyI => 0x17,
+        KeyJ => 0x24,
+        KeyK => 0x25,
+        KeyL => 0x26,
+        KeyM => 0x32,
+        KeyN => 0x31,
+        KeyO => 0x18,
+        KeyP => 0x19,
+        KeyQ => 0x10,
+        KeyR => 0x13,
+        KeyS => 0x1f,
+        KeyT => 0x14,
+        KeyU => 0x16,
+        KeyV => 0x2f,
+        KeyW => 0x11,
+        KeyX => 0x2d,
+        KeyY => 0x15,
+        KeyZ => 0x2c,
         F1 => 0x3b,
         F2 => 0x3c,
         F3 => 0x3d,
@@ -132,21 +133,22 @@ pub fn from_minifb(k: minifb::Key) -> Option<u16> {
         F10 => 0x44,
         F11 => 0x57,
         F12 => 0x58,
-        Down => 0xe050,
-        Left => 0xe04b,
-        Right => 0xe04d,
-        Up => 0xe048,
-        Apostrophe => 0x28,
+        ArrowDown => 0xe050,
+        ArrowLeft => 0xe04b,
+        ArrowRight => 0xe04d,
+        ArrowUp => 0xe048,
+        Quote => 0x28,
         Backquote => 0x29,
         Backslash => 0x2b,
         Comma => 0x33,
         Equal => 0x0d,
-        LeftBracket => 0x1a,
+        BracketLeft => 0x1a,
         Minus => 0x0c,
         Period => 0x34,
-        RightBracket => 0x1b,
+        BracketRight => 0x1b,
         Semicolon => 0x27,
         Slash => 0x35,
+        IntlBackslash => 0x56,
         Backspace => 0x0e,
         Delete => 0xe053,
         End => 0xe04f,
@@ -154,7 +156,7 @@ pub fn from_minifb(k: minifb::Key) -> Option<u16> {
         Escape => 0x01,
         Home => 0xe047,
         Insert => 0xe052,
-        Menu => 0xe05d,
+        ContextMenu => 0xe05d,
         PageDown => 0xe051,
         PageUp => 0xe049,
         Space => 0x39,
@@ -162,30 +164,82 @@ pub fn from_minifb(k: minifb::Key) -> Option<u16> {
         NumLock => 0x45,
         CapsLock => 0x3a,
         ScrollLock => 0x46,
-        LeftShift => 0x2a,
-        RightShift => 0x36,
-        LeftCtrl => 0x1d,
-        RightCtrl => 0xe01d,
-        NumPad0 => 0x52,
-        NumPad1 => 0x4f,
-        NumPad2 => 0x50,
-        NumPad3 => 0x51,
-        NumPad4 => 0x4b,
-        NumPad5 => 0x4c,
-        NumPad6 => 0x4d,
-        NumPad7 => 0x47,
-        NumPad8 => 0x48,
-        NumPad9 => 0x49,
-        NumPadDot => 0x53,
-        NumPadSlash => 0xe035,
-        NumPadAsterisk => 0x37,
-        NumPadMinus => 0x4a,
-        NumPadPlus => 0x4e,
-        NumPadEnter => 0xe01c,
-        LeftAlt => 0x38,
-        RightAlt => 0xe038,
-        LeftSuper => 0xe05b,
-        RightSuper => 0xe05c,
+        PrintScreen => 0xe037,
+        ShiftLeft => 0x2a,
+        ShiftRight => 0x36,
+        ControlLeft => 0x1d,
+        ControlRight => 0xe01d,
+        AltLeft => 0x38,
+        AltRight => 0xe038,
+        SuperLeft => 0xe05b,
+        SuperRight => 0xe05c,
+        Numpad0 => 0x52,
+        Numpad1 => 0x4f,
+        Numpad2 => 0x50,
+        Numpad3 => 0x51,
+        Numpad4 => 0x4b,
+        Numpad5 => 0x4c,
+        Numpad6 => 0x4d,
+        Numpad7 => 0x47,
+        Numpad8 => 0x48,
+        Numpad9 => 0x49,
+        NumpadDecimal => 0x53,
+        NumpadDivide => 0xe035,
+        NumpadMultiply => 0x37,
+        NumpadSubtract => 0x4a,
+        NumpadAdd => 0x4e,
+        NumpadEnter => 0xe01c,
         _ => return None,
     })
+}
+
+#[cfg(all(test, feature = "window"))]
+mod tests {
+    use super::*;
+    use winit::keyboard::KeyCode;
+
+    #[test]
+    fn letters_and_digits_match_the_typing_table() {
+        let letters = [
+            KeyCode::KeyA, KeyCode::KeyB, KeyCode::KeyC, KeyCode::KeyD, KeyCode::KeyE, KeyCode::KeyF, KeyCode::KeyG, KeyCode::KeyH, KeyCode::KeyI,
+            KeyCode::KeyJ, KeyCode::KeyK, KeyCode::KeyL, KeyCode::KeyM, KeyCode::KeyN, KeyCode::KeyO, KeyCode::KeyP, KeyCode::KeyQ, KeyCode::KeyR,
+            KeyCode::KeyS, KeyCode::KeyT, KeyCode::KeyU, KeyCode::KeyV, KeyCode::KeyW, KeyCode::KeyX, KeyCode::KeyY, KeyCode::KeyZ,
+        ];
+        for (code, c) in letters.into_iter().zip('a'..='z') {
+            assert_eq!(from_keycode(code), char_key(c).map(|k| k.0), "{c}");
+        }
+        let digits = [
+            KeyCode::Digit0, KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3, KeyCode::Digit4,
+            KeyCode::Digit5, KeyCode::Digit6, KeyCode::Digit7, KeyCode::Digit8, KeyCode::Digit9,
+        ];
+        for (code, c) in digits.into_iter().zip('0'..='9') {
+            assert_eq!(from_keycode(code), char_key(c).map(|k| k.0), "{c}");
+        }
+    }
+
+    #[test]
+    fn modifiers_and_named_keys_match_their_names() {
+        for (code, name) in [
+            (KeyCode::ControlLeft, "lctrl"),
+            (KeyCode::ControlRight, "rctrl"),
+            (KeyCode::AltLeft, "lalt"),
+            (KeyCode::AltRight, "ralt"),
+            (KeyCode::ShiftLeft, "lshift"),
+            (KeyCode::ShiftRight, "rshift"),
+            (KeyCode::SuperLeft, "lwin"),
+            (KeyCode::SuperRight, "rwin"),
+            (KeyCode::ContextMenu, "menu"),
+            (KeyCode::Escape, "esc"),
+            (KeyCode::Enter, "enter"),
+            (KeyCode::ArrowUp, "up"),
+            (KeyCode::Delete, "delete"),
+            (KeyCode::F11, "f11"),
+            (KeyCode::Backquote, "`"),
+            (KeyCode::Quote, "'"),
+        ] {
+            assert_eq!(from_keycode(code), by_name(name), "{name}");
+        }
+        assert_eq!(from_keycode(KeyCode::NumpadEnter), Some(0xe01c));
+        assert_eq!(from_keycode(KeyCode::Fn), None);
+    }
 }

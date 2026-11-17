@@ -1,5 +1,6 @@
 //! Mouse capture: the host cursor is hidden and pinned, and raw host motion
 //! goes to the guest's PS/2 mouse, for games that read relative motion.
+#![cfg_attr(not(feature = "window"), allow(dead_code))]
 
 /// What starts a capture, besides Ctrl+Option+G and the `capture` command.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -45,197 +46,38 @@ impl Accumulator {
     }
 }
 
-#[cfg(feature = "window")]
-pub use host::{Grab, app_active, set_content_size};
-
-#[cfg(feature = "window")]
-mod host {
-    use std::ffi::c_void;
-    use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
-    use std::sync::{Mutex, Once, mpsc};
-
-    #[repr(C)]
-    struct Point {
-        x: f64,
-        y: f64,
+/// Whether a left click in the window captures the mouse.
+pub fn click_captures(mode: CaptureMode, tablet_in_use: bool) -> bool {
+    match mode {
+        CaptureMode::Key => false,
+        CaptureMode::Click => true,
+        CaptureMode::Auto => !tablet_in_use,
     }
+}
 
-    type EventRef = *mut c_void;
-    type TapCallback = extern "C" fn(*mut c_void, u32, EventRef, *mut c_void) -> EventRef;
+/// What the window saw since it last decided.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Input {
+    /// The mouse is captured now (the window or the `capture` command set it).
+    pub captured: bool,
+    /// Ctrl+Option+G was pressed.
+    pub toggle: bool,
+    /// A left click landed in the window, and clicks capture in this mode.
+    pub capturing_click: bool,
+    pub focused: bool,
+}
 
-    const SESSION_TAP: u32 = 1;
-    const HEAD_INSERT: u32 = 0;
-    const LISTEN_ONLY: u32 = 1;
-    const MOUSE_MOVED: u32 = 5;
-    const LEFT_DRAGGED: u32 = 6;
-    const RIGHT_DRAGGED: u32 = 7;
-    const OTHER_DRAGGED: u32 = 27;
-    const DELTA_X: u32 = 4;
-    const DELTA_Y: u32 = 5;
-    const TAP_DISABLED_BY_TIMEOUT: u32 = 0xffff_fffe;
-
-    #[link(name = "CoreGraphics", kind = "framework")]
-    unsafe extern "C" {
-        fn CGMainDisplayID() -> u32;
-        fn CGDisplayHideCursor(display: u32) -> i32;
-        fn CGDisplayShowCursor(display: u32) -> i32;
-        fn CGAssociateMouseAndMouseCursorPosition(connected: u8) -> i32;
-        fn CGWarpMouseCursorPosition(p: Point) -> i32;
-        fn CGEventTapCreate(tap: u32, place: u32, options: u32, mask: u64, callback: TapCallback, info: *mut c_void) -> *mut c_void;
-        fn CGEventTapEnable(tap: *mut c_void, enable: bool);
-        fn CGEventGetDoubleValueField(event: EventRef, field: u32) -> f64;
+/// Whether the mouse is captured next, and whether the guest must not see
+/// the left button until it is released, because that click captured it.
+pub fn decide(i: Input) -> (bool, bool) {
+    if !i.focused {
+        return (false, false);
     }
-
-    #[link(name = "CoreFoundation", kind = "framework")]
-    unsafe extern "C" {
-        static kCFRunLoopCommonModes: *const c_void;
-        fn CFMachPortCreateRunLoopSource(alloc: *const c_void, port: *mut c_void, order: isize) -> *mut c_void;
-        fn CFRunLoopGetCurrent() -> *mut c_void;
-        fn CFRunLoopAddSource(rl: *mut c_void, source: *mut c_void, mode: *const c_void);
-        fn CFRunLoopRun();
+    let want = i.captured != i.toggle;
+    if !want && !i.captured && i.capturing_click {
+        return (true, true);
     }
-
-    #[link(name = "objc")]
-    unsafe extern "C" {
-        fn objc_getClass(name: *const std::ffi::c_char) -> *mut c_void;
-        fn sel_registerName(name: *const std::ffi::c_char) -> *mut c_void;
-        fn objc_msgSend();
-    }
-
-    static LISTENING: AtomicBool = AtomicBool::new(false);
-    static MOTION: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
-    static TAP: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
-    static START: Once = Once::new();
-
-    extern "C" fn on_event(_proxy: *mut c_void, kind: u32, event: EventRef, _info: *mut c_void) -> EventRef {
-        if kind == TAP_DISABLED_BY_TIMEOUT {
-            unsafe { CGEventTapEnable(TAP.load(Ordering::Relaxed), true) };
-        } else if LISTENING.load(Ordering::Relaxed) {
-            let (dx, dy) = unsafe { (CGEventGetDoubleValueField(event, DELTA_X), CGEventGetDoubleValueField(event, DELTA_Y)) };
-            let mut m = MOTION.lock().unwrap();
-            m.0 += dx;
-            m.1 += dy;
-        }
-        event
-    }
-
-    fn start_tap() {
-        START.call_once(|| {
-            let (tx, rx) = mpsc::channel();
-            std::thread::spawn(move || {
-                let mask = [MOUSE_MOVED, LEFT_DRAGGED, RIGHT_DRAGGED, OTHER_DRAGGED].iter().fold(0u64, |m, &t| m | 1 << t);
-                let tap = unsafe { CGEventTapCreate(SESSION_TAP, HEAD_INSERT, LISTEN_ONLY, mask, on_event, std::ptr::null_mut()) };
-                let _ = tx.send(!tap.is_null());
-                if tap.is_null() {
-                    return;
-                }
-                TAP.store(tap, Ordering::Relaxed);
-                unsafe {
-                    let source = CFMachPortCreateRunLoopSource(std::ptr::null(), tap, 0);
-                    CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopCommonModes);
-                    CGEventTapEnable(tap, true);
-                    CFRunLoopRun();
-                }
-            });
-            if !rx.recv().unwrap_or(false) {
-                eprintln!("mouse capture: macOS refused a mouse event tap, so the guest gets no motion");
-            }
-        });
-    }
-
-    /// Whether this app has the focus. minifb 0.29's macOS `is_active` is
-    /// inverted (it returns true while the window is in the background).
-    pub fn app_active() -> bool {
-        unsafe {
-            let send: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-            let app = send(objc_getClass(c"NSApplication".as_ptr()), sel_registerName(c"sharedApplication".as_ptr()));
-            if app.is_null() {
-                return false;
-            }
-            let is_active: extern "C" fn(*mut c_void, *mut c_void) -> bool = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-            is_active(app, sel_registerName(c"isActive".as_ptr()))
-        }
-    }
-
-    /// Resizes the content area of the minifb window `window` (its NSWindow)
-    /// in place, so the window keeps its identity for screen recorders.
-    pub fn set_content_size(window: *mut c_void, w: f64, h: f64) {
-        #[repr(C)]
-        struct Size {
-            w: f64,
-            h: f64,
-        }
-        unsafe {
-            let send: extern "C" fn(*mut c_void, *mut c_void, Size) = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-            send(window, sel_registerName(c"setContentSize:".as_ptr()), Size { w, h });
-            // minifb refreshes the size it maps the mouse with only when a live resize ends.
-            let get: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-            let is_kind: extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> bool = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-            let end = sel_registerName(c"viewDidEndLiveResize".as_ptr());
-            let ask = sel_registerName(c"isKindOfClass:".as_ptr());
-            let frame_view = objc_getClass(c"OSXWindowFrameView".as_ptr());
-            let mut view = get(window, sel_registerName(c"contentView".as_ptr()));
-            while !view.is_null() && !frame_view.is_null() && !is_kind(view, ask, frame_view) {
-                view = get(view, sel_registerName(c"superview".as_ptr()));
-            }
-            if !view.is_null() && !frame_view.is_null() {
-                let call: extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-                call(view, end);
-            }
-        }
-    }
-
-    /// The host side of a capture: a hidden cursor detached from the mouse,
-    /// so it never stops at a screen edge, and the motion the mouse reports.
-    #[derive(Default)]
-    pub struct Grab {
-        on: bool,
-    }
-
-    impl Grab {
-        pub fn is_on(&self) -> bool {
-            self.on
-        }
-
-        /// Hides the cursor and pins it at `at`, in global display points.
-        pub fn engage(&mut self, at: (f64, f64)) {
-            if self.on {
-                return;
-            }
-            start_tap();
-            unsafe {
-                CGWarpMouseCursorPosition(Point { x: at.0, y: at.1 });
-                CGAssociateMouseAndMouseCursorPosition(0);
-                CGDisplayHideCursor(CGMainDisplayID());
-            }
-            *MOTION.lock().unwrap() = (0.0, 0.0);
-            LISTENING.store(true, Ordering::Relaxed);
-            self.on = true;
-        }
-
-        pub fn release(&mut self) {
-            if !self.on {
-                return;
-            }
-            LISTENING.store(false, Ordering::Relaxed);
-            unsafe {
-                CGAssociateMouseAndMouseCursorPosition(1);
-                CGDisplayShowCursor(CGMainDisplayID());
-            }
-            self.on = false;
-        }
-
-        /// Mouse motion since the last call, in points, with positive y down.
-        pub fn take_motion(&self) -> (f64, f64) {
-            std::mem::take(&mut *MOTION.lock().unwrap())
-        }
-    }
-
-    impl Drop for Grab {
-        fn drop(&mut self) {
-            self.release();
-        }
-    }
+    (want, false)
 }
 
 #[cfg(test)]
@@ -263,6 +105,42 @@ mod tests {
         a.add(0.9, 0.9);
         a.clear();
         assert_eq!(a.add(0.2, 0.2), (0, 0));
+    }
+
+    fn focused() -> Input {
+        Input { focused: true, ..Default::default() }
+    }
+
+    #[test]
+    fn the_hotkey_toggles() {
+        assert_eq!(decide(Input { toggle: true, ..focused() }), (true, false));
+        assert_eq!(decide(Input { toggle: true, captured: true, ..focused() }), (false, false));
+        assert_eq!(decide(Input { captured: true, ..focused() }), (true, false));
+    }
+
+    #[test]
+    fn a_capturing_click_captures_and_is_swallowed() {
+        assert_eq!(decide(Input { capturing_click: true, ..focused() }), (true, true));
+        assert_eq!(decide(Input { capturing_click: true, captured: true, ..focused() }), (true, false));
+    }
+
+    #[test]
+    fn a_click_does_not_undo_a_hotkey_release() {
+        assert_eq!(decide(Input { capturing_click: true, captured: true, toggle: true, ..focused() }), (false, false));
+    }
+
+    #[test]
+    fn losing_focus_releases() {
+        assert_eq!(decide(Input { captured: true, ..Default::default() }), (false, false));
+        assert_eq!(decide(Input { toggle: true, capturing_click: true, ..Default::default() }), (false, false));
+    }
+
+    #[test]
+    fn which_clicks_capture() {
+        assert!(!click_captures(CaptureMode::Key, false));
+        assert!(click_captures(CaptureMode::Click, true));
+        assert!(click_captures(CaptureMode::Auto, false));
+        assert!(!click_captures(CaptureMode::Auto, true));
     }
 
     #[test]
