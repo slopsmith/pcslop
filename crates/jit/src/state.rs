@@ -39,6 +39,8 @@ pub mod fill {
     pub const WRITABLE: u32 = 1;
     pub const GLOBAL: u32 = 2;
     pub const BIG: u32 = 4;
+    /// Filled in the CPL 3 tree.
+    pub const USER: u32 = 8;
 }
 
 /// How the runtime continues after a FAULT exit (`State::resume`).
@@ -131,6 +133,23 @@ pub struct State {
     pub sse_fp_ok: u32,
     /// FPSR exception flags gathered at each exit from the VM.
     pub fpsr: u32,
+    pub ds_sel: u32,
+    pub es_sel: u32,
+    pub fs_sel: u32,
+    pub gs_sel: u32,
+    pub gdt_base: u32,
+    pub gdt_limit: u32,
+    pub sysenter_cs: u32,
+    pub sysenter_esp: u32,
+    pub sysenter_eip: u32,
+    pub cr0: u32,
+    pub cr2: u32,
+    pub cr3: u32,
+    pub cr4: u32,
+    /// TTBR0 value and root VA of the CPL 0 and CPL 3 shadow trees, so
+    /// SYSENTER and SYSEXIT switch trees without an exit.
+    pub ttbr0: [u64; 2],
+    pub roots: [u64; 2],
 }
 
 pub const REGS: usize = offset_of!(State, regs);
@@ -169,6 +188,18 @@ pub const XMM: usize = offset_of!(State, xmm);
 pub const MXCSR: usize = offset_of!(State, mxcsr);
 pub const SSE_FP_OK: usize = offset_of!(State, sse_fp_ok);
 pub const FPSR: usize = offset_of!(State, fpsr);
+pub const DS_SEL: usize = offset_of!(State, ds_sel);
+pub const ES_SEL: usize = offset_of!(State, es_sel);
+pub const FS_SEL: usize = offset_of!(State, fs_sel);
+pub const GS_SEL: usize = offset_of!(State, gs_sel);
+pub const GDT_BASE: usize = offset_of!(State, gdt_base);
+pub const GDT_LIMIT: usize = offset_of!(State, gdt_limit);
+pub const SYSENTER_CS: usize = offset_of!(State, sysenter_cs);
+pub const SYSENTER_ESP: usize = offset_of!(State, sysenter_esp);
+pub const SYSENTER_EIP: usize = offset_of!(State, sysenter_eip);
+pub const CR0: usize = offset_of!(State, cr0);
+pub const TTBR0: usize = offset_of!(State, ttbr0);
+pub const ROOTS: usize = offset_of!(State, roots);
 pub const FSE: usize = offset_of!(State, fse);
 pub const FCW: usize = offset_of!(State, fcw);
 pub const FSW: usize = offset_of!(State, fsw);

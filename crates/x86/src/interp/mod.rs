@@ -120,6 +120,12 @@ pub fn translate_global<B: Bus>(cpu: &mut Cpu, bus: &mut B, lin: u32, write: boo
     }
 }
 
+/// Loads data segment register `seg` with `sel` as MOV would, reading the descriptor.
+pub fn load_segment<B: Bus>(cpu: &mut Cpu, bus: &mut B, seg: usize, sel: u16) -> bool {
+    let mut ctx = Ctx { cpu, bus, insn: Insn::default(), start_eip: 0 };
+    ctx.load_seg(seg, sel).is_ok()
+}
+
 /// Delivers `e` as a fault raised by the instruction at `cpu.eip`.
 pub fn deliver_fault<B: Bus>(cpu: &mut Cpu, bus: &mut B, e: Exception) -> Exit {
     let mut ctx = Ctx { cpu, bus, insn: Insn::default(), start_eip: 0 };

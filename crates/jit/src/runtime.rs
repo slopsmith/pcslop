@@ -266,6 +266,8 @@ fn try_fill(a: &mut Asm, fail: Label) {
     a.str(Width::W, eff, t7, 0);
     a.str(Width::W, far, t7, 4);
     a.orr(Size::W, eff, phys, t6);
+    a.ldr(Width::W, t6, STATE, state::USER as i32);
+    a.logic_shift(Logic::Orr, false, Size::W, eff, eff, t6, Shift::Lsl, 3);
     a.str(Width::W, eff, t7, 8);
     a.str(Width::W, pde, t7, 12);
     a.str(Width::W, pte, t7, 16);

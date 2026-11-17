@@ -979,3 +979,83 @@ fn random_sse_programs_match_the_interpreter() {
     }
     assert!(exits * 3 < insns, "{exits} interpreter exits for {insns} SSE instructions");
 }
+
+#[test]
+fn sysenter_sysexit_and_fs_loads_match_the_interpreter() {
+    let user = [
+        0x40, // inc eax
+        0x89, 0xe2, // mov edx, esp
+        0x0f, 0x34, // sysenter
+        0x50, // push eax
+        0x0f, 0xa2, // cpuid: an exit back to the host with FS = 0x3b
+        0x58, // pop eax
+        0x64, 0x8b, 0x1d, 0, 0, 0, 0, // mov ebx, fs:[0]
+        0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // keeps the interpreter out of the kernel
+        0xeb, 0xe0, // jmp 0x1000
+    ];
+    let kernel = [
+        0xfe, 0x05, 0x3c, 0x40, 0, 0, // inc byte [0x403c]: the 0x3b descriptor's base moves by 64 KiB
+        0x89, 0xd5, // mov ebp, edx
+        0x6a, 0x30, // push 0x30
+        0x0f, 0xa1, // pop fs
+        0x64, 0x8b, 0x0d, 0, 0, 0, 0, // mov ecx, fs:[0]
+        0x01, 0xce, // add esi, ecx
+        0xb9, 0x23, 0, 0, 0, // mov ecx, 0x23
+        0x8e, 0xd9, // mov ds, cx
+        0x8e, 0xc1, // mov es, cx
+        0x0f, 0x20, 0xd7, // mov edi, cr2
+        0x83, 0xf8, 0x10, // cmp eax, 16: later rounds run with no exits in between
+        0x74, 0x0e, // je the final pop fs
+        0x6a, 0x3b, // push 0x3b
+        0x0f, 0xa1, // pop fs
+        0xba, 0x05, 0x10, 0, 0, // mov edx, 0x1005
+        0x89, 0xe9, // mov ecx, ebp
+        0xfb, // sti
+        0x0f, 0x35, // sysexit
+        0x6a, 0x3b, // push 0x3b
+        0x0f, 0xa1, // pop fs
+        0xf4, // hlt
+    ];
+    let mut a = flat_cpu(0x1000, 0x8000);
+    let mut bus_a = bus_with(0x1000, &user);
+    let mem = bus_a.ram.as_mut_slice();
+    mem[0x2000..0x2000 + kernel.len()].copy_from_slice(&kernel);
+    let gdt: [u64; 8] = [
+        0,
+        0x00cf_9b00_0000_ffff,
+        0x00cf_9300_0000_ffff,
+        0x00cf_fb00_0000_ffff,
+        0x00cf_f300_0000_ffff,
+        0,
+        0x0040_9300_5000_0fff,
+        0x0040_f300_5100_0fff,
+    ];
+    for (i, d) in gdt.iter().enumerate() {
+        mem[0x4000 + 8 * i..0x4008 + 8 * i].copy_from_slice(&d.to_le_bytes());
+    }
+    mem[0x5000..0x5004].copy_from_slice(&0x1111_1111u32.to_le_bytes());
+    for k in 0..32usize {
+        let at = 0x5100 + (k << 16);
+        mem[at..at + 4].copy_from_slice(&(0x2222_0000 + k as u32).to_le_bytes());
+    }
+    paged(&mut a, &mut bus_a, false);
+    a.gdtr = x86::cpu::DescriptorTable { base: 0x4000, limit: 0x3f };
+    a.sysenter_cs = 8;
+    a.sysenter_esp = 0x9000;
+    a.sysenter_eip = 0x2000;
+    for (seg, sel) in [(0, 0x23), (1, 0x1b), (2, 0x23), (3, 0x23)] {
+        a.segs[seg].selector = sel;
+        a.segs[seg].attr |= 3 << 5;
+    }
+    assert!(interp::load_segment(&mut a, &mut bus_a, 4, 0x3b));
+    let mut b = a.clone();
+    let mut bus_b = FlatBus { ram: GuestMemory::new(RAM).unwrap() };
+    bus_b.ram.as_mut_slice().copy_from_slice(bus_a.ram.as_slice());
+    run_interp(&mut a, &mut bus_a);
+    let stats = run_jit(&mut b, &mut bus_b);
+    assert_eq!(a.regs, b.regs);
+    assert_eq!(a.eip, b.eip);
+    assert_eq!(a.eflags & ARITH_MASK, b.eflags & ARITH_MASK);
+    assert_eq!(a.segs, b.segs);
+    assert!(stats.interp_exits <= 17, "system calls left translated code: {stats:?}");
+}

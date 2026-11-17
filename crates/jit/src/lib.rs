@@ -543,6 +543,8 @@ impl Jit {
     fn load_state(&mut self, cpu: &Cpu) {
         let vm_fill = self.vm_fill;
         let afp = self.afp;
+        let ttbr0 = [0, 1].map(|r| self.shadow[r].root_ipa() | (r as u64 + 1) << 48);
+        let roots = [0, 1].map(|r| self.shadow[r].root_va());
         if afp {
             let fpcr = state::fpcr_for(cpu.mxcsr);
             if fpcr != self.fpcr {
@@ -602,6 +604,21 @@ impl Jit {
         s.xmm = cpu.xmm;
         s.mxcsr = cpu.mxcsr;
         s.fpsr = 0;
+        s.ds_sel = cpu.segs[DS].selector as u32;
+        s.es_sel = cpu.segs[ES].selector as u32;
+        s.fs_sel = cpu.segs[FS].selector as u32;
+        s.gs_sel = cpu.segs[GS].selector as u32;
+        s.gdt_base = cpu.gdtr.base;
+        s.gdt_limit = cpu.gdtr.limit as u32;
+        s.sysenter_cs = cpu.sysenter_cs;
+        s.sysenter_esp = cpu.sysenter_esp;
+        s.sysenter_eip = cpu.sysenter_eip;
+        s.cr0 = cpu.cr0;
+        s.cr2 = cpu.cr2;
+        s.cr3 = cpu.cr3;
+        s.cr4 = cpu.cr4;
+        s.ttbr0 = ttbr0;
+        s.roots = roots;
         s.sse_fp_ok = (sse_ok && afp && cpu.mxcsr & 0x1f80 == 0x1f80) as u32;
     }
 
@@ -640,6 +657,34 @@ impl Jit {
                 }
             }
             cpu.fpu.enter_mmx();
+        }
+    }
+
+    /// Takes in a SYSENTER, SYSEXIT or FS/GS load that translated code did,
+    /// which switched CPL, segments and the shadow tree without an exit.
+    fn sync_mode<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B) {
+        use x86::cpu::{Segment, attr};
+        let (user, cs, fs, gs, fs_base, gs_base) = {
+            let s = self.state();
+            (s.user, s.cs_sel, s.fs_sel, s.gs_sel, s.fs_base, s.gs_base)
+        };
+        self.root = user as usize;
+        if cs != cpu.segs[CS].selector as u32 {
+            let flat = attr::P | attr::S | attr::RW | attr::ACCESSED | attr::DB | attr::G;
+            let dpl = if user != 0 { 3 << 5 } else { 0 };
+            let base = cpu.sysenter_cs as u16 & !3;
+            let (cs_sel, ss_sel) = if user != 0 { ((base + 16) | 3, (base + 24) | 3) } else { (base, base + 8) };
+            cpu.segs[CS] = Segment { selector: cs_sel, attr: flat | attr::CODE | dpl, base: 0, limit: 0xffff_ffff };
+            cpu.segs[SS] = Segment { selector: ss_sel, attr: flat | dpl, base: 0, limit: 0xffff_ffff };
+        }
+        // The same selector can come back with another base: XP rewrites the
+        // TEB descriptor on every thread switch.
+        for (seg, sel, base) in [(FS, fs, fs_base), (GS, gs, gs_base)] {
+            if sel != cpu.segs[seg].selector as u32 || base != cpu.segs[seg].base {
+                let ok = interp::load_segment(cpu, bus, seg, sel as u16);
+                assert!(ok, "translated code loaded selector {sel:#x} that the interpreter rejects");
+                cpu.segs[seg].base = base;
+            }
         }
     }
 
@@ -957,6 +1002,7 @@ impl Jit {
             let t0 = self.timing.then(std::time::Instant::now);
             let exit = self.vcpu.run()?;
             self.take_fill_log(cpu, bus);
+            self.sync_mode(cpu, bus);
             let t1 = self.timing.then(std::time::Instant::now);
             if let (Some(a), Some(b)) = (t0, t1) {
                 self.stats.vm_ns += (b - a).as_nanos() as u64;
@@ -1143,12 +1189,12 @@ impl Jit {
     /// Takes in the shadow fills the runtime did inside the VM since the last exit.
     fn take_fill_log<B: Bus>(&mut self, cpu: &Cpu, bus: &mut B) {
         let n = std::mem::take(&mut self.state().fill_count) as usize;
-        let r = self.root;
         for i in 0..n {
             let off = layout::FILL_LOG + i * 32;
             let word = |j: usize| u32::from_le_bytes(self.mem.as_slice()[off + 4 * j..off + 4 * j + 4].try_into().unwrap());
             let (leaf, lin, phys_flags, pde, pte) = (word(0) as usize, word(1), word(2), word(3), word(4));
             let phys = phys_flags & !0xfff;
+            let r = (phys_flags & state::fill::USER != 0) as usize;
             if phys_flags & state::fill::GLOBAL == 0 {
                 self.nonglobal[r].push(leaf);
             }

@@ -1,0 +1,173 @@
+//! Kernel entry and exit without leaving the VM: SYSENTER and SYSEXIT switch
+//! CPL and the shadow tree themselves (the host catches up in `sync_mode`),
+//! FS and GS loads read their descriptor from the GDT, and reading a control
+//! register comes from the runtime state. Anything unusual goes to the
+//! interpreter, which raises the right fault.
+
+use a64::{Label, Logic, Reg, Shift, Size, Width, ZR, sysreg};
+use x86::decode::Insn;
+
+use super::{Emit, Step, T_A, T_ADDR, T_B, T_C, T_D, T_E};
+use crate::runtime::{STATE, guest_reg};
+use crate::state;
+
+const ES: usize = 0;
+const DS: usize = 3;
+const FS: usize = 4;
+const GS: usize = 5;
+
+impl Emit {
+    /// SYSENTER: CPL 0 at SYSENTER_EIP with the flat segments SYSENTER_CS implies.
+    pub(super) fn sysenter(&mut self, eip: u32) -> Step {
+        let slow = self.a.label();
+        self.a.ldr(Width::W, T_A, STATE, state::SYSENTER_CS as i32);
+        self.and_imm32(T_A, T_A, 0xfffc);
+        self.a.cbz(Size::W, T_A, slow);
+        self.a.str(Width::W, ZR, STATE, state::IF_FLAG as i32);
+        self.a.str(Width::W, T_A, STATE, state::CS_SEL as i32);
+        self.a.ldr(Width::W, guest_reg(4), STATE, state::SYSENTER_ESP as i32);
+        self.a.ldr(Width::W, T_C, STATE, state::SYSENTER_EIP as i32);
+        self.switch_tree(false);
+        self.goto_reg(T_C);
+        self.a.bind(slow);
+        self.exit_interp(eip);
+        Step::End
+    }
+
+    /// SYSEXIT from CPL 0: CPL 3 at EDX with ESP = ECX.
+    pub(super) fn sysexit(&mut self, eip: u32) -> Step {
+        if self.user {
+            return Step::Unsupported;
+        }
+        let slow = self.a.label();
+        self.a.ldr(Width::W, T_A, STATE, state::SYSENTER_CS as i32);
+        self.and_imm32(T_A, T_A, 0xfffc);
+        self.a.cbz(Size::W, T_A, slow);
+        self.a.add_imm(Size::W, T_A, T_A, 16 | 3);
+        self.a.str(Width::W, T_A, STATE, state::CS_SEL as i32);
+        self.a.mov(Size::W, guest_reg(4), guest_reg(1));
+        self.a.mov(Size::W, T_C, guest_reg(2));
+        self.switch_tree(true);
+        self.goto_reg(T_C);
+        self.a.bind(slow);
+        self.exit_interp(eip);
+        Step::End
+    }
+
+    fn switch_tree(&mut self, user: bool) {
+        let r = user as i32;
+        self.a.movz(Size::W, T_B, r as u32, 0);
+        self.a.str(Width::W, T_B, STATE, state::USER as i32);
+        self.a.ldr(Width::X, T_B, STATE, state::TTBR0 as i32 + 8 * r);
+        self.a.msr(sysreg::TTBR0_EL1, T_B);
+        self.a.isb();
+        self.a.ldr(Width::X, T_B, STATE, state::ROOTS as i32 + 8 * r);
+        self.a.str(Width::X, T_B, STATE, state::SHADOW_ROOT as i32);
+    }
+
+    /// POP to a segment register (07, 1F, 0F A1, 0F A9).
+    pub(super) fn pop_seg(&mut self, insn: &Insn, eip: u32, seg: usize) -> bool {
+        if !insn.op32 {
+            return false;
+        }
+        let (slow, done) = (self.a.label(), self.a.label());
+        let esp = guest_reg(4);
+        self.a.mov(Size::W, T_ADDR, esp);
+        self.load(Width::H, T_A);
+        self.load_seg(seg, slow);
+        self.a.add_imm(Size::W, esp, esp, 4);
+        self.a.b(done);
+        self.a.bind(slow);
+        self.exit_interp(eip);
+        self.a.bind(done);
+        true
+    }
+
+    /// MOV Sreg, r/m16 (8E) for ES, DS, FS and GS.
+    pub(super) fn mov_to_seg(&mut self, insn: &Insn, eip: u32) -> bool {
+        let seg = insn.reg();
+        if !matches!(seg, ES | DS | FS | GS) {
+            return false;
+        }
+        match insn.mem {
+            Some(m) => {
+                if !self.ea(insn, &m) {
+                    return false;
+                }
+                self.load(Width::H, T_A);
+            }
+            None => self.a.uxth(T_A, guest_reg(insn.rm())),
+        }
+        let (slow, done) = (self.a.label(), self.a.label());
+        self.load_seg(seg, slow);
+        self.a.b(done);
+        self.a.bind(slow);
+        self.exit_interp(eip);
+        self.a.bind(done);
+        true
+    }
+
+    /// Loads `seg` with the selector in T_A or branches to `slow`: ES and DS keep
+    /// their selector; FS and GS take a present, accessed GDT data descriptor.
+    fn load_seg(&mut self, seg: usize, slow: Label) {
+        if matches!(seg, ES | DS) {
+            let at = if seg == ES { state::ES_SEL } else { state::DS_SEL };
+            self.a.ldr(Width::W, T_B, STATE, at as i32);
+            self.a.eor(Size::W, T_B, T_B, T_A);
+            self.a.cbnz(Size::W, T_B, slow);
+            return;
+        }
+        let (base_at, sel_at) = if seg == FS { (state::FS_BASE, state::FS_SEL) } else { (state::GS_BASE, state::GS_SEL) };
+        let (null, store) = (self.a.label(), self.a.label());
+        self.and_imm32(T_B, T_A, 0xfffc);
+        self.a.cbz(Size::W, T_B, null);
+        if self.user {
+            self.a.b(slow);
+        } else {
+            self.a.tbnz(T_A, 2, slow);
+            self.and_imm32(T_C, T_A, 0xfff8);
+            self.a.add_imm(Size::W, T_E, T_C, 7);
+            self.a.ldr(Width::W, T_D, STATE, state::GDT_LIMIT as i32);
+            self.a.sub(Size::W, T_D, T_D, T_E);
+            self.a.tbnz(T_D, 31, slow);
+            self.a.ldr(Width::W, T_D, STATE, state::GDT_BASE as i32);
+            self.a.add(Size::W, T_ADDR, T_D, T_C);
+            self.a.ldr(Width::X, T_D, T_ADDR, 0);
+            self.a.ubfx(Size::X, T_E, T_D, 40, 8);
+            self.a.mov_imm(Size::W, T_B, 0x99);
+            self.a.and(Size::W, T_E, T_E, T_B);
+            self.a.mov_imm(Size::W, T_B, 0x91);
+            self.a.eor(Size::W, T_E, T_E, T_B);
+            self.a.cbnz(Size::W, T_E, slow);
+            self.a.ubfx(Size::X, T_E, T_D, 45, 2);
+            self.and_imm32(T_B, T_A, 3);
+            self.a.sub(Size::W, T_E, T_E, T_B);
+            self.a.tbnz(T_E, 31, slow);
+            self.a.ubfx(Size::X, T_B, T_D, 16, 24);
+            self.a.lsr_imm(Size::X, T_E, T_D, 56);
+            self.a.logic_shift(Logic::Orr, false, Size::W, T_B, T_B, T_E, Shift::Lsl, 24);
+            self.a.b(store);
+        }
+        self.a.bind(null);
+        self.a.movz(Size::W, T_B, 0, 0);
+        self.a.bind(store);
+        self.a.str(Width::W, T_B, STATE, base_at as i32);
+        self.a.str(Width::W, T_A, STATE, sel_at as i32);
+    }
+
+    /// MOV r32, CR0/CR2/CR3/CR4 (0F 20) at CPL 0.
+    pub(super) fn mov_from_cr(&mut self, insn: &Insn) -> bool {
+        let cr = insn.reg();
+        if self.user || !matches!(cr, 0 | 2 | 3 | 4) {
+            return false;
+        }
+        let at = state::CR0 + 4 * if cr == 0 { 0 } else { cr - 1 };
+        self.a.ldr(Width::W, guest_reg(insn.rm()), STATE, at as i32);
+        true
+    }
+
+    fn and_imm32(&mut self, rd: Reg, rn: Reg, imm: u64) {
+        let ok = self.a.logic_imm(Logic::And, Size::W, rd, rn, imm);
+        assert!(ok);
+    }
+}

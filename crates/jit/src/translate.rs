@@ -11,6 +11,7 @@ use crate::runtime::{AF_AUX, Entries, ICOUNT, PF_RESULT, STATE, guest_reg};
 use crate::state::{self, reason};
 
 mod sse;
+mod system;
 mod x87;
 
 const MAX_INSNS: usize = 64;
@@ -1327,6 +1328,30 @@ impl Emit {
                 self.a.movz(Size::W, T_B, if op == 0xf8 { 2 } else { 0 }, 0);
                 self.a.rmif(T_B, 0, 0b0010);
             }
+            0x07 | 0x1f | 0x1a1 | 0x1a9 => {
+                let seg = match op {
+                    0x07 => 0,
+                    0x1f => 3,
+                    0x1a1 => 4,
+                    _ => 5,
+                };
+                if !self.pop_seg(insn, eip, seg) {
+                    return Step::Unsupported;
+                }
+            }
+            0x8e => {
+                if !self.mov_to_seg(insn, eip) {
+                    return Step::Unsupported;
+                }
+            }
+            0x134 => return self.sysenter(eip),
+            0x135 => return self.sysexit(eip),
+            0x120 => {
+                if !self.mov_from_cr(insn) {
+                    return Step::Unsupported;
+                }
+            }
+            0x1ae if insn.mem.is_none() && matches!(insn.modrm, 0xe8 | 0xf0 | 0xf8) => self.a.dmb(0xb),
             0xd8..=0xdf => {
                 if !self.x87(insn, eip) {
                     return Step::Unsupported;
