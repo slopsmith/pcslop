@@ -802,7 +802,7 @@ impl Jit {
         cpu.set_flag(x86::cpu::flags::DF, df);
         cpu.xmm = s.xmm;
         cpu.dr = s.dr;
-        cpu.mxcsr |= state::mxcsr_flags(s.fpsr);
+        cpu.mxcsr = s.mxcsr | state::mxcsr_flags(s.fpsr);
         s.fpsr = 0;
         let f = &mut cpu.fpu;
         for i in 0..8 {

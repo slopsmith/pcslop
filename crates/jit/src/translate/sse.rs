@@ -7,7 +7,7 @@
 use a64::{Fcm, Label, Logic, Size, V, Width};
 use x86::decode::{Insn, Rep};
 
-use super::{Emit, T_A, T_ADDR, T_B, simd_three};
+use super::{Emit, T_A, T_ADDR, T_B, T_C, T_D, simd_three};
 use crate::runtime::{AF_AUX, PF_RESULT, STATE, guest_reg};
 use crate::state;
 
@@ -56,6 +56,7 @@ pub(super) fn is_sse(insn: &Insn) -> bool {
         0x173 => pfx == P66 && !mem && matches!(insn.reg(), 2 | 3 | 6 | 7),
         0x1c4 => pfx == P66,
         0x1c5 | 0x1d7 => pfx == P66 && !mem,
+        0x1d1..=0x1d3 | 0x1e1 | 0x1e2 | 0x1f1..=0x1f3 => pfx == P66,
         _ => false,
     }
 }
@@ -192,6 +193,37 @@ impl Emit {
                     _ => {}
                 }
                 self.a.str_q(XA, STATE, xmm(rm));
+            }
+            (0x1d1..=0x1d3 | 0x1e1 | 0x1e2 | 0x1f1..=0x1f3, _) => {
+                let (esize, log) = match op & 3 {
+                    1 => (16, 4),
+                    2 => (32, 5),
+                    _ => (64, 6),
+                };
+                let (right, arith) = (op < 0x1f0, op & 0xf0 == 0xe0);
+                self.src(insn, 16, true, XB, bail);
+                self.a.fmov_xd(T_C, XB);
+                let small = self.a.label();
+                self.a.lsr_imm(Size::X, T_D, T_C, log);
+                self.a.cbz(Size::X, T_D, small);
+                self.a.movz(Size::W, T_C, esize, 0);
+                self.a.bind(small);
+                if right {
+                    self.a.neg(Size::W, T_C, T_C);
+                }
+                let ok = self.a.logic_imm(Logic::And, Size::W, T_C, T_C, 0xff);
+                assert!(ok);
+                if esize == 16 {
+                    self.a.logic_shift(Logic::Orr, false, Size::W, T_C, T_C, T_C, a64::Shift::Lsl, 16);
+                }
+                if esize <= 32 {
+                    self.a.logic_shift(Logic::Orr, false, Size::X, T_C, T_C, T_C, a64::Shift::Lsl, 32);
+                }
+                self.a.fmov_dx(XT, T_C);
+                self.a.ins(3, XT, 1, XT, 0);
+                self.a.ldr_q(XA, STATE, xmm(reg));
+                self.a.vec3(true, !arith, log - 3, 0b01000, XA, XA, XT);
+                self.a.str_q(XA, STATE, xmm(reg));
             }
             (0x1c4, _) => {
                 self.a.ldr_q(XA, STATE, xmm(reg));

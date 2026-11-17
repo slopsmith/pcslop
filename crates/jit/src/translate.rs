@@ -232,6 +232,15 @@ impl Emit {
         self.a.b_offset(off);
     }
 
+    /// Bit 0 of `dst` becomes 1 when the last result's low byte has odd parity,
+    /// that is when PF is clear. NZCV holds guest flags, so this avoids it.
+    fn parity_odd(&mut self, dst: Reg) {
+        self.a.ubfx(Size::W, dst, PF_RESULT, 0, 8);
+        for sh in [4, 2, 1] {
+            self.a.logic_shift(a64::Logic::Eor, false, Size::W, dst, dst, dst, Shift::Lsr, sh);
+        }
+    }
+
     fn exit_interp(&mut self, eip: u32) {
         self.x87_flush();
         self.a.mov_imm(Size::W, r(0), eip as u64);
@@ -766,7 +775,8 @@ impl Emit {
             return if self.sse(insn, eip) { Step::Next } else { Step::Unsupported };
         }
         let string = matches!(op, 0xa4..=0xa7 | 0xaa..=0xaf);
-        if insn.rep != Rep::None && !(matches!(op, 0x90 | 0xc2 | 0xc3) || string) {
+        let branch = matches!(op, 0x70..=0x7f | 0x180..=0x18f | 0xe8 | 0xe9 | 0xeb) || (op == 0xff && matches!(insn.reg(), 2 | 4));
+        if insn.rep != Rep::None && !(matches!(op, 0x90 | 0xc2 | 0xc3) || string || branch) {
             return Step::Unsupported;
         }
         match op {
@@ -824,9 +834,18 @@ impl Emit {
                 if !op32 && op >= 0x100 {
                     return Step::Unsupported;
                 }
-                let Some(c) = x86_cond(op) else { return Step::Unsupported };
                 let taken = self.a.label();
-                self.a.b_cond(c, taken);
+                match x86_cond(op) {
+                    Some(c) => self.a.b_cond(c, taken),
+                    None => {
+                        self.parity_odd(T_B);
+                        if op & 1 == 0 {
+                            self.a.tbz(T_B, 0, taken);
+                        } else {
+                            self.a.tbnz(T_B, 0, taken);
+                        }
+                    }
+                }
                 self.goto(next);
                 self.a.bind(taken);
                 self.goto(next.wrapping_add(rel));
@@ -1149,14 +1168,36 @@ impl Emit {
                 _ => return Step::Unsupported,
             },
             0x140..=0x14f if op32 => {
-                let Some(c) = x86_cond(op) else { return Step::Unsupported };
                 let Some(v) = self.rm32(insn) else { return Step::Unsupported };
                 let dst = guest_reg(insn.reg());
-                self.a.csel(Size::W, dst, v, dst, c);
+                match x86_cond(op) {
+                    Some(c) => self.a.csel(Size::W, dst, v, dst, c),
+                    None => {
+                        let skip = self.a.label();
+                        self.parity_odd(T_B);
+                        if op & 1 == 0 {
+                            self.a.tbnz(T_B, 0, skip);
+                        } else {
+                            self.a.tbz(T_B, 0, skip);
+                        }
+                        self.a.mov(Size::W, dst, v);
+                        self.a.bind(skip);
+                    }
+                }
             }
             0x190..=0x19f => {
-                let Some(c) = x86_cond(op) else { return Step::Unsupported };
-                self.a.cset(Size::W, T_B, c);
+                match x86_cond(op) {
+                    Some(c) => self.a.cset(Size::W, T_B, c),
+                    None => {
+                        self.parity_odd(T_B);
+                        let ok = self.a.logic_imm(a64::Logic::And, Size::W, T_B, T_B, 1);
+                        assert!(ok);
+                        if op & 1 == 0 {
+                            let ok = self.a.logic_imm(a64::Logic::Eor, Size::W, T_B, T_B, 1);
+                            assert!(ok);
+                        }
+                    }
+                }
                 match insn.mem {
                     Some(m) => {
                         if !self.ea(insn, &m) {
@@ -1540,6 +1581,80 @@ impl Emit {
                 }
             }
             0x1ae if insn.mem.is_none() && matches!(insn.modrm, 0xe8 | 0xf0 | 0xf8) => self.a.dmb(0xb),
+            0x1ae if matches!(insn.reg(), 2 | 3) && insn.rep == Rep::None && !insn.opsize_prefix => {
+                let Some(m) = insn.mem else { return Step::Unsupported };
+                if !self.ea(insn, &m) {
+                    return Step::Unsupported;
+                }
+                let (slow, done) = (self.a.label(), self.a.label());
+                self.a.ldr(Width::W, T_B, STATE, state::SSE_OK as i32);
+                self.a.cbz(Size::W, T_B, slow);
+                if insn.reg() == 3 {
+                    self.a.mrs(T_B, a64::sysreg::FPSR);
+                    self.a.ldr(Width::W, T_C, STATE, state::FPSR as i32);
+                    self.a.orr(Size::W, T_B, T_B, T_C);
+                    self.a.ldr(Width::W, T_C, STATE, state::MXCSR as i32);
+                    for (bit, to) in [(0, 0), (1, 2), (2, 3), (3, 4), (4, 5)] {
+                        self.a.ubfx(Size::W, T_D, T_B, bit, 1);
+                        self.a.logic_shift(a64::Logic::Orr, false, Size::W, T_C, T_C, T_D, Shift::Lsl, to);
+                    }
+                    self.store(Width::W, T_C);
+                } else {
+                    // Only a load that keeps the control bits stays here: FPCR,
+                    // SSE_FP_OK and the x87 rounding check all follow them.
+                    self.load(Width::W, T_B);
+                    self.a.ldr(Width::W, T_C, STATE, state::MXCSR as i32);
+                    self.a.eor(Size::W, T_C, T_C, T_B);
+                    self.a.lsr_imm(Size::W, T_C, T_C, 6);
+                    self.a.cbnz(Size::W, T_C, slow);
+                    self.a.str(Width::W, T_B, STATE, state::MXCSR as i32);
+                    self.a.str(Width::W, ZR, STATE, state::FPSR as i32);
+                    self.a.msr(a64::sysreg::FPSR, ZR);
+                }
+                self.a.b(done);
+                self.a.bind(slow);
+                self.exit_interp(eip);
+                self.a.bind(done);
+            }
+            0x1a3 | 0x1ab | 0x1b3 | 0x1bb if op32 => {
+                let kind = (op as usize >> 3) & 3;
+                let idx = guest_reg(insn.reg());
+                let a = match insn.mem {
+                    Some(m) => {
+                        if !self.ea(insn, &m) {
+                            return Step::Unsupported;
+                        }
+                        self.a.asr_imm(Size::W, T_B, idx, 5);
+                        self.a.add_shift(Size::W, T_ADDR, T_ADDR, T_B, Shift::Lsl, 2);
+                        self.load(Width::W, T_A);
+                        T_A
+                    }
+                    None => guest_reg(insn.rm()),
+                };
+                let ok = self.a.logic_imm(a64::Logic::And, Size::W, T_C, idx, 31);
+                assert!(ok);
+                self.a.lsrv(Size::W, T_B, a, T_C);
+                if kind != 0 {
+                    self.a.movz(Size::W, T_D, 1, 0);
+                    self.a.lslv(Size::W, T_D, T_D, T_C);
+                    let (logic, invert) = match kind {
+                        1 => (a64::Logic::Orr, false),
+                        2 => (a64::Logic::And, true),
+                        _ => (a64::Logic::Eor, false),
+                    };
+                    self.a.logic_shift(logic, invert, Size::W, T_RES, a, T_D, Shift::Lsl, 0);
+                    match insn.mem {
+                        Some(_) => self.store(Width::W, T_RES),
+                        None => self.a.mov(Size::W, guest_reg(insn.rm()), T_RES),
+                    }
+                }
+                let ok = self.a.logic_imm(a64::Logic::And, Size::W, T_B, T_B, 1);
+                assert!(ok);
+                let ok = self.a.logic_imm(a64::Logic::Eor, Size::W, T_B, T_B, 1);
+                assert!(ok);
+                self.a.lsl_imm(Size::W, T_B, T_B, 1);
+                self.a.rmif(T_B, 0, 0b0010);
+            }
             0xd8..=0xdf => {
                 if !self.x87(insn, eip) {
                     return Step::Unsupported;
@@ -2088,6 +2203,8 @@ fn is_recent(insn: &Insn) -> bool {
     let (op, reg, op32) = (insn.op, insn.reg(), insn.op32);
     match op {
     0x1c8..=0x1cf | 0xc0 | 0xd0 | 0xd2 | 0x9c | 0x9d | 0x1ba | 0xf5 | 0xf8 | 0xf9 | 0x118 | 0x11f | 0x12b => true,
+    0x1ae | 0x1a3 | 0x1ab | 0x1b3 | 0x1bb | 0x7a | 0x7b | 0x18a | 0x18b | 0x14a | 0x14b | 0x19a | 0x19b => true,
+    0x70..=0x7f | 0x180..=0x18f | 0xe8 | 0xe9 | 0xeb | 0xff if insn.rep != Rep::None => true,
     0x1c0 | 0x1c1 | 0x1b0 | 0x1b1 | 0x1c7 | 0x1a4 | 0x1a5 | 0x1ac | 0x1ad | 0xfb => true,
     0xd8..=0xdf | 0x9b => true,
     _ if sse::is_sse(insn) => true,

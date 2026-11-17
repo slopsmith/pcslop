@@ -203,6 +203,85 @@ fn rep_ret_runs_translated() {
 }
 
 #[test]
+fn prefixed_branches_and_parity_conditions_run_translated() {
+    let mut code = vec![
+        0xb9, 0x40, 0, 0, 0, // mov ecx, 64
+        0x89, 0xc8, // loop: mov eax, ecx
+        0x83, 0xe0, 0x07, // and eax, 7
+        0x0f, 0x9a, 0xc3, // setp bl
+        0x0f, 0x9b, 0xc7, // setnp bh
+        0x01, 0xde, // add esi, ebx
+        0x0f, 0x4a, 0xf9, // cmovp edi, ecx
+        0x0f, 0x4b, 0xd1, // cmovnp edx, ecx
+        0x83, 0xf8, 0x03, // cmp eax, 3
+        0xf2, 0x7a, 0x01, // bnd jp +1
+        0x45, // inc ebp
+        0xf3, 0x7b, 0x01, // rep jnp +1
+        0x4d, // dec ebp
+        0x85, 0xc0, // test eax, eax
+        0x0f, 0x8a, 0x01, 0, 0, 0, // jp +1
+        0x47, // inc edi
+        0xf2, 0xe8, 0x0c, 0, 0, 0, // bnd call +12
+    ];
+    code.extend([0x90; 12]); // past the interpreter's tail
+    code.extend([0x49, 0xf2, 0x75, 0xcb, 0xf4]); // dec ecx; bnd jnz loop; hlt
+    code.extend([0x40, 0xf2, 0xc3]); // inc eax; bnd ret
+    let stats = compare(&code, |_| {});
+    assert!(stats.interp_exits < 8, "Firefox's builds branch on parity after UCOMISS and prefix branches: {stats:?}");
+}
+
+#[test]
+fn bit_tests_with_a_register_index_match_the_interpreter() {
+    let mut rng = Rng(0xb17);
+    for round in 0..200 {
+        let mut code = Vec::new();
+        for _ in 0..20 {
+            let op = [0xa3, 0xab, 0xb3, 0xbb][rng.below(4) as usize];
+            let (reg, rm) = (rng.below(4) as u8, rng.below(4) as u8);
+            match rng.below(3) {
+                0 => code.extend([0x0f, op, modrm_rr(reg, rm)]),
+                _ => code.extend([0x0f, op, 0x80 | reg << 3 | 6, 0x00, 0x01, 0, 0]), // [esi+0x100]
+            }
+            code.extend([0x0f, 0x92, 0xc0 | rng.below(8) as u8]); // setc r8
+        }
+        code.push(0xf4);
+        let hex: Vec<String> = code.iter().map(|b| format!("{b:02x}")).collect();
+        let mut vals = [0u32; 4];
+        for v in vals.iter_mut() {
+            *v = match rng.below(3) {
+                0 => rng.below(64 * 8),
+                1 => rng.below(64 * 8).wrapping_neg(),
+                _ => rng.next(),
+            };
+        }
+        let mut a = flat_cpu(0x1000, 0x8000);
+        a.regs[..4].copy_from_slice(&vals);
+        a.regs[6] = 0x3100;
+        let mut b = a.clone();
+        let mut bus_a = bus_with(0x1000, &code);
+        let mut bus_b = bus_with(0x1000, &code);
+        for k in 0..0x200 {
+            let byte = rng.next() as u8;
+            bus_a.ram.as_mut_slice()[0x2f00 + k] = byte;
+            bus_b.ram.as_mut_slice()[0x2f00 + k] = byte;
+        }
+        let in_range = vals.iter().all(|&v| (v as i32) >= -0x800 && (v as i32) < 0x800);
+        if !in_range {
+            a.regs[..4].iter_mut().zip(b.regs[..4].iter_mut()).for_each(|(x, y)| {
+                *x &= 0x3ff;
+                *y = *x;
+            });
+        }
+        run_interp(&mut a, &mut bus_a);
+        let stats = run_jit(&mut b, &mut bus_b);
+        assert_eq!(a.regs, b.regs, "round {round} registers\ncode: {}", hex.join(" "));
+        assert_eq!(a.eflags & x86::cpu::flags::CF, b.eflags & x86::cpu::flags::CF, "round {round} CF\ncode: {}", hex.join(" "));
+        assert!(bus_a.ram.as_slice() == bus_b.ram.as_slice(), "round {round} memory\ncode: {}", hex.join(" "));
+        assert!(stats.interp_exits < 4, "round {round}: {stats:?}");
+    }
+}
+
+#[test]
 fn one_operand_mul_and_imul_run_translated() {
     let mut code = vec![
         0xb9, 0x40, 0, 0, 0, // mov ecx, 64
@@ -969,7 +1048,19 @@ fn random_sse(rng: &mut Rng, out: &mut Vec<u8>) {
         0xda, 0xdc, 0xdd, 0xde, 0xe0, 0xe3, 0xe4, 0xe5, 0xe8, 0xe9, 0xea, 0xec, 0xed, 0xee, 0xf4, 0xf5, 0xf6, 0xf8, 0xf9, 0xfa, 0xfb,
         0xfc, 0xfd, 0xfe, 0xdb,
     ];
-    match rng.below(24) {
+    const SHIFT_OPS: [u8; 8] = [0xd1, 0xd2, 0xd3, 0xe1, 0xe2, 0xf1, 0xf2, 0xf3];
+    match rng.below(27) {
+        24 => sse_op(out, 0x66, SHIFT_OPS[rng.below(8) as usize], reg, rm, slot),
+        25 => {
+            out.extend([0xc7, 0x05, 0x80, 0x31, 0, 0]);
+            out.extend(rng.below(70).to_le_bytes());
+            out.extend([0xc7, 0x05, 0x84, 0x31, 0, 0, 0, 0, 0, 0]);
+            sse_op(out, 0x66, SHIFT_OPS[rng.below(8) as usize], reg, None, 0x3180);
+        }
+        26 => {
+            out.extend([0x0f, 0xae, 3 << 3 | 5]);
+            out.extend((0x31c0 + 4 * rng.below(4)).to_le_bytes());
+        }
         20 | 21 => sse_op(out, 0x66, INT_OPS[rng.below(INT_OPS.len() as u32) as usize], reg, rm, slot),
         22 => {
             let (op, sub) = [(0x71, 2), (0x71, 4), (0x71, 6), (0x72, 2), (0x72, 4), (0x72, 6), (0x73, 2), (0x73, 3), (0x73, 6), (0x73, 7)]
@@ -1085,6 +1176,11 @@ fn random_sse_programs_match_the_interpreter() {
         }
         let de = x86::fpu::exc::DE as u32;
         assert_eq!(a.mxcsr | de, b.mxcsr | de, "round {round} mxcsr\ncode: {}", hex.join(" "));
+        for ram in [bus_a.ram.as_mut_slice(), bus_b.ram.as_mut_slice()] {
+            for k in 0..4 {
+                ram[0x31c0 + 4 * k] |= de as u8;
+            }
+        }
         assert!(bus_a.ram.as_slice() == bus_b.ram.as_slice(), "round {round} memory\ncode: {}", hex.join(" "));
         exits += stats.interp_exits;
         insns += n;
