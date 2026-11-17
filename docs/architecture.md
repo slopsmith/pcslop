@@ -70,7 +70,7 @@ A plain host-side interpreter comes first, for three reasons:
 ## Platform and firmware (LLE)
 
 - **Firmware:** SeaBIOS + SeaVGABIOS run as real firmware. We do not emulate BIOS calls at a high level. SeaBIOS is LGPLv3 and runs as a separate ROM image, so its license does not affect ours.
-- **Board:** i440FX + PIIX3/PIIX4, the board SeaBIOS knows best.
+- **Board:** i440FX + PIIX3/PIIX4, the board SeaBIOS knows best. `--board bx` swaps in a 440BX with an AGP port for the Radeon (see [gpu.md](gpu.md#bus-agp-on-a-440bx)); our SeaBIOS build carries a small patch for it.
 - **Configuration:** goes through QEMU's `fw_cfg` interface (I/O ports `0x510`/`0x511`), so SeaBIOS can run its QEMU code path unchanged.
 - **ACPI:** current SeaBIOS no longer builds ACPI tables itself. We build ACPI 1.0b tables (RSDP, RSDT, FADT, FACS and a DSDT encoded by a small AML builder in `crates/pc/src/acpi`) and pass them through `fw_cfg` as QEMU does: `etc/acpi/tables`, `etc/acpi/rsdp`, and the linker/loader script `etc/table-loader`. The DSDT has the PCI root with `_PRT` and PIRQ link devices, the ISA devices, a control-method power button on GPE0 bit 0, and `\_S5`.
   - A PIIX4 power management function at 00:01.3 holds PM1 event and control, the PM timer and GPE0 at I/O 0x600 (where SeaBIOS puts them when a table loader exists), with the SCI on IRQ 9. Writing SLP_EN with the S5 sleep type ends the run, and the control socket's `power` presses the power button.

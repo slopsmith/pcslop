@@ -1,6 +1,6 @@
 # GPU
 
-Plan for 2D and 3D acceleration. Nothing here is built yet.
+Plan for 2D and 3D acceleration. Built so far: the 440BX board with AGP, the card's PCI function, the real video BIOS's POST, VGA and VBE modes, DDC with our EDID, and the primary CRTC with its cursor. Run it with `--gpu radeon --vga-rom ROM`, and add `--gpu-trace PATH` to log every register access.
 
 ## Target: ATI Radeon 9700 (R300)
 
@@ -31,14 +31,18 @@ Rejected:
 2. **Windows XP with Catalyst, 2D only.** The desktop drawn through GDI acceleration, at the resolutions and depths Catalyst offers.
 3. **3D.** dxdiag's Direct3D tests first, then games.
 
-## Bus: PCI or AGP
+## Bus: AGP on a 440BX
 
-The 9700 is an AGP card: its ROM's build string reads `R300AGP`. Our i440FX board has no AGP. Options:
+The 9700 is an AGP card: its ROM's build string reads `R300AGP`. We put it on AGP, behind an Intel 440BX, because Catalyst on XP is likely to refuse an R300 without AGP, and AGP costs little:
 
-- **Put it on the PCI bus with no AGP capability.** The Linux driver then uses its PCI GART, a page table in system RAM that the card walks. This is enough for milestone 1. Whether Catalyst accepts an R300 without AGP is unknown.
-- **Add AGP.** Swap the host bridge for an Intel 440BX (82443BX), which has an AGP port and a GART aperture. This touches the chipset, SeaBIOS's PCI setup and the ACPI tables.
+- `--board bx` swaps the 82441FX for the 82443BX host bridge (8086:7190) with its AGP capability and the GART aperture registers (APBASE, APSIZE, AGPCTRL, ATTBASE). Its PCI-to-PCI bridge (8086:7191) at 00:01.0 leads to AGP bus 1, where the card sits with AGP 3.0 and power management capabilities. The PIIX3 moves to 00:07, as on real 440BX boards. `--gpu radeon` implies `--board bx`; the 440FX stays the default, so existing XP installs see no new hardware.
+- Like a 440BX board's firmware, the board sets APSIZE to 64 MiB before SeaBIOS sizes APBASE.
+- CPU accesses to the aperture go through the translation table at ATTBASE, which Linux's `intel-agp` fills.
+- SeaBIOS 1.17 only knows the 82441FX and Q35, so `nix/seabios-i440bx.patch` lets it treat the 82443BX like the 82441FX (same PAM registers) and fixes its static $PIR table for the PIIX3 at device 7 and the AGP slot.
 
-Start with PCI. Move to the 440BX if Catalyst refuses to work without AGP.
+Linux 2.6.24 finds it as `agpgart: Detected an Intel 440BX Chipset`, with a 64M aperture, and puts the host and the card into AGP 2x.
+
+Windows XP on `--board bx` with the stdvga reaches the desktop, then reports new devices and asks for a restart.
 
 ## Pieces
 
@@ -78,12 +82,38 @@ In the order we need them:
    - Fast Z clears and Z compression: track the clear state per surface and resolve it ourselves.
 9. **Sync.** Drivers wait on scratch register writebacks, `WAIT_UNTIL`, cache flushes and software interrupts.
 
+## What the video BIOS's POST needs
+
+The supplied ROM (BIOS B8480.002, 2002/12/16) POSTs, sets text mode, and sets VBE modes. A trace of its POST is kept outside the repository. What it needs:
+
+- **Access path:** BAR1 only. Registers above 0xFF go through MM_INDEX/MM_DATA. The ROM uses no extended VGA index registers. It reads its PCI configuration through the MMIO mirror at 0xF00.
+- **Memory controller:** writes `MEM_CNTL`, `MEM_TIMING_CNTL`, the R300 indirect MC registers (`MC_IND_INDEX`/`MC_IND_DATA`), byte-wise `MEM_SDRAM_MODE_REG` sequences, `MC_FB_LOCATION` = 0x1FFF0000 and `MC_AGP_LOCATION`. It writes `CONFIG_MEMSIZE` = 128 MiB itself and runs no VRAM sizing probe. It reads `MC_STATUS` and goes on whether or not the idle bits are set.
+- **PLLs:** programs MCLK, SCLK, MPLL, SPLL and the pixel PLL through CLOCK_CNTL_INDEX/DATA with PLL_WR_EN. It needs no lock bits. Drivers also poll `PPLL_REF_DIV`'s ATOMIC_UPDATE bit, which must clear.
+- **Engine status:** POST polls no engine status bits.
+- **Output detection:** DAC load comparison (`DAC_CNTL.DAC_CMP_EN`, read back as `DAC_CMP_OUTPUT`), the TV DAC comparator, and I2C bit-banged over `GPIO_DVI_DDC` and `GPIO_VGA_DDC`. Results go into `BIOS_0..7_SCRATCH`.
+- **Text mode:** standard VGA registers.
+- **VBE modes:** the extended CRTC (`CRTC_H/V_TOTAL_DISP`, `CRTC_PITCH`, `CRTC_OFFSET`, `CRTC_GEN_CNTL.CRTC_EXT_DISP_EN`) plus the pixel PLL. The A0000 window is banked through `MEM_VGA_WP_SEL`/`MEM_VGA_RP_SEL` in 8 KiB pages, or 32 KiB with `VGA_ATI_LINEAR`, as in 86Box's Rage 128 model.
+- **VGA shadowing:** VGA CRTC timing writes must show up in the extended CRTC registers. The ROM writes CR12 and checks `CRTC_V_TOTAL_DISP`. If that fails, it sets `BIOS_0_SCRATCH` bit 7 and never clears `CRTC_EXT_DISP_EN` again, so a later text mode shows nothing.
+
+## Linux drivers (Ubuntu 8.04.4)
+
+- **radeonfb:** finds the monitor through our EDID and drives a 1024x768 console. Its fills and scrolls use the 2D engine (`DP_GUI_MASTER_CNTL`, `DP_CNTL`, `SRC_Y_X`, `DST_Y_X`, `DST_HEIGHT_WIDTH`, `DST_WIDTH_HEIGHT`, waiting on `RB2D_DSTCACHE_CTLSTAT` and `RBBM_STATUS`), so scrolling does not work until that exists. `video=radeonfb:noaccel` avoids it.
+- **X with the radeon driver (xf86-video-ati 6.8.0):** reads the ROM's connector table and our EDID, then sets 1024x768x24 with the ARGB hardware cursor. With `NoAccel` and DRI off, the GNOME desktop draws correctly. With the defaults (XAA over the CP, DRI, colour tiling), X sets the mode but draws nothing, and then waits forever on `CP_RB_RPTR` and `GUI_SCRATCH_REG3`.
+- **The radeon DRM:** initializes, loads the R300 microcode through `CP_ME_RAM_*`, and reports `writeback test failed` (no scratch writeback to system memory).
+
+What the drivers want next, in order:
+
+1. **CP:** the ring (`CP_RB_CNTL`, `CP_RB_BASE`, `CP_RB_RPTR`/`WPTR`, `CP_RB_RPTR_ADDR` writeback), microcode upload, and the scratch registers with their writeback (`SCRATCH_ADDR`, `SCRATCH_UMSK`, `GUI_SCRATCH_REG0..7`).
+2. **2D engine:** the registers listed under radeonfb, plus the brush and source colours, `DP_DATATYPE`, `DP_WRITE_MASK`, `DEFAULT_OFFSET`/`SC_*` clipping, and the 2D and 3D destination cache flushes.
+3. **Colour tiling:** `CRTC_OFFSET_CNTL` tiling, `SURFACE_CNTL` and the eight `SURFACEn_*` ranges, which X sets up by default.
+4. **Interrupts:** `GEN_INT_CNTL`/`GEN_INT_STATUS` on the card's INTA (IRQ 10 here).
+5. **Reads only, already fine as stored values:** CRTC2, the flat panel, LVDS and TMDS, the TV encoder, the overlay (`OV0_*`), capture (`CAP0/1_*`), VIP and `AGP_BASE`.
+
 ## Open questions
 
-- **Catalyst without AGP.** See [Bus](#bus-pci-or-agp). Answer it early, with Catalyst 2D, before building much of the CP.
+- **Catalyst on the 440BX.** See [Bus](#bus-agp-on-a-440bx). Check early, with Catalyst 2D, that it accepts our AGP setup before building much of the CP.
 - **Fixed-function Direct3D.** We expect Catalyst to turn fixed-function state into vertex and fragment programs, since R300 runs all transform, lighting and texture combining through its shader units. Logging what the driver sends confirms it.
 - **Sync with the guest.** If we write fences only when the Metal command buffer completes, every fence costs a round trip to the GPU. If we write them early, the guest can lock a render target and read stale pixels. A middle path: write early, and when the guest reads a surface, wait for pending Metal work and read the surface back.
-- **What the ROM's POST touches.** Tracing the real ROM's register accesses tells us how much of the memory controller and PLLs must behave like hardware.
 
 ## Apple Silicon and Metal
 
