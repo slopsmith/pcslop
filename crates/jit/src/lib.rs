@@ -334,6 +334,8 @@ pub struct Jit {
     pc_samples: HashMap<i64, u64>,
     /// Profile samples per block key.
     block_samples: HashMap<u64, u64>,
+    /// Profile samples per host PC in the code cache.
+    host_samples: HashMap<u64, u64>,
     /// Declared last so it is dropped after the vCPU.
     vm: Vm,
     fb: Option<Framebuffer>,
@@ -447,6 +449,7 @@ impl Jit {
             interp_profile: std::env::var_os("SLOPPER_JIT_PROFILE").map(|_| HashMap::default()),
             pc_samples: HashMap::default(),
             block_samples: HashMap::default(),
+            host_samples: HashMap::default(),
             verify: std::env::var_os("SLOPPER_JIT_VERIFY").is_some(),
             vm_fill: std::env::var_os("SLOPPER_JIT_NO_VM_FILL").is_none(),
             afp: false,
@@ -563,6 +566,7 @@ impl Jit {
         self.interp_profile = on.then(HashMap::default);
         self.pc_samples.clear();
         self.block_samples.clear();
+        self.host_samples.clear();
         let s = &mut self.stats;
         (s.vm_ns, s.miss_ns, s.interp_ns, s.fault_ns, s.mmio_ns) = (0, 0, 0, 0, 0);
     }
@@ -619,6 +623,13 @@ impl Jit {
             let guest: Vec<u8> = (0..len).map(|i| bus.read8(phys.wrapping_add(i))).collect();
             std::fs::write(dir.join(format!("{rank:02}.x86")), &guest)?;
             std::fs::write(dir.join(format!("{rank:02}.a64")), host)?;
+            let mut hits = String::new();
+            for word in 0..host.len() / 4 {
+                if let Some(n) = self.host_samples.get(&(b.va + 4 * word as u64)) {
+                    hits += &format!("{word} {n}\n");
+                }
+            }
+            std::fs::write(dir.join(format!("{rank:02}.hits")), hits)?;
             index += &format!(
                 "{rank:02} {samples} {:.1}% {first:08x} {phys:08x} {} {} {}\n",
                 *samples as f64 * 100.0 / total.max(1) as f64,
@@ -674,6 +685,7 @@ impl Jit {
             if let Some((_, &block)) = self.by_va.range(..=pc).next_back() {
                 *self.block_samples.entry(block).or_default() += 1;
             }
+            *self.host_samples.entry(pc).or_default() += 1;
             self.eip_at(pc).map_or(-1, |e| e as i64)
         } else {
             -((pc.wrapping_sub(layout::RUNTIME_VA) & !63) as i64) - 1
@@ -770,6 +782,12 @@ impl Jit {
         let afp = self.afp;
         let ttbr0 = [0, 1].map(|r| self.shadow[r].root_ipa() | (r as u64 + 1) << 48);
         let roots = [0, 1].map(|r| self.shadow[r].root_va());
+        let s = self.state();
+        let x87_fpcr = std::mem::take(&mut s.fpcr_x87) != 0;
+        (s.x87_taint, s.fpsr_saved) = (0, 0);
+        if x87_fpcr {
+            self.fpcr = u64::MAX;
+        }
         if afp {
             let fpcr = state::fpcr_for(cpu.mxcsr);
             if fpcr != self.fpcr {
@@ -812,6 +830,7 @@ impl Jit {
         s.mm = std::array::from_fn(|i| cpu.fpu.mm(i));
         s.mmx_ok = (cpu.cr0 & ts_em == 0 && cpu.fpu.sw & x86::fpu::sw::ES == 0) as u32;
         s.mm_used = 0;
+        s.fp64_valid = 0;
         let f = &cpu.fpu;
         s.fse = std::array::from_fn(|i| f.regs[i].se);
         s.fcw = f.cw as u32;

@@ -70,7 +70,16 @@ fn store_guest(a: &mut Asm, nzcv_from_spsr: Option<Reg>) {
     a.str(Width::W, PF_RESULT, STATE, state::PF_RESULT as i32);
     a.str(Width::W, AF_AUX, STATE, state::AF_AUX as i32);
     a.str(Width::X, ICOUNT, STATE, state::ICOUNT as i32);
+    // After x87 code the live FPSR holds x87 flags; the MXCSR ones are saved.
+    let (live, merge) = (a.label(), a.label());
+    a.ldr(Width::W, r(9), STATE, state::X87_TAINT as i32);
+    a.cbz(Size::W, r(9), live);
+    a.ldr(Width::W, r(9), STATE, state::FPSR_SAVED as i32);
+    a.str(Width::W, ZR, STATE, state::FPSR_SAVED as i32);
+    a.b(merge);
+    a.bind(live);
     a.mrs(r(9), sysreg::FPSR);
+    a.bind(merge);
     a.ldr(Width::W, r(10), STATE, state::FPSR as i32);
     a.orr(Size::W, r(10), r(10), r(9));
     a.str(Width::W, r(10), STATE, state::FPSR as i32);

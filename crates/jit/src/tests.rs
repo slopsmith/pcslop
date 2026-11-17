@@ -1255,6 +1255,51 @@ fn random_sse_programs_match_the_interpreter() {
 }
 
 #[test]
+fn mixed_x87_and_sse_keep_their_own_flags_and_rounding() {
+    let mut rng = Rng(0x8787_55e2);
+    for round in 0..300 {
+        let mut code = Vec::new();
+        for k in 0..4 {
+            mem_abs(&mut code, 0xdd, 0, 0x3000 + 8 * k);
+        }
+        for _ in 0..24 {
+            if rng.below(2) == 0 {
+                random_x87(&mut rng, &mut code);
+            } else {
+                random_sse(&mut rng, &mut code);
+            }
+        }
+        code.push(0xf4);
+        let mut mem = x87_memory(&mut rng);
+        for (j, csr) in [0x1f80u32, 0x3f80, 0x5f80, 0x7f80, 0x9f80, 0x1fc0].iter().enumerate() {
+            mem[0x100 + 4 * j..0x104 + 4 * j].copy_from_slice(&csr.to_le_bytes());
+        }
+        let mut a = flat_cpu(0x1000, 0x8000);
+        a.cr4 |= x86::cpu::cr4::OSFXSR;
+        a.fpu.cw = [0x37f, 0x27f, 0x07f, 0xc7f, 0x77f, 0xb7f][round % 6];
+        a.mxcsr = [0x1f80, 0x3f80, 0x5f80, 0x7f80][round % 4];
+        for i in 0..8 {
+            a.xmm[i] = (0..4).fold(0u128, |v, k| v | (sse_value(&mut rng) as u128) << (32 * k));
+        }
+        let mut b = a.clone();
+        let mut bus_a = bus_with(0x1000, &code);
+        let mut bus_b = bus_with(0x1000, &code);
+        bus_a.ram.as_mut_slice()[0x3000..0x3600].copy_from_slice(&mem);
+        bus_b.ram.as_mut_slice()[0x3000..0x3600].copy_from_slice(&mem);
+        let hex: Vec<String> = code.iter().map(|b| format!("{b:02x}")).collect();
+        run_interp(&mut a, &mut bus_a);
+        run_jit(&mut b, &mut bus_b);
+        let de = x86::fpu::exc::DE as u32;
+        assert_eq!(a.mxcsr | de, b.mxcsr | de, "round {round} mxcsr\ncode: {}", hex.join(" "));
+        assert_eq!(a.fpu, b.fpu, "round {round} x87 state\ncode: {}", hex.join(" "));
+        for i in 0..8 {
+            assert_eq!(a.xmm[i], b.xmm[i], "round {round} xmm{i}\ncode: {}", hex.join(" "));
+        }
+        assert_eq!(a.regs, b.regs, "round {round} registers\ncode: {}", hex.join(" "));
+    }
+}
+
+#[test]
 fn sysenter_sysexit_and_fs_loads_match_the_interpreter() {
     let user = [
         0x40, // inc eax

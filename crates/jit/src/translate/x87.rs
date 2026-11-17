@@ -19,9 +19,6 @@ const P: Reg = Reg(5);
 const M: Reg = Reg(6);
 const S: Reg = Reg(7);
 const U: Reg = Reg(8);
-/// FPSR as it was when the block's x87 work started; restored by `x87_flush`,
-/// so x87 arithmetic leaves no flags for MXCSR.
-const SAVED_FPSR: Reg = Reg(1);
 const FA: V = V(18);
 const FB: V = V(19);
 const FR: V = V(20);
@@ -535,6 +532,12 @@ impl Emit {
         self.a.and(Size::W, T_B, T_B, T_C);
         self.a.str(Width::W, T_B, STATE, state::X87_OK as i32);
         self.a.str(Width::W, T_A, STATE, state::FCW as i32);
+        let sse_fpcr = self.a.label();
+        self.a.ldr(Width::W, T_B, STATE, state::FPCR_X87 as i32);
+        self.a.cbz(Size::W, T_B, sse_fpcr);
+        self.a.movz(Size::W, T_B, 2, 0);
+        self.a.str(Width::W, T_B, STATE, state::FPCR_X87 as i32);
+        self.a.bind(sse_fpcr);
     }
 
     fn and_imm(&mut self, sz: Size, rd: Reg, rn: Reg, imm: u64) {
@@ -554,8 +557,40 @@ impl Emit {
         self.a.ldr(Width::W, SW, STATE, state::FSW as i32);
         self.a.ubfx(Size::W, TOP, SW, 11, 3);
         self.a.ldr(Width::W, TAGS, STATE, state::FTAGS as i32);
-        self.a.mrs(SAVED_FPSR, sysreg::FPSR);
+        let (tainted, x87_fpcr) = (self.a.label(), self.a.label());
+        self.a.ldr(Width::W, U, STATE, state::X87_TAINT as i32);
+        self.a.cbnz(Size::W, U, tainted);
+        self.a.mrs(U, sysreg::FPSR);
+        self.a.str(Width::W, U, STATE, state::FPSR_SAVED as i32);
+        self.a.movz(Size::W, U, 1, 0);
+        self.a.str(Width::W, U, STATE, state::X87_TAINT as i32);
+        self.a.bind(tainted);
+        self.a.ldr(Width::W, U, STATE, state::FPCR_X87 as i32);
+        self.a.sub_imm(Size::W, U, U, 1);
+        self.a.cbz(Size::W, U, x87_fpcr);
         self.set_fpcr(true);
+        self.a.movz(Size::W, U, 1, 0);
+        self.a.str(Width::W, U, STATE, state::FPCR_X87 as i32);
+        self.a.bind(x87_fpcr);
+    }
+
+    /// Ends the block's x87 work and puts FPSR and FPCR back as SSE code
+    /// needs them, if x87 code changed them.
+    pub(super) fn leave_x87_fp(&mut self) {
+        self.x87_flush();
+        self.x87 = X87Block::default();
+        let (clean, sse_fpcr) = (self.a.label(), self.a.label());
+        self.a.ldr(Width::W, T_E, STATE, state::X87_TAINT as i32);
+        self.a.cbz(Size::W, T_E, clean);
+        self.a.ldr(Width::W, T_E, STATE, state::FPSR_SAVED as i32);
+        self.a.msr(sysreg::FPSR, T_E);
+        self.a.str(Width::W, ZR, STATE, state::X87_TAINT as i32);
+        self.a.bind(clean);
+        self.a.ldr(Width::W, T_E, STATE, state::FPCR_X87 as i32);
+        self.a.cbz(Size::W, T_E, sse_fpcr);
+        self.set_fpcr(false);
+        self.a.str(Width::W, ZR, STATE, state::FPCR_X87 as i32);
+        self.a.bind(sse_fpcr);
     }
 
     /// Sets FPCR's rounding mode and flush bits for x87 code (FCW's RC, no
@@ -629,9 +664,19 @@ impl Emit {
     fn st_val(&mut self, i: usize, bail: Label) -> V {
         let r = self.slot(i);
         if self.x87.cached & 1 << r == 0 {
+            let (convert, done) = (self.a.label(), self.a.label());
+            self.phys(i);
+            self.a.ldr(Width::W, T_E, STATE, state::FP64_VALID as i32);
+            self.a.lsrv(Size::W, T_E, T_E, P);
+            self.a.tbz(T_E, 0, convert);
+            self.a.add_shift(Size::X, U, STATE, P, Shift::Lsl, 3);
+            self.a.ldr_d(cv(r), U, state::FP64 as i32);
+            self.a.b(done);
+            self.a.bind(convert);
             self.fget(i, M, S);
             self.to_f64(bail, true);
             self.a.fmov_dx(cv(r), T_C);
+            self.a.bind(done);
             self.x87.cached |= 1 << r;
         }
         cv(r)
@@ -708,8 +753,31 @@ impl Emit {
         }
         self.a.add_shift(Size::X, U, STATE, P, Shift::Lsl, 3);
         self.a.str(Width::X, M, U, state::MM as i32);
+        self.a.str_d(cv(r), U, state::FP64 as i32);
         self.a.add_shift(Size::X, U, STATE, P, Shift::Lsl, 1);
         self.a.str(Width::H, S, U, state::FSE as i32);
+        self.a.movz(Size::W, U, 1, 0);
+        self.a.lslv(Size::W, U, U, P);
+        self.a.ldr(Width::W, T_E, STATE, state::FP64_VALID as i32);
+        self.a.orr(Size::W, T_E, T_E, U);
+        self.a.str(Width::W, T_E, STATE, state::FP64_VALID as i32);
+    }
+
+    /// Saves the cached f64 of slot `r`, whose 80-bit value is current, for the next block.
+    fn keep_fp64(&mut self, r: usize) {
+        if r == 0 {
+            self.a.mov(Size::W, P, TOP);
+        } else {
+            self.a.add_imm(Size::W, P, TOP, r as u32);
+            self.and_imm(Size::W, P, P, 7);
+        }
+        self.a.add_shift(Size::X, U, STATE, P, Shift::Lsl, 3);
+        self.a.str_d(cv(r), U, state::FP64 as i32);
+        self.a.movz(Size::W, U, 1, 0);
+        self.a.lslv(Size::W, U, U, P);
+        self.a.ldr(Width::W, T_E, STATE, state::FP64_VALID as i32);
+        self.a.orr(Size::W, T_E, T_E, U);
+        self.a.str(Width::W, T_E, STATE, state::FP64_VALID as i32);
     }
 
     /// Writes everything newer in registers back to the state, on the path
@@ -719,10 +787,11 @@ impl Emit {
             return;
         }
         let saved = self.x87;
-        self.a.msr(sysreg::FPSR, SAVED_FPSR);
         for r in 0..8 {
             if saved.dirty & 1 << r != 0 {
                 self.f80_from_cache(r);
+            } else if saved.cached & 1 << r != 0 {
+                self.keep_fp64(r);
             }
         }
         if saved.meta {
@@ -733,7 +802,6 @@ impl Emit {
             self.a.mov_imm(Size::W, U, saved.note.1 as u64);
             self.a.str(Width::W, U, STATE, state::FNOTE as i32);
         }
-        self.set_fpcr(false);
         self.x87 = saved;
     }
 
@@ -825,6 +893,9 @@ impl Emit {
         self.a.movz(Size::W, U, 1, 0);
         self.a.lslv(Size::W, U, U, P);
         self.a.orr(Size::W, TAGS, TAGS, U);
+        self.a.ldr(Width::W, T_E, STATE, state::FP64_VALID as i32);
+        self.a.bic(Size::W, T_E, T_E, U);
+        self.a.str(Width::W, T_E, STATE, state::FP64_VALID as i32);
     }
 
     fn fpush(&mut self) {

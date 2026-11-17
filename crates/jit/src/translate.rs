@@ -1618,6 +1618,7 @@ impl Emit {
             0x1ae if insn.mem.is_none() && matches!(insn.modrm, 0xe8 | 0xf0 | 0xf8) => self.a.dmb(0xb),
             0x1ae if matches!(insn.reg(), 2 | 3) && insn.rep == Rep::None && !insn.opsize_prefix => {
                 let Some(m) = insn.mem else { return Step::Unsupported };
+                self.leave_x87_fp();
                 if !self.ea(insn, &m) {
                     return Step::Unsupported;
                 }
@@ -2090,6 +2091,9 @@ impl Emit {
         self.a.mov_imm(Size::W, T_C, bits);
         self.a.orr(Size::W, T_B, T_B, T_C);
         self.a.str(Width::W, T_B, STATE, state::MM_USED as i32);
+        if written.is_some() {
+            self.a.str(Width::W, ZR, STATE, state::FP64_VALID as i32);
+        }
         true
     }
 

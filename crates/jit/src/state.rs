@@ -108,6 +108,18 @@ pub struct State {
     /// MMX registers (the x87 significands), and whether MMX instructions may
     /// run here: CR0.EM and CR0.TS clear, no x87 exception pending.
     pub mm: [u64; 8],
+    /// Each physical x87 register as an f64, valid where `fp64_valid` has its
+    /// bit: translated code keeps these beside the 80-bit values so a block
+    /// can take up its predecessor's registers without converting them.
+    pub fp64: [u64; 8],
+    pub fp64_valid: u32,
+    /// Set once x87 code ran since SSE code or the last entry: FPSR then holds
+    /// x87 flags, and `fpsr_saved` the MXCSR flags gathered before them.
+    pub x87_taint: u32,
+    pub fpsr_saved: u32,
+    /// How FPCR is set up: 0 for SSE code (MXCSR), 1 for x87 code under the
+    /// current FCW, 2 for x87 code under an FCW that FLDCW has since replaced.
+    pub fpcr_x87: u32,
     pub mmx_ok: u32,
     /// Bit n: MM n was written; bit 8: an MMX instruction ran.
     pub mm_used: u32,
@@ -204,6 +216,11 @@ pub const INFO: usize = offset_of!(State, info);
 pub const SCRATCH: usize = offset_of!(State, scratch);
 pub const SSE_OK: usize = offset_of!(State, sse_ok);
 pub const MM: usize = offset_of!(State, mm);
+pub const FP64: usize = offset_of!(State, fp64);
+pub const FP64_VALID: usize = offset_of!(State, fp64_valid);
+pub const X87_TAINT: usize = offset_of!(State, x87_taint);
+pub const FPSR_SAVED: usize = offset_of!(State, fpsr_saved);
+pub const FPCR_X87: usize = offset_of!(State, fpcr_x87);
 pub const MMX_OK: usize = offset_of!(State, mmx_ok);
 pub const MM_USED: usize = offset_of!(State, mm_used);
 pub const SHADOW_ROOT: usize = offset_of!(State, shadow_root);
