@@ -285,10 +285,9 @@ impl Board {
 
     /// The APIC register at `addr`, if one of the APICs decodes it.
     fn apic_read(&mut self, addr: u32) -> Option<u32> {
-        let now = self.now_ns();
-        if let Some(l) = self.lapic.as_mut()
-            && l.claims(addr)
-        {
+        if self.lapic.as_ref().is_some_and(|l| l.claims(addr)) {
+            let now = self.now_ns();
+            let l = self.lapic.as_mut().unwrap();
             return Some(l.read(addr - l.base(), now));
         }
         if self.lapic.is_some() && addr.wrapping_sub(ioapic::BASE) < ioapic::SIZE {
@@ -300,11 +299,10 @@ impl Board {
     /// Writes an APIC register. Only aligned 32-bit writes do anything,
     /// as in QEMU; returns false if no APIC decodes `addr`.
     fn apic_write(&mut self, addr: u32, v: u32, size: u8) -> bool {
-        let now = self.now_ns();
         let aligned = size == 4 && addr & 3 == 0;
-        if let Some(l) = self.lapic.as_mut()
-            && l.claims(addr)
-        {
+        if self.lapic.as_ref().is_some_and(|l| l.claims(addr)) {
+            let now = self.now_ns();
+            let l = self.lapic.as_mut().unwrap();
             if aligned && let Some(vector) = l.write(addr - l.base(), v, now) {
                 self.ioapic.eoi(vector);
                 self.service_ioapic();
