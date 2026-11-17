@@ -670,6 +670,25 @@ fn rdmsr_reports_the_northwood_bus_and_core_ratio() {
 }
 
 #[test]
+fn debugctl_keeps_its_bits_and_the_branch_records_read_empty() {
+    use crate::cpu::{EAX, ECX, EDX};
+    let mut mc = Machine::new();
+    mc.cpu.regs[ECX] = 0x1d9;
+    mc.cpu.regs[EAX] = 0xffff_ff43;
+    mc.cpu.regs[EDX] = 0;
+    mc.run(&[0x0f, 0x30]).unwrap();
+    mc.cpu.regs[EAX] = 0;
+    mc.run(&[0x0f, 0x32]).unwrap();
+    assert_eq!(mc.cpu.regs[EAX], 0x43);
+    for msr in [0x1d7, 0x1d8, 0x1da, 0x1db, 0x1de] {
+        mc.cpu.regs[ECX] = msr;
+        mc.cpu.regs[EAX] = 1;
+        mc.run(&[0x0f, 0x32]).unwrap();
+        assert_eq!((mc.cpu.regs[EAX], mc.cpu.regs[EDX]), (0, 0), "MSR {msr:#x}");
+    }
+}
+
+#[test]
 fn rdmsr_of_an_unknown_msr_raises_gp() {
     let mut mc = Machine::new();
     mc.cpu.regs[crate::cpu::ECX] = 0x2a;

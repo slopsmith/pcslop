@@ -232,6 +232,8 @@ pub struct Cpu {
     pub sysenter_cs: u32,
     pub sysenter_esp: u32,
     pub sysenter_eip: u32,
+    /// IA32_DEBUGCTL. Stored only: we record no branches and never trap on them.
+    pub debugctl: u32,
     pub halted: bool,
     pub interrupt_shadow: bool,
     pub fpu: crate::fpu::Fpu,
@@ -275,6 +277,7 @@ impl Cpu {
             sysenter_cs: 0,
             sysenter_esp: 0,
             sysenter_eip: 0,
+            debugctl: 0,
             halted: false,
             interrupt_shadow: false,
             fpu: crate::fpu::Fpu::default(),
