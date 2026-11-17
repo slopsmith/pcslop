@@ -1,0 +1,10 @@
+[package]
+name = "snapshot"
+description = "Saving and restoring device state for save states"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+snapshot-derive = { path = "../snapshot-derive" }
