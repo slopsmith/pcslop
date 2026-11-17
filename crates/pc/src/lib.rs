@@ -957,7 +957,9 @@ impl Board {
         }
         self.pic = pic::Pic::default();
         if let Some(l) = self.lapic.as_mut() {
+            let stats = l.stats;
             *l = apic::LocalApic::default();
+            l.stats = stats;
         }
         self.ioapic = ioapic::IoApic::default();
         self.pci_irqs = 0;
@@ -1341,6 +1343,24 @@ impl Bus for Board {
         self.lapic.as_ref().is_some_and(|l| l.hw_enabled())
     }
 
+    fn apic_page(&self) -> Option<u32> {
+        self.lapic.as_ref().filter(|l| l.hw_enabled()).map(|l| l.base())
+    }
+
+    fn apic_tpr(&self) -> u8 {
+        self.lapic.as_ref().map_or(0, |l| l.tpr())
+    }
+
+    fn set_apic_tpr(&mut self, tpr: u8) {
+        if let Some(l) = self.lapic.as_mut() {
+            l.set_tpr(tpr);
+        }
+    }
+
+    fn tpr_threshold(&self) -> u8 {
+        self.lapic.as_ref().map_or(0, |l| l.tpr_threshold())
+    }
+
     fn watch_code_page(&mut self, addr: u32) {
         let page = (addr >> 12) as usize;
         if let Some(word) = self.code_watch.bits.get_mut(page >> 6) {
@@ -1579,6 +1599,15 @@ mod tests {
         b.set_irq(11, false);
         b.write32(apic::DEFAULT_BASE + apic::reg::EOI, 0);
         assert!(!b.intr());
+    }
+
+    #[test]
+    fn reset_keeps_apic_access_counters_running() {
+        let mut b = board();
+        b.write32(apic::DEFAULT_BASE + apic::reg::TPR, 0x20);
+        b.reset();
+        b.write32(apic::DEFAULT_BASE + apic::reg::TPR, 0x20);
+        assert_eq!(b.lapic.as_ref().unwrap().stats.tpr_writes, 2);
     }
 
     fn bx_board() -> Board {

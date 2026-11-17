@@ -247,6 +247,8 @@ pub struct Stats {
     pub flush_single_all: u64,
     pub flush_multi: u64,
     pub flush_pool: u64,
+    /// APIC TPR accesses served inside the VM.
+    pub tpr_fast: u64,
     /// Nanoseconds inside `hv_vcpu_run`, and handling each kind of exit.
     pub vm_ns: u64,
     pub miss_ns: u64,
@@ -276,6 +278,9 @@ pub struct Jit {
     shadow_key: Option<u64>,
     /// Whether the shadow tables were filled with x86 paging enabled.
     shadow_paged: bool,
+    /// Physical APIC page and whether its x86 mapping is global, while
+    /// `State::apic_va` is set.
+    apic: Option<(u32, bool)>,
     code_next: usize,
     blocks: HashMap<u64, BlockInfo>,
     ahead_cache: HashMap<u64, Ahead>,
@@ -411,6 +416,7 @@ impl Jit {
             root: 0,
             shadow_key: None,
             shadow_paged: false,
+            apic: None,
             code_next: layout::CODE_CACHE,
             blocks: HashMap::default(),
             ahead_cache: HashMap::default(),
@@ -865,7 +871,13 @@ impl Jit {
         s.vepoch = s.vepoch.wrapping_add(1);
     }
 
+    fn disarm_apic(&mut self) {
+        self.apic = None;
+        self.state().apic_va = 0;
+    }
+
     fn flush_shadow(&mut self) {
+        self.disarm_apic();
         self.bump_vcache();
         self.pt_watch.clear();
         for t in &mut self.shadow {
@@ -895,6 +907,9 @@ impl Jit {
                 self.shadow_key = Some(key);
                 match cpu.tlb.last_flush {
                     FlushKind::Page(lin) => {
+                        if self.state().apic_va == u64::from(lin & !0xfff) | 1 {
+                            self.disarm_apic();
+                        }
                         self.bump_vcache();
                         for t in &mut self.shadow {
                             t.unmap(self.mem.as_mut_slice(), lin);
@@ -902,6 +917,9 @@ impl Jit {
                         self.tlbi_page(lin);
                     }
                     _ => {
+                        if self.apic.is_some_and(|(_, global)| !global) {
+                            self.disarm_apic();
+                        }
                         self.bump_vcache();
                         self.pt_watch.forget();
                         for r in 0..2 {
@@ -1181,8 +1199,19 @@ impl Jit {
             if self.verify && expected.is_none() {
                 self.state().budget = 0;
             }
+            if self.apic.is_some_and(|(page, _)| bus.apic_page() != Some(page)) {
+                self.disarm_apic();
+            }
+            let (tpr, threshold) = (bus.apic_tpr(), bus.tpr_threshold());
+            {
+                let s = self.state();
+                s.tpr = tpr.into();
+                s.tpr_threshold = threshold.into();
+            }
             let t0 = self.timing.then(std::time::Instant::now);
             let exit = self.vcpu.run()?;
+            bus.set_apic_tpr(self.state().tpr as u8);
+            self.stats.tpr_fast = self.state().tpr_fast;
             self.take_fill_log(cpu, bus);
             self.sync_mode(cpu, bus);
             let t1 = self.timing.then(std::time::Instant::now);
@@ -1536,6 +1565,15 @@ impl Jit {
         match interp::translate_global(cpu, bus, lin, write) {
             Ok((phys, global)) => {
                 let page = phys & !0xfff;
+                if bus.apic_page() == Some(page) && cpu.cpl() == 0 && lin == far as u32 {
+                    let at = elr.wrapping_sub(layout::va(0)) as usize;
+                    let insn = u32::from_le_bytes(self.mem.as_slice()[at..at + 4].try_into().unwrap());
+                    if let Some(access) = decode_access(insn) {
+                        self.apic_access(cpu, bus, access, phys, global);
+                        return None;
+                    }
+                    self.disarm_apic();
+                }
                 if write && self.code_pages.contains_key(&page) {
                     // The store may rewrite the running block, so finish it in the
                     // interpreter and continue from fresh translations.
@@ -1574,6 +1612,56 @@ impl Jit {
             }
         }
         None
+    }
+
+    /// Performs a faulting access to the APIC page from the syndrome and arms
+    /// the in-VM TPR path for its linear page, which stays unmapped.
+    fn apic_access<B: Bus>(&mut self, cpu: &Cpu, bus: &mut B, access: Access, phys: u32, global: bool) {
+        let [_, far, elr, _] = self.state().info;
+        let lin = far as u32;
+        for t in &mut self.shadow {
+            t.unmap(self.mem.as_mut_slice(), lin);
+        }
+        self.tlbi_page(lin);
+        if cpu.cr0 & x86::cpu::cr0::PG != 0 {
+            self.pt_watch.watch(cpu, bus, lin);
+        }
+        self.apic = Some((phys & !0xfff, global));
+        self.state().apic_va = u64::from(lin & !0xfff) | 1;
+
+        self.stats.mmio_exits += 1;
+        let Access { load, size, sign, rt: srt } = access;
+        let reg_value = |j: &mut Self| match srt {
+            0..18 => j.state().scratch[srt],
+            31 => 0,
+            _ => j.vcpu.reg(reg::X0 + srt as u32).expect("vCPU register read"),
+        };
+        if !load {
+            let v = reg_value(self);
+            match size {
+                1 => bus.write8(phys, v as u8),
+                2 => bus.write16(phys, v as u16),
+                _ => bus.write32(phys, v as u32),
+            }
+        } else {
+            let mut v = match size {
+                1 => bus.read8(phys) as u64,
+                2 => bus.read16(phys) as u64,
+                _ => bus.read32(phys) as u64,
+            };
+            if sign {
+                let shift = 64 - 8 * size;
+                v = (((v << shift) as i64) >> shift) as u64;
+            }
+            match srt {
+                0..18 => self.state().scratch[srt] = v,
+                31 => {}
+                _ => self.vcpu.set_reg(reg::X0 + srt as u32, v).expect("vCPU register write"),
+            }
+        }
+        self.vcpu.set_sys_reg(sysreg::ELR_EL1, elr + 4).expect("ELR write");
+        self.state().irq = bus.intr() as u32;
+        self.state().resume = resume::RETRY;
     }
 
     /// Interprets a REP string op that hit MMIO, or with `any` any instruction
@@ -1659,6 +1747,29 @@ impl Jit {
         let pc = self.vcpu.reg(reg::PC)?;
         self.vcpu.set_reg(reg::PC, pc + 4)
     }
+}
+
+/// A load or store decoded from the ARM instruction that faulted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Access {
+    load: bool,
+    /// Bytes: 1, 2 or 4.
+    size: u32,
+    sign: bool,
+    rt: usize,
+}
+
+/// Decodes the single-register, non-writeback integer loads and stores of up
+/// to 32 bits that translated code makes to guest memory.
+fn decode_access(insn: u32) -> Option<Access> {
+    let size = 1u32 << (insn >> 30);
+    let opc = (insn >> 22) & 3;
+    let unsigned_imm = insn & 0x3f00_0000 == 0x3900_0000;
+    let unscaled_or_reg = insn & 0x3f00_0000 == 0x3800_0000 && matches!(insn >> 10 & 3 | (insn >> 19 & 4), 0b000 | 0b110);
+    if size > 4 || !(unsigned_imm || unscaled_or_reg) {
+        return None;
+    }
+    Some(Access { load: opc != 0, size, sign: opc >= 2, rt: (insn & 31) as usize })
 }
 
 #[cfg(test)]

@@ -659,3 +659,19 @@ fn maskmovq_writes_selected_bytes() {
     mc.run(&[0x0f, 0xf7, 0xc1]).unwrap();
     assert_eq!(mc.get(DATA, 8), [0x88, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0x11]);
 }
+
+#[test]
+fn rdmsr_reports_the_northwood_bus_and_core_ratio() {
+    use crate::cpu::{EAX, ECX, EDX};
+    let mut mc = Machine::new();
+    mc.cpu.regs[ECX] = 0x2c;
+    mc.run(&[0x0f, 0x32]).unwrap();
+    assert_eq!((mc.cpu.regs[EAX] >> 24, mc.cpu.regs[EAX] >> 16 & 7, mc.cpu.regs[EDX]), (18, 1, 0));
+}
+
+#[test]
+fn rdmsr_of_an_unknown_msr_raises_gp() {
+    let mut mc = Machine::new();
+    mc.cpu.regs[crate::cpu::ECX] = 0x2a;
+    assert_eq!(mc.run(&[0x0f, 0x32]), Err(Exception::with_error(vector::GP, 0)));
+}

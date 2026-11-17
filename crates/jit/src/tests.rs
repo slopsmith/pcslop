@@ -1383,3 +1383,160 @@ fn shadowed_rom_chunks_are_read_without_exits() {
     assert_eq!(&bus.ram.as_slice()[0xc8000..0xc8004], &0x5555_aaaau32.to_le_bytes());
     assert_eq!(stats.mmio_exits, 2, "only the unmapped chunk and the write-protected one may reach the bus: {stats:?}");
 }
+
+const APIC: u32 = 0xfee0_0000;
+
+struct ApicBus {
+    flat: FlatBus,
+    tpr: u8,
+    threshold: u8,
+    host_tpr_accesses: u32,
+    other: Vec<(u32, Option<u32>)>,
+}
+
+impl Bus for ApicBus {
+    fn read8(&mut self, addr: u32) -> u8 {
+        self.flat.read8(addr)
+    }
+
+    fn write8(&mut self, addr: u32, value: u8) {
+        self.flat.write8(addr, value)
+    }
+
+    fn read32(&mut self, addr: u32) -> u32 {
+        match addr {
+            0xfee0_0080 => {
+                self.host_tpr_accesses += 1;
+                self.tpr.into()
+            }
+            _ if addr >> 12 == APIC >> 12 => {
+                self.other.push((addr, None));
+                0x5005_0014
+            }
+            _ => u32::from_le_bytes([0, 1, 2, 3].map(|i| self.flat.read8(addr + i))),
+        }
+    }
+
+    fn write32(&mut self, addr: u32, value: u32) {
+        match addr {
+            0xfee0_0080 => {
+                self.host_tpr_accesses += 1;
+                self.tpr = value as u8;
+            }
+            _ if addr >> 12 == APIC >> 12 => self.other.push((addr, Some(value))),
+            _ => (0..4).for_each(|i| self.flat.write8(addr + i, (value >> (8 * i)) as u8)),
+        }
+    }
+
+    fn io_read(&mut self, _port: u16, _size: u8) -> u32 {
+        0xffff_ffff
+    }
+
+    fn io_write(&mut self, _port: u16, _size: u8, _value: u32) {}
+
+    fn apic_page(&self) -> Option<u32> {
+        Some(APIC)
+    }
+
+    fn apic_tpr(&self) -> u8 {
+        self.tpr
+    }
+
+    fn set_apic_tpr(&mut self, tpr: u8) {
+        self.tpr = tpr;
+    }
+
+    fn tpr_threshold(&self) -> u8 {
+        self.threshold
+    }
+}
+
+/// A paged CPU at 0x1000 with the APIC mapped at its physical address, as XP's HAL maps it.
+fn apic_setup(code: &[u8]) -> (Cpu, ApicBus) {
+    let mut cpu = flat_cpu(0x1000, 0x8000);
+    let mut bus = ApicBus { flat: bus_with(0x1000, code), tpr: 0, threshold: 0, host_tpr_accesses: 0, other: Vec::new() };
+    paged(&mut cpu, &mut bus.flat, false);
+    let mem = bus.flat.ram.as_mut_slice();
+    mem[0x10000 + 4 * (APIC >> 22) as usize..][..4].copy_from_slice(&0x12003u32.to_le_bytes());
+    mem[0x12000 + 4 * (APIC >> 12 & 0x3ff) as usize..][..4].copy_from_slice(&(APIC | 0x13).to_le_bytes());
+    cpu.regs[2] = 0;
+    (cpu, bus)
+}
+
+fn run_apic(cpu: &mut Cpu, bus: &mut ApicBus) -> (Stats, usize) {
+    let _vm = VM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut jit = unsafe { Jit::new(bus.flat.ram.as_ptr(), RAM).unwrap() };
+    jit.vm_fill = true;
+    let mut runs = 0;
+    while !cpu.halted && runs < 1000 {
+        runs += 1;
+        jit.run(cpu, bus).unwrap();
+    }
+    assert!(cpu.halted, "JIT run did not reach HLT; eip {:#x}", cpu.eip);
+    (jit.stats, runs)
+}
+
+#[test]
+fn apic_tpr_accesses_stay_in_the_vm() {
+    let code = [
+        0xbe, 0x80, 0x00, 0xe0, 0xfe, // mov esi, 0xfee00080
+        0xb9, 0xe8, 0x03, 0x00, 0x00, // mov ecx, 1000
+        0x89, 0x0e, // loop: mov [esi], ecx
+        0x8b, 0x1e, // mov ebx, [esi]
+        0x01, 0xda, // add edx, ebx
+        0x49, // dec ecx
+        0x75, 0xf7, // jnz loop
+        0x8b, 0x46, 0x80, // mov eax, [esi-0x80]
+        0xc7, 0x06, 0x20, 0x00, 0x00, 0x00, // mov dword [esi], 0x20
+        0xf4,
+    ];
+    let (mut cpu, mut bus) = apic_setup(&code);
+    let (stats, _) = run_apic(&mut cpu, &mut bus);
+    let sum: u32 = (1..=1000u32).map(|i| i & 0xff).sum();
+    assert_eq!(cpu.regs[2], sum, "XP's IRQL would come back wrong");
+    assert_eq!(bus.tpr, 0x20);
+    assert_eq!(cpu.regs[0], 0x5005_0014);
+    assert_eq!(bus.other, [(APIC, None)]);
+    assert!(bus.host_tpr_accesses <= 1, "every IRQL change would cost a VM exit: {} host accesses, {stats:?}", bus.host_tpr_accesses);
+    assert!(stats.tpr_fast >= 2000);
+}
+
+#[test]
+fn lowering_the_tpr_below_a_held_back_interrupt_leaves_the_vm() {
+    let code = [
+        0xc7, 0x05, 0x80, 0x00, 0xe0, 0xfe, 0x30, 0x00, 0x00, 0x00, // mov dword [0xfee00080], 0x30
+        0xc7, 0x05, 0x80, 0x00, 0xe0, 0xfe, 0x50, 0x00, 0x00, 0x00, // mov dword [0xfee00080], 0x50
+        0xc7, 0x05, 0x80, 0x00, 0xe0, 0xfe, 0x20, 0x00, 0x00, 0x00, // mov dword [0xfee00080], 0x20
+        0xeb, 0xfe, // jmp $
+    ];
+    let (mut cpu, mut bus) = apic_setup(&code);
+    bus.threshold = 0x40;
+    let _vm = VM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut jit = unsafe { Jit::new(bus.flat.ram.as_ptr(), RAM).unwrap() };
+    let kicker = jit.kicker();
+    let watchdog = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        kicker.kick();
+    });
+    let start = std::time::Instant::now();
+    let exit = jit.run(&mut cpu, &mut bus).unwrap();
+    let took = start.elapsed();
+    watchdog.join().unwrap();
+    assert!(matches!(exit, RunExit::Kicked));
+    assert!(took < std::time::Duration::from_secs(1), "an interrupt unmasked by a TPR write waited {took:?} for delivery");
+    assert_eq!(bus.tpr, 0x20);
+}
+
+#[test]
+fn decodes_the_loads_and_stores_translated_code_makes() {
+    let mut a = a64::Asm::new();
+    a.ldr(a64::Width::W, a64::r(22), a64::r(9), 0);
+    a.str(a64::Width::W, a64::r(20), a64::r(9), 0);
+    a.ldst(true, a64::Width::H, true, false, a64::r(3), a64::r(9), -2);
+    a.ldst_reg(false, a64::Width::B, false, false, a64::r(4), a64::r(9), a64::r(10), a64::Extend::Uxtw, false);
+    a.ldst_index(true, a64::Width::W, a64::r(5), a64::r(9), 4, true);
+    a.ldr(a64::Width::X, a64::r(6), a64::r(9), 0);
+    let got: Vec<_> = a.finish().into_iter().map(decode_access).collect();
+    let acc = |load, size, sign, rt| Some(Access { load, size, sign, rt });
+    assert_eq!(got, [acc(true, 4, false, 22), acc(false, 4, false, 20), acc(true, 2, true, 3), acc(false, 1, false, 4), None, None]);
+}

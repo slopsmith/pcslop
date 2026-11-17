@@ -59,6 +59,25 @@ pub trait Bus {
         false
     }
 
+    /// Physical page of the local APIC registers while the APIC is enabled.
+    fn apic_page(&self) -> Option<u32> {
+        None
+    }
+
+    fn apic_tpr(&self) -> u8 {
+        0
+    }
+
+    /// Sets the APIC TPR without an MMIO access, for a JIT that serves TPR
+    /// accesses itself.
+    fn set_apic_tpr(&mut self, _tpr: u8) {}
+
+    /// The priority class of the highest interrupt request that only the TPR
+    /// holds back, or 0: a TPR below it in class lets the request through.
+    fn tpr_threshold(&self) -> u8 {
+        0
+    }
+
     /// Asks the bus to report writes to the physical page containing `addr`,
     /// because translated code was made from it.
     fn watch_code_page(&mut self, _addr: u32) {}

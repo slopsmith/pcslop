@@ -161,6 +161,14 @@ pub struct State {
     /// Set by translated code after LLDT loaded the null selector in `ldtr_sel`.
     pub ldtr_nulled: u32,
     pub ldtr_sel: u32,
+    /// The linear page that maps the local APIC, plus 1, or 0. The fault
+    /// handler serves 32-bit TPR accesses on it from `tpr` at CPL 0.
+    pub apic_va: u64,
+    pub tpr: u32,
+    /// A TPR write below this priority class lets a held-back interrupt
+    /// through, so it sets `pending`.
+    pub tpr_threshold: u32,
+    pub tpr_fast: u64,
 }
 
 pub const REGS: usize = offset_of!(State, regs);
@@ -218,6 +226,10 @@ pub const TSC_MUL: usize = offset_of!(State, tsc_mul);
 pub const DR: usize = offset_of!(State, dr);
 pub const LDTR_NULLED: usize = offset_of!(State, ldtr_nulled);
 pub const LDTR_SEL: usize = offset_of!(State, ldtr_sel);
+pub const APIC_VA: usize = offset_of!(State, apic_va);
+pub const TPR: usize = offset_of!(State, tpr);
+pub const TPR_THRESHOLD: usize = offset_of!(State, tpr_threshold);
+pub const TPR_FAST: usize = offset_of!(State, tpr_fast);
 pub const FSE: usize = offset_of!(State, fse);
 pub const FCW: usize = offset_of!(State, fcw);
 pub const FSW: usize = offset_of!(State, fsw);

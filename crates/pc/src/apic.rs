@@ -230,6 +230,24 @@ impl LocalApic {
         if self.tpr >> 4 >= isrv >> 4 { self.tpr } else { isrv & 0xf0 }
     }
 
+    pub fn tpr(&self) -> u8 {
+        self.tpr
+    }
+
+    /// Sets the TPR without counting an access, for a TPR the JIT keeps in the VM.
+    pub fn set_tpr(&mut self, v: u8) {
+        self.tpr = v;
+    }
+
+    /// The priority class of the highest request that only the TPR holds back,
+    /// or 0. Lowering the TPR class below it lets that request through.
+    pub fn tpr_threshold(&self) -> u8 {
+        match self.irr.highest() {
+            Some(v) if self.pending().is_none() && v >> 4 > self.isrv() >> 4 && self.sw_enabled() => v & 0xf0,
+            _ => 0,
+        }
+    }
+
     /// The vector the APIC would deliver now, if any beats the processor priority.
     pub fn pending(&self) -> Option<u8> {
         if !self.hw_enabled() || !self.sw_enabled() {
@@ -501,6 +519,28 @@ mod tests {
         assert_eq!(a.pending(), None);
         a.write(reg::EOI, 0, 0);
         assert_eq!(a.pending(), Some(0x55));
+    }
+
+    #[test]
+    fn tpr_threshold_names_the_class_the_tpr_holds_back() {
+        let mut a = enabled();
+        a.write(reg::TPR, 0x50, 0);
+        assert_eq!(a.tpr_threshold(), 0);
+        a.accept(fixed(0x45, false));
+        assert_eq!(a.tpr_threshold(), 0x40);
+        a.set_tpr(0x3f);
+        assert_eq!(a.pending(), Some(0x45));
+        assert_eq!(a.tpr_threshold(), 0);
+    }
+
+    #[test]
+    fn tpr_threshold_ignores_requests_held_back_by_the_isr() {
+        let mut a = enabled();
+        a.accept(fixed(0x80, false));
+        assert_eq!(a.ack(), 0x80);
+        a.write(reg::TPR, 0x50, 0);
+        a.accept(fixed(0x45, false));
+        assert_eq!(a.tpr_threshold(), 0);
     }
 
     #[test]

@@ -281,6 +281,103 @@ fn try_fill(a: &mut Asm, fail: Label) {
     a.isb();
 }
 
+/// CPL 0 TPR accesses on `State::apic_va` use `State::tpr`; the rest go to
+/// `other` with x0..x17 still saved.
+fn tpr_access(a: &mut Asm, other: Label) {
+    let (esr, far, t2, t3, srt, val, t6, t7) = (r(0), r(1), r(2), r(3), r(4), r(5), r(6), r(7));
+    let logic = |a: &mut Asm, op: Logic, sz: Size, rd: Reg, rn: Reg, imm: u64| {
+        let ok = a.logic_imm(op, sz, rd, rn, imm);
+        assert!(ok);
+    };
+    a.ldr(Width::X, t2, STATE, state::APIC_VA as i32);
+    a.cbz(Size::X, t2, other);
+    a.mrs(far, sysreg::FAR_EL1);
+    logic(a, Logic::And, Size::X, t3, far, !0xfff);
+    logic(a, Logic::Orr, Size::X, t3, t3, 1);
+    a.cmp(Size::X, t3, t2);
+    a.b_cond(Cond::Ne, other);
+    a.ubfx(Size::X, t3, far, 0, 12);
+    a.cmp_imm(Size::W, t3, 0x80);
+    a.b_cond(Cond::Ne, other);
+    a.ldr(Width::W, t3, STATE, state::USER as i32);
+    a.cbnz(Size::W, t3, other);
+    a.mrs(esr, sysreg::ESR_EL1);
+    a.ubfx(Size::X, t3, esr, 26, 6);
+    a.cmp_imm(Size::W, t3, 0x25);
+    a.b_cond(Cond::Ne, other);
+    // ESR_EL1.ISV is 0 for these stage 1 faults, so read the instruction:
+    // only the 32-bit LDR/STR (unsigned offset) that translated code emits.
+    a.mrs(t6, sysreg::ELR_EL1);
+    a.ldr(Width::W, esr, t6, 0);
+    logic(a, Logic::And, Size::W, t3, esr, 0xff80_0000);
+    a.mov_imm(Size::W, t7, 0xb900_0000);
+    a.cmp(Size::W, t3, t7);
+    a.b_cond(Cond::Ne, other);
+    a.ubfx(Size::X, srt, esr, 0, 5);
+
+    let (write, done, got, high) = (a.label(), a.label(), a.label(), a.label());
+    a.tbz(esr, 22, write);
+    a.ldr(Width::W, val, STATE, state::TPR as i32);
+    a.cmp_imm(Size::W, srt, 31);
+    a.b_cond(Cond::Eq, done);
+    a.cmp_imm(Size::W, srt, 18);
+    a.b_cond(Cond::Hs, high);
+    a.add_shift(Size::X, t6, STATE, srt, Shift::Lsl, 3);
+    a.str(Width::X, val, t6, state::SCRATCH as i32);
+    a.b(done);
+    let table = a.label();
+    a.bind(high);
+    a.adr(t6, table);
+    a.sub_imm(Size::W, t7, srt, 18);
+    a.add_shift(Size::X, t6, t6, t7, Shift::Lsl, 3);
+    a.br(t6);
+    a.bind(table);
+    for n in 18..31 {
+        a.mov(Size::X, Reg(n), val);
+        a.b(done);
+    }
+
+    let (write_high, write_table) = (a.label(), a.label());
+    a.bind(write);
+    a.mov(Size::W, val, ZR);
+    a.cmp_imm(Size::W, srt, 31);
+    a.b_cond(Cond::Eq, got);
+    a.cmp_imm(Size::W, srt, 18);
+    a.b_cond(Cond::Hs, write_high);
+    a.add_shift(Size::X, t6, STATE, srt, Shift::Lsl, 3);
+    a.ldr(Width::X, val, t6, state::SCRATCH as i32);
+    a.b(got);
+    a.bind(write_high);
+    a.adr(t6, write_table);
+    a.sub_imm(Size::W, t7, srt, 18);
+    a.add_shift(Size::X, t6, t6, t7, Shift::Lsl, 3);
+    a.br(t6);
+    a.bind(write_table);
+    for n in 18..31 {
+        a.mov(Size::X, val, Reg(n));
+        a.b(got);
+    }
+    a.bind(got);
+    logic(a, Logic::And, Size::W, val, val, 0xff);
+    a.str(Width::W, val, STATE, state::TPR as i32);
+    a.ldr(Width::W, t6, STATE, state::TPR_THRESHOLD as i32);
+    logic(a, Logic::And, Size::W, t7, val, 0xf0);
+    a.cmp(Size::W, t7, t6);
+    a.b_cond(Cond::Hs, done);
+    a.movz(Size::W, t6, 1, 0);
+    a.str(Width::W, t6, STATE, state::PENDING as i32);
+
+    a.bind(done);
+    a.ldr(Width::X, t6, STATE, state::TPR_FAST as i32);
+    a.add_imm(Size::X, t6, t6, 1);
+    a.str(Width::X, t6, STATE, state::TPR_FAST as i32);
+    a.mrs(t6, sysreg::ELR_EL1);
+    a.add_imm(Size::X, t6, t6, 4);
+    a.msr(sysreg::ELR_EL1, t6);
+    restore_scratch(a);
+    a.eret();
+}
+
 /// Builds the vectors and runtime code. The returned words are placed at
 /// `layout::VECTORS`; `Entries` offsets are relative to the runtime region.
 pub fn build() -> (Vec<u32>, Entries) {
@@ -400,7 +497,9 @@ pub fn build() -> (Vec<u32>, Entries) {
         a.bind(label);
         save_scratch(&mut a);
         if why == reason::FAULT {
-            let (slow, report) = (a.label(), a.label());
+            let (slow, report, fill) = (a.label(), a.label(), a.label());
+            tpr_access(&mut a, fill);
+            a.bind(fill);
             try_fill(&mut a, slow);
             restore_scratch(&mut a);
             a.eret();

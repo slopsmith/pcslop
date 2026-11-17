@@ -1252,6 +1252,7 @@ impl<B: Bus> Ctx<'_, B> {
         Ok(match msr {
             0x10 => self.cpu.read_tsc(),
             0x17 | 0x8b => 0,
+            0x2c => crate::cpuid::EBC_FREQUENCY_ID,
             0x174 => self.cpu.sysenter_cs as u64,
             0x175 => self.cpu.sysenter_esp as u64,
             0x176 => self.cpu.sysenter_eip as u64,

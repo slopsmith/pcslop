@@ -38,6 +38,10 @@ pub const FEATURES_EDX: u32 = edx::FPU
     | edx::SSE
     | edx::SSE2;
 
+/// MSR_EBC_FREQUENCY_ID (0x2C) of a 2.4 GHz Northwood: a 133 MHz bus and a core ratio of 18.
+/// XP's intelppm.sys reads it on every family 15 CPU.
+pub const EBC_FREQUENCY_ID: u64 = 18 << 24 | 1 << 16;
+
 const BRAND: &[u8; 48] = b"86slopper Virtual CPU\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
 
 fn brand_regs(part: usize) -> [u32; 4] {

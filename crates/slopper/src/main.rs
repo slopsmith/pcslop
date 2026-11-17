@@ -707,11 +707,12 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                                 let (a, b) = (j.stats, last_stats);
                                 let r = |x: u64, y: u64| (x - y) as f64 / span;
                                 out += &format!(
-                                    "\nexits/s: interp {:.0} miss {:.0} fault {:.0} mmio {:.0} | translations/s {:.0} smc/s {:.0} flushes/s {:.0} guest #PF/s {:.0}",
+                                    "\nexits/s: interp {:.0} miss {:.0} fault {:.0} mmio {:.0} | in-VM tpr/s {:.0} | translations/s {:.0} smc/s {:.0} flushes/s {:.0} guest #PF/s {:.0}",
                                     r(a.interp_exits, b.interp_exits),
                                     r(a.miss_exits, b.miss_exits),
                                     r(a.shadow_fills + a.page_faults, b.shadow_fills + b.page_faults),
                                     r(a.mmio_exits, b.mmio_exits),
+                                    r(a.tpr_fast, b.tpr_fast),
                                     r(a.blocks, b.blocks),
                                     r(a.smc_invalidations, b.smc_invalidations),
                                     r(a.flushes, b.flushes),
