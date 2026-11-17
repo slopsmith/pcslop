@@ -5,6 +5,7 @@ pub mod fw_cfg;
 pub mod i8042;
 pub mod pci;
 pub mod pic;
+pub mod pm;
 pub mod pit;
 pub mod ram;
 pub mod rtc;
@@ -50,8 +51,9 @@ pub struct Board {
     a20: bool,
     pci_addr: u32,
     pci: Vec<(Bdf, ConfigSpace)>,
-    /// ISA IRQs currently held high by PCI interrupt lines.
+    /// ISA IRQs currently held high by PCI interrupt lines and the SCI.
     pci_irqs: u16,
+    sci: bool,
     pub pic: pic::Pic,
     pub pit: pit::Pit,
     fdc: fdc::Fdc,
@@ -66,6 +68,7 @@ pub struct Board {
     pub vga: vga::Vga,
     pub ide: ide::Ide,
     pub uhci: usb::Uhci,
+    pub pm: pm::Pm,
     vgabios: Vec<u8>,
     pub debugcon: Box<dyn Write + Send>,
     start: Instant,
@@ -78,6 +81,7 @@ const PIIX3_ISA: usize = 1;
 const IDE: usize = 2;
 const DISPLAY: usize = 3;
 const UHCI: usize = 4;
+const PM: usize = 5;
 const UHCI_PORTS: u16 = 32;
 const LEGACY_END: u32 = 0x10_0000;
 /// SMBIOS strings by (structure type, field offset within the structure).
@@ -104,6 +108,7 @@ impl Board {
             a20: true,
             pci_addr: 0,
             pci_irqs: 0,
+            sci: false,
             pci: vec![
                 (Bdf { dev: 0, func: 0 }, pci::host_bridge()),
                 (Bdf { dev: 1, func: 0 }, pci::piix3_isa()),
@@ -120,6 +125,7 @@ impl Board {
             vga: vga::Vga::new(),
             ide: ide::Ide::new(),
             uhci: usb::Uhci::new(),
+            pm: pm::Pm::default(),
             vgabios: Vec::new(),
             debugcon: Box::new(std::io::stdout()),
             start: Instant::now(),
@@ -138,6 +144,7 @@ impl Board {
         }
         b.pci.push((Bdf { dev: 2, func: 0 }, display));
         b.pci.push((Bdf { dev: 1, func: 2 }, pci::piix3_uhci()));
+        b.pci.push((Bdf { dev: 1, func: 3 }, pm::config_space()));
         b.uhci.attach(0, Box::new(usb::Tablet::new()));
         b.setup_cmos(ram_bytes);
         b.fw_cfg.set(fw_cfg::key::RAM_SIZE, (ram_bytes as u64).to_le_bytes().to_vec());
@@ -187,7 +194,24 @@ impl Board {
         if self.pci[UHCI].1.bus_master() {
             self.uhci.run(now, &mut RamDma(&mut self.ram[..], &mut self.code_watch));
         }
+        self.sync_sci();
+    }
+
+    fn sync_sci(&mut self) {
+        let now = self.now_ns();
+        self.sci = self.pm.sci(now);
         self.sync_pci_irqs();
+    }
+
+    /// Whether the guest has asked to enter the soft-off state.
+    pub fn power_off_requested(&self) -> bool {
+        self.pm.power_off_requested
+    }
+
+    /// Presses the power button. The DSDT turns the GPE into a notification.
+    pub fn power_button(&mut self) {
+        self.pm.raise_gpe(pm::GPE_POWER_BUTTON);
+        self.sync_sci();
     }
 
     /// Timer interrupts not yet delivered; it grows when the guest falls behind.
@@ -371,6 +395,7 @@ impl Board {
                 v
             }
             0x402 => 0xe9,
+            pm::PORT_APM_CNT | pm::PORT_APM_STS => self.pm.apm_read(port),
             0x510 => 0,
             0x511 => self.fw_cfg.read_data(),
             0x60 | 0x64 => {
@@ -417,6 +442,7 @@ impl Board {
                     let _ = self.debugcon.flush();
                 }
             }
+            pm::PORT_APM_CNT | pm::PORT_APM_STS => self.pm.apm_write(port, v),
             0xcf9 if v & 4 != 0 => self.reset_requested = true,
             0x60 | 0x64 => {
                 self.kbc.write(port, v);
@@ -467,12 +493,10 @@ impl Board {
         function == UHCI && self.uhci.irq()
     }
 
-    /// Drives the PIC from the PCI interrupt lines through the PIIX3 PIRQ router.
-    /// PCI interrupts are level-triggered, so an IRQ stays high while any
-    /// device routed to it asserts its line.
+    /// PCI interrupts and the SCI are level-triggered and may share an IRQ.
     fn sync_pci_irqs(&mut self) {
         let route = &self.pci[PIIX3_ISA].1.data[pci::PIRQRC..pci::PIRQRC + 4];
-        let mut levels = 0u16;
+        let mut levels = (self.sci as u16) << pm::SCI_IRQ;
         for (i, (bdf, cfg)) in self.pci.iter().enumerate() {
             let pin = cfg.data[pci::INTERRUPT_PIN];
             if pin == 0 || !self.intx(i) {
@@ -508,6 +532,9 @@ impl Board {
         self.pic = pic::Pic::default();
         self.pci_irqs = 0;
         self.uhci.reset();
+        self.pm.reset();
+        self.sci = false;
+        self.pci[PM].1 = pm::config_space();
         self.pit = pit::Pit::default();
         self.fdc = fdc::Fdc::default();
         self.com1.reset();
@@ -627,6 +654,17 @@ impl Bus for Board {
         {
             return self.uhci.read(port - base, size);
         }
+        if let Some(base) = pm::io_base(&self.pci[PM].1)
+            && (base..base + pm::IO_LEN).contains(&port)
+        {
+            let now = self.now_ns();
+            return self.pm.read(port - base, size, now);
+        }
+        if let Some(base) = pm::smbus_base(&self.pci[PM].1)
+            && (base..base + pm::SMBUS_LEN).contains(&port)
+        {
+            return (0..size as u16).fold(0, |v, i| v | (self.pm.smbus_read(port - base + i) as u32) << (8 * i));
+        }
         self.ide.set_bus_master_base(self.pci[IDE].1.io_bar(4));
         if let Some(v) = self.ide.io_read(port, size) {
             self.sync_ide();
@@ -660,6 +698,22 @@ impl Bus for Board {
             let now = self.now_ns();
             self.uhci.write(port - base, size, value, now);
             self.sync_pci_irqs();
+            return;
+        }
+        if let Some(base) = pm::io_base(&self.pci[PM].1)
+            && (base..base + pm::IO_LEN).contains(&port)
+        {
+            let now = self.now_ns();
+            self.pm.write(port - base, size, value, now);
+            self.sync_sci();
+            return;
+        }
+        if let Some(base) = pm::smbus_base(&self.pci[PM].1)
+            && (base..base + pm::SMBUS_LEN).contains(&port)
+        {
+            for i in 0..size as u16 {
+                self.pm.smbus_write(port - base + i, (value >> (8 * i)) as u8);
+            }
             return;
         }
         self.ide.set_bus_master_base(self.pci[IDE].1.io_bar(4));
