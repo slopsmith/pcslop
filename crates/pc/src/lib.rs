@@ -76,6 +76,8 @@ pub struct Board {
     pub ide: ide::Ide,
     pub uhci: usb::Uhci,
     pub pm: pm::Pm,
+    /// The AC'97 controller and its index in `pci`, when the board has one.
+    ac97: Option<(usize, ac97::Ac97)>,
     vgabios: Vec<u8>,
     pub debugcon: Box<dyn Write + Send>,
     start: Instant,
@@ -140,6 +142,7 @@ impl Board {
             ide: ide::Ide::new(),
             uhci: usb::Uhci::new(),
             pm: pm::Pm::default(),
+            ac97: None,
             vgabios: Vec::new(),
             debugcon: Box::new(std::io::stdout()),
             start: Instant::now(),
@@ -173,6 +176,24 @@ impl Board {
             b.fw_cfg.add_file("etc/irq0-override", 1u32.to_le_bytes().to_vec());
         }
         b
+    }
+
+    /// Adds an AC'97 audio controller at 00:04.0 that plays into `out`.
+    pub fn add_ac97(&mut self, out: Box<dyn ac97::AudioOut>) {
+        let mut c = ConfigSpace::new(ac97::PCI_VENDOR, ac97::PCI_DEVICE, ac97::PCI_CLASS_CODE, 0x01, 0x00);
+        c.set16(0x2c, 0x1af4);
+        c.set16(0x2e, 0x1100);
+        c.add_bar(0, pci::BarKind::Io, ac97::NAM_LEN as u32);
+        c.add_bar(1, pci::BarKind::Io, ac97::NABM_LEN as u32);
+        c.writable[0x04] |= 0x04;
+        c.data[pci::INTERRUPT_PIN] = 1;
+        self.pci.push((Bdf { dev: 4, func: 0 }, c));
+        self.ac97 = Some((self.pci.len() - 1, ac97::Ac97::new(out)));
+    }
+
+    /// I/O BAR `bar` of the AC'97 controller, if the guest has it decoded.
+    fn ac97_bar(&self, bar: usize) -> Option<u16> {
+        self.ac97.as_ref().and_then(|(i, _)| self.pci[*i].1.io_bar(bar))
     }
 
     fn setup_cmos(&mut self, ram: u32) {
@@ -217,6 +238,11 @@ impl Board {
         }
         if self.pci[UHCI].1.bus_master() {
             self.uhci.run(now, &mut RamDma(&mut self.ram[..], &mut self.code_watch));
+        }
+        if let Some((i, a)) = self.ac97.as_mut()
+            && self.pci[*i].1.bus_master()
+        {
+            a.run(now, &mut RamDma(&mut self.ram[..], &mut self.code_watch));
         }
         self.sync_sci();
     }
@@ -597,7 +623,10 @@ impl Board {
 
     /// Level of the INTx line of `self.pci[function]`.
     fn intx(&self, function: usize) -> bool {
-        function == UHCI && self.uhci.irq()
+        match &self.ac97 {
+            Some((i, a)) if *i == function => a.irq(),
+            _ => function == UHCI && self.uhci.irq(),
+        }
     }
 
     /// PCI interrupts and the SCI are level-triggered and may share an IRQ.
@@ -652,6 +681,9 @@ impl Board {
         self.ioapic = ioapic::IoApic::default();
         self.pci_irqs = 0;
         self.uhci.reset();
+        if let Some((_, a)) = self.ac97.as_mut() {
+            a.reset();
+        }
         self.pm.reset();
         self.sci = false;
         self.pci[PM].1 = pm::config_space();
@@ -683,6 +715,16 @@ impl ide::DmaMemory for RamDma<'_> {
                 *slot = b;
             }
         }
+    }
+}
+
+impl ac97::DmaMemory for RamDma<'_> {
+    fn read_phys(&mut self, addr: u32, buf: &mut [u8]) {
+        ide::DmaMemory::read_phys(self, addr, buf)
+    }
+
+    fn write_phys(&mut self, addr: u32, buf: &[u8]) {
+        ide::DmaMemory::write_phys(self, addr, buf)
     }
 }
 
@@ -782,6 +824,16 @@ impl Bus for Board {
         {
             return self.uhci.read(port - base, size);
         }
+        if let Some(base) = self.ac97_bar(0)
+            && (base..base + ac97::NAM_LEN).contains(&port)
+        {
+            return self.ac97.as_mut().unwrap().1.nam_read(port - base, size);
+        }
+        if let Some(base) = self.ac97_bar(1)
+            && (base..base + ac97::NABM_LEN).contains(&port)
+        {
+            return self.ac97.as_mut().unwrap().1.nabm_read(port - base, size);
+        }
         if let Some(base) = pm::io_base(&self.pci[PM].1)
             && (base..base + pm::IO_LEN).contains(&port)
         {
@@ -825,6 +877,20 @@ impl Bus for Board {
         {
             let now = self.now_ns();
             self.uhci.write(port - base, size, value, now);
+            self.sync_pci_irqs();
+            return;
+        }
+        if let Some(base) = self.ac97_bar(0)
+            && (base..base + ac97::NAM_LEN).contains(&port)
+        {
+            self.ac97.as_mut().unwrap().1.nam_write(port - base, size, value);
+            return;
+        }
+        if let Some(base) = self.ac97_bar(1)
+            && (base..base + ac97::NABM_LEN).contains(&port)
+        {
+            let dma = &mut RamDma(&mut self.ram[..], &mut self.code_watch);
+            self.ac97.as_mut().unwrap().1.nabm_write(port - base, size, value, dma);
             self.sync_pci_irqs();
             return;
         }
@@ -960,6 +1026,57 @@ mod tests {
         b.write32(apic::DEFAULT_BASE + apic::reg::LVT_LINT0, 0x8700);
         assert!(b.intr());
         assert_eq!(b.inta(), 0x09);
+    }
+
+    fn pci_write(b: &mut Board, dev: u32, off: u32, v: u32) {
+        b.io_write(0xcf8, 4, 0x8000_0000 | dev << 11 | off);
+        b.io_write(0xcfc, 4, v);
+    }
+
+    /// A board whose AC'97 controller has just finished a buffer marked for
+    /// an interrupt, with PIRQD routed to IRQ 11.
+    fn ac97_after_buffer() -> Board {
+        let mut b = board();
+        b.add_ac97(Box::new(ac97::NullOut));
+        pci_write(&mut b, 4, 0x10, 0xc000);
+        pci_write(&mut b, 4, 0x14, 0xc100);
+        pci_write(&mut b, 4, 0x04, 5);
+        b.io_write(0xcf8, 4, 0x8000_0000 | 1 << 11 | pci::PIRQRC as u32);
+        b.io_write(0xcfc + 3, 1, 11);
+        b.write32(0x1000, 0x2000);
+        b.write32(0x1004, ac97::BD_IOC | 4);
+        b.io_write(0xc000 + ac97::codec::reg::MASTER_VOLUME as u16, 2, 0);
+        b.io_write(0xc100 + ac97::PCM_OUT + ac97::bm::BDBAR, 4, 0x1000);
+        b.io_write(0xc100 + ac97::PCM_OUT + ac97::bm::CR, 1, (ac97::cr::RPBM | ac97::cr::IOCE) as u32);
+        b
+    }
+
+    #[test]
+    fn ac97_interrupt_reaches_the_8259_through_its_pirq() {
+        let mut b = ac97_after_buffer();
+        let slave_irr = |b: &Board| b.pic.registers()[1].0;
+        assert_eq!(slave_irr(&b), 0);
+        b.tick();
+        assert_eq!(slave_irr(&b), 1 << (11 - 8));
+    }
+
+    #[test]
+    fn ac97_interrupt_reaches_the_io_apic_on_pirqd() {
+        let mut b = ac97_after_buffer();
+        b.write32(apic::DEFAULT_BASE + apic::reg::SVR, 0x1ff);
+        b.write32(ioapic::BASE, 0x10 + 2 * (PIRQ_PIN as u32 + 3));
+        b.write32(ioapic::BASE + 0x10, 0x8000 | 0x45);
+        b.tick();
+        assert_eq!(b.inta(), 0x45);
+    }
+
+    #[test]
+    fn board_has_no_sound_card_unless_one_is_added() {
+        let mut b = board();
+        b.io_write(0xcf8, 4, 0x8000_0000 | 4 << 11);
+        assert_eq!(b.io_read(0xcfc, 4), u32::MAX);
+        b.add_ac97(Box::new(ac97::NullOut));
+        assert_eq!(b.io_read(0xcfc, 4), 0x2415_8086);
     }
 
     #[test]
