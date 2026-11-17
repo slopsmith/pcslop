@@ -110,6 +110,7 @@ A plain host-side interpreter comes first, for three reasons:
   - libslirp is not thread-safe, so it gets its own thread, which sleeps in poll(2) on its sockets and a wake-up pipe. Guest frames go into a queue and wake that thread; frames for the guest go into another queue that `Board::tick` drains into the card. When that queue fills from empty, the network thread unparks the emulator thread if it sleeps in HLT and kicks the vCPU, so a frame does not wait for the next timer. The vCPU never blocks on the network.
   - Every register access is a VM exit. Pulling 100 MB from a host web server: Ubuntu 8.04 gets 11 to 12 MB/s with either driver, its CPU saturated, at 3.9 register accesses per frame with 8139too (port I/O) and 0.9 with 8139cp (MMIO); XP gets about 40 MB/s at 3.5 per frame.
 - **Hot MMIO and ports, handled inside the VM:** APIC TPR (if we move to an APIC HAL), PIC EOI, and PIT counter reads. Everything else exits to the host.
+- **Device threads:** the board and its devices live on the emulation thread. Three devices hand work to threads of their own: the network card (libslirp, above), the AC'97 output (CoreAudio's render thread) and the Radeon's command processor, which runs the ring, the 2D and 3D engines and Metal encoding on a worker so a `CP_RB_WPTR` write returns at once (see [gpu.md](gpu.md#command-processor-thread)). Each wakes the emulation thread and kicks the vCPU when it needs an interrupt raised; the board raises it at its next `tick`.
 
 ## Remote display (VNC)
 
@@ -117,7 +118,7 @@ A plain host-side interpreter comes first, for three reasons:
 
 ## Save states
 
-The control socket's `save DIR` writes the running machine to a directory, `load DIR` puts it back, and `--load DIR` starts from one instead of booting. A save takes place between runs of the JIT, when the host holds the whole CPU state.
+The control socket's `save DIR` writes the running machine to a directory, `load DIR` puts it back, and `--load DIR` starts from one instead of booting. A save takes place between runs of the JIT, when the host holds the whole CPU state, and after the Radeon's command processor thread has run everything posted to it.
 
 - **What a snapshot holds:** the interpreter's `Cpu` (registers, x87, SSE, MSRs, and its software TLB), guest RAM, every board device (PIC, PIT, RTC and CMOS, i8042, UART, FDC, IDE with any PIO or DMA transfer in flight and the ATAPI state, PCI configuration spaces with the PAM registers, local and I/O APIC, the PIIX4 PM function, the battery window, UHCI and the tablet, the stdvga's registers, VBE state and VRAM, AC'97, and the RTL8139's registers and ring pointers), and a description of the machine: RAM size, chipset, display, the PCI functions present and hashes of both firmware images.
 - **What it leaves out:** the JIT's translations and shadow page tables, which are dropped on restore and rebuilt as the guest runs; host resources such as the disk file handles, audio output and the network backend, which the restoring machine already has; and libslirp's state. After a restore the network card is cabled to a fresh libslirp: DHCP and new connections work, the lease stays valid since slirp hands out the same address, and connections that were open get a reset when the guest next sends on them.
