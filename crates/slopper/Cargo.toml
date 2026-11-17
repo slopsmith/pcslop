@@ -12,6 +12,7 @@ window = ["dep:minifb"]
 
 [dependencies]
 minifb = { version = "0.29", optional = true }
+ac97 = { path = "../ac97" }
 pc = { path = "../pc" }
 flate2 = "1.1"
 png = "0.18"

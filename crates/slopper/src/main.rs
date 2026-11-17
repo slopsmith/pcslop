@@ -1,3 +1,4 @@
+mod audio;
 mod keys;
 mod vnc;
 
@@ -29,10 +30,14 @@ struct Args {
     script: Option<PathBuf>,
     control: Option<PathBuf>,
     vnc: Option<String>,
+    audio: bool,
+    audio_wav: Option<PathBuf>,
+    audio_silent: bool,
 }
 
 const USAGE: &str = "usage: slopper --bios <bios.bin> [--vgabios <vgabios.bin>] [--cdrom <iso>] [--hda <img>] \
-[--serial PATH|-] [--ram MiB] [--headless] [--jit] [--screenshot SECONDS:PATH]... [--exit-on-text TEXT] [--script FILE] [--control SOCKET] [--vnc [ADDR:]PORT] [--max-instructions N]";
+[--serial PATH|-] [--ram MiB] [--headless] [--jit] [--screenshot SECONDS:PATH]... [--exit-on-text TEXT] [--script FILE] [--control SOCKET] [--vnc [ADDR:]PORT] \
+[--audio ac97 [--audio-wav PATH] [--audio-silent]] [--max-instructions N]";
 
 fn parse_args() -> Result<Args, String> {
     let mut args = Args {
@@ -50,6 +55,9 @@ fn parse_args() -> Result<Args, String> {
         script: None,
         control: None,
         vnc: None,
+        audio: false,
+        audio_wav: None,
+        audio_silent: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -70,6 +78,12 @@ fn parse_args() -> Result<Args, String> {
             "--script" => args.script = Some(PathBuf::from(value()?)),
             "--control" => args.control = Some(PathBuf::from(value()?)),
             "--vnc" => args.vnc = Some(vnc::parse_addr(&value()?)?),
+            "--audio" => match value()?.as_str() {
+                "ac97" => args.audio = true,
+                other => return Err(format!("unknown sound card {other:?}; the only one is ac97")),
+            },
+            "--audio-wav" => args.audio_wav = Some(PathBuf::from(value()?)),
+            "--audio-silent" => args.audio_silent = true,
             "--screenshot" => {
                 let v = value()?;
                 let (secs, path) = v.split_once(':').ok_or("--screenshot needs SECONDS:PATH")?;
@@ -81,6 +95,9 @@ fn parse_args() -> Result<Args, String> {
     }
     if args.bios.is_empty() {
         return Err(USAGE.into());
+    }
+    if !args.audio && (args.audio_wav.is_some() || args.audio_silent) {
+        return Err("--audio-wav and --audio-silent need --audio ac97".into());
     }
     Ok(args)
 }
@@ -267,6 +284,15 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
     {
         eprintln!("cannot open {path}: {e}");
         return ExitCode::FAILURE;
+    }
+    if args.audio {
+        match audio::HostAudio::new(!args.audio_silent, args.audio_wav.as_deref()) {
+            Ok(out) => board.add_ac97(Box::new(out)),
+            Err(e) => {
+                eprintln!("cannot record audio: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
     }
     if let Some(path) = &args.hda
         && let Err(e) = board.attach_disk(path)
