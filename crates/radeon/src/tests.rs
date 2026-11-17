@@ -225,3 +225,11 @@ fn scanout_counts_from_display_base_addr() {
     assert_eq!(r.mode().unwrap().offset, 0x1000);
     assert_ne!(r.mmio_read(MC_STATUS, 4) & 1 << 4, 0);
 }
+
+#[test]
+fn pll_atomic_updates_finish_at_once() {
+    let mut r = card();
+    r.io_write(8, 1, PPLL_REF_DIV as u32 | PLL_WR_EN);
+    r.io_write(0xc, 4, 0x0030_800c);
+    assert_eq!(r.io_read(0xc, 4), 0x0030_000c);
+}

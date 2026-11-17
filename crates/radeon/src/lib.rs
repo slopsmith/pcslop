@@ -280,7 +280,10 @@ impl Radeon {
     }
 
     fn read_pll(&self, index: usize) -> u32 {
-        self.pll[index]
+        match index {
+            PPLL_REF_DIV | P2PLL_REF_DIV => self.pll[index] & !PLL_ATOMIC_UPDATE,
+            _ => self.pll[index],
+        }
     }
 
     fn write_pll(&mut self, index: usize, v: u32, mask: u32) {

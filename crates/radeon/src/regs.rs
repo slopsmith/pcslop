@@ -62,3 +62,7 @@ pub const MC_STATUS: u32 = 0x0150;
 pub const MC_STATUS_IDLE: u32 = 1 << 2 | 1 << 4;
 pub const MC_FB_LOCATION: u32 = 0x0148;
 pub const DISPLAY_BASE_ADDR: u32 = 0x023c;
+pub const PPLL_REF_DIV: usize = 0x03;
+pub const P2PLL_REF_DIV: usize = 0x2b;
+/// PPLL_REF_DIV and P2PLL_REF_DIV: ATOMIC_UPDATE_W on writes, ATOMIC_UPDATE_R on reads.
+pub const PLL_ATOMIC_UPDATE: u32 = 1 << 15;
