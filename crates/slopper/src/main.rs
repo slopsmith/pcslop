@@ -994,9 +994,7 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
             if jit.as_mut().is_some_and(|j| j.take_framebuffer_written().unwrap_or(true)) {
                 board.framebuffer_written();
             }
-            if board.display_changed()
-                && let Some((w, h)) = board.render(&mut scratch)
-            {
+            if let Some((w, h)) = board.render_live(&mut scratch) {
                 let mut f = shared.frame.lock().unwrap();
                 std::mem::swap(&mut f.pixels, &mut scratch);
                 f.width = w;

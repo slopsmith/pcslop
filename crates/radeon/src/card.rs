@@ -12,7 +12,7 @@
 //! the ring does not depend on are written at once, as on the card.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::*};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError};
 use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
@@ -135,7 +135,13 @@ pub struct Card {
     vram: *mut u8,
     rom: Vec<u8>,
     tracing: bool,
+    /// Live display refreshes skipped in a row because the card was busy.
+    skipped: u32,
 }
+
+/// Live refreshes that may be skipped in a row, about 100 ms at 60 Hz,
+/// before one waits for the card.
+const MAX_SKIPPED_REFRESHES: u32 = 6;
 
 // `vram` points into the VRAM `core` owns, which never moves.
 unsafe impl Send for Card {}
@@ -146,7 +152,7 @@ impl Card {
         let vram = r.vram_mut().as_mut_ptr();
         let st = r.status.clone();
         st.publish(&mut r);
-        Card { core: Arc::new(Mutex::new(r)), st, worker: None, vram, rom, tracing: false }
+        Card { core: Arc::new(Mutex::new(r)), st, worker: None, vram, rom, tracing: false, skipped: 0 }
     }
 
     fn lock(&self) -> MutexGuard<'_, Radeon> {
@@ -325,9 +331,43 @@ impl Card {
         self.st.fb_written.store(true, Relaxed);
     }
 
-    pub fn take_changed(&mut self) -> bool {
+    /// The picture if it may have changed since the last call, for the display refresh on
+    /// the emulation thread: while the command processor holds the card or
+    /// Metal draws into the visible buffer it skips the refresh and returns
+    /// None, so the guest does not wait for the GPU, and catches up later.
+    pub fn render_live(&mut self, out: &mut Vec<u32>) -> Option<(u32, u32)> {
         let written = self.st.fb_written.swap(false, Relaxed);
-        self.lock().take_changed() || written
+        let wait = self.skipped >= MAX_SKIPPED_REFRESHES;
+        let (frame, skipped) = {
+            let guard = if wait {
+                Some(self.lock())
+            } else {
+                match self.core.try_lock() {
+                    Ok(g) => Some(g),
+                    Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
+                    Err(TryLockError::WouldBlock) => None,
+                }
+            };
+            match guard {
+                None => {
+                    self.st.fb_written.fetch_or(written, Relaxed);
+                    (None, true)
+                }
+                Some(mut g) => {
+                    g.now_ns = self.st.now_ns.load(Relaxed);
+                    if !(g.take_changed() || written || self.skipped > 0) {
+                        (None, false)
+                    } else {
+                        match g.render_unless_drawing(out, wait) {
+                            Some(frame) => (frame, false),
+                            None => (None, true),
+                        }
+                    }
+                }
+            }
+        };
+        self.skipped = if skipped { self.skipped + 1 } else { 0 };
+        frame
     }
 
     /// Draws the current picture into `out` as 0x00RRGGBB pixels.

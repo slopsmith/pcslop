@@ -221,3 +221,24 @@ fn stopping_the_thread_runs_the_ring_on_the_callers_thread_again() {
     submit(&mut c, &mut ram, &[pkt0(SCRATCH_REG0, 1), 9]);
     assert_eq!(c.mmio_read(SCRATCH_REG0, 4), 9);
 }
+
+#[test]
+fn a_live_refresh_skips_while_the_worker_holds_the_card_and_waits_after_six_skips() {
+    let mut ram = Ram::new();
+    let (mut c, _) = threaded_card(&mut ram);
+    let mut out = Vec::new();
+    c.mark_changed();
+    ram.shut();
+    submit(&mut c, &mut ram, &[pkt0(SCRATCH_REG0, 1), 1]);
+    std::thread::sleep(Duration::from_millis(20));
+    for _ in 0..6 {
+        let start = Instant::now();
+        assert!(c.render_live(&mut out).is_none());
+        assert!(start.elapsed() < Duration::from_millis(20), "a skipped refresh must not wait");
+    }
+    ram.open_later();
+    let start = Instant::now();
+    c.render_live(&mut out);
+    assert!(start.elapsed() >= Duration::from_millis(20), "the seventh refresh waits for the card");
+    wait_idle(&mut c);
+}

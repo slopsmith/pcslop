@@ -569,9 +569,18 @@ impl Radeon {
     /// Draws the current picture into `out` as 0x00RRGGBB pixels.
     pub fn render(&mut self, out: &mut Vec<u32>) -> Option<(u32, u32)> {
         if self.extended() {
-            return self.render_extended(out);
+            return self.render_extended(out, true).flatten();
         }
         self.vga.render(out)
+    }
+
+    /// Like `render`, but if `wait` is false and Metal still draws into the
+    /// visible buffer, returns None instead of waiting.
+    pub fn render_unless_drawing(&mut self, out: &mut Vec<u32>, wait: bool) -> Option<Option<(u32, u32)>> {
+        if self.extended() {
+            return self.render_extended(out, wait);
+        }
+        Some(self.vga.render(out))
     }
 
     /// GEN_INT_STATUS: the latched vertical blank and the software interrupt.

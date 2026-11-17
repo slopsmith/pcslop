@@ -937,11 +937,12 @@ impl Board {
         }
     }
 
-    /// True if the picture may differ from the last time this was asked.
-    pub fn display_changed(&mut self) -> bool {
+    /// The picture for the display's regular refresh, if it may have changed
+    /// and the display can provide it without the guest waiting for the GPU.
+    pub fn render_live(&mut self, out: &mut Vec<u32>) -> Option<(u32, u32)> {
         match &mut self.display {
-            Display::Std(v) => v.take_changed(),
-            Display::Radeon(r) => r.take_changed(),
+            Display::Std(v) => v.take_changed().then(|| v.render(out)).flatten(),
+            Display::Radeon(r) => r.render_live(out),
         }
     }
 

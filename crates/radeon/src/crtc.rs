@@ -90,14 +90,19 @@ impl Radeon {
         (self.frame() + 1) * FRAME_NS
     }
 
-    pub(crate) fn render_extended(&mut self, out: &mut Vec<u32>) -> Option<(u32, u32)> {
+    /// The picture in extended modes, or None without waiting if `wait` is
+    /// false and queued Metal work still draws into it.
+    pub(crate) fn render_extended(&mut self, out: &mut Vec<u32>, wait: bool) -> Option<Option<(u32, u32)>> {
         let ctl = self.reg(CRTC_GEN_CNTL);
         if ctl & CRTC_EN == 0 || self.reg(CRTC_EXT_CNTL) & CRTC_DISPLAY_DIS != 0 {
-            return None;
+            return Some(None);
         }
-        let m = self.mode()?;
+        let Some(m) = self.mode() else { return Some(None) };
         let shown = m.offset as usize..m.offset as usize + m.pitch as usize * m.height as usize;
         if self.metal.as_mut().is_some_and(|g| g.writes_pending(shown.start, shown.end)) {
+            if !wait {
+                return None;
+            }
             self.gpu_sync();
         }
         let pal = if m.bits == 8 {
@@ -130,7 +135,7 @@ impl Radeon {
             convert_row(m.bits, src, row, &pal);
         }
         self.draw_cursor(out, &m);
-        Some((m.width, m.height))
+        Some(Some((m.width, m.height)))
     }
 }
 
