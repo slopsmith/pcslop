@@ -12,7 +12,8 @@
     in
     {
       packages.${system} = {
-        seabios = (x86pkgs.seabios.override { ___build-type = "qemu"; }).overrideAttrs {
+        seabios = (x86pkgs.seabios.override { ___build-type = "qemu"; }).overrideAttrs (old: {
+          patches = (old.patches or [ ]) ++ [ ./nix/seabios-i440bx.patch ];
           postConfigure = ''
             cat > .config <<CONFIG
             CONFIG_QEMU=y
@@ -21,7 +22,7 @@
             CONFIG
             make olddefconfig
           '';
-        };
+        });
 
         seavgabios = (x86pkgs.seabios.override { ___build-type = "qemu"; }).overrideAttrs {
           pname = "seavgabios-stdvga";

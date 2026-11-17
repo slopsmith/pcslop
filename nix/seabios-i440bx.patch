@@ -1,0 +1,118 @@
+Treat the Intel 82443BX host bridge (8086:7190) like the 82441FX.
+
+Both keep their PAM registers at 0x59..0x5f, so SeaBIOS can unlock and lock
+shadow RAM, lay out the PCI hole and route PIIX interrupts the same way.
+86slopper's 440BX board (with an AGP port) needs this; SeaBIOS 1.17 only
+matches the 82441FX and Q35.
+
+That board moves the PIIX3 from device 1 to device 7, as on real 440BX
+boards, so the $PIR table now names the router where it is, and gains
+entries for device 7 and for the AGP slot (bus 1, device 0).
+
+This patch modifies SeaBIOS (https://www.seabios.org, Kevin O'Connor and
+contributors) and is distributed under SeaBIOS's license, the GNU LGPLv3.
+
+--- a/src/fw/paravirt.c	2026-11-17 11:54:33
++++ b/src/fw/paravirt.c	2026-11-17 11:54:43
+@@ -211,6 +211,9 @@
+     case 0x1237:
+         dprintf(1, "Running on QEMU (i440fx)\n");
+         break;
++    case 0x7190:
++        dprintf(1, "Running on QEMU (i440bx)\n");
++        break;
+     case 0x29c0:
+         dprintf(1, "Running on QEMU (q35)\n");
+         break;
+--- a/src/fw/pciinit.c	2026-11-17 11:54:33
++++ b/src/fw/pciinit.c	2026-11-17 11:54:43
+@@ -513,6 +513,8 @@
+ static const struct pci_device_id pci_platform_tbl[] = {
+     PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_82441,
+                i440fx_mem_addr_setup),
++    PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_82443BX_0,
++               i440fx_mem_addr_setup),
+     PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_Q35_MCH,
+                mch_mem_addr_setup),
+     PCI_DEVICE_END
+--- a/src/fw/pirtable.c	2026-11-17 11:54:33
++++ b/src/fw/pirtable.c	2026-11-17 11:58:46
+@@ -8,13 +8,15 @@
+ 
+ #include "config.h" // CONFIG_*
+ #include "output.h" // dprintf
++#include "hw/pcidevice.h" // pci_find_device
++#include "hw/pci_ids.h" // PCI_DEVICE_ID_INTEL_82371SB_0
+ #include "std/pirtable.h" // struct pir_header
+ #include "string.h" // checksum
+ #include "util.h" // PirAddr
+ 
+ struct pir_table {
+     struct pir_header pir;
+-    struct pir_slot slots[6];
++    struct pir_slot slots[8];
+ } PACKED;
+ 
+ static struct pir_table PIR_TABLE = {
+@@ -85,6 +87,27 @@
+                 {.link = 0x60, .bitmap = 0xdef8}, // INTD#
+             },
+             .slot_nr = 5,
++        }, {
++            // 6th PCI slot, or the PIIX3 on a 440BX board
++            .dev = 7<<3,
++            .links = {
++                {.link = 0x62, .bitmap = 0xdef8}, // INTA#
++                {.link = 0x63, .bitmap = 0xdef8}, // INTB#
++                {.link = 0x60, .bitmap = 0xdef8}, // INTC#
++                {.link = 0x61, .bitmap = 0xdef8}, // INTD#
++            },
++            .slot_nr = 6,
++        }, {
++            // AGP slot behind the 440BX's bridge at 00:01.0
++            .bus = 1,
++            .dev = 0<<3,
++            .links = {
++                {.link = 0x60, .bitmap = 0xdef8}, // INTA#
++                {.link = 0x61, .bitmap = 0xdef8}, // INTB#
++                {.link = 0x62, .bitmap = 0xdef8}, // INTC#
++                {.link = 0x63, .bitmap = 0xdef8}, // INTD#
++            },
++            .slot_nr = 7,
+         },
+     }
+ };
+@@ -96,6 +119,11 @@
+         return;
+ 
+     dprintf(3, "init PIR table\n");
++
++    struct pci_device *isa = pci_find_device(PCI_VENDOR_ID_INTEL,
++                                             PCI_DEVICE_ID_INTEL_82371SB_0);
++    if (isa)
++        PIR_TABLE.pir.router_devfunc = isa->bdf & 0xff;
+ 
+     PIR_TABLE.pir.signature = PIR_SIGNATURE;
+     PIR_TABLE.pir.checksum -= checksum(&PIR_TABLE, sizeof(PIR_TABLE));
+--- a/src/fw/shadow.c
++++ b/src/fw/shadow.c
+@@ -129,7 +129,8 @@
+         u32 vendev = pci_ioconfig_readl(bdf, PCI_VENDOR_ID);
+         u16 vendor = vendev & 0xffff, device = vendev >> 16;
+         if (vendor == PCI_VENDOR_ID_INTEL
+-            && device == PCI_DEVICE_ID_INTEL_82441) {
++            && (device == PCI_DEVICE_ID_INTEL_82441
++                || device == PCI_DEVICE_ID_INTEL_82443BX_0)) {
+             make_bios_writable_intel(bdf, I440FX_PAM0);
+             code_mutable_preinit();
+             ShadowBDF = bdf;
+@@ -160,7 +161,8 @@
+     }
+ 
+     u16 device = pci_config_readw(ShadowBDF, PCI_DEVICE_ID);
+-    if (device == PCI_DEVICE_ID_INTEL_82441)
++    if (device == PCI_DEVICE_ID_INTEL_82441
++        || device == PCI_DEVICE_ID_INTEL_82443BX_0)
+         make_bios_readonly_intel(ShadowBDF, I440FX_PAM0);
+     else
+         make_bios_readonly_intel(ShadowBDF, Q35_HOST_BRIDGE_PAM0);
