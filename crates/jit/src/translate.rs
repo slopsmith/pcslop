@@ -948,6 +948,24 @@ impl Emit {
             }
             0x98 if op32 => self.a.sxth(Size::W, guest_reg(0), guest_reg(0)),
             0x99 if op32 => self.a.asr_imm(Size::W, guest_reg(2), guest_reg(0), 31),
+            0xed if op32 && !self.user => {
+                let slow = self.a.label();
+                let done = self.a.label();
+                self.a.ldr(Width::W, T_A, STATE, state::PM_PORT as i32);
+                self.a.ubfx(Size::W, T_B, guest_reg(2), 0, 16);
+                self.a.eor(Size::W, T_B, T_B, T_A);
+                self.a.cbnz(Size::W, T_B, slow);
+                self.a.mrs(T_A, a64::sysreg::CNTVCT_EL0);
+                self.a.ldr(Width::X, T_B, STATE, state::PM_MUL as i32);
+                self.a.umulh(T_A, T_A, T_B);
+                self.a.ldr(Width::X, T_B, STATE, state::PM_ADD as i32);
+                self.a.add(Size::X, T_A, T_A, T_B);
+                self.a.ubfx(Size::W, guest_reg(0), T_A, 0, 24);
+                self.a.b(done);
+                self.a.bind(slow);
+                self.exit_interp(eip);
+                self.a.bind(done);
+            }
             0x131 if !self.user => {
                 self.a.mrs(T_A, a64::sysreg::CNTVCT_EL0);
                 self.a.ldr(Width::X, T_B, STATE, state::TSC_ORIGIN as i32);
@@ -2203,7 +2221,7 @@ fn is_recent(insn: &Insn) -> bool {
     let (op, reg, op32) = (insn.op, insn.reg(), insn.op32);
     match op {
     0x1c8..=0x1cf | 0xc0 | 0xd0 | 0xd2 | 0x9c | 0x9d | 0x1ba | 0xf5 | 0xf8 | 0xf9 | 0x118 | 0x11f | 0x12b => true,
-    0x1ae | 0x1a3 | 0x1ab | 0x1b3 | 0x1bb | 0x7a | 0x7b | 0x18a | 0x18b | 0x14a | 0x14b | 0x19a | 0x19b => true,
+    0x1ae | 0x1a3 | 0x1ab | 0x1b3 | 0x1bb | 0x7a | 0x7b | 0x18a | 0x18b | 0x14a | 0x14b | 0x19a | 0x19b | 0xed => true,
     0x70..=0x7f | 0x180..=0x18f | 0xe8 | 0xe9 | 0xeb | 0xff if insn.rep != Rep::None => true,
     0x1c0 | 0x1c1 | 0x1b0 | 0x1b1 | 0x1c7 | 0x1a4 | 0x1a5 | 0x1ac | 0x1ad | 0xfb => true,
     0xd8..=0xdf | 0x9b => true,

@@ -419,6 +419,11 @@ static TIMEBASE: std::sync::LazyLock<Timebase> = std::sync::LazyLock::new(|| {
     t
 });
 
+/// Nanoseconds per host tick, as the fraction (numer, denom).
+pub fn host_timebase() -> (u32, u32) {
+    (TIMEBASE.numer, TIMEBASE.denom)
+}
+
 /// The host's monotonic tick counter, which a Hypervisor.framework guest
 /// reads as CNTVCT_EL0 when the vCPU's virtual timer offset is 0.
 pub fn host_ticks() -> u64 {

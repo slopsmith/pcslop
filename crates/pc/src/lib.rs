@@ -131,6 +131,8 @@ pub struct Board {
     start: Instant,
     /// Board time at `start`, which a restored snapshot carries on from.
     clock_base: u64,
+    /// The host tick count when `start` was taken.
+    start_ticks: u64,
     /// The same clock for device threads.
     shared_clock: Arc<audio::SharedClock>,
     pub reset_requested: bool,
@@ -224,6 +226,7 @@ impl Board {
             debugcon: Box::new(std::io::stdout()),
             start,
             clock_base: 0,
+            start_ticks: x86::cpu::host_ticks(),
             shared_clock: audio::SharedClock::new(start),
             reset_requested: false,
             post_code: 0,
@@ -393,6 +396,25 @@ impl Board {
     /// Host address and size of guest RAM, which starts at guest physical 0.
     pub fn ram_region(&mut self) -> (*mut u8, usize) {
         (self.ram.as_mut_ptr(), self.ram.len())
+    }
+
+    /// The ACPI PM timer as translated code computes it: its I/O port,
+    /// and `mul` and `add` such that the 24-bit count is
+    /// `umulh(host ticks, mul) + add`. The board reads the timer the same
+    /// way, so the count never steps back between the two.
+    pub fn pm_timer(&self) -> Option<(u16, u64, u64)> {
+        let port = pm::io_base(&self.pci[PM].1)? + pm::reg::PM_TMR;
+        let (numer, denom) = x86::cpu::host_timebase();
+        let mul = ((numer as u128 * pm::PM_TIMER_HZ) << 64) / (denom as u128 * 1_000_000_000);
+        let mul = mul.min(u64::MAX as u128) as u64;
+        let base = (self.clock_base as u128 * pm::PM_TIMER_HZ / 1_000_000_000) as u64;
+        let add = base.wrapping_sub(((self.start_ticks as u128 * mul as u128) >> 64) as u64);
+        Some((port, mul, add))
+    }
+
+    fn pm_timer_now(&self, mul: u64, add: u64) -> u32 {
+        let t = ((x86::cpu::host_ticks() as u128 * mul as u128) >> 64) as u64;
+        (t.wrapping_add(add) & 0xff_ffff) as u32
     }
 
     pub fn now_ns(&self) -> u64 {
@@ -1462,8 +1484,15 @@ impl Bus for Board {
         if let Some(base) = pm::io_base(&self.pci[PM].1)
             && (base..base + pm::IO_LEN).contains(&port)
         {
+            let off = port - base;
+            if (pm::reg::PM_TMR..pm::reg::PM_TMR + 4).contains(&off)
+                && let Some((_, mul, add)) = self.pm_timer()
+            {
+                let v = self.pm_timer_now(mul, add) >> (8 * (off - pm::reg::PM_TMR));
+                return v & (u32::MAX >> (32 - 8 * size as u32));
+            }
             let now = self.now_ns();
-            return self.pm.read(port - base, size, now);
+            return self.pm.read(off, size, now);
         }
         if let Some(base) = pm::smbus_base(&self.pci[PM].1)
             && (base..base + pm::SMBUS_LEN).contains(&port)
@@ -1687,6 +1716,25 @@ mod tests {
 
     fn board() -> Board {
         Board::new(Config { ram_bytes: 1 << 20, bios: vec![0; 0x2_0000], vgabios: None, apic: true, chipset: Chipset::I440fx, gpu: Gpu::StdVga, power: battery::Power::default() })
+    }
+
+    #[test]
+    fn the_pm_timer_reads_the_formula_translated_code_uses_at_3_58_mhz() {
+        let mut b = board();
+        assert_eq!(b.pm_timer(), None);
+        b.pci[PM].1.write(pm::PMBA, 4, acpi::PM_BASE as u32 | 1);
+        b.pci[PM].1.write(pm::PMREGMISC, 1, 1);
+        let (port, mul, add) = b.pm_timer().unwrap();
+        assert_eq!(port, acpi::PM_BASE + pm::reg::PM_TMR);
+        let formula = || (((x86::cpu::host_ticks() as u128 * mul as u128) >> 64) as u64).wrapping_add(add) & 0xff_ffff;
+        let (before, read, after) = (formula(), b.io_read(port, 4) as u64, formula());
+        assert!((read.wrapping_sub(before) & 0xff_ffff) <= (after.wrapping_sub(before) & 0xff_ffff));
+        let t = std::time::Instant::now();
+        let first = b.io_read(port, 4);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let ticks = (b.io_read(port, 4).wrapping_sub(first) & 0xff_ffff) as f64;
+        let hz = ticks / t.elapsed().as_secs_f64();
+        assert!((3.4e6..3.7e6).contains(&hz), "XP takes the PM timer to tick at 3.579545 MHz, not {hz} Hz");
     }
 
     #[test]

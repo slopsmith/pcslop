@@ -337,6 +337,7 @@ pub struct Jit {
     fb: Option<Framebuffer>,
     ram: usize,
     shadowed_rom: [Option<bool>; 16],
+    pm_timer: Option<(u16, u64, u64)>,
 }
 
 /// Offset of the two-entry lookup bucket for `key`; the runtime's dispatcher
@@ -457,6 +458,7 @@ impl Jit {
             fb: None,
             ram: ram as usize,
             shadowed_rom: [None; 16],
+            pm_timer: None,
         };
         for t in &mut jit.shadow {
             t.flush(jit.mem.as_mut_slice());
@@ -663,6 +665,12 @@ impl Jit {
     /// Maps the 16 KiB chunks of 0xC0000..0x100000 that read from RAM, as
     /// `Board::shadowed_rom` reports them, so translated code reads shadowed
     /// ROMs without exits; writes exit unless the chunk is writable.
+    /// The ACPI PM timer's port and formula from `Board::pm_timer`, so
+    /// translated kernel code reads it without an exit.
+    pub fn set_pm_timer(&mut self, timer: Option<(u16, u64, u64)>) {
+        self.pm_timer = timer;
+    }
+
     pub fn set_shadowed_rom(&mut self, chunks: [Option<bool>; 16]) -> hvf::Result<()> {
         for (i, &want) in chunks.iter().enumerate() {
             if want == self.shadowed_rom[i] {
@@ -715,6 +723,7 @@ impl Jit {
     }
 
     fn load_state(&mut self, cpu: &Cpu) {
+        let pm_timer = self.pm_timer;
         let vm_fill = self.vm_fill;
         let afp = self.afp;
         let ttbr0 = [0, 1].map(|r| self.shadow[r].root_ipa() | (r as u64 + 1) << 48);
@@ -795,6 +804,8 @@ impl Jit {
         s.roots = roots;
         s.tsc_origin = cpu.tsc_origin;
         s.tsc_mul = cpu.tsc_mul;
+        let (port, mul, add) = pm_timer.map_or((u32::MAX, 0, 0), |(p, m, a)| (p as u32, m, a));
+        (s.pm_port, s.pm_mul, s.pm_add) = (port, mul, add);
         s.dr = cpu.dr;
         s.ldtr_nulled = 0;
         s.sse_fp_ok = (sse_ok && afp && cpu.mxcsr & 0x1f80 == 0x1f80) as u32;

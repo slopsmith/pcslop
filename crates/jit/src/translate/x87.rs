@@ -235,12 +235,14 @@ impl Emit {
                     self.a.sub_imm(Size::W, T_C, T_B, 1);
                     self.a.cbz(Size::W, T_C, bail);
                     self.a.cbnz(Size::W, T_B, normal);
-                    self.a.lsl_imm(Size::W, T_B, T_A, 1);
-                    self.a.cbnz(Size::W, T_B, bail);
-                    self.a.fmov_xd(T_B, v);
-                    self.a.lsl_imm(Size::X, T_B, T_B, 1);
+                    self.a.fp1(false, 5, E1, FB);
+                    self.a.fcm(Fcm::Eq, true, E1, E1, v);
+                    self.a.fmov_xd(T_B, E1);
+                    self.a.mvn(Size::X, T_B, T_B);
                     self.a.cbz(Size::X, T_B, zero);
-                    self.a.b(bail);
+                    let ok = self.a.logic_imm(Logic::Orr, Size::W, SW, SW, 3 << 4);
+                    assert!(ok);
+                    self.a.b(zero);
                     self.a.bind(normal);
                     let exact = self.a.label();
                     self.a.tbnz(SW, PE_SHIFT, exact);
@@ -529,22 +531,34 @@ impl Emit {
         self.a.ubfx(Size::W, TOP, SW, 11, 3);
         self.a.ldr(Width::W, TAGS, STATE, state::FTAGS as i32);
         self.a.mrs(SAVED_FPSR, sysreg::FPSR);
-        self.set_rmode(state::FCW, 10);
+        self.set_fpcr(true);
     }
 
-    /// Points FPCR's rounding mode at the RC field at bit `shift` of the
-    /// state word at `at` (FCW for x87 code, MXCSR outside it).
-    fn set_rmode(&mut self, at: usize, shift: u32) {
+    /// Sets FPCR's rounding mode and flush bits for x87 code (FCW's RC, no
+    /// flushing) or for SSE code (MXCSR's RC, FTZ and DAZ, as `fpcr_for`).
+    fn set_fpcr(&mut self, x87: bool) {
         let same = self.a.label();
-        self.a.ldr(Width::W, M, STATE, at as i32);
-        self.a.ubfx(Size::W, S, M, shift, 1);
-        self.a.ubfx(Size::W, M, M, shift + 1, 1);
+        let (at, rc) = if x87 { (state::FCW, 10) } else { (state::MXCSR, 13) };
+        self.a.ldr(Width::W, T_E, STATE, at as i32);
+        self.a.ubfx(Size::W, S, T_E, rc, 1);
+        self.a.ubfx(Size::W, M, T_E, rc + 1, 1);
         self.a.logic_shift(Logic::Orr, false, Size::W, M, M, S, Shift::Lsl, 1);
+        self.a.lsl_imm(Size::W, M, M, 22);
+        if !x87 {
+            self.a.ubfx(Size::W, S, T_E, 15, 1);
+            self.a.ubfx(Size::W, U, T_E, 11, 1);
+            self.a.and(Size::W, S, S, U);
+            self.a.logic_shift(Logic::Orr, false, Size::W, M, M, S, Shift::Lsl, 24);
+            self.a.ubfx(Size::W, S, T_E, 6, 1);
+            self.a.orr(Size::W, M, M, S);
+        }
+        self.a.mov_imm(Size::X, T_E, 7 << 22 | 1);
         self.a.mrs(S, sysreg::FPCR);
-        self.a.ubfx(Size::X, U, S, 22, 2);
-        self.a.eor(Size::W, U, U, M);
-        self.a.cbz(Size::W, U, same);
-        self.a.bfi(Size::X, S, M, 22, 2);
+        self.a.and(Size::X, U, S, T_E);
+        self.a.eor(Size::X, U, U, M);
+        self.a.cbz(Size::X, U, same);
+        self.a.bic(Size::X, S, S, T_E);
+        self.a.orr(Size::X, S, S, M);
         self.a.msr(sysreg::FPCR, S);
         self.a.bind(same);
     }
@@ -695,7 +709,7 @@ impl Emit {
             self.a.mov_imm(Size::W, U, saved.note.1 as u64);
             self.a.str(Width::W, U, STATE, state::FNOTE as i32);
         }
-        self.set_rmode(state::MXCSR, 13);
+        self.set_fpcr(false);
         self.x87 = saved;
     }
 

@@ -321,6 +321,28 @@ fn bit_tests_with_a_register_index_match_the_interpreter() {
 }
 
 #[test]
+fn kernel_reads_of_the_pm_timer_stay_translated() {
+    const PORT: u16 = 0x408;
+    let mul = 0x2622_0000_0000_0000u64;
+    let add = 12345u64;
+    let mut code = vec![0xb9, 0x40, 0, 0, 0, 0x66, 0xba, 0x08, 0x04]; // mov ecx, 64; mov dx, 0x408
+    code.extend([0xed, 0x89, 0xc3]); // loop: in eax, dx; mov ebx, eax
+    code.extend([0x90; 12]);
+    code.extend([0x49, 0x75, 0xee]); // dec ecx; jnz loop
+    code.extend([0x66, 0xba, 0x09, 0x04, 0xed, 0xf4]); // mov dx, 0x409; in eax, dx; hlt
+    let mut cpu = flat_cpu(0x1000, 0x8000);
+    let mut bus = bus_with(0x1000, &code);
+    let formula = || ((((x86::cpu::host_ticks() as u128 * mul as u128) >> 64) as u64).wrapping_add(add) & 0xff_ffff) as u32;
+    let before = formula();
+    let stats = run_jit_with(&mut cpu, &mut bus, |j| j.set_pm_timer(Some((PORT, mul, add))), |_| {});
+    let after = formula();
+    let read = cpu.regs[3];
+    assert!(read.wrapping_sub(before) & 0xff_ffff <= after.wrapping_sub(before) & 0xff_ffff, "{before:#x} {read:#x} {after:#x}");
+    assert_eq!(cpu.regs[0], 0xffff_ffff, "other ports still reach the bus");
+    assert!(stats.interp_exits < 8, "XP's QueryPerformanceCounter reads the PM timer constantly: {stats:?}");
+}
+
+#[test]
 fn one_operand_mul_and_imul_run_translated() {
     let mut code = vec![
         0xb9, 0x40, 0, 0, 0, // mov ecx, 64

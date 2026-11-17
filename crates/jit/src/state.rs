@@ -157,6 +157,12 @@ pub struct State {
     /// The TSC is (CNTVCT_EL0 - tsc_origin) * tsc_mul, as in `Cpu::read_tsc`.
     pub tsc_origin: u64,
     pub tsc_mul: u64,
+    /// The ACPI PM timer, as `Board::pm_timer`: the count is
+    /// umulh(CNTVCT_EL0, pm_mul) + pm_add, read at port `pm_port`
+    /// (u32::MAX when there is none).
+    pub pm_mul: u64,
+    pub pm_add: u64,
+    pub pm_port: u32,
     pub dr: [u32; 8],
     /// Set by translated code after LLDT loaded the null selector in `ldtr_sel`.
     pub ldtr_nulled: u32,
@@ -223,6 +229,9 @@ pub const TTBR0: usize = offset_of!(State, ttbr0);
 pub const ROOTS: usize = offset_of!(State, roots);
 pub const TSC_ORIGIN: usize = offset_of!(State, tsc_origin);
 pub const TSC_MUL: usize = offset_of!(State, tsc_mul);
+pub const PM_MUL: usize = offset_of!(State, pm_mul);
+pub const PM_ADD: usize = offset_of!(State, pm_add);
+pub const PM_PORT: usize = offset_of!(State, pm_port);
 pub const DR: usize = offset_of!(State, dr);
 pub const LDTR_NULLED: usize = offset_of!(State, ldtr_nulled);
 pub const LDTR_SEL: usize = offset_of!(State, ldtr_sel);

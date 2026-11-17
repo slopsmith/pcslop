@@ -54,7 +54,7 @@ pub const GPE_POWER_BUTTON: u8 = 0;
 /// GPE0 bit raised by battery and AC adapter changes, handled by `\_GPE._E01`.
 pub const GPE_BATTERY: u8 = 1;
 
-const PM_TIMER_HZ: u128 = 3_579_545;
+pub const PM_TIMER_HZ: u128 = 3_579_545;
 const SMB_HST_STS: u16 = 0;
 const SMB_HST_CNT: u16 = 2;
 const SMB_START: u8 = 0x40;
