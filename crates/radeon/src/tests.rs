@@ -55,3 +55,69 @@ fn mmio_mirrors_config_space() {
     assert_eq!(r.mmio_read(0xf00, 4), 0x4e44_1002);
     assert_eq!(r.mmio_read(0xf02, 2), 0x4e44);
 }
+
+fn set_640x480x16(r: &mut Radeon) {
+    r.mmio_write(CRTC_H_TOTAL_DISP, 4, 0x004f_0063);
+    r.mmio_write(CRTC_V_TOTAL_DISP, 4, 0x01df_020c);
+    r.mmio_write(CRTC_PITCH, 4, 0x50);
+    r.mmio_write(CRTC_OFFSET, 4, 0x1000);
+    r.mmio_write(CRTC_GEN_CNTL, 4, CRTC_EN | CRTC_EXT_DISP_EN | 4 << 8);
+}
+
+#[test]
+fn crtc_mode_from_the_vbe_registers_the_rom_writes() {
+    let mut r = card();
+    set_640x480x16(&mut r);
+    let m = r.mode().unwrap();
+    assert_eq!((m.width, m.height, m.bits, m.pitch, m.offset), (640, 480, 16, 1280, 0x1000));
+    r.vram_mut()[0x1000..0x1002].copy_from_slice(&0xf800u16.to_le_bytes());
+    let mut out = Vec::new();
+    assert_eq!(r.render(&mut out), Some((640, 480)));
+    assert_eq!(out[0], 0xff_0000);
+    r.mmio_write(CRTC_EXT_CNTL, 4, CRTC_DISPLAY_DIS);
+    assert_eq!(r.render(&mut out), None);
+}
+
+#[test]
+fn palette_registers_reach_the_dac() {
+    let mut r = card();
+    r.mmio_write(DAC_CNTL, 4, DAC_8BIT_EN);
+    r.mmio_write(PALETTE_INDEX, 4, 5);
+    r.mmio_write(PALETTE_DATA, 4, 0x0012_3456);
+    r.mmio_write(PALETTE_DATA, 4, 0x00ab_cdef);
+    assert_eq!(r.vga().dac_entry(6), [0xab, 0xcd, 0xef]);
+    r.mmio_write(PALETTE_INDEX, 4, 5 << 16);
+    assert_eq!(r.mmio_read(PALETTE_DATA, 4), 0x0012_3456);
+    assert_eq!(r.mmio_read(PALETTE_INDEX, 4) >> 16, 6);
+}
+
+#[test]
+fn extended_modes_bank_the_a0000_window() {
+    let mut r = card();
+    set_640x480x16(&mut r);
+    r.mmio_write(MEM_VGA_WP_SEL, 4, 0x000c_0008);
+    r.mmio_write(MEM_VGA_RP_SEL, 4, 0x000c_0008);
+    r.vga().mem_write8(0xa8001, 0x77);
+    assert_eq!(r.vram()[0xc * 0x2000 + 1], 0x77);
+    assert_eq!(r.vga().mem_read8(0xa8001), 0x77);
+    r.mmio_write(CRTC_EXT_CNTL, 4, VGA_ATI_LINEAR);
+    r.vga().mem_write8(0xa0002, 0x55);
+    assert_eq!(r.vram()[8 * 0x8000 + 2], 0x55);
+    r.mmio_write(CRTC_EXT_CNTL, 4, 0);
+    r.mmio_write(CRTC_GEN_CNTL, 4, 0);
+    r.vga().mem_write8(0xa8001, 0x11);
+    assert_eq!(r.vram()[0xc * 0x2000 + 1], 0x77);
+}
+
+#[test]
+fn vblank_status_latches_until_acknowledged() {
+    let mut r = card();
+    set_640x480x16(&mut r);
+    r.set_time(1_000_000_000);
+    assert_ne!(r.mmio_read(CRTC_STATUS, 4) & CRTC_VBLANK_SAVE, 0);
+    r.mmio_write(CRTC_STATUS, 4, CRTC_VBLANK_SAVE);
+    assert_eq!(r.mmio_read(CRTC_STATUS, 4) & CRTC_VBLANK_SAVE, 0);
+    r.set_time(1_000_000_000 + 17_000_000);
+    assert_ne!(r.mmio_read(CRTC_STATUS, 4) & CRTC_VBLANK_SAVE, 0);
+    assert_ne!(r.mmio_read(GEN_INT_STATUS, 4) & VSYNC_INT, 0);
+}

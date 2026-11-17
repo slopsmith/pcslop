@@ -6,6 +6,7 @@
 //! those first bytes. The legacy VGA keeps its planes interleaved at the start
 //! of VRAM, as QEMU's stdvga and ati-vga do.
 
+mod crtc;
 mod names;
 pub mod regs;
 mod trace;
@@ -16,6 +17,7 @@ mod tests;
 use std::io::Write;
 
 use regs::*;
+pub use crtc::Mode;
 pub use trace::Trace;
 use vga::Vga;
 
@@ -59,6 +61,8 @@ pub struct Radeon {
     /// The PCI configuration space, which MMIO 0xF00..0x1000 mirrors.
     pub config: [u8; 256],
     now_ns: u64,
+    /// Frames whose vertical blank CRTC_STATUS and GEN_INT_STATUS have been acknowledged up to.
+    vblank_acked: [u64; 2],
     trace: Option<Trace>,
 }
 
@@ -72,6 +76,7 @@ impl Radeon {
             bars: Bars::default(),
             config: [0; 256],
             now_ns: 0,
+            vblank_acked: [0; 2],
             trace: None,
         };
         r.reset();
@@ -82,6 +87,7 @@ impl Radeon {
     pub fn reset(&mut self) {
         self.regs.fill(0);
         self.pll = [0; 64];
+        self.vga.set_bank_window(None);
     }
 
     pub fn set_trace(&mut self, out: Box<dyn Write + Send>) {
@@ -239,8 +245,28 @@ impl Radeon {
         *p = (*p & !mask) | (v & mask);
     }
 
-    fn read_reg(&self, reg: u32) -> u32 {
+    fn read_reg(&mut self, reg: u32) -> u32 {
         match reg {
+            CRTC_STATUS => {
+                let saved = if self.frame() > self.vblank_acked[0] { CRTC_VBLANK_SAVE } else { 0 };
+                saved | (self.in_vblank() as u32 * CRTC_VBLANK_CUR)
+            }
+            GEN_INT_STATUS => {
+                let v = self.reg(GEN_INT_STATUS) & !VSYNC_INT;
+                v | if self.frame() > self.vblank_acked[1] { VSYNC_INT } else { 0 }
+            }
+            CRTC_VLINE_CRNT_VLINE => self.vline() << 16,
+            CRTC_CRNT_FRAME => self.frame() as u32 & 0x1f_ffff,
+            PALETTE_DATA | PALETTE_30_DATA => {
+                let index = self.reg(PALETTE_INDEX);
+                let [r, g, b] = self.vga.dac_entry((index >> 16) as u8);
+                self.regs[PALETTE_INDEX as usize / 4] = (index & !0x00ff_0000) | ((index + 0x1_0000) & 0x00ff_0000);
+                if reg == PALETTE_DATA {
+                    (r as u32) << 16 | (g as u32) << 8 | b as u32
+                } else {
+                    (r as u32) << 22 | (g as u32) << 12 | (b as u32) << 2
+                }
+            }
             CONFIG_APER_0_BASE => self.bars.fb,
             CONFIG_APER_1_BASE => self.bars.fb.wrapping_add(APER_SIZE),
             CONFIG_APER_SIZE => APER_SIZE,
@@ -256,12 +282,58 @@ impl Radeon {
     }
 
     fn write_reg(&mut self, reg: u32, v: u32, mask: u32) {
-        let r = &mut self.regs[reg as usize / 4];
-        *r = (*r & !mask) | (v & mask);
-        if reg == DAC_CNTL {
-            let on = self.regs[DAC_CNTL as usize / 4] & DAC_8BIT_EN != 0;
-            self.vga.set_dac_8bit(on);
+        let old = self.reg(reg);
+        let new = (old & !mask) | (v & mask);
+        match reg {
+            CRTC_STATUS => {
+                if new & CRTC_VBLANK_SAVE != 0 {
+                    self.vblank_acked[0] = self.frame();
+                }
+                return;
+            }
+            GEN_INT_STATUS => {
+                if new & VSYNC_INT != 0 {
+                    self.vblank_acked[1] = self.frame();
+                }
+                return;
+            }
+            PALETTE_DATA | PALETTE_30_DATA => {
+                let rgb = if reg == PALETTE_DATA {
+                    [(new >> 16) as u8, (new >> 8) as u8, new as u8]
+                } else {
+                    [(new >> 22) as u8, (new >> 12) as u8, (new >> 2) as u8]
+                };
+                let index = self.reg(PALETTE_INDEX);
+                self.vga.set_dac_entry(index as u8, rgb);
+                self.regs[PALETTE_INDEX as usize / 4] = (index & !0xff) | ((index + 1) & 0xff);
+                return;
+            }
+            _ => {}
         }
+        self.regs[reg as usize / 4] = new;
+        match reg {
+            DAC_CNTL => self.vga.set_dac_8bit(new & DAC_8BIT_EN != 0),
+            CRTC_GEN_CNTL | CRTC_EXT_CNTL | MEM_VGA_WP_SEL | MEM_VGA_RP_SEL => {
+                self.update_bank_window();
+                self.vga.touch();
+            }
+            0x0200..=0x027c => self.vga.touch(),
+            _ => {}
+        }
+    }
+
+    // Page units of 8 KiB, or 32 KiB with VGA_ATI_LINEAR, follow 86Box's Rage 128
+    // model (vid_ati_rage128_display.c); this ROM's VBE window calls agree.
+    fn update_bank_window(&mut self) {
+        let ext = self.reg(CRTC_EXT_CNTL);
+        let paged = self.extended() || ext & VGA_MEM_PS_EN != 0;
+        let shift = if ext & VGA_ATI_LINEAR != 0 { 15 } else { 13 };
+        let pages = |r: u32| [(r & 0x3ff) << shift, ((r >> 16) & 0x3ff) << shift];
+        let w = paged.then(|| vga::BankWindow {
+            read: pages(self.reg(MEM_VGA_RP_SEL)),
+            write: pages(self.reg(MEM_VGA_WP_SEL)),
+        });
+        self.vga.set_bank_window(w);
     }
 
     fn trace_reg(&mut self, src: Source, dir: char, size: u8, off: u32, v: u32) {
@@ -279,6 +351,9 @@ impl Radeon {
 
     /// Draws the current picture into `out` as 0x00RRGGBB pixels.
     pub fn render(&mut self, out: &mut Vec<u32>) -> Option<(u32, u32)> {
+        if self.extended() {
+            return self.render_extended(out);
+        }
         self.vga.render(out)
     }
 
