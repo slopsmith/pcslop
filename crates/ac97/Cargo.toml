@@ -1,0 +1,9 @@
+[package]
+name = "ac97"
+description = "Intel 82801AA AC'97 audio controller and its codec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
