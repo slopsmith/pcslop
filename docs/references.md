@@ -22,7 +22,7 @@ Nothing listed here is committed. Run `scripts/fetch-references.sh` (add `--test
 | [AsahiLinux/docs](https://github.com/AsahiLinux/docs) | CC-BY-3.0 | Text with attribution | Apple CPU implementation-defined registers and features |
 | [Mesa](https://gitlab.freedesktop.org/mesa/mesa) | MIT (r300 driver) | Yes, with attribution | `src/gallium/drivers/r300/`: shader encodings (`compiler/`), state to register mapping, texture formats and tiling. See [gpu.md](gpu.md) |
 | [Linux](https://github.com/torvalds/linux) `drivers/gpu/drm/radeon/` | MIT for the radeon files (the kernel overall is GPL-2.0-only) | Yes, with attribution; check each file's header | Command-stream checker, COMBIOS tables, legacy mode setting, CP and PCI GART setup, register headers. Fetched as a sparse clone |
-| [Linux 2.6.24](https://github.com/torvalds/linux/tree/v2.6.24) `drivers/char/drm/` | MIT for the radeon files | Yes, with attribution; check each file's header | The UMS radeon DRM that Ubuntu 8.04 runs. Fetched as a sparse clone |
+| [Linux 2.6.24](https://github.com/torvalds/linux/tree/v2.6.24) `drivers/char/drm/`, `drivers/video/aty/` | MIT for the radeon DRM files; radeonfb is GPL-2.0-only | DRM files yes, with attribution; radeonfb only for reading, since our GPL-2.0-or-later code cannot take GPL-2.0-only code | The UMS radeon DRM and radeonfb that Ubuntu 8.04 runs. Fetched as a sparse clone |
 | [xf86-video-ati](https://gitlab.freedesktop.org/xorg/driver/xf86-video-ati) | MIT | Yes, with attribution | Checked out at 6.14.6, the last release with UMS: mode setting, BIOS parsing, XAA and EXA 2D acceleration |
 
 ## Apple Silicon and Hypervisor.framework
@@ -46,6 +46,7 @@ Nothing listed here is committed. Run `scripts/fetch-references.sh` (add `--test
 | CPU | Intel 80386 Programmer's Reference (1986), i486 Programmer's Reference (1990) | Simpler to read than the SDM for the base ISA; bitsavers scans |
 | CPU | [felixcloutier.com/x86](https://www.felixcloutier.com/x86/), [sandpile.org](https://www.sandpile.org/) | Quick per-instruction lookup; sandpile covers opcode maps, CPUID, MSRs |
 | Chipset | Intel 440FX PCIset 82441FX/82442FX (290549) | Host bridge, PAM registers (shadow BIOS) |
+| Chipset | Intel 440BX AGPset 82443BX (290633) | Host bridge with AGP: the aperture, GART and AGP bridge registers |
 | Chipset | Intel PIIX3 82371SB (290550), PIIX4 82371AB (290562) | ISA bridge, IDE, USB, PIIX4 power management |
 | Chipset | Intel 82093AA I/O APIC (290566), MultiProcessor Spec 1.4 (242016) | |
 | Chipset | PCI Local Bus Spec 2.2 | PCI-SIG copyright; bitsavers copy, strictly local |

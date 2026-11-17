@@ -20,6 +20,7 @@ get intel-optimization-reference-248966.pdf https://cdrdv2.intel.com/v1/dl/getCo
 get i386-programmers-reference-1986.pdf $bs/components/intel/80386/230985-001_80386_Programmers_Reference_Manual_1986.pdf
 get i486-programmers-reference-1990.pdf $bs/components/intel/80486/i486_Processor_Programmers_Reference_Manual_1990.pdf
 get intel-440fx-pciset-82441fx-82442fx-29054901.pdf $wb/2010/http://download.intel.com/design/chipsets/datashts/29054901.pdf
+get intel-440bx-82443bx-29063301.pdf $wb/2010/http://download.intel.com/design/chipsets/datashts/29063301.pdf
 get intel-piix3-82371sb-29055002.pdf $wb/2005/http://www.intel.com/design/chipsets/datashts/29055002.pdf
 get intel-piix4-82371ab-29056201.pdf $wb/2005/http://www.intel.com/design/chipsets/datashts/29056201.pdf
 get intel-mp-spec-1.4-24201606.pdf $wb/2010/http://download.intel.com/design/archives/processors/pro/docs/24201606.pdf

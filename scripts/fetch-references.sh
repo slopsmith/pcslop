@@ -45,7 +45,7 @@ for arg in "$@"; do
 	--gpu)
 		clone mesa https://gitlab.freedesktop.org/mesa/mesa.git
 		sparse linux https://github.com/torvalds/linux.git master drivers/gpu/drm/radeon include/uapi/drm include/drm
-		sparse linux-2.6.24 https://github.com/torvalds/linux.git v2.6.24 drivers/char/drm include/linux
+		sparse linux-2.6.24 https://github.com/torvalds/linux.git v2.6.24 drivers/char/drm drivers/video/aty include/linux include/video
 		if [ ! -d xf86-video-ati ]; then
 			git clone --progress https://gitlab.freedesktop.org/xorg/driver/xf86-video-ati.git xf86-video-ati
 			git -C xf86-video-ati -c advice.detachedHead=false checkout xf86-video-ati-6.14.6
