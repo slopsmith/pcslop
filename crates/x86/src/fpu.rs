@@ -332,11 +332,19 @@ fn round_up(rc: u8, sign: bool, half: Ordering, kept: u128) -> bool {
     }
 }
 
+/// Whether a value just below the smallest normal of `f` rounds up to it when
+/// rounded with unbounded exponent range: x86 detects tininess after rounding.
+fn rounds_to_normal(sign: bool, m: u64, rc: u8, f: &Binary) -> bool {
+    let (kept, lost, half) = split((m as u128) << 64, 63 - f.frac + 64);
+    lost && round_up(rc, sign, half, kept) && (kept + 1) >> (f.frac + 1) != 0
+}
+
 /// Rounds `m * 2^(e - 63)`, where `m` has bit 63 set, to format `f` by `rc`.
 pub(crate) fn round_pack(sign: bool, e: i32, m: u64, rc: u8, f: &Binary) -> (u64, u16) {
     let mut be = e + f.bias;
     let mut shift = 63 - f.frac;
     let tiny = be <= 0;
+    let tiny_after_rounding = tiny && (be < 0 || !rounds_to_normal(sign, m, rc, f));
     if tiny {
         shift += (1 - be).min(100) as u32;
         be = 0;
@@ -346,7 +354,7 @@ pub(crate) fn round_pack(sign: bool, e: i32, m: u64, rc: u8, f: &Binary) -> (u64
     let kept = (kept + up as u128) as u64;
     let mut bits = if tiny { kept } else { ((be as u64 - 1) << f.frac) + kept };
     let mut x = if lost { exc::PE } else { 0 };
-    if tiny && lost {
+    if tiny_after_rounding && lost {
         x |= exc::UE;
     }
     let max_exp = (1u64 << f.exp_bits) - 1;
@@ -500,6 +508,17 @@ mod tests {
         let (big, e) = F80::from_f64(1e300).to_f32_bits(rc::ZERO);
         assert_eq!(f32::from_bits(big), f32::MAX);
         assert!(e & exc::OE != 0);
+    }
+
+    #[test]
+    fn tininess_is_detected_after_rounding() {
+        let just_below = F80 { mant: u64::MAX, se: 0x3fff - 127 };
+        let (bits, e) = just_below.to_f32_bits(rc::UP);
+        assert_eq!(bits, 0x0080_0000);
+        assert_eq!(e, exc::PE);
+        let (bits, e) = just_below.to_f32_bits(rc::ZERO);
+        assert_eq!(bits, 0x007f_ffff);
+        assert_eq!(e, exc::PE | exc::UE);
     }
 
     #[test]
