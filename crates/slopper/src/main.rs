@@ -99,6 +99,7 @@ enum Event {
     Screenshot(PathBuf),
     /// A control-socket query answered by the emulator thread.
     Query(String, Sender<String>),
+    PowerButton,
     Quit,
 }
 
@@ -393,6 +394,10 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
             cpu.reset();
             board.reset();
         }
+        if board.power_off_requested() {
+            eprintln!("guest powered off");
+            break ExitCode::SUCCESS;
+        }
         keyq.poll(&mut board);
         if let Some(sc) = script.as_mut() {
             match sc.poll(&mut board, &mut keyq) {
@@ -538,6 +543,7 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                     };
                     let _ = reply.send(answer);
                 }
+                Event::PowerButton => board.power_button(),
                 Event::Quit => break 'run ExitCode::SUCCESS,
             }
         }
@@ -699,7 +705,7 @@ fn run_command(line: &str, tx: &Sender<Event>) -> Option<String> {
     })
 }
 
-/// Parses an input command (`shot`, `type`, `serial`, `key`, `mouse`, `tablet`, `quit`) into events.
+/// Parses an input command (`shot`, `type`, `serial`, `key`, `mouse`, `tablet`, `power`, `quit`) into events.
 fn command_event(line: &str) -> Result<Vec<Event>, String> {
     let (cmd, rest) = line.split_once(' ').unwrap_or((line, ""));
     Ok(match cmd {
@@ -732,9 +738,10 @@ fn command_event(line: &str) -> Result<Vec<Event>, String> {
                 _ => return Err("usage: tablet X Y [BUTTONS [WHEEL]] (guest screen pixels)".into()),
             }
         }
+        "power" => vec![Event::PowerButton],
         "quit" => vec![Event::Quit],
         _ => {
-            return Err("commands: screen | status | regs | mem HEXADDR [LEN] | profile [on|off] | pause | resume | shot PATH | type TEXT | serial LINE | key NAME[+NAME] | mouse DX DY [BUTTONS] | tablet X Y [BUTTONS [WHEEL]] | quit\n\
+            return Err("commands: screen | status | regs | mem HEXADDR [LEN] | profile [on|off] | pause | resume | shot PATH | type TEXT | serial LINE | key NAME[+NAME] | mouse DX DY [BUTTONS] | tablet X Y [BUTTONS [WHEEL]] | power | quit\n\
                  mouse sends relative PS/2 motion; tablet moves the USB tablet to guest screen pixel (X, Y)".into());
         }
     })
