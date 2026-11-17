@@ -37,6 +37,7 @@ scripts/vm stop xp
 
 **Control socket commands:**
 - `screen`, `status`, `regs`, `mem HEXADDR [LEN [CR3]]` (CR3 picks the address space; `regs` can be stale while the JIT runs)
+- `dump HEXADDR HEXLEN PATH [CR3]` writes guest memory to a host file (unmapped bytes read as `cc`); `poke HEXADDR HEXBYTES [CR3]` writes bytes, write protection ignored, so a process's copy-on-write data and code can be patched for an experiment
 - `profile on|off`, `pause`, `resume`
 - `shot PATH`, `type TEXT`, `serial LINE`, `key NAME[+NAME]`, `down NAME`, `up NAME` (hold a key between them)
 - `mouse DX DY [BUTTONS]`, `tablet X Y [BUTTONS [WHEEL]]`

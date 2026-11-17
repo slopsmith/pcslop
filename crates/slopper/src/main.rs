@@ -932,14 +932,9 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                         }
                         "mem" => {
                             let mut it = rest.split_whitespace();
-                            let addr = it.next().and_then(|a| u32::from_str_radix(a.trim_start_matches("0x"), 16).ok());
+                            let addr = hex_arg(it.next());
                             let len = it.next().and_then(|l| l.parse::<u32>().ok()).unwrap_or(64).min(4096);
-                            let mut other = it.next().and_then(|c| u32::from_str_radix(c.trim_start_matches("0x"), 16).ok()).map(|cr3| {
-                                let mut c = cpu.clone();
-                                c.cr3 = cr3;
-                                c.tlb.flush();
-                                c
-                            });
+                            let mut other = address_space(&cpu, hex_arg(it.next()));
                             let space = other.as_mut().unwrap_or(&mut cpu);
                             match addr {
                                 Some(a) => (0..len)
@@ -954,6 +949,50 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                                     .collect::<Vec<_>>()
                                     .join("\n"),
                                 None => "usage: mem HEXADDR [LEN [CR3]]".into(),
+                            }
+                        }
+                        "dump" => {
+                            let mut it = rest.split_whitespace();
+                            let (addr, len, path) = (hex_arg(it.next()), hex_arg(it.next()), it.next());
+                            let mut other = address_space(&cpu, hex_arg(it.next()));
+                            let space = other.as_mut().unwrap_or(&mut cpu);
+                            match (addr, len, path) {
+                                (Some(a), Some(l), Some(path)) => {
+                                    let data = (0..l)
+                                        .map(|i| match x86::interp::translate(space, &mut board, a.wrapping_add(i), false) {
+                                            Ok(p) => x86::bus::Bus::read8(&mut board, p),
+                                            Err(_) => 0xcc,
+                                        })
+                                        .collect::<Vec<_>>();
+                                    match std::fs::write(path, data) {
+                                        Ok(()) => format!("dumped {l:#x} bytes"),
+                                        Err(e) => format!("dump: {e}"),
+                                    }
+                                }
+                                _ => "usage: dump HEXADDR HEXLEN PATH [CR3]".into(),
+                            }
+                        }
+                        "poke" => {
+                            let mut it = rest.split_whitespace();
+                            let addr = hex_arg(it.next());
+                            let bytes = it.next().and_then(|h| (0..h.len() / 2).map(|i| u8::from_str_radix(h.get(2 * i..2 * i + 2)?, 16).ok()).collect::<Option<Vec<_>>>());
+                            let mut other = address_space(&cpu, hex_arg(it.next()));
+                            let space = other.as_mut().unwrap_or(&mut cpu);
+                            match (addr, bytes) {
+                                (Some(a), Some(b)) => {
+                                    // Translated as a read, so write-protected and copy-on-write pages can be patched.
+                                    let written = b
+                                        .iter()
+                                        .enumerate()
+                                        .filter(|&(i, &v)| {
+                                            let Ok(p) = x86::interp::translate(space, &mut board, a.wrapping_add(i as u32), false) else { return false };
+                                            x86::bus::Bus::write8(&mut board, p, v);
+                                            true
+                                        })
+                                        .count();
+                                    format!("wrote {written} bytes")
+                                }
+                                _ => "usage: poke HEXADDR HEXBYTES [CR3]".into(),
                             }
                         }
                         _ => format!("unknown query {cmd:?}"),
@@ -1123,10 +1162,22 @@ fn control_server(path: PathBuf, tx: Sender<Event>) {
 
 /// Runs one stdin or control-socket command and returns its answer, or None
 /// once the emulator has stopped.
+fn hex_arg(arg: Option<&str>) -> Option<u32> {
+    u32::from_str_radix(arg?.trim_start_matches("0x"), 16).ok()
+}
+
+/// A copy of `cpu` that walks the page tables at `cr3`, if one is given.
+fn address_space(cpu: &Cpu, cr3: Option<u32>) -> Option<Cpu> {
+    let mut c = cpu.clone();
+    c.cr3 = cr3?;
+    c.tlb.flush();
+    Some(c)
+}
+
 fn run_command(line: &str, tx: &Sender<Event>) -> Option<String> {
     let cmd = line.split_whitespace().next().unwrap_or("");
     let battery_query = cmd == "battery" && line.split_whitespace().nth(1).is_none();
-    if battery_query || matches!(cmd, "screen" | "regs" | "status" | "capture" | "pause" | "resume" | "mem" | "profile" | "cdrom" | "eject" | "save" | "load" | "stall") {
+    if battery_query || matches!(cmd, "screen" | "regs" | "status" | "capture" | "pause" | "resume" | "mem" | "poke" | "dump" | "profile" | "cdrom" | "eject" | "save" | "load" | "stall") {
         let (rtx, rrx) = channel();
         tx.send(Event::Query(line.to_string(), rtx)).ok()?;
         let wait = Duration::from_secs(if matches!(cmd, "save" | "load") { 120 } else { 10 });
@@ -1185,7 +1236,7 @@ fn command_event(line: &str) -> Result<Vec<Event>, String> {
         "battery" => vec![Event::Battery(parse_battery(rest.trim())?)],
         "quit" => vec![Event::Quit],
         _ => {
-            return Err("commands: screen | status | regs | mem HEXADDR [LEN [CR3]] | profile [on|off] | pause | resume | save DIR | load DIR | shot PATH | type TEXT | serial LINE | key NAME[+NAME] | down NAME | up NAME | mouse DX DY [BUTTONS [WHEEL]] | tablet X Y [BUTTONS [WHEEL]] | capture [on|off|toggle] | power | battery [host|off|PERCENT[:ac]] | cdrom [ISO] | eject | stall MS EVERY_MS | quit\n\
+            return Err("commands: screen | status | regs | mem HEXADDR [LEN [CR3]] | dump HEXADDR HEXLEN PATH [CR3] | poke HEXADDR HEXBYTES [CR3] | profile [on|off] | pause | resume | save DIR | load DIR | shot PATH | type TEXT | serial LINE | key NAME[+NAME] | down NAME | up NAME | mouse DX DY [BUTTONS [WHEEL]] | tablet X Y [BUTTONS [WHEEL]] | capture [on|off|toggle] | power | battery [host|off|PERCENT[:ac]] | cdrom [ISO] | eject | stall MS EVERY_MS | quit\n\
                  down and up press or release one key and hold it in between;\n\
                  mouse sends relative PS/2 motion; tablet moves the USB tablet to guest screen pixel (X, Y);\n\
                  capture sends the window's mouse as PS/2 motion only and drops tablet input;\n\
