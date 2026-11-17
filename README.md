@@ -23,6 +23,6 @@ cargo run --release -p cputest -- references/src/SingleStepTests-80386/v1_ex_rea
 
 SeaBIOS's debug output (port 0x402) goes to stdout.
 
-To watch and drive the VM from another machine, add `--vnc 5900` (with or without `--headless`) and connect a VNC client to port 5900. The server listens on 127.0.0.1 unless given an address, as in `--vnc 0.0.0.0:5900`. Set `SLOPPER_VNC_PASSWORD` to require a password; macOS Screen Sharing needs one. VNC authentication does not encrypt anything, so reach the port through SSH (`ssh -L 5900:localhost:5900 mac`) or a VPN.
+To watch and drive the VM from another machine, add `--vnc 5900` (with or without `--headless`) and connect a VNC client to port 5900. The server listens on 127.0.0.1 unless given an address, as in `--vnc 0.0.0.0:5900`. Set `SLOPPER_VNC_PASSWORD` to require a password; macOS Screen Sharing needs one. VNC authentication does not encrypt anything, so reach the port through SSH (`ssh -L 5900:localhost:5900 mac`) or a VPN. Over a slow link, pick ZRLE or Tight in the client if it does not already prefer one.
 
 Licensed under GPL-2.0-or-later.
