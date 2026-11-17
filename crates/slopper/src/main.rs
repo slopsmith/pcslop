@@ -634,6 +634,15 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                     let (cmd, rest) = q.split_once(' ').unwrap_or((q.as_str(), ""));
                     let answer = match cmd {
                         "screen" => text_screen(&mut board),
+                        "cdrom" if rest.trim().is_empty() => board.cdrom().unwrap_or("empty").to_string(),
+                        "cdrom" => match board.change_cdrom(Some(rest.trim())) {
+                            Ok(()) => "ok".into(),
+                            Err(e) => format!("cannot open {}: {e}", rest.trim()),
+                        },
+                        "eject" => {
+                            let _ = board.change_cdrom(None);
+                            "ok".into()
+                        }
                         "regs" => format_regs(&cpu),
                         "battery" => {
                             let source = if mirror_host { "mirroring the host" } else { "fixed" };
@@ -925,7 +934,7 @@ fn control_server(path: PathBuf, tx: Sender<Event>) {
 fn run_command(line: &str, tx: &Sender<Event>) -> Option<String> {
     let cmd = line.split_whitespace().next().unwrap_or("");
     let battery_query = cmd == "battery" && line.split_whitespace().nth(1).is_none();
-    if battery_query || matches!(cmd, "screen" | "regs" | "status" | "pause" | "resume" | "mem" | "profile") {
+    if battery_query || matches!(cmd, "screen" | "regs" | "status" | "pause" | "resume" | "mem" | "profile" | "cdrom" | "eject") {
         let (rtx, rrx) = channel();
         tx.send(Event::Query(line.to_string(), rtx)).ok()?;
         return Some(rrx.recv_timeout(Duration::from_secs(10)).unwrap_or_else(|_| "no answer".into()));
@@ -978,7 +987,7 @@ fn command_event(line: &str) -> Result<Vec<Event>, String> {
         "battery" => vec![Event::Battery(parse_battery(rest.trim())?)],
         "quit" => vec![Event::Quit],
         _ => {
-            return Err("commands: screen | status | regs | mem HEXADDR [LEN] | profile [on|off] | pause | resume | shot PATH | type TEXT | serial LINE | key NAME[+NAME] | mouse DX DY [BUTTONS] | tablet X Y [BUTTONS [WHEEL]] | power | battery [host|off|PERCENT[:ac]] | quit\n\
+            return Err("commands: screen | status | regs | mem HEXADDR [LEN] | profile [on|off] | pause | resume | shot PATH | type TEXT | serial LINE | key NAME[+NAME] | mouse DX DY [BUTTONS] | tablet X Y [BUTTONS [WHEEL]] | power | battery [host|off|PERCENT[:ac]] | cdrom [ISO] | eject | quit\n\
                  mouse sends relative PS/2 motion; tablet moves the USB tablet to guest screen pixel (X, Y)".into());
         }
     })

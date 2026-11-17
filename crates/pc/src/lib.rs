@@ -123,6 +123,8 @@ pub struct Board {
     start: Instant,
     pub reset_requested: bool,
     pub post_code: u8,
+    /// The ISO in the CD-ROM drive.
+    cdrom: Option<String>,
 }
 
 const LEGACY_START: u32 = 0xa_0000;
@@ -203,6 +205,7 @@ impl Board {
             start: Instant::now(),
             reset_requested: false,
             post_code: 0,
+            cdrom: None,
         };
         match cfg.gpu {
             Gpu::StdVga => {
@@ -236,6 +239,7 @@ impl Board {
         }
         b.sync_display_bars();
         b.uhci.attach(0, Box::new(usb::Tablet::new()));
+        b.ide.attach_cdrom(1, 0, None);
         b.setup_cmos(ram_bytes);
         b.fw_cfg.set(fw_cfg::key::RAM_SIZE, (ram_bytes as u64).to_le_bytes().to_vec());
         let e820 = fw_cfg::e820(&[(0, ram_bytes as u64, 1)]);
@@ -883,9 +887,25 @@ impl Board {
 
     /// Inserts an ISO image into the CD-ROM drive on the secondary master.
     pub fn attach_cdrom(&mut self, path: &str) -> std::io::Result<()> {
-        let b = ide::FileBackend::open(path, true)?;
-        self.ide.attach_cdrom(1, 0, Some(Box::new(b)));
+        self.change_cdrom(Some(path))
+    }
+
+    /// Puts the ISO at `path` in the CD-ROM drive, or empties it with `None`.
+    /// The guest sees a medium change, as if someone swapped the disc, even
+    /// if it had locked the tray.
+    pub fn change_cdrom(&mut self, path: Option<&str>) -> std::io::Result<()> {
+        let medium = match path {
+            Some(p) => Some(Box::new(ide::FileBackend::open(p, true)?) as Box<dyn ide::BlockBackend>),
+            None => None,
+        };
+        self.ide.attach_cdrom(1, 0, medium);
+        self.cdrom = path.map(str::to_string);
         Ok(())
+    }
+
+    /// The ISO in the CD-ROM drive, if any.
+    pub fn cdrom(&self) -> Option<&str> {
+        self.cdrom.as_deref()
     }
 
     /// Attaches a raw disk image as the primary master.
@@ -1630,6 +1650,23 @@ mod tests {
     fn config_write(b: &mut Board, bus: u32, dev: u32, off: u32, v: u32) {
         b.io_write(0xcf8, 4, 0x8000_0000 | bus << 16 | dev << 11 | off);
         b.io_write(0xcfc, 4, v);
+    }
+
+    #[test]
+    fn the_cdrom_drive_is_there_without_a_disc_and_takes_one_later() {
+        let mut b = board();
+        b.io_write(0x176, 1, 0xa0);
+        assert_eq!((b.io_read(0x174, 1), b.io_read(0x175, 1)), (0x14, 0xeb), "guests only look for a drive at boot");
+        assert_eq!(b.cdrom(), None);
+        let iso = std::env::temp_dir().join(format!("slopper-cdrom-test-{}.iso", std::process::id()));
+        std::fs::write(&iso, vec![0u8; 2048 * 16]).unwrap();
+        let path = iso.to_str().unwrap();
+        b.change_cdrom(Some(path)).unwrap();
+        assert_eq!(b.cdrom(), Some(path));
+        b.change_cdrom(None).unwrap();
+        assert_eq!(b.cdrom(), None);
+        assert!(b.change_cdrom(Some("/nonexistent/disc.iso")).is_err());
+        std::fs::remove_file(iso).unwrap();
     }
 
     #[test]
