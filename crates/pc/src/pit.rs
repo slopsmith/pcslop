@@ -86,6 +86,7 @@ impl Channel {
         let e = now.saturating_sub(start);
         match self.mode {
             0 => (e < p).then_some(start + p),
+            4 => (e <= p).then_some(start + p + 1),
             2 => Some(start + (e / p + 1) * p),
             3 => Some(start + (e / p + 1) * p),
             _ => None,
@@ -124,7 +125,7 @@ impl Pit {
             }
             self.irq_seen = edge;
             edges += 1;
-            if self.ch[0].mode == 0 || edges >= MAX_BACKLOG {
+            if matches!(self.ch[0].mode, 0 | 4) || edges >= MAX_BACKLOG {
                 self.irq_seen = now;
                 break;
             }
@@ -287,6 +288,19 @@ mod tests {
         assert_eq!(p.poll_irq0(one_period_ns / 2), 0);
         assert_eq!(p.poll_irq0(one_period_ns + 1000), 1);
         assert_eq!(p.poll_irq0(3 * one_period_ns + 1000), 2);
+    }
+
+    #[test]
+    fn mode4_strobe_raises_one_edge_after_terminal_count() {
+        let mut p = Pit::default();
+        p.write(0x43, 0x38, 0);
+        p.write(0x40, 0x00, 0);
+        p.write(0x40, 0x10, 0);
+        assert_eq!(p.poll_irq0(ns_at(0xfff)), 0);
+        assert!(p.next_irq0_ns(ns_at(0xfff)).is_some());
+        assert_eq!(p.poll_irq0(ns_at(0x1002)), 1);
+        assert_eq!(p.poll_irq0(ns_at(0x3000)), 0);
+        assert_eq!(p.next_irq0_ns(ns_at(0x3000)), None);
     }
 
     #[test]
