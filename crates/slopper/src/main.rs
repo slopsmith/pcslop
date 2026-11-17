@@ -37,12 +37,13 @@ struct Args {
     audio: bool,
     audio_wav: Option<PathBuf>,
     audio_silent: bool,
+    net: Option<net::user::UserNet>,
 }
 
 const USAGE: &str = "usage: slopper --bios <bios.bin> [--vgabios <vgabios.bin>] [--board fx|bx] \
 [--gpu stdvga|radeon --vga-rom <rom> [--gpu-trace PATH]] [--cdrom <iso>] [--hda <img>] \
 [--serial PATH|-] [--ram MiB] [--headless] [--jit] [--screenshot SECONDS:PATH]... [--exit-on-text TEXT] [--script FILE] [--control SOCKET] [--vnc [ADDR:]PORT] \
-[--audio ac97 [--audio-wav PATH] [--audio-silent]] [--max-instructions N]";
+[--audio ac97 [--audio-wav PATH] [--audio-silent]] [--net user[,hostfwd=tcp::HOSTPORT-:GUESTPORT]...] [--max-instructions N]";
 
 fn parse_args() -> Result<Args, String> {
     let mut args = Args {
@@ -67,6 +68,7 @@ fn parse_args() -> Result<Args, String> {
         audio: false,
         audio_wav: None,
         audio_silent: false,
+        net: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -109,6 +111,7 @@ fn parse_args() -> Result<Args, String> {
             },
             "--audio-wav" => args.audio_wav = Some(PathBuf::from(value()?)),
             "--audio-silent" => args.audio_silent = true,
+            "--net" => args.net = Some(net::user::UserNet::parse(&value()?)?),
             "--screenshot" => {
                 let v = value()?;
                 let (secs, path) = v.split_once(':').ok_or("--screenshot needs SECONDS:PATH")?;
@@ -371,6 +374,23 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
             }
         });
     }
+    if let Some(cfg) = &args.net {
+        let emu = std::thread::current();
+        let kicker = jit.as_ref().map(|j| j.kicker());
+        let wake = move || {
+            emu.unpark();
+            if let Some(k) = &kicker {
+                k.kick();
+            }
+        };
+        match net::start_user_network(cfg, Box::new(wake)) {
+            Ok(backend) => board.attach_nic(net::DEFAULT_MAC, backend),
+            Err(e) => {
+                eprintln!("cannot start the network: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     let mut cpu = Cpu::new();
     cpu.start_host_tsc();
     let started = Instant::now();
@@ -382,6 +402,7 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
     let mut last_time = HostTime::default();
     let mut last_stats = jit::Stats::default();
     let mut last_apic = pc::apic::Stats::default();
+    let mut last_nic = net::rtl8139::Stats::default();
     let mut script = match args.script.as_ref().map(Script::load).transpose() {
         Ok(s) => s,
         Err(e) => {
@@ -434,7 +455,7 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
             Some(Exit::Halted) => {
                 let wait = board.next_event_ns().min(1_000_000);
                 let t = Instant::now();
-                std::thread::sleep(Duration::from_nanos(wait));
+                std::thread::park_timeout(Duration::from_nanos(wait));
                 time.halted += t.elapsed();
             }
             Some(Exit::Shutdown) => {
@@ -565,6 +586,18 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                                     l.ppr()
                                 );
                                 last_apic = a;
+                            }
+                            if let Some(a) = board.nic_stats() {
+                                let b = last_nic;
+                                let frames = (a.tx_frames + a.rx_frames - b.tx_frames - b.rx_frames).max(1);
+                                out += &format!(
+                                    "\nnic/s: tx {:.0} rx {:.0} dropped {:.0} | register accesses per frame {:.1}",
+                                    (a.tx_frames - b.tx_frames) as f64 / span,
+                                    (a.rx_frames - b.rx_frames) as f64 / span,
+                                    (a.rx_dropped - b.rx_dropped) as f64 / span,
+                                    (a.reads + a.writes - b.reads - b.writes) as f64 / frames as f64,
+                                );
+                                last_nic = a;
                             }
                             if let Some(j) = jit.as_mut() {
                                 let (a, b) = (j.stats, last_stats);

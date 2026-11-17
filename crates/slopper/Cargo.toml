@@ -18,4 +18,5 @@ flate2 = "1.1"
 png = "0.18"
 usb = { path = "../usb" }
 jit = { path = "../jit" }
+net = { path = "../net" }
 x86 = { path = "../x86" }

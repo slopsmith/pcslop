@@ -49,6 +49,11 @@
         packages = [
           pkgs.acpica-tools
           pkgs.nasm
+          pkgs.pkg-config
+        ];
+        buildInputs = [
+          pkgs.glib
+          pkgs.libslirp
         ];
       };
     };

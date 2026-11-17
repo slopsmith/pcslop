@@ -372,6 +372,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "net"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "libc",
+ "pkg-config",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -394,6 +403,7 @@ version = "0.1.0"
 dependencies = [
  "ac97",
  "ide",
+ "net",
  "radeon",
  "usb",
  "vga",
@@ -603,6 +613,7 @@ dependencies = [
  "flate2",
  "jit",
  "minifb",
+ "net",
  "pc",
  "png",
  "usb",

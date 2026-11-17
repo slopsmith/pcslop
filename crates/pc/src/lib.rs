@@ -113,6 +113,8 @@ pub struct Board {
     pub pm: pm::Pm,
     /// The AC'97 controller and its index in `pci`, when the board has one.
     ac97: Option<(usize, ac97::Ac97)>,
+    /// The network card and its index in `pci`, if one is plugged in.
+    nic: Option<(usize, net::Rtl8139)>,
     vgabios: Vec<u8>,
     pub debugcon: Box<dyn Write + Send>,
     start: Instant,
@@ -130,6 +132,7 @@ const PM: usize = 5;
 /// Only on the 440BX.
 const AGP_BRIDGE: usize = 6;
 const UHCI_PORTS: u16 = 32;
+const NIC_SLOT: u8 = 3;
 const LEGACY_END: u32 = 0x10_0000;
 /// The I/O APIC input that ISA IRQ 0 drives. QEMU wires it the same way
 /// (hw/intc/ioapic.c), and SeaBIOS's MP table says so with etc/irq0-override.
@@ -190,6 +193,7 @@ impl Board {
             uhci: usb::Uhci::new(),
             pm: pm::Pm::default(),
             ac97: None,
+            nic: None,
             vgabios: Vec::new(),
             debugcon: Box::new(std::io::stdout()),
             start: Instant::now(),
@@ -266,6 +270,56 @@ impl Board {
         self.ac97.as_ref().and_then(|(i, _)| self.pci[*i].1.io_bar(bar))
     }
 
+    /// Plugs an RTL8139 into slot 3, cabled to `backend`. Call it before the
+    /// guest starts, so the firmware sees the card.
+    pub fn attach_nic(&mut self, mac: [u8; 6], backend: Box<dyn net::Backend>) {
+        use net::rtl8139;
+        let mut c = ConfigSpace::new(rtl8139::PCI_VENDOR, rtl8139::PCI_DEVICE, rtl8139::PCI_CLASS_CODE, rtl8139::PCI_REVISION, 0);
+        c.set16(0x2c, 0x1af4);
+        c.set16(0x2e, 0x1100);
+        c.add_bar(0, pci::BarKind::Io, rtl8139::REGS_SIZE);
+        c.add_bar(1, pci::BarKind::Mem, rtl8139::REGS_SIZE);
+        c.data[pci::INTERRUPT_PIN] = 1;
+        // Linux's 8139cp gives up on a card whose cache line size it cannot set.
+        c.writable[0x0c] = 0xff;
+        self.pci.push((Bdf::new(0, NIC_SLOT, 0), c));
+        self.nic = Some((self.pci.len() - 1, net::Rtl8139::new(mac, backend)));
+    }
+
+    /// Register and frame counts of the network card, if there is one.
+    pub fn nic_stats(&self) -> Option<net::rtl8139::Stats> {
+        self.nic.as_ref().map(|(_, n)| n.stats)
+    }
+
+    fn nic_port(&self, port: u16) -> Option<u8> {
+        let (i, _) = self.nic.as_ref()?;
+        let off = port.wrapping_sub(self.pci[*i].1.io_bar(0)?);
+        (u32::from(off) < net::rtl8139::REGS_SIZE).then_some(off as u8)
+    }
+
+    fn nic_mmio(&self, addr: u32) -> Option<u8> {
+        let (i, _) = self.nic.as_ref()?;
+        let off = addr.wrapping_sub(self.pci[*i].1.mem_bar(1)?);
+        (off < net::rtl8139::REGS_SIZE).then_some(off as u8)
+    }
+
+    fn nic_read(&mut self, off: u8, size: u8) -> u32 {
+        let now = self.now_ns();
+        self.nic.as_mut().map_or(0, |(_, n)| n.read(off, size, now))
+    }
+
+    fn nic_write(&mut self, off: u8, size: u8, v: u32) {
+        let now = self.now_ns();
+        if let Some((i, nic)) = self.nic.as_mut() {
+            if self.pci[*i].1.bus_master() {
+                nic.write(off, size, v, now, &mut RamDma(&mut self.ram[..], &mut self.code_watch));
+            } else {
+                nic.write(off, size, v, now, &mut NoDma);
+            }
+        }
+        self.sync_pci_irqs();
+    }
+
     fn setup_cmos(&mut self, ram: u32) {
         let r = &mut self.rtc.ram;
         let ext_kb = ((ram.saturating_sub(0x10_0000)) / 1024).min(0xfc00);
@@ -314,6 +368,13 @@ impl Board {
         {
             a.run(now, &mut RamDma(&mut self.ram[..], &mut self.code_watch));
         }
+        if let Some((i, nic)) = self.nic.as_mut() {
+            if self.pci[*i].1.bus_master() {
+                nic.poll(now, &mut RamDma(&mut self.ram[..], &mut self.code_watch));
+            } else {
+                nic.poll(now, &mut NoDma);
+            }
+        }
         self.sync_sci();
     }
 
@@ -347,7 +408,9 @@ impl Board {
         }
         let usb = self.uhci.next_frame_ns().map(|t| t.saturating_sub(now));
         let lapic = self.lapic.as_ref().and_then(|l| l.next_event_ns(now));
-        self.pit.next_irq0_ns(now).unwrap_or(1_000_000).min(usb.unwrap_or(u64::MAX)).min(lapic.unwrap_or(u64::MAX)).min(1_000_000)
+        let nic = self.nic.as_ref().and_then(|(_, n)| n.next_event_ns()).map(|t| t.saturating_sub(now));
+        let others = usb.unwrap_or(u64::MAX).min(lapic.unwrap_or(u64::MAX)).min(nic.unwrap_or(u64::MAX));
+        self.pit.next_irq0_ns(now).unwrap_or(1_000_000).min(others).min(1_000_000)
     }
 
     /// True while the last timer interrupt still waits to be taken, on
@@ -525,6 +588,9 @@ impl Board {
         if let Some(v) = self.apic_read(addr & !3) {
             return (v >> (8 * (addr & 3))) & (u32::MAX >> (32 - 8 * size as u32));
         }
+        if let Some(off) = self.nic_mmio(addr) {
+            return self.nic_read(off, size);
+        }
         let now = self.now_ns();
         let c = &self.pci[DISPLAY].1;
         let (fb, regs, rom) = (c.mem_bar(0), c.mem_bar(2), c.rom_bar());
@@ -572,6 +638,9 @@ impl Board {
     fn mmio_write(&mut self, addr: u32, size: u8, v: u32) {
         if self.apic_write(addr, v, size) {
             return;
+        }
+        if let Some(off) = self.nic_mmio(addr) {
+            return self.nic_write(off, size, v);
         }
         let now = self.now_ns();
         let c = &self.pci[DISPLAY].1;
@@ -812,9 +881,14 @@ impl Board {
 
     /// Level of the INTx line of `self.pci[function]`.
     fn intx(&self, function: usize) -> bool {
-        match &self.ac97 {
-            Some((i, a)) if *i == function => a.irq(),
-            _ => function == UHCI && self.uhci.irq(),
+        if let Some((i, a)) = &self.ac97
+            && *i == function
+        {
+            return a.irq();
+        }
+        match function {
+            UHCI => self.uhci.irq(),
+            _ => self.nic.as_ref().is_some_and(|(i, n)| *i == function && n.irq()),
         }
     }
 
@@ -878,6 +952,9 @@ impl Board {
         if let Some((_, a)) = self.ac97.as_mut() {
             a.reset();
         }
+        if let Some((_, nic)) = self.nic.as_mut() {
+            nic.reset();
+        }
         self.pm.reset();
         self.sci = false;
         self.pci[PM].1 = pm::config_space();
@@ -924,6 +1001,32 @@ impl ac97::DmaMemory for RamDma<'_> {
     fn write_phys(&mut self, addr: u32, buf: &[u8]) {
         ide::DmaMemory::write_phys(self, addr, buf)
     }
+}
+
+impl net::DmaMemory for RamDma<'_> {
+    fn read_phys(&mut self, addr: u64, buf: &mut [u8]) {
+        match u32::try_from(addr) {
+            Ok(a) => ide::DmaMemory::read_phys(self, a, buf),
+            Err(_) => buf.fill(0xff),
+        }
+    }
+
+    fn write_phys(&mut self, addr: u64, buf: &[u8]) {
+        if let Ok(a) = u32::try_from(addr) {
+            ide::DmaMemory::write_phys(self, a, buf)
+        }
+    }
+}
+
+/// What a card sees while the guest has bus mastering turned off.
+struct NoDma;
+
+impl net::DmaMemory for NoDma {
+    fn read_phys(&mut self, _addr: u64, buf: &mut [u8]) {
+        buf.fill(0xff);
+    }
+
+    fn write_phys(&mut self, _addr: u64, _buf: &[u8]) {}
 }
 
 impl usb::DmaMemory for RamDma<'_> {
@@ -1069,6 +1172,9 @@ impl Bus for Board {
         {
             return (0..size as u16).fold(0, |v, i| v | (self.pm.smbus_read(port - base + i) as u32) << (8 * i));
         }
+        if let Some(off) = self.nic_port(port) {
+            return self.nic_read(off, size);
+        }
         self.ide.set_bus_master_base(self.pci[IDE].1.io_bar(4));
         if let Some(v) = self.ide.io_read(port, size) {
             self.sync_ide();
@@ -1146,6 +1252,9 @@ impl Bus for Board {
                 self.pm.smbus_write(port - base + i, (value >> (8 * i)) as u8);
             }
             return;
+        }
+        if let Some(off) = self.nic_port(port) {
+            return self.nic_write(off, size, value);
         }
         self.ide.set_bus_master_base(self.pci[IDE].1.io_bar(4));
         if self.ide.io_write(port, size, value, &mut RamDma(&mut self.ram[..], &mut self.code_watch)) {
@@ -1320,6 +1429,102 @@ mod tests {
         assert_eq!(b.io_read(0xcfc, 4), u32::MAX);
         b.add_ac97(Box::new(ac97::NullOut));
         assert_eq!(b.io_read(0xcfc, 4), 0x2415_8086);
+    }
+
+    struct Silent;
+
+    impl net::Backend for Silent {
+        fn send(&mut self, _frame: &[u8]) {}
+        fn recv(&mut self) -> Option<Vec<u8>> {
+            None
+        }
+    }
+
+    fn pci_write_sized(b: &mut Board, dev: u32, reg: u32, size: u8, v: u32) {
+        b.io_write(0xcf8, 4, 0x8000_0000 | dev << 11 | (reg & !3));
+        b.io_write(0xcfc + (reg & 3) as u16, size, v);
+    }
+
+    fn pci_read(b: &mut Board, dev: u32, reg: u32) -> u32 {
+        b.io_write(0xcf8, 4, 0x8000_0000 | dev << 11 | reg);
+        b.io_read(0xcfc, 4)
+    }
+
+    /// A board with the card's BARs at I/O 0xc100 and 0xfebf1000, as SeaBIOS
+    /// would place them, and PIRQC routed to IRQ 11.
+    fn board_with_nic() -> Board {
+        let mut b = board();
+        b.attach_nic(net::DEFAULT_MAC, Box::new(Silent));
+        pci_write_sized(&mut b, 3, 0x10, 4, 0xc100);
+        pci_write_sized(&mut b, 3, 0x14, 4, 0xfebf_1000);
+        pci_write_sized(&mut b, 3, 0x04, 2, 0x07);
+        pci_write_sized(&mut b, 1, pci::PIRQRC as u32 + 2, 1, 11);
+        b
+    }
+
+    #[test]
+    fn nic_is_absent_unless_attached() {
+        let mut b = board();
+        assert_eq!(pci_read(&mut b, 3, 0), 0xffff_ffff);
+    }
+
+    #[test]
+    fn nic_sits_at_slot_3_with_an_io_and_a_memory_bar() {
+        let mut b = board();
+        b.attach_nic(net::DEFAULT_MAC, Box::new(Silent));
+        assert_eq!(pci_read(&mut b, 3, 0), 0x8139_10ec);
+        assert_eq!(pci_read(&mut b, 3, 0x08), 0x0200_0020);
+        assert_eq!(pci_read(&mut b, 3, 0x3c) >> 8 & 0xff, 1, "INTA#");
+        pci_write_sized(&mut b, 3, 0x10, 4, 0xffff_ffff);
+        pci_write_sized(&mut b, 3, 0x14, 4, 0xffff_ffff);
+        assert_eq!(pci_read(&mut b, 3, 0x10), 0xffff_ff01);
+        assert_eq!(pci_read(&mut b, 3, 0x14), 0xffff_ff00);
+    }
+
+    #[test]
+    fn nic_registers_answer_through_both_bars() {
+        let mut b = board_with_nic();
+        assert_eq!(b.io_read(0xc100, 4), u32::from_le_bytes([0x52, 0x54, 0x00, 0x12]));
+        assert_eq!(b.read16(0xfebf_1004), 0x5634);
+        b.write32(0xfebf_1030, 0x0012_3400);
+        assert_eq!(b.io_read(0xc130, 4), 0x0012_3400, "a 32-bit MMIO write reaches RxBuf whole");
+    }
+
+    #[test]
+    fn nic_interrupt_reaches_irq_11_through_pirqc() {
+        let mut b = board_with_nic();
+        for (port, v) in [(0x20, 0x11), (0x21, 0x08), (0x21, 0x04), (0x21, 0x01), (0x21, 0x00), (0xa0, 0x11), (0xa1, 0x70), (0xa1, 0x02), (0xa1, 0x01), (0xa1, 0x00)] {
+            b.io_write(port, 1, v);
+        }
+        b.io_write(0x4d1, 1, 0x08);
+        b.write32(apic::DEFAULT_BASE + apic::reg::SVR, 0x1ff);
+        b.write32(apic::DEFAULT_BASE + apic::reg::LVT_LINT0, 0x8700);
+        b.io_write(0xc137, 1, 0x0c);
+        b.io_write(0xc13c, 2, 0x0004);
+        b.io_write(0xc120, 4, 0x2000);
+        b.io_write(0xc110, 4, 60);
+        let irr11 = |b: &Board| b.pic.registers()[1].0 & 1 << 3 != 0;
+        assert!(irr11(&b));
+        assert_eq!(b.inta(), 0x73);
+        b.io_write(0xc13e, 2, 0x0004);
+        assert!(!irr11(&b));
+    }
+
+    #[test]
+    fn nic_interrupt_reaches_io_apic_input_18() {
+        let mut b = board_with_nic();
+        b.write32(apic::DEFAULT_BASE + apic::reg::SVR, 0x1ff);
+        b.write32(ioapic::BASE, 0x10 + 2 * (PIRQ_PIN as u32 + 2));
+        b.write32(ioapic::BASE + 0x10, 0x8000 | 0x42);
+        b.io_write(0xc137, 1, 0x0c);
+        b.io_write(0xc13c, 2, 0x0004);
+        b.io_write(0xc120, 4, 0x2000);
+        b.io_write(0xc110, 4, 60);
+        assert!(b.intr());
+        assert_eq!(b.inta(), 0x42);
+        b.io_write(0xc13e, 2, 0x0004);
+        b.write32(apic::DEFAULT_BASE + apic::reg::EOI, 0);
+        assert!(!b.intr());
     }
 
     #[test]

@@ -74,3 +74,5 @@ Not found as free, trustworthy copies: PCI BIOS Spec 2.1, PCI Local Bus 2.3, the
 | --- | --- | --- | --- |
 | `crates/pc/src/rtc.rs` | `civil_from_days` / `days_from_civil` date conversions | Howard Hinnant, [chrono-compatible low-level date algorithms](https://howardhinnant.github.io/date_algorithms.html) | Public domain |
 | `crates/cputest/src/moo.rs` | MOO reader, written from the format spec (no code copied) | Daniel Balsom, [moo_format_v1.md](https://github.com/dbalsom/moo/blob/main/doc/moo_format_v1.md) | MIT |
+| `crates/net/src/rtl8139.rs`, `crates/net/src/eeprom.rs` | RTL8139C+ registers, receive ring, transmit descriptors, C+ rings and offloads, 93C46 EEPROM; the multicast hash follows `net_crc32` in `net/net.c` | QEMU `hw/net/rtl8139.c`, Igor Kovalenko with Mark Malakanov, Juergen Lock, Frediano Ziglio, Benjamin Poirier and others | MIT |
+| `crates/net/src/slirp.rs` | Links libslirp (not copied) and declares the parts of `libslirp.h` it calls | [libslirp](https://gitlab.freedesktop.org/slirp/libslirp) | BSD-3-Clause |

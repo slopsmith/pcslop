@@ -10,6 +10,7 @@ publish.workspace = true
 ac97 = { path = "../ac97" }
 ide = { path = "../ide" }
 radeon = { path = "../radeon" }
+net = { path = "../net" }
 usb = { path = "../usb" }
 vga = { path = "../vga" }
 x86 = { path = "../x86" }
