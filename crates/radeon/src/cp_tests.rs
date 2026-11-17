@@ -320,3 +320,17 @@ fn nextchar_packets_draw_a_glyph_with_the_current_colours() {
     submit(&mut r, &mut ram, &[pkt3(cp::op::NEXTCHAR, 3), 1 << 16 | 2, 1 << 16 | 4, 0b0110]);
     assert_eq!([2, 3, 4, 5].map(|x| px32(&r, x, 1)), [0x11, 0xaa, 0xaa, 0x11]);
 }
+
+#[test]
+fn hostdata_blt_translates_8bpp_pixels_through_the_loaded_palette() {
+    let mut ram = Ram::new();
+    let mut r = card_with_ring(&mut ram);
+    let gmc = GMC_DST_PITCH_OFFSET_CNTL | 15 << 4 | 6 << 8 | 1 << 12 | 0xcc << 16 | 4 << 24 | 1 << 27;
+    let po = (256 / 64) << 22 | 0xf000_0000 >> 10;
+    let mut ring = vec![pkt3(cp::op::LOAD_PALETTE, 17), 1];
+    ring.extend((0..16).map(|i| 0x0010_0000 * i + i));
+    ring.extend_from_slice(&[pkt3(cp::op::HOSTDATA_BLT, 9), gmc, po, 0, 0, 1 << 16 | 1, 2 << 16 | 3, 2, 0x0302_0100, 0x0f05]);
+    submit(&mut r, &mut ram, &ring);
+    assert_eq!([1, 2, 3].map(|x| px32(&r, x, 1)), [0x0000_0000, 0x0010_0001, 0x0020_0002]);
+    assert_eq!([1, 2, 3].map(|x| px32(&r, x, 2)), [0x0030_0003, 0x0050_0005, 0x00f0_000f]);
+}

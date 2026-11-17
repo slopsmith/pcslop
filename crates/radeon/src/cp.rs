@@ -17,6 +17,7 @@ pub(crate) mod op {
     pub const NOP: u8 = 0x10;
     pub const NEXTCHAR: u8 = 0x19;
     pub const SET_SCISSORS: u8 = 0x1e;
+    pub const LOAD_PALETTE: u8 = 0x2c;
     pub const PAINT: u8 = 0x91;
     pub const BITBLT: u8 = 0x92;
     pub const HOSTDATA_BLT: u8 = 0x94;
@@ -165,6 +166,13 @@ impl Radeon {
                 for (reg, &v) in [SC_TOP_LEFT, SC_BOTTOM_RIGHT].into_iter().zip(body) {
                     self.cp_reg_write(mem, reg, v);
                 }
+            }
+            op::LOAD_PALETTE => {
+                let n = match body.first() {
+                    Some(1) => 16,
+                    _ => 256,
+                };
+                self.engine.palette = body.iter().skip(1).take(n).copied().collect();
             }
             op::PAINT
             | op::BITBLT

@@ -65,6 +65,11 @@ pub(crate) struct Engine {
     pub line: (i32, i32),
     pub host: Option<HostBlit>,
     pub ops: u64,
+    /// GMC bit 27, the third bit of the source type, which selects palette
+    /// sources (R5xx Acceleration guide v1.5, DP_GUI_MASTER_CNTL).
+    pub src_type_hi: bool,
+    /// Entries from LOAD_PALETTE, already in the destination format.
+    pub palette: Vec<u32>,
 }
 
 struct Cursor<'a> {
@@ -191,6 +196,12 @@ impl Radeon {
         self.reg(DP_DATATYPE)
     }
 
+    /// 0 and 1 are mono opaque and transparent, 3 matches the destination,
+    /// 5 indexes the palette with 8-bit pixels.
+    fn src_type(&self) -> u32 {
+        (self.datatype() >> 16) & 3 | (self.engine.src_type_hi as u32) << 2
+    }
+
     fn rop(&self) -> u8 {
         (self.reg(DP_MIX) >> 16) as u8
     }
@@ -206,6 +217,7 @@ impl Radeon {
     }
 
     fn gui_master_written(&mut self, g: u32) {
+        self.engine.src_type_hi = g & 1 << 27 != 0;
         let dt = self.reg(DP_DATATYPE) & !0x4003_0f0f;
         self.regs[DP_DATATYPE as usize / 4] =
             dt | (g >> 8 & 0xf) | (g >> 4 & 0xf) << 8 | (g >> 12 & 3) << 16 | (g >> 14 & 1) << 30;
@@ -328,15 +340,11 @@ impl Radeon {
     /// Dwords of HOST_DATA a blit of `rect` takes.
     fn host_dwords(&self, rect: Rect) -> usize {
         let (w, h) = (rect.w as usize, rect.h as usize);
-        if (self.datatype() >> 16) & 3 != 3 {
-            if self.src_source() == 4 {
-                (w.div_ceil(8) * h).div_ceil(4)
-            } else {
-                (w * h).div_ceil(32)
-            }
-        } else {
-            let bpp = bytes_per_pixel(self.datatype()).unwrap_or(4);
-            (w * h * bpp).div_ceil(4)
+        match self.src_type() {
+            3 => (w * h * bytes_per_pixel(self.datatype()).unwrap_or(4)).div_ceil(4),
+            5 => (w * h).div_ceil(4),
+            _ if self.src_source() == 4 => (w.div_ceil(8) * h).div_ceil(4),
+            _ => (w * h).div_ceil(32),
         }
     }
 
@@ -355,7 +363,18 @@ impl Radeon {
             return;
         };
         let w = hb.rect.w as usize;
-        if (self.datatype() >> 16) & 3 != 3 {
+        let ty = self.src_type();
+        if ty == 5 {
+            let bpp = bytes_per_pixel(self.datatype()).unwrap_or(4);
+            let bytes: Vec<u8> = hb
+                .data
+                .iter()
+                .flat_map(|d| d.to_le_bytes())
+                .take(w * hb.rect.h as usize)
+                .flat_map(|i| self.engine.palette.get(i as usize).copied().unwrap_or(0).to_le_bytes().into_iter().take(bpp))
+                .collect();
+            self.draw(hb.rect, Src::Pixels { data: &bytes, stride: w }, mem);
+        } else if ty < 3 {
             let row_bits = if self.src_source() == 4 {
                 w.div_ceil(8) * 8
             } else {
@@ -371,7 +390,7 @@ impl Radeon {
                 },
                 mem,
             );
-        } else {
+        } else if ty == 3 {
             let bytes: Vec<u8> = hb.data.iter().flat_map(|d| d.to_le_bytes()).collect();
             self.draw(
                 hb.rect,
@@ -566,7 +585,7 @@ impl Radeon {
         let base = in_vram.unwrap_or(0);
         let need_pat = uses_pat(rop);
         let need_src = uses_src(rop);
-        let mono = (self.datatype() >> 16) & 3;
+        let mono = self.src_type();
         let (sfg, sbg) = (self.reg(DP_SRC_FRGD_CLR), self.reg(DP_SRC_BKGD_CLR));
         let solid = matches!((self.datatype() >> 8) & 0xf, 13 | 14);
         if solid
