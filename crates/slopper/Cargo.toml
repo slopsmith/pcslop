@@ -13,6 +13,7 @@ window = ["dep:minifb"]
 [dependencies]
 minifb = { version = "0.29", optional = true }
 pc = { path = "../pc" }
+flate2 = "1.1"
 png = "0.18"
 usb = { path = "../usb" }
 jit = { path = "../jit" }

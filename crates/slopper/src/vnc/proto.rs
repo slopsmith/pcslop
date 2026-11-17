@@ -78,19 +78,26 @@ impl PixelFormat {
             return;
         }
         for &p in pixels {
-            let mut v = 0u32;
-            for (i, at) in [16, 8, 0].into_iter().enumerate() {
-                let c = (p >> at) & 0xff;
-                let max = self.max[i] as u32;
-                v |= ((c * max + 127) / 255) << self.shift[i];
-            }
-            match (self.bpp, self.big_endian) {
-                (8, _) => out.push(v as u8),
-                (16, false) => out.extend((v as u16).to_le_bytes()),
-                (16, true) => out.extend((v as u16).to_be_bytes()),
-                (_, false) => out.extend(v.to_le_bytes()),
-                (_, true) => out.extend(v.to_be_bytes()),
-            }
+            let (b, n) = self.pixel_bytes(p);
+            out.extend_from_slice(&b[..n]);
+        }
+    }
+
+    /// One `0x00RRGGBB` pixel in this format: its bytes in wire order, and
+    /// how many of them there are.
+    pub fn pixel_bytes(&self, p: u32) -> ([u8; 4], usize) {
+        let mut v = 0u32;
+        for (i, at) in [16, 8, 0].into_iter().enumerate() {
+            let c = (p >> at) & 0xff;
+            let max = self.max[i] as u32;
+            v |= ((c * max + 127) / 255) << self.shift[i];
+        }
+        match (self.bpp, self.big_endian) {
+            (8, _) => ([v as u8, 0, 0, 0], 1),
+            (16, false) => ([v as u8, (v >> 8) as u8, 0, 0], 2),
+            (16, true) => ([(v >> 8) as u8, v as u8, 0, 0], 2),
+            (_, false) => (v.to_le_bytes(), 4),
+            (_, true) => (v.to_be_bytes(), 4),
         }
     }
 }

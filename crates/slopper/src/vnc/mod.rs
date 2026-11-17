@@ -2,6 +2,7 @@
 //! pointer input back into the guest.
 
 mod des;
+mod encode;
 mod keysym;
 mod proto;
 
@@ -91,7 +92,8 @@ fn client(mut conn: TcpStream, tx: Sender<Event>, shared: Arc<Shared>, password:
         }
         input.release_all();
     });
-    let result = Session::new(w, h, size).run(&mut conn, msg_rx, &shared);
+    let peer = conn.peer_addr().map_or_else(|_| "?".into(), |a| a.to_string());
+    let result = Session::new(w, h, size, peer).run(&mut conn, msg_rx, &shared);
     let _ = conn.shutdown(Shutdown::Both);
     result
 }
@@ -174,10 +176,12 @@ struct Session {
     request: Option<bool>,
     size: Arc<AtomicU32>,
     view: Vec<u32>,
+    encoder: encode::Encoder,
+    peer: String,
 }
 
 impl Session {
-    fn new(width: u32, height: u32, size: Arc<AtomicU32>) -> Session {
+    fn new(width: u32, height: u32, size: Arc<AtomicU32>, peer: String) -> Session {
         Session {
             pf: PixelFormat::NATIVE,
             desktop_size: false,
@@ -191,6 +195,8 @@ impl Session {
             request: None,
             size,
             view: Vec::new(),
+            encoder: encode::Encoder::new(),
+            peer,
         }
     }
 
@@ -235,7 +241,14 @@ impl Session {
                 }
                 self.pf = pf;
             }
-            ClientMsg::SetEncodings(encs) => self.desktop_size = encs.contains(&ENC_DESKTOP_SIZE),
+            ClientMsg::SetEncodings(encs) => {
+                self.desktop_size = encs.contains(&ENC_DESKTOP_SIZE);
+                let before = self.encoder.kind;
+                self.encoder.set_encodings(&encs);
+                if self.encoder.kind != before || self.sent_seq.is_none() {
+                    eprintln!("vnc: {} gets {:?} encoding", self.peer, self.encoder.kind);
+                }
+            }
             ClientMsg::UpdateRequest { incremental } => {
                 self.request = Some(self.request.unwrap_or(false) || !incremental);
             }
@@ -283,7 +296,7 @@ impl Session {
             proto::rect_header(out, Rect { x: 0, y: 0, w: w as u16, h: h as u16 }, ENC_DESKTOP_SIZE);
         }
         for r in rects {
-            proto::raw_rect(out, &self.pf, &self.view, w, r);
+            self.encoder.rect(out, &self.pf, &self.view, w, r);
         }
         std::mem::swap(&mut self.sent, &mut self.view);
         self.request = None;
