@@ -325,6 +325,22 @@ pub fn build() -> (Vec<u32>, Entries) {
     a.str(Width::W, r(1), STATE, state::BUDGET as i32);
     a.cbz(Size::W, r(1), pending);
     a.bind(unlimited);
+    let (tag, entry) = (r(6), r(7));
+    let translate = a.label();
+    a.ldr(Width::W, tag, STATE, state::USER as i32);
+    a.logic_shift(Logic::Orr, false, Size::X, tag, r(0), tag, Shift::Lsl, 32);
+    a.ldr(Width::W, entry, STATE, state::VEPOCH as i32);
+    a.logic_shift(Logic::Orr, false, Size::X, tag, tag, entry, Shift::Lsl, 33);
+    a.logic_shift(Logic::Eor, false, Size::W, entry, r(0), r(0), Shift::Lsr, 14);
+    let ok = a.logic_imm(Logic::And, Size::W, entry, entry, layout::VLOOKUP_ENTRIES as u64 - 1);
+    assert!(ok);
+    a.ldr(Width::X, r(2), STATE, state::VLOOKUP as i32);
+    a.add_shift(Size::X, entry, r(2), entry, Shift::Lsl, 4);
+    a.ldp(Size::X, r(4), r(5), entry, 0);
+    a.eor(Size::X, r(4), r(4), tag);
+    a.cbnz(Size::X, r(4), translate);
+    a.br(r(5));
+    a.bind(translate);
     a.at_s1e1r(r(0));
     a.isb();
     a.mrs(r(1), sysreg::PAR_EL1);
@@ -343,11 +359,13 @@ pub fn build() -> (Vec<u32>, Entries) {
     a.ldp(Size::X, r(4), r(5), r(2), 0);
     a.eor(Size::X, r(4), r(4), r(1));
     a.cbnz(Size::X, r(4), second);
+    a.stp(Size::X, tag, r(5), entry, 0);
     a.br(r(5));
     a.bind(second);
     a.ldp(Size::X, r(4), r(5), r(2), 16);
     a.eor(Size::X, r(4), r(4), r(1));
     a.cbnz(Size::X, r(4), miss);
+    a.stp(Size::X, tag, r(5), entry, 0);
     a.br(r(5));
 
     a.bind(miss);

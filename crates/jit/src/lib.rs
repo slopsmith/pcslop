@@ -442,6 +442,7 @@ impl Jit {
             v.set_reg(reg::FPCR, 0)?;
         }
         jit.state().lookup = layout::va(layout::LOOKUP);
+        jit.state().vlookup = layout::va(layout::VLOOKUP);
         Ok(jit)
     }
 
@@ -734,7 +735,14 @@ impl Jit {
         self.state().user = r as u32;
     }
 
+    /// Invalidates every dispatcher cache entry.
+    fn bump_vcache(&mut self) {
+        let s = self.state();
+        s.vepoch = s.vepoch.wrapping_add(1);
+    }
+
     fn flush_shadow(&mut self) {
+        self.bump_vcache();
         self.pt_watch.clear();
         for t in &mut self.shadow {
             t.flush(self.mem.as_mut_slice());
@@ -763,12 +771,14 @@ impl Jit {
                 self.shadow_key = Some(key);
                 match cpu.tlb.last_flush {
                     FlushKind::Page(lin) => {
+                        self.bump_vcache();
                         for t in &mut self.shadow {
                             t.unmap(self.mem.as_mut_slice(), lin);
                         }
                         self.tlbi_page(lin);
                     }
                     _ => {
+                        self.bump_vcache();
                         self.pt_watch.forget();
                         for r in 0..2 {
                             for off in std::mem::take(&mut self.nonglobal[r]) {
@@ -815,6 +825,7 @@ impl Jit {
         // that is about to become code.
         if self.shadow[r].maps(self.mem.as_slice(), lin, false) {
             self.tlbi_page(lin);
+            self.bump_vcache();
         }
         let leaf = match self.shadow[r].map(self.mem.as_mut_slice(), lin, phys, writable) {
             Some(off) => off,
@@ -862,6 +873,7 @@ impl Jit {
 
     /// Forgets the block for `key`: unlinks chains into it and clears its lookup slot.
     fn remove_block(&mut self, key: u64) {
+        self.bump_vcache();
         self.retry.remove(&key);
         for site in self.chain_in.remove(&key).unwrap_or_default() {
             self.patch_chain(site, None);
@@ -874,6 +886,7 @@ impl Jit {
     }
 
     fn clear_lookup(&mut self, key: u64) {
+        self.bump_vcache();
         let b = bucket(key);
         for off in [b, b + 16] {
             let slot = &mut self.mem.as_mut_slice()[off..off + 16];
@@ -884,6 +897,7 @@ impl Jit {
     }
 
     fn reset_code_cache(&mut self) {
+        self.bump_vcache();
         self.retry.clear();
         self.chain_wanted.clear();
         self.chain_in.clear();

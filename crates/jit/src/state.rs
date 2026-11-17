@@ -84,6 +84,10 @@ pub struct State {
     pub eflags_rest: u32,
     pub tlbi_page: u64,
     pub lookup: u64,
+    /// `layout::VLOOKUP` and the epoch its entries must carry to be valid; the
+    /// host bumps it whenever a mapping or a block they could name goes away.
+    pub vlookup: u64,
+    pub vepoch: u32,
     /// x86 instructions retired by translated code.
     pub icount: u64,
     /// When non-zero, counts dispatches down and exits with PENDING at zero.
@@ -171,6 +175,8 @@ pub const GS_BASE: usize = offset_of!(State, gs_base);
 pub const EFLAGS_REST: usize = offset_of!(State, eflags_rest);
 pub const TLBI_PAGE: usize = offset_of!(State, tlbi_page);
 pub const LOOKUP: usize = offset_of!(State, lookup);
+pub const VLOOKUP: usize = offset_of!(State, vlookup);
+pub const VEPOCH: usize = offset_of!(State, vepoch);
 pub const ICOUNT: usize = offset_of!(State, icount);
 pub const BUDGET: usize = offset_of!(State, budget);
 pub const INFO: usize = offset_of!(State, info);
