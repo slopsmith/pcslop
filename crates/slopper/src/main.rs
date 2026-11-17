@@ -332,7 +332,7 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
 
     let code = 'run: loop {
         let mut outcome = None;
-        let irq_due = cpu.flag(x86::cpu::flags::IF) && board.pic.intr();
+        let irq_due = cpu.flag(x86::cpu::flags::IF) && x86::bus::Bus::intr(&mut board);
         if let Some(j) = jit.as_mut()
             && jit::supported(&cpu)
             && !cpu.halted
@@ -388,7 +388,7 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
         }
         let jit_insns = jit.as_mut().map_or(0, |j| j.instructions());
         shared.instructions.store(executed + jit_insns, Ordering::Relaxed);
-        board.pic.set_irq(13, cpu.ferr_pending);
+        board.set_irq(13, cpu.ferr_pending);
         board.tick();
         if board.reset_requested {
             cpu.reset();
@@ -872,7 +872,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let cfg = Config { ram_bytes: args.ram_mb << 20, bios, vgabios };
+    let cfg = Config { ram_bytes: args.ram_mb << 20, bios, vgabios, apic: true };
     let shared = Arc::new(Shared {
         frame: Mutex::new(Frame::default()),
         done: AtomicBool::new(false),

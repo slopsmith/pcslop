@@ -24,6 +24,8 @@ pub struct Config {
     pub ram_bytes: u32,
     pub bios: Vec<u8>,
     pub vgabios: Option<Vec<u8>>,
+    /// Adds a local APIC and an I/O APIC.
+    pub apic: bool,
 }
 
 /// Physical pages holding translated code, and the ones written since the JIT last looked.
@@ -58,6 +60,8 @@ pub struct Board {
     pci_irqs: u16,
     sci: bool,
     pub pic: pic::Pic,
+    pub lapic: Option<apic::LocalApic>,
+    pub ioapic: ioapic::IoApic,
     pub pit: pit::Pit,
     fdc: fdc::Fdc,
     /// Timer interrupts owed to the guest: Windows counts them to keep time,
@@ -87,6 +91,11 @@ const UHCI: usize = 4;
 const PM: usize = 5;
 const UHCI_PORTS: u16 = 32;
 const LEGACY_END: u32 = 0x10_0000;
+/// The I/O APIC input that ISA IRQ 0 drives. QEMU wires it the same way
+/// (hw/intc/ioapic.c), and SeaBIOS's MP table says so with etc/irq0-override.
+const IRQ0_PIN: u8 = 2;
+/// I/O APIC inputs wired straight to PIRQA..PIRQD.
+const PIRQ_PIN: u8 = 16;
 /// SMBIOS strings by (structure type, field offset within the structure).
 const SMBIOS: &[(u8, u16, &str)] = &[
     (0, 4, "86slopper"),
@@ -118,6 +127,8 @@ impl Board {
                 (Bdf { dev: 1, func: 1 }, pci::piix3_ide()),
             ],
             pic: pic::Pic::default(),
+            lapic: cfg.apic.then(apic::LocalApic::default),
+            ioapic: ioapic::IoApic::default(),
             pit: pit::Pit::default(),
             fdc: fdc::Fdc::default(),
             irq0_backlog: 0,
@@ -158,6 +169,9 @@ impl Board {
         b.fw_cfg.add_file(acpi::TABLES_FILE, acpi.tables);
         b.fw_cfg.add_file(acpi::RSDP_FILE, acpi.rsdp);
         b.fw_cfg.add_file(acpi::LOADER_FILE, acpi.loader);
+        if cfg.apic {
+            b.fw_cfg.add_file("etc/irq0-override", 1u32.to_le_bytes().to_vec());
+        }
         b
     }
 
@@ -191,12 +205,15 @@ impl Board {
     pub fn tick(&mut self) {
         let now = self.now_ns();
         self.irq0_backlog = (self.irq0_backlog + self.pit.poll_irq0(now)).min(pit::MAX_BACKLOG);
-        if self.irq0_backlog > 0 && !self.pic.requested(0) {
+        if self.irq0_backlog > 0 && !self.irq0_waiting() {
             self.irq0_backlog -= 1;
-            self.pic.pulse_irq(0);
+            self.pulse_irq(0);
         }
         if self.rtc.poll(now) {
-            self.pic.pulse_irq(8);
+            self.pulse_irq(8);
+        }
+        if let Some(l) = self.lapic.as_mut() {
+            l.poll(now);
         }
         if self.pci[UHCI].1.bus_master() {
             self.uhci.run(now, &mut RamDma(&mut self.ram[..], &mut self.code_watch));
@@ -229,11 +246,79 @@ impl Board {
     /// Nanoseconds until a timer will next need attention.
     pub fn next_event_ns(&self) -> u64 {
         let now = self.now_ns();
-        if self.irq0_backlog > 0 && !self.pic.requested(0) {
+        if self.irq0_backlog > 0 && !self.irq0_waiting() {
             return 0;
         }
         let usb = self.uhci.next_frame_ns().map(|t| t.saturating_sub(now));
-        self.pit.next_irq0_ns(now).unwrap_or(1_000_000).min(usb.unwrap_or(u64::MAX)).min(1_000_000)
+        let lapic = self.lapic.as_ref().and_then(|l| l.next_event_ns(now));
+        self.pit.next_irq0_ns(now).unwrap_or(1_000_000).min(usb.unwrap_or(u64::MAX)).min(lapic.unwrap_or(u64::MAX)).min(1_000_000)
+    }
+
+    /// True while the last timer interrupt still waits to be taken, on
+    /// whichever interrupt controller the guest lets it through.
+    fn irq0_waiting(&self) -> bool {
+        let pic = self.pic.requested(0) && self.pic.registers()[0].2 & 1 == 0;
+        let e = self.ioapic.entry(IRQ0_PIN as usize);
+        let ioapic = e & ioapic::redir::MASKED == 0 && self.lapic.as_ref().is_some_and(|l| l.requested(e as u8));
+        pic || ioapic
+    }
+
+    /// Drives ISA interrupt line `irq` into the 8259s and the I/O APIC.
+    pub fn set_irq(&mut self, irq: u8, level: bool) {
+        self.pic.set_irq(irq, level);
+        if self.lapic.is_some() {
+            self.ioapic.set_irq(if irq == 0 { IRQ0_PIN } else { irq }, level);
+            self.service_ioapic();
+        }
+    }
+
+    fn pulse_irq(&mut self, irq: u8) {
+        self.set_irq(irq, true);
+        self.set_irq(irq, false);
+    }
+
+    fn service_ioapic(&mut self) {
+        if let Some(l) = self.lapic.as_mut() {
+            self.ioapic.service(|m| l.accept(m));
+        }
+    }
+
+    /// The APIC register at `addr`, if one of the APICs decodes it.
+    fn apic_read(&mut self, addr: u32) -> Option<u32> {
+        let now = self.now_ns();
+        if let Some(l) = self.lapic.as_mut()
+            && l.claims(addr)
+        {
+            return Some(l.read(addr - l.base(), now));
+        }
+        if self.lapic.is_some() && addr.wrapping_sub(ioapic::BASE) < ioapic::SIZE {
+            return Some(self.ioapic.read(addr - ioapic::BASE));
+        }
+        None
+    }
+
+    /// Writes an APIC register. Only aligned 32-bit writes do anything,
+    /// as in QEMU; returns false if no APIC decodes `addr`.
+    fn apic_write(&mut self, addr: u32, v: u32, size: u8) -> bool {
+        let now = self.now_ns();
+        let aligned = size == 4 && addr & 3 == 0;
+        if let Some(l) = self.lapic.as_mut()
+            && l.claims(addr)
+        {
+            if aligned && let Some(vector) = l.write(addr - l.base(), v, now) {
+                self.ioapic.eoi(vector);
+                self.service_ioapic();
+            }
+            return true;
+        }
+        if self.lapic.is_some() && addr.wrapping_sub(ioapic::BASE) < ioapic::SIZE {
+            if aligned {
+                self.ioapic.write(addr - ioapic::BASE, v);
+                self.service_ioapic();
+            }
+            return true;
+        }
+        false
     }
 
     fn a20_enabled(&self) -> bool {
@@ -246,8 +331,8 @@ impl Board {
 
     fn sync_kbc(&mut self) {
         let (kbd, aux) = self.kbc.irqs();
-        self.pic.set_irq(1, kbd);
-        self.pic.set_irq(12, aux);
+        self.set_irq(1, kbd);
+        self.set_irq(12, aux);
         if self.kbc.reset_requested {
             self.kbc.reset_requested = false;
             self.reset_requested = true;
@@ -257,7 +342,7 @@ impl Board {
     /// Feeds bytes to the guest through COM1.
     pub fn serial_input(&mut self, bytes: &[u8]) {
         self.com1.send(bytes);
-        self.pic.set_irq(4, self.com1.irq());
+        self.set_irq(4, self.com1.irq());
     }
 
     pub fn key(&mut self, code: u16, pressed: bool) {
@@ -327,6 +412,9 @@ impl Board {
     }
 
     fn mmio_read(&mut self, addr: u32) -> u8 {
+        if let Some(v) = self.apic_read(addr & !3) {
+            return (v >> (8 * (addr & 3))) as u8;
+        }
         if let Some(base) = self.display().mem_bar(0)
             && (base..base + vga::VRAM_SIZE as u32).contains(&addr)
         {
@@ -341,6 +429,9 @@ impl Board {
     }
 
     fn mmio_write(&mut self, addr: u32, v: u8) {
+        if self.apic_write(addr, v as u32, 1) {
+            return;
+        }
         if let Some(base) = self.display().mem_bar(0)
             && (base..base + vga::VRAM_SIZE as u32).contains(&addr)
         {
@@ -392,13 +483,13 @@ impl Board {
             0x70 | 0x71 => self.rtc.read(port),
             0x3f0..=0x3f5 | 0x3f7 => {
                 let v = self.fdc.read(port);
-                self.pic.set_irq(6, self.fdc.irq());
+                self.set_irq(6, self.fdc.irq());
                 v
             }
             0x92 => (self.a20 as u8) << 1,
             0x3f8..=0x3ff => {
                 let v = self.com1.read(port - 0x3f8);
-                self.pic.set_irq(4, self.com1.irq());
+                self.set_irq(4, self.com1.irq());
                 v
             }
             0x402 => 0xe9,
@@ -410,8 +501,8 @@ impl Board {
                 if port == 0x60 {
                     // Reading the output buffer drops IRQ 1/12; dropping them here gives the
                     // PIC an edge for the next byte even when it is loaded straight away.
-                    self.pic.set_irq(1, false);
-                    self.pic.set_irq(12, false);
+                    self.set_irq(1, false);
+                    self.set_irq(12, false);
                 }
                 self.sync_kbc();
                 v
@@ -430,12 +521,12 @@ impl Board {
             0x70 | 0x71 => self.rtc.write(port, v),
             0x3f0..=0x3f5 | 0x3f7 => {
                 self.fdc.write(port, v);
-                self.pic.set_irq(6, self.fdc.irq());
+                self.set_irq(6, self.fdc.irq());
             }
             0x80 => self.post_code = v,
             0x3f8..=0x3ff => {
                 self.com1.write(port - 0x3f8, v);
-                self.pic.set_irq(4, self.com1.irq());
+                self.set_irq(4, self.com1.irq());
             }
             0x92 => {
                 self.a20 = v & 2 != 0;
@@ -504,27 +595,36 @@ impl Board {
     fn sync_pci_irqs(&mut self) {
         let route = &self.pci[PIIX3_ISA].1.data[pci::PIRQRC..pci::PIRQRC + 4];
         let mut levels = (self.sci as u16) << pm::SCI_IRQ;
+        let mut pirqs = 0u8;
         for (i, (bdf, cfg)) in self.pci.iter().enumerate() {
             let pin = cfg.data[pci::INTERRUPT_PIN];
             if pin == 0 || !self.intx(i) {
                 continue;
             }
-            if let Some(irq) = pci::pirq_route(route[pci::pirq_for(bdf.dev, pin)]) {
+            let pirq = pci::pirq_for(bdf.dev, pin);
+            pirqs |= 1 << pirq;
+            if let Some(irq) = pci::pirq_route(route[pirq]) {
                 levels |= 1 << irq;
             }
+        }
+        if self.lapic.is_some() {
+            for i in 0..4 {
+                self.ioapic.set_irq(PIRQ_PIN + i, pirqs & 1 << i != 0);
+            }
+            self.service_ioapic();
         }
         let changed = levels ^ self.pci_irqs;
         self.pci_irqs = levels;
         for irq in 0..16 {
             if changed & 1 << irq != 0 {
-                self.pic.set_irq(irq, levels & 1 << irq != 0);
+                self.set_irq(irq, levels & 1 << irq != 0);
             }
         }
     }
 
     fn sync_ide(&mut self) {
-        self.pic.set_irq(14, self.ide.irq(0));
-        self.pic.set_irq(15, self.ide.irq(1));
+        self.set_irq(14, self.ide.irq(0));
+        self.set_irq(15, self.ide.irq(1));
     }
 
     pub fn reset(&mut self) {
@@ -537,6 +637,10 @@ impl Board {
             self.pci[PIIX3_ISA].1.data[r] = 0x80;
         }
         self.pic = pic::Pic::default();
+        if let Some(l) = self.lapic.as_mut() {
+            *l = apic::LocalApic::default();
+        }
+        self.ioapic = ioapic::IoApic::default();
         self.pci_irqs = 0;
         self.uhci.reset();
         self.pm.reset();
@@ -617,6 +721,11 @@ impl Bus for Board {
             let a = addr as usize;
             return u32::from_le_bytes(self.ram[a..a + 4].try_into().unwrap());
         }
+        if addr & 3 == 0
+            && let Some(v) = self.apic_read(addr)
+        {
+            return v;
+        }
         let b = [0, 1, 2, 3].map(|i| self.read_slow(addr.wrapping_add(i)));
         u32::from_le_bytes(b)
     }
@@ -642,6 +751,9 @@ impl Bus for Board {
             self.code_watch.note_write(addr + 3);
             let a = addr as usize;
             self.ram[a..a + 4].copy_from_slice(&value.to_le_bytes());
+            return;
+        }
+        if self.apic_write(addr, value, 4) {
             return;
         }
         for (i, b) in value.to_le_bytes().into_iter().enumerate() {
@@ -753,7 +865,29 @@ impl Bus for Board {
     }
 
     fn intr(&mut self) -> bool {
-        self.pic.intr()
+        match &self.lapic {
+            Some(l) if l.hw_enabled() => (l.accepts_pic() && self.pic.intr()) || l.pending().is_some(),
+            _ => self.pic.intr(),
+        }
+    }
+
+    fn rdmsr(&mut self, msr: u32) -> Option<u64> {
+        let l = self.lapic.as_ref()?;
+        (msr == apic::msr::APIC_BASE).then(|| l.msr())
+    }
+
+    fn wrmsr(&mut self, msr: u32, value: u64) -> bool {
+        match self.lapic.as_mut() {
+            Some(l) if msr == apic::msr::APIC_BASE => {
+                l.set_msr(value);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn apic_present(&self) -> bool {
+        self.lapic.as_ref().is_some_and(|l| l.hw_enabled())
     }
 
     fn watch_code_page(&mut self, addr: u32) {
@@ -767,7 +901,15 @@ impl Bus for Board {
         std::mem::take(&mut self.code_watch.written)
     }
 
+    /// 8259 interrupts come first, as in QEMU's apic_get_interrupt: ExtINT
+    /// ignores the APIC's priorities.
     fn inta(&mut self) -> u8 {
+        if let Some(l) = self.lapic.as_mut()
+            && l.hw_enabled()
+            && !(l.accepts_pic() && self.pic.intr())
+        {
+            return l.ack();
+        }
         self.pic.inta()
     }
 }
