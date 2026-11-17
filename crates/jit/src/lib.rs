@@ -291,8 +291,7 @@ pub struct Jit {
     pub stats: Stats,
     /// Runs each block against the interpreter and stops at the first difference.
     pub verify: bool,
-    /// Fills shadow entries inside the VM (SLOPPER_JIT_VM_FILL). Off by default:
-    /// XP's first boot can hang with it.
+    /// Fills shadow entries inside the VM; SLOPPER_JIT_NO_VM_FILL turns it off.
     pub vm_fill: bool,
     /// Verify only blocks with recent translations (SLOPPER_JIT_VERIFY=new).
     verify_recent_only: bool,
@@ -380,7 +379,7 @@ impl Jit {
             stats: Stats::default(),
             interp_profile: std::env::var_os("SLOPPER_JIT_PROFILE").map(|_| HashMap::default()),
             verify: std::env::var_os("SLOPPER_JIT_VERIFY").is_some(),
-            vm_fill: std::env::var_os("SLOPPER_JIT_VM_FILL").is_some(),
+            vm_fill: std::env::var_os("SLOPPER_JIT_NO_VM_FILL").is_none(),
             verify_recent_only: std::env::var("SLOPPER_JIT_VERIFY").is_ok_and(|v| v == "new"),
             timing: std::env::var_os("SLOPPER_JIT_PROFILE").is_some(),
             audit: std::env::var_os("SLOPPER_JIT_AUDIT").is_some(),
