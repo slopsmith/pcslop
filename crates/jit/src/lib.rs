@@ -1212,6 +1212,7 @@ impl Jit {
                         continue;
                     }
                     self.mmio(bus, syndrome, ipa as u32)?;
+                    self.state().irq = bus.intr() as u32;
                     at_dispatch = false;
                 }
                 Exit::Exception { .. } if exit.ec() == Some(0x16) => {
