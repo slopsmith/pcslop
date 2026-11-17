@@ -465,6 +465,19 @@ fn a_texture_map_with_another_logical_id_reads_as_disabled() {
     assert_eq!(g.px(4, 4), 0xff00_0000);
 }
 
+#[test]
+fn the_alpha_test_orders_its_functions_as_opengl_does() {
+    let green = |a: f32| [0.0, 1.0, 0.0, a];
+    for (func, low, high) in [(6, false, true), (3, true, false), (2, false, false), (5, true, true)] {
+        let mut g = Gpu::new();
+        g.w(FG_ALPHA_FUNC, 1 << 11 | func << 8 | 0x80);
+        g.draw(13, &quad(0.0, 0.0, 10.0, 10.0, green(0.25)));
+        g.draw(13, &quad(20.0, 0.0, 30.0, 10.0, green(0.75)));
+        assert_eq!(g.px(5, 5) != 0, low, "function {func}, alpha 0.25");
+        assert_eq!(g.px(25, 5) != 0, high, "function {func}, alpha 0.75");
+    }
+}
+
 /// Catalyst's fast colour clear, as Mesa's r300 driver also does it: the
 /// top half of the colour buffer is the colour buffer and the bottom half
 /// the Z buffer, which writes ZB_DEPTHCLEARVALUE with ZB_CB_CLEAR set.

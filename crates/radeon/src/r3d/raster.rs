@@ -162,6 +162,11 @@ fn combine(cntl: u32, k: usize, s: V4, d: V4, cc: V4) -> f32 {
     if comb % 2 == 0 { v.clamp(0.0, 1.0) } else { v }
 }
 
+/// FG_ALPHA_FUNC orders its functions as OpenGL does (never, less, equal,
+/// less or equal, greater, not equal, greater or equal, always), unlike the
+/// Z and stencil functions `test` takes; AMD's R3xx 3D register reference.
+const ALPHA_TO_Z_FUNC: [u32; 8] = [0, 1, 3, 2, 5, 6, 4, 7];
+
 fn test(func: u32, v: u32, reference: u32) -> bool {
     match func {
         0 => false,
@@ -545,7 +550,7 @@ impl Raster {
         self.pixels += 1;
         if self.alpha_func & (1 << 11) != 0 {
             let a = (colour[3].clamp(0.0, 1.0) * 255.0).round() as u32;
-            if !test((self.alpha_func >> 8) & 7, a, self.alpha_func & 0xff) {
+            if !test(ALPHA_TO_Z_FUNC[((self.alpha_func >> 8) & 7) as usize], a, self.alpha_func & 0xff) {
                 return;
             }
         }

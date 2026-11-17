@@ -427,7 +427,8 @@ static float4 blend_fog(constant Uniforms &u, float4 c, float value) {
 static void backend(constant Uniforms &u, device uchar *vram, device atomic_uint *counter, uint x, uint y, float4 colour, float z, bool front) {
     if (u.alpha_func & (1 << 11)) {
         uint a = uint(round(clamp(colour.w, 0.0, 1.0) * 255.0));
-        if (!test((u.alpha_func >> 8) & 7, a, u.alpha_func & 0xff)) return;
+        const uint alpha_to_z[8] = {0, 1, 3, 2, 5, 6, 4, 7};
+        if (!test(alpha_to_z[(u.alpha_func >> 8) & 7], a, u.alpha_func & 0xff)) return;
     }
     if (!depth_stencil(u, vram, x, y, z, front)) return;
     atomic_fetch_add_explicit(counter, 1, memory_order_relaxed);
