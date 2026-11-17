@@ -132,6 +132,35 @@ impl Vga {
         self.vram.as_mut_ptr()
     }
 
+    /// DAC entry `index` as 8-bit red, green and blue.
+    pub fn dac_entry(&self, index: u8) -> [u8; 3] {
+        let i = index as usize * 3;
+        let c = |v: u8| if self.dac_8bit { v } else { (v << 2) | (v >> 4) };
+        [c(self.dac[i]), c(self.dac[i + 1]), c(self.dac[i + 2])]
+    }
+
+    /// Sets DAC entry `index` from 8-bit red, green and blue.
+    pub fn set_dac_entry(&mut self, index: u8, rgb: [u8; 3]) {
+        let i = index as usize * 3;
+        for (c, v) in rgb.into_iter().enumerate() {
+            self.dac[i + c] = if self.dac_8bit { v } else { v >> 2 };
+        }
+        self.changed = true;
+    }
+
+    /// Whether DAC entries hold 8 bits per colour instead of 6.
+    pub fn set_dac_8bit(&mut self, on: bool) {
+        if on != self.dac_8bit {
+            self.dac_8bit = on;
+            self.changed = true;
+        }
+    }
+
+    /// Marks the picture as changed, for VRAM or registers that live outside the VGA.
+    pub fn touch(&mut self) {
+        self.changed = true;
+    }
+
     /// I/O base of the CRTC and input status 1: 0x3D0 in color mode, 0x3B0 in mono.
     fn crtc_base(&self) -> u16 {
         if self.misc & 1 != 0 { 0x3d0 } else { 0x3b0 }

@@ -137,7 +137,7 @@ impl Vga {
         })
     }
 
-    fn palette256(&self) -> [u32; 256] {
+    pub fn palette256(&self) -> [u32; 256] {
         std::array::from_fn(|i| self.dac_rgb(i as u8))
     }
 
