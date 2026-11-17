@@ -1411,7 +1411,9 @@ impl Jit {
         let Ok(phys) = interp::translate(cpu, bus, eip, false) else { return };
         let insn = x86::decode::decode::<()>(true, |i| Ok(bus.read8(phys.wrapping_add(i))));
         if let (Ok(i), Some(p)) = (insn, self.interp_profile.as_mut()) {
-            let key = if i.has_modrm && matches!(i.op, 0x80..=0x83 | 0xc0 | 0xc1 | 0xd0..=0xd3 | 0xf6 | 0xf7 | 0xfe | 0xff) {
+            let key = if matches!(i.op, 0xd8..=0xdf) && i.mem.is_none() {
+                i.op << 8 | i.modrm as u16
+            } else if i.has_modrm && matches!(i.op, 0x80..=0x83 | 0xc0 | 0xc1 | 0xd0..=0xd3 | 0xd8..=0xdf | 0xf6 | 0xf7 | 0xfe | 0xff) {
                 i.op << 4 | i.reg() as u16 | 0x8000
             } else {
                 i.op | if i.op32 { 0 } else { 0x4000 } | if i.rep != x86::decode::Rep::None { 0x2000 } else { 0 }

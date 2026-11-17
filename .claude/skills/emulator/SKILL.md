@@ -90,6 +90,7 @@ scripts/vm stop xp
     - `+0x2000` means REP;
     - `+0x4000` means 16-bit operand size;
     - `0x8000 | op<<4 | reg` is a group opcode, e.g. `8f75` = `F7 /5`, `imul r/m32`.
+    - x87: `8d9x` = `D9 /x` with a memory operand; `d9c0`..`dfff` = the opcode byte and ModRM of a register form, e.g. `d9fe` = `fsin`.
   - **PC samples:** `rt+0x980` is the `hvc` at the end of the runtime's exit path, i.e. time spent in the host handling exits, not in guest code.
 - **Hangs:** sample `ctl NAME status` a few times. `regs` gives EIP and registers, and `mem ADDR LEN` dumps guest memory at linear addresses, enough to disassemble a busy loop. Add `--gpu-trace` for the Radeon, or `--serial` for Linux.
 - **JIT correctness:**
