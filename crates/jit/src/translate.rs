@@ -74,6 +74,9 @@ pub struct Compiled {
     pub recent: bool,
     /// The block leaves for the interpreter after this many instructions.
     pub interp_after: Option<usize>,
+    /// Its first instruction runs onto a page that was not mapped; translate
+    /// it again once the interpreter has run it.
+    pub retry: bool,
 }
 
 struct Emit {
@@ -2049,14 +2052,21 @@ pub fn compile(
     let mut code_end = eip;
     let mut recent = false;
     let mut interp_after = None;
+    let mut retry = false;
     loop {
-        let insn = decode::<()>(true, |i| byte(pc.wrapping_add(i)).ok_or(()));
+        let mut missing = false;
+        let insn = decode::<()>(true, |i| {
+            let b = byte(pc.wrapping_add(i));
+            missing |= b.is_none();
+            b.ok_or(())
+        });
         let Ok(insn) = insn else {
             if let Some(at) = sti {
                 e.back_to_sti(at, &mut pc, &mut insns, &mut boundaries);
             } else if insns == 0 {
                 e.exit_interp(pc);
                 interp_after = Some(0);
+                retry = missing;
             } else {
                 e.goto(pc);
             }
@@ -2170,5 +2180,5 @@ pub fn compile(
     count.add_imm(Size::X, ICOUNT, ICOUNT, insns as u32);
     let mut code = e.a.finish();
     code[0] = count.code[0];
-    Compiled { code, boundaries, insns, chains: e.chains, has_rep, recent, interp_after }
+    Compiled { code, boundaries, insns, chains: e.chains, has_rep, recent, interp_after, retry }
 }

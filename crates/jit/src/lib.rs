@@ -274,6 +274,8 @@ pub struct Jit {
     code_next: usize,
     blocks: HashMap<u64, BlockInfo>,
     ahead_cache: HashMap<u64, Ahead>,
+    /// Blocks translated while their first instruction could not be read.
+    retry: HashSet<u64>,
     by_va: BTreeMap<u64, u64>,
     code_pages: HashMap<u32, Vec<u64>>,
     /// Times each physical page lost its translations to writes.
@@ -386,6 +388,7 @@ impl Jit {
             code_next: layout::CODE_CACHE,
             blocks: HashMap::default(),
             ahead_cache: HashMap::default(),
+            retry: HashSet::default(),
             by_va: BTreeMap::new(),
             code_pages: HashMap::default(),
             smc_counts: HashMap::default(),
@@ -829,6 +832,7 @@ impl Jit {
 
     /// Forgets the block for `key`: unlinks chains into it and clears its lookup slot.
     fn remove_block(&mut self, key: u64) {
+        self.retry.remove(&key);
         for site in self.chain_in.remove(&key).unwrap_or_default() {
             self.patch_chain(site, None);
             self.chain_wanted.entry(key).or_default().push(site);
@@ -850,6 +854,7 @@ impl Jit {
     }
 
     fn reset_code_cache(&mut self) {
+        self.retry.clear();
         self.chain_wanted.clear();
         self.chain_in.clear();
         self.blocks.clear();
@@ -926,6 +931,9 @@ impl Jit {
         let verified = if trusted { VERIFY_RUNS } else { 0 };
         if self.verify && trusted {
             self.insert_lookup(key, block_va);
+        }
+        if compiled.retry {
+            self.retry.insert(key);
         }
         self.blocks.insert(key, BlockInfo { va: block_va, boundaries: compiled.boundaries, insns: compiled.insns, interp_after: compiled.interp_after, verified });
         self.by_va.insert(block_va, key);
@@ -1056,6 +1064,7 @@ impl Jit {
                         reason::INTERP => {
                             self.stats.interp_exits += 1;
                             self.store_state(cpu);
+                            self.drop_retry_block(cpu, bus);
                             if self.interp_profile.is_some() {
                                 self.profile_interp(cpu, bus);
                             }
@@ -1237,6 +1246,19 @@ impl Jit {
             }
         }
         None
+    }
+
+    /// Drops the block at EIP if it was translated while its first instruction
+    /// could not be read, so the next visit translates it properly.
+    fn drop_retry_block<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B) {
+        if self.retry.is_empty() {
+            return;
+        }
+        let Ok(phys) = interp::translate(&mut cpu.clone(), bus, cpu.eip, false) else { return };
+        let key = block_key(phys, cpu.cpl() == 3);
+        if self.retry.contains(&key) {
+            self.remove_block(key);
+        }
     }
 
     /// What the code at EIP would do in the translator.
