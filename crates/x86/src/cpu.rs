@@ -229,7 +229,6 @@ pub struct Cpu {
     pub sysenter_cs: u32,
     pub sysenter_esp: u32,
     pub sysenter_eip: u32,
-    pub apic_base: u64,
     pub halted: bool,
     pub interrupt_shadow: bool,
     pub fpu: crate::fpu::Fpu,
@@ -273,7 +272,6 @@ impl Cpu {
             sysenter_cs: 0,
             sysenter_esp: 0,
             sysenter_eip: 0,
-            apic_base: 0,
             halted: false,
             interrupt_shadow: false,
             fpu: crate::fpu::Fpu::default(),
@@ -310,7 +308,6 @@ impl Cpu {
         self.cr3 = 0;
         self.cr4 = 0;
         self.dr = [0, 0, 0, 0, 0, 0, 0xffff_0ff0, 0x400];
-        self.apic_base = 0xfee0_0000 | (1 << 11) | (1 << 8);
         self.write_tsc(0);
         self.halted = false;
         self.interrupt_shadow = false;

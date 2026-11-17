@@ -44,6 +44,21 @@ pub trait Bus {
         0
     }
 
+    /// Reads an MSR that lives outside the CPU core, such as IA32_APIC_BASE.
+    fn rdmsr(&mut self, _msr: u32) -> Option<u64> {
+        None
+    }
+
+    /// Writes an MSR that lives outside the CPU core. False if there is none.
+    fn wrmsr(&mut self, _msr: u32, _value: u64) -> bool {
+        false
+    }
+
+    /// Whether CPUID should report a local APIC.
+    fn apic_present(&self) -> bool {
+        false
+    }
+
     /// Asks the bus to report writes to the physical page containing `addr`,
     /// because translated code was made from it.
     fn watch_code_page(&mut self, _addr: u32) {}

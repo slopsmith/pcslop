@@ -1084,7 +1084,10 @@ impl<B: Bus> Ctx<'_, B> {
                 self.set_sp(self.sp().wrapping_add(self.opsz()));
             }
             0xa2 => {
-                let [a, b, c, d] = crate::cpuid::cpuid(self.cpu.regs[EAX], self.cpu.regs[ECX]);
+                let [a, b, c, mut d] = crate::cpuid::cpuid(self.cpu.regs[EAX], self.cpu.regs[ECX]);
+                if self.cpu.regs[EAX] == 1 && self.bus.apic_present() {
+                    d |= crate::cpuid::edx::APIC;
+                }
                 self.cpu.regs[EAX] = a;
                 self.cpu.regs[EBX] = b;
                 self.cpu.regs[ECX] = c;
@@ -1248,23 +1251,22 @@ impl<B: Bus> Ctx<'_, B> {
     fn rdmsr(&mut self, msr: u32) -> Res<u64> {
         Ok(match msr {
             0x10 => self.cpu.read_tsc(),
-            0x1b => self.cpu.apic_base,
             0x17 | 0x8b => 0,
             0x174 => self.cpu.sysenter_cs as u64,
             0x175 => self.cpu.sysenter_esp as u64,
             0x176 => self.cpu.sysenter_eip as u64,
-            _ => return gp(0),
+            _ => return self.bus.rdmsr(msr).map_or_else(|| gp(0), Ok),
         })
     }
 
     fn wrmsr(&mut self, msr: u32, v: u64) -> Res<()> {
         match msr {
             0x10 => self.cpu.write_tsc(v),
-            0x1b => self.cpu.apic_base = v,
             0x8b => {}
             0x174 => self.cpu.sysenter_cs = v as u32,
             0x175 => self.cpu.sysenter_esp = v as u32,
             0x176 => self.cpu.sysenter_eip = v as u32,
+            _ if self.bus.wrmsr(msr, v) => {}
             _ => return gp(0),
         }
         Ok(())
