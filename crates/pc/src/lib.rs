@@ -513,7 +513,8 @@ impl Board {
             Display::Radeon(r) => r.next_irq_ns().map(|t| t.saturating_sub(now)),
             Display::Std(_) => None,
         };
-        let others = usb.unwrap_or(u64::MAX).min(lapic.unwrap_or(u64::MAX)).min(nic.unwrap_or(u64::MAX)).min(gpu.unwrap_or(u64::MAX));
+        let rtc = self.rtc.next_event_ns(now);
+        let others = usb.unwrap_or(u64::MAX).min(lapic.unwrap_or(u64::MAX)).min(nic.unwrap_or(u64::MAX)).min(gpu.unwrap_or(u64::MAX)).min(rtc.unwrap_or(u64::MAX));
         self.pit.next_irq0_ns(now).unwrap_or(1_000_000).min(others).min(1_000_000)
     }
 

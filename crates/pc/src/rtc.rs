@@ -1,6 +1,11 @@
 //! MC146818-compatible RTC and CMOS RAM (Motorola MC146818A datasheet).
 //! Time comes from the host clock. The periodic, alarm and update-ended
 //! interrupts are implemented.
+//!
+//! Windows' APIC HALs keep their clock by counting periodic interrupts, so
+//! periods that pass while the emulation thread is busy are remembered and
+//! delivered one per read of register C, as QEMU's mc146818rtc does with its
+//! "slew" lost tick policy (hw/rtc/mc146818rtc.c, the QEMU project authors).
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -30,9 +35,15 @@ pub struct Rtc {
     /// Seconds added to the host clock by guest writes to the time registers.
     offset: i64,
     next_periodic_ns: u64,
+    /// Periodic interrupts that came due and are not delivered yet.
+    #[snap(skip)]
+    missed_periodic: u32,
     /// The RTC second the update and alarm checks last saw.
     last_second: Option<i64>,
 }
+
+/// Periodic interrupts remembered for catch-up; beyond this, time is lost.
+const MAX_MISSED: u64 = 1000;
 
 impl Default for Rtc {
     fn default() -> Self {
@@ -40,7 +51,7 @@ impl Default for Rtc {
         ram[REG_A] = 0x26;
         ram[REG_B] = B_24H;
         ram[REG_D] = 0x80;
-        Rtc { ram, index: 0, offset: 0, next_periodic_ns: 0, last_second: None }
+        Rtc { ram, index: 0, offset: 0, next_periodic_ns: 0, missed_periodic: 0, last_second: None }
     }
 }
 
@@ -169,18 +180,33 @@ impl Rtc {
     fn poll_periodic(&mut self, now_ns: u64) -> bool {
         let Some(period) = self.periodic_ns() else {
             self.next_periodic_ns = 0;
+            self.missed_periodic = 0;
             return false;
         };
         if self.next_periodic_ns == 0 {
             self.next_periodic_ns = now_ns + period;
             return false;
         }
-        if now_ns < self.next_periodic_ns {
+        if now_ns >= self.next_periodic_ns {
+            let due = (now_ns - self.next_periodic_ns) / period + 1;
+            self.next_periodic_ns += due * period;
+            self.missed_periodic = (self.missed_periodic as u64 + due).min(MAX_MISSED) as u32;
+        }
+        if self.missed_periodic == 0 || self.ram[REG_C] & C_IRQF != 0 {
             return false;
         }
-        self.next_periodic_ns = now_ns + period;
+        self.missed_periodic -= 1;
         self.ram[REG_C] |= C_PF | C_IRQF;
         true
+    }
+
+    /// Nanoseconds from `now_ns` until the periodic interrupt next needs a poll.
+    pub fn next_event_ns(&self, now_ns: u64) -> Option<u64> {
+        self.periodic_ns()?;
+        if self.missed_periodic > 0 && self.ram[REG_C] & C_IRQF == 0 {
+            return Some(0);
+        }
+        (self.next_periodic_ns != 0).then(|| self.next_periodic_ns.saturating_sub(now_ns))
     }
 
     /// Sets the update-ended and alarm flags once per RTC second, given the
@@ -341,6 +367,63 @@ mod tests {
         }
         assert!(!rtc.poll_second(7));
         assert!(rtc.poll_second(8));
+    }
+
+    fn periodic_rtc(rate: u8) -> Rtc {
+        let mut rtc = Rtc::default();
+        rtc.ram[REG_A] = 0x20 | rate;
+        rtc.ram[REG_B] |= B_PIE;
+        rtc
+    }
+
+    fn ack(rtc: &mut Rtc) -> u8 {
+        rtc.write(0x70, REG_C as u8);
+        rtc.read(0x71)
+    }
+
+    #[test]
+    fn periodic_interrupts_missed_between_polls_are_delivered_on_acknowledge() {
+        let mut rtc = periodic_rtc(6);
+        let period = rtc.periodic_ns().unwrap();
+        assert!(!rtc.poll_periodic(0));
+        assert!(rtc.poll_periodic(3 * period + period / 2));
+        assert!(!rtc.poll_periodic(3 * period + period / 2));
+        assert_eq!(ack(&mut rtc), C_IRQF | C_PF);
+        assert!(rtc.poll_periodic(3 * period + period / 2));
+        ack(&mut rtc);
+        assert!(rtc.poll_periodic(3 * period + period / 2));
+        ack(&mut rtc);
+        assert!(!rtc.poll_periodic(3 * period + period / 2));
+        assert_eq!(rtc.next_event_ns(3 * period + period / 2), Some(period / 2));
+    }
+
+    #[test]
+    fn periodic_rate_holds_when_polls_come_late() {
+        let mut rtc = periodic_rtc(6);
+        let period = rtc.periodic_ns().unwrap();
+        let poll = period + period / 10;
+        rtc.poll_periodic(0);
+        let mut fired = 0;
+        for i in 1..=1000 {
+            while rtc.poll_periodic(i * poll) {
+                fired += 1;
+                ack(&mut rtc);
+            }
+        }
+        assert_eq!(fired, 1000 * poll / period);
+    }
+
+    #[test]
+    fn next_periodic_interrupt_waits_for_register_c() {
+        let mut rtc = periodic_rtc(15);
+        let period = rtc.periodic_ns().unwrap();
+        rtc.poll_periodic(0);
+        assert!(rtc.poll_periodic(period));
+        assert!(!rtc.poll_periodic(2 * period));
+        assert_eq!(rtc.next_event_ns(2 * period), Some(period));
+        ack(&mut rtc);
+        assert_eq!(rtc.next_event_ns(2 * period), Some(0));
+        assert!(rtc.poll_periodic(2 * period));
     }
 
     #[test]
