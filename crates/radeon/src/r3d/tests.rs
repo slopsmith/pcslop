@@ -806,3 +806,42 @@ mod against_metal {
     }
 }
 
+
+fn stale_depth_with_a_cleared_zmask(g: &mut Gpu, fast_fill: bool) {
+    g.w(ZB_CNTL, 6);
+    g.w(ZB_ZSTENCILCNTL, 1);
+    g.w(ZB_FORMAT, 2);
+    g.w(ZB_DEPTHOFFSET, VRAM + DEPTH);
+    g.w(ZB_DEPTHPITCH, PITCH as u32);
+    g.w(SU_DEPTH_SCALE, f(16_777_215.0));
+    g.w(ZB_ZMASK_PITCH, PITCH as u32);
+    g.w(ZB_DEPTHCLEARVALUE, 0xffff_ff00);
+    g.w(ZB_BW_CNTL, if fast_fill { FAST_FILL | 3 << 3 } else { 0 });
+    let p = [pkt3(0x32, 3), 0, 8, 0];
+    g.r.execute(&mut g.ram, &p);
+}
+
+fn at_depth(z: f32, c: [f32; 4]) -> [[f32; 8]; 4] {
+    quad(0.0, 0.0, 16.0, 16.0, c).map(|mut v| {
+        v[2] = z;
+        v
+    })
+}
+
+#[test]
+fn a_zeroed_zmask_reads_as_the_depth_clear_value_with_fast_fill() {
+    let mut g = Gpu::new();
+    stale_depth_with_a_cleared_zmask(&mut g, true);
+    g.draw(13, &at_depth(0.5, RED));
+    assert_eq!(g.count(0xffff_0000), 256);
+    g.draw(13, &at_depth(0.75, BLUE));
+    assert_eq!(g.count(0xffff_0000), 256, "the clear applies once, then Z holds the red quad");
+}
+
+#[test]
+fn the_zmask_is_ignored_without_fast_fill() {
+    let mut g = Gpu::new();
+    stale_depth_with_a_cleared_zmask(&mut g, false);
+    g.draw(13, &at_depth(0.5, RED));
+    assert_eq!(g.count(0xffff_0000), 0);
+}

@@ -22,6 +22,7 @@ mod raster;
 pub(crate) mod regs;
 mod tex;
 mod us;
+mod zmask;
 
 #[cfg(test)]
 mod tests;
@@ -115,6 +116,7 @@ pub(crate) mod op {
     pub const DRAW_VBUF_2: u8 = 0x34;
     pub const DRAW_IMMD_2: u8 = 0x35;
     pub const DRAW_INDX_2: u8 = 0x36;
+    pub const CLEAR_ZMASK: u8 = 0x32;
     pub const CLEAR_HIZ: u8 = 0x37;
     pub const DRAW_128: u8 = 0x39;
 }
@@ -144,6 +146,7 @@ pub(crate) struct ThreeD {
     vec_ptr: u32,
     /// VAP_VF_CNTL of a 3D_DRAW_INDX that waits for INDX_BUFFER's indices.
     pending_indx: Option<u32>,
+    zmask: zmask::ZMask,
     pub draws: u64,
     /// CRTC_OFFSET writes, which is how drivers flip buffers.
     #[snap(skip)]
@@ -152,7 +155,7 @@ pub(crate) struct ThreeD {
 
 impl Default for ThreeD {
     fn default() -> Self {
-        ThreeD { vecmem: vec![0; VECMEM_DWORDS], vec_ptr: 0, pending_indx: None, draws: 0, flips: 0 }
+        ThreeD { vecmem: vec![0; VECMEM_DWORDS], vec_ptr: 0, pending_indx: None, zmask: zmask::ZMask::default(), draws: 0, flips: 0 }
     }
 }
 
@@ -349,6 +352,7 @@ impl Radeon {
                     i += if second { 3 } else { 2 };
                 }
             }
+            op::CLEAR_ZMASK => self.r3d.zmask.clear(get(0), get(1), get(2)),
             op::CLEAR_HIZ => {}
             _ => return false,
         }
@@ -694,6 +698,7 @@ impl Radeon {
 
     fn draw_3d(&mut self, mem: &mut dyn BusMemory, vf: u32, verts: Verts<'_>) {
         self.r3d.draws += 1;
+        self.resolve_zmask();
         let prim = vf & 15;
         let dwords = self.vertex_dwords(mem, vf, &verts);
         if self.trace.is_some() {

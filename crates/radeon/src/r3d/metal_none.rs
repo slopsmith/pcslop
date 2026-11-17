@@ -1,6 +1,7 @@
 //! Stands in for the Metal backend where there is no Metal.
 
 use super::raster::{Captured, Raster};
+use super::zmask::Fill;
 
 pub(crate) struct Pipeline;
 
@@ -16,6 +17,10 @@ impl MetalR3d {
     }
 
     pub fn draw(&mut self, _r: &Raster, _cap: &Captured, _p: &Pipeline) {}
+
+    pub fn fill(&mut self, _f: Fill, _bpp: usize, _value: u32) -> bool {
+        false
+    }
 
     pub fn kick(&mut self) -> u64 {
         0

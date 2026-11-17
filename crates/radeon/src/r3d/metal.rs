@@ -11,6 +11,7 @@
 
 use super::msl;
 use super::raster::{Captured, Raster};
+use super::zmask::Fill;
 use super::tex::{TexMem, Texture};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -85,6 +86,30 @@ struct Uniforms {
 
 type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 pub(crate) type Pipeline = Retained<ProtocolObject<dyn MTLRenderPipelineState>>;
+type ComputePipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
+
+const FILL_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+struct FillArgs { uint offset; uint stride; uint bpp; uint value; };
+kernel void fill(device uchar *vram [[buffer(0)]], constant FillArgs &a [[buffer(1)]],
+                 uint2 id [[thread_position_in_grid]]) {
+    uint at = a.offset + id.y * a.stride + id.x * a.bpp;
+    if (a.bpp == 2) {
+        *(device ushort *)(vram + at) = ushort(a.value);
+    } else {
+        *(device uint *)(vram + at) = a.value;
+    }
+}
+"#;
+
+#[repr(C)]
+struct FillArgs {
+    offset: u32,
+    stride: u32,
+    bpp: u32,
+    value: u32,
+}
 
 struct Arena {
     buf: Buffer,
@@ -123,6 +148,8 @@ pub(crate) struct MetalR3d {
     vram_len: usize,
     counter: Buffer,
     pipelines: HashMap<Vec<u32>, Option<Pipeline>>,
+    /// Built on first use; None inside if it failed.
+    fill_pipeline: Option<Option<ComputePipeline>>,
     batch: Option<Batch>,
     /// Committed command buffers, oldest first, with their serial numbers.
     inflight: std::collections::VecDeque<(Retained<ProtocolObject<dyn MTLCommandBuffer>>, Arena, u64)>,
@@ -161,6 +188,7 @@ impl MetalR3d {
             vram_len: vram.len(),
             counter,
             pipelines: HashMap::new(),
+            fill_pipeline: None,
             batch: None,
             inflight: Default::default(),
             committed: 0,
@@ -401,6 +429,43 @@ impl MetalR3d {
             }
         }
         u
+    }
+
+    fn fill_pipeline(&mut self) -> Option<ComputePipeline> {
+        if self.fill_pipeline.is_none() {
+            let built = (|| {
+                let lib = self.device.newLibraryWithSource_options_error(&NSString::from_str(FILL_MSL), None).ok()?;
+                let f = lib.newFunctionWithName(&NSString::from_str("fill"))?;
+                self.device.newComputePipelineStateWithFunction_error(&f).ok()
+            })();
+            if built.is_none() {
+                eprintln!("radeon: Metal fill pipeline failed; filling on the CPU instead");
+            }
+            self.fill_pipeline = Some(built);
+        }
+        self.fill_pipeline.clone().flatten()
+    }
+
+    /// Queues a write of `value` into each `bpp`-byte pixel of `f`, after
+    /// the draws queued so far. False if the CPU must do it.
+    pub fn fill(&mut self, f: Fill, bpp: usize, value: u32) -> bool {
+        let Some(pipeline) = self.fill_pipeline() else { return false };
+        let vram = self.vram.clone();
+        let Some(batch) = self.open() else { return false };
+        if let Some(enc) = batch.enc.take() {
+            enc.endEncoding();
+        }
+        let Some(enc) = batch.cmd.computeCommandEncoder() else { return false };
+        let args = FillArgs { offset: f.offset as u32, stride: f.stride as u32, bpp: bpp as u32, value };
+        enc.setComputePipelineState(&pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&vram), 0, 0);
+            enc.setBytes_length_atIndex(NonNull::from(&args).cast(), size_of::<FillArgs>(), 1);
+        }
+        let grid = MTLSize { width: f.width / bpp, height: f.rows, depth: 1 };
+        enc.dispatchThreads_threadsPerThreadgroup(grid, MTLSize { width: 64, height: 1, depth: 1 });
+        enc.endEncoding();
+        true
     }
 
     /// True while draws are queued or running.
