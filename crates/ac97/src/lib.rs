@@ -243,6 +243,16 @@ impl Ac97 {
         self.carry.clear();
     }
 
+    /// The PCM out channel and codec state, for debugging.
+    pub fn describe(&self) -> String {
+        let c = &self.ch[1];
+        format!(
+            "ac97: po civ {} lvi {} piv {} sr {:#x} cr {:#x} picb {} bdbar {:#x} bd {:#x}/{:#x} | rate {} gain {:?} glob_cnt {:#x} irq {}",
+            c.civ, c.lvi, c.piv, c.sr, c.cr, c.picb, c.bdbar, c.bd_addr, c.bd_ctl,
+            self.codec.dac_rate(), self.codec.out_gain(), self.glob_cnt, self.irq()
+        )
+    }
+
     /// Level of INTA#.
     pub fn irq(&self) -> bool {
         self.ch.iter().any(Channel::irq)

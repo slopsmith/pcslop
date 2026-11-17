@@ -514,6 +514,9 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                                 sl.1,
                                 sl.2
                             );
+                            if let Some(a) = board.describe_audio() {
+                                out += &format!("\n{a}");
+                            }
                             if let Some(l) = &board.lapic {
                                 let (a, b) = (l.stats, last_apic);
                                 let r = |x: u64, y: u64| (x - y) as f64 / span;

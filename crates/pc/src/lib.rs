@@ -191,6 +191,11 @@ impl Board {
         self.ac97 = Some((self.pci.len() - 1, ac97::Ac97::new(out)));
     }
 
+    /// The sound card's state, for debugging.
+    pub fn describe_audio(&self) -> Option<String> {
+        self.ac97.as_ref().map(|(_, a)| a.describe())
+    }
+
     /// I/O BAR `bar` of the AC'97 controller, if the guest has it decoded.
     fn ac97_bar(&self, bar: usize) -> Option<u16> {
         self.ac97.as_ref().and_then(|(i, _)| self.pci[*i].1.io_bar(bar))
