@@ -61,7 +61,26 @@ struct Mouse {
     rate_history: [u8; 3],
     buttons: u8,
     expect_arg: Option<u8>,
+    #[snap(skip)]
+    pending: Motion,
 }
+
+#[derive(Default, Clone, Copy)]
+struct Motion {
+    dx: i32,
+    dy: i32,
+    wheel: i32,
+    buttons_changed: bool,
+}
+
+impl Motion {
+    fn waiting(&self) -> bool {
+        self.buttons_changed || self.dx != 0 || self.dy != 0 || self.wheel != 0
+    }
+}
+
+const AUX_QUEUE_LIMIT: usize = 32;
+const MAX_PENDING: i32 = 4096;
 
 impl Default for I8042 {
     fn default() -> Self {
@@ -108,6 +127,9 @@ impl I8042 {
             && let Some(b) = self.aux_queue.pop_front()
         {
             self.out = Some((b, Src::Aux));
+            if self.aux_queue.is_empty() && self.mouse.pending.waiting() {
+                self.send_motion();
+            }
         }
     }
 
@@ -142,19 +164,51 @@ impl I8042 {
         self.refill();
     }
 
-    /// Queues a relative mouse movement (positive dy is up) and button state.
-    pub fn mouse_motion(&mut self, dx: i32, dy: i32, buttons: u8) {
-        if !self.mouse.reporting || self.aux_queue.len() > 30 {
+    /// Queues a relative mouse movement (positive dy is up), wheel detents
+    /// (positive is away from the user) and button state. Motion larger than
+    /// one packet holds is split over several.
+    pub fn mouse_motion(&mut self, dx: i32, dy: i32, wheel: i32, buttons: u8) {
+        if !self.mouse.reporting {
             return;
         }
-        self.mouse.buttons = buttons & 7;
-        let dx = dx.clamp(-255, 255);
-        let dy = dy.clamp(-255, 255);
-        let b0 = 0x08 | self.mouse.buttons | if dx < 0 { 0x10 } else { 0 } | if dy < 0 { 0x20 } else { 0 };
-        self.aux_reply(&[b0, dx as u8, dy as u8]);
+        let p = &mut self.mouse.pending;
+        let add = |acc: i32, v: i32| acc.saturating_add(v).clamp(-MAX_PENDING, MAX_PENDING);
+        p.dx = add(p.dx, dx);
+        p.dy = add(p.dy, dy);
         if self.mouse.id == 3 {
-            self.aux_reply(&[0]);
+            p.wheel = add(p.wheel, wheel);
         }
+        if buttons & 7 != self.mouse.buttons {
+            self.mouse.buttons = buttons & 7;
+            p.buttons_changed = true;
+        }
+        self.send_motion();
+    }
+
+    fn send_motion(&mut self) {
+        let size = if self.mouse.id == 3 { 4 } else { 3 };
+        loop {
+            let p = self.mouse.pending;
+            if !self.mouse.reporting || !p.waiting() || self.aux_queue.len() + size > AUX_QUEUE_LIMIT {
+                break;
+            }
+            let dx = p.dx.clamp(-256, 255);
+            let dy = p.dy.clamp(-256, 255);
+            // The IntelliMouse wheel byte counts detents towards the user.
+            let dz = (-p.wheel).clamp(-8, 7);
+            self.mouse.pending = Motion {
+                dx: p.dx - dx,
+                dy: p.dy - dy,
+                wheel: p.wheel + dz,
+                buttons_changed: false,
+            };
+            let b0 = 0x08 | self.mouse.buttons | if dx < 0 { 0x10 } else { 0 } | if dy < 0 { 0x20 } else { 0 };
+            self.aux_queue.extend([b0, dx as u8, dy as u8]);
+            if size == 4 {
+                self.aux_queue.push_back(dz as u8);
+            }
+        }
+        self.refill();
     }
 
     pub fn read(&mut self, port: u16) -> u8 {
@@ -386,8 +440,68 @@ mod tests {
         k.write(0x64, 0xd4);
         k.write(0x60, 0xf4);
         assert_eq!(k.read(0x60), 0xfa);
-        k.mouse_motion(5, -3, 1);
+        k.mouse_motion(5, -3, 0, 1);
         assert_eq!(k.irqs(), (false, true));
-        assert_eq!([k.read(0x60), k.read(0x60), k.read(0x60), k.read(0x60)], [0x29, 5, 0xfd, 0]);
+        assert_eq!(read_n(&mut k), [0x29, 5, 0xfd, 0]);
+        k.mouse_motion(0, 0, 1, 1);
+        assert_eq!(read_n(&mut k), [0x09, 0, 0, 0xff]);
+    }
+
+    fn read_n<const N: usize>(k: &mut I8042) -> [u8; N] {
+        std::array::from_fn(|_| k.read(0x60))
+    }
+
+    fn reporting_mouse() -> I8042 {
+        let mut k = I8042::default();
+        k.write(0x64, 0xd4);
+        k.write(0x60, 0xf4);
+        assert_eq!(k.read(0x60), 0xfa);
+        k
+    }
+
+    fn packet_delta(p: [u8; 3]) -> (i32, i32) {
+        let x = p[1] as i32 - if p[0] & 0x10 != 0 { 256 } else { 0 };
+        let y = p[2] as i32 - if p[0] & 0x20 != 0 { 256 } else { 0 };
+        (x, y)
+    }
+
+    #[test]
+    fn large_motion_is_split_into_nine_bit_packets() {
+        let mut k = reporting_mouse();
+        k.mouse_motion(700, -300, 0, 0);
+        let mut total = (0, 0);
+        let mut packets = 0;
+        while k.read(0x64) & STATUS_OBF != 0 {
+            let (x, y) = packet_delta(read_n(&mut k));
+            assert!((-256..=255).contains(&x) && (-256..=255).contains(&y));
+            total = (total.0 + x, total.1 + y);
+            packets += 1;
+        }
+        assert_eq!(total, (700, -300));
+        assert_eq!(packets, 3);
+    }
+
+    #[test]
+    fn motion_beyond_the_queue_waits_until_the_guest_reads() {
+        let mut k = reporting_mouse();
+        for _ in 0..40 {
+            k.mouse_motion(200, 0, 0, 0);
+        }
+        let mut total = 0;
+        while k.read(0x64) & STATUS_OBF != 0 {
+            total += packet_delta(read_n(&mut k)).0;
+        }
+        assert!(total > MAX_PENDING && total < 40 * 200, "{total}");
+    }
+
+    #[test]
+    fn a_button_change_without_motion_still_sends_a_packet() {
+        let mut k = reporting_mouse();
+        k.mouse_motion(0, 0, 0, 2);
+        assert_eq!(read_n(&mut k), [0x0a, 0, 0]);
+        k.mouse_motion(0, 0, 0, 2);
+        assert_eq!(k.read(0x64) & STATUS_OBF, 0);
+        k.mouse_motion(0, 0, 0, 0);
+        assert_eq!(read_n(&mut k), [0x08, 0, 0]);
     }
 }

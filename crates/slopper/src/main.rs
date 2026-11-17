@@ -638,7 +638,7 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                 Event::Key(code, down) => board.key(code, down),
                 Event::Type(text) => text.chars().for_each(|c| keyq.push_char(c)),
                 Event::Serial(bytes) => board.serial_input(&bytes),
-                Event::Mouse(dx, dy, b) => board.mouse_motion(dx, dy, b),
+                Event::Mouse(dx, dy, b) => board.mouse_motion(dx, dy, 0, b),
                 // A guest with a USB tablet driver gets absolute positions only:
                 // feeding the same motion through PS/2 as well would move the
                 // cursor twice and send every click twice.
@@ -646,7 +646,7 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                     if board.tablet_in_use() {
                         board.tablet(x, y, buttons, wheel);
                     } else {
-                        board.mouse_motion(dx, dy, buttons);
+                        board.mouse_motion(dx, dy, wheel, buttons);
                     }
                 }
                 Event::Tablet(px, py, buttons, wheel) => {

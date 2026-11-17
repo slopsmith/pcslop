@@ -556,8 +556,10 @@ impl Board {
         self.sync_kbc();
     }
 
-    pub fn mouse_motion(&mut self, dx: i32, dy: i32, buttons: u8) {
-        self.kbc.mouse_motion(dx, dy, buttons);
+    /// PS/2 mouse motion (positive `dy` is up), wheel detents (positive is
+    /// away from the user) and buttons.
+    pub fn mouse_motion(&mut self, dx: i32, dy: i32, wheel: i32, buttons: u8) {
+        self.kbc.mouse_motion(dx, dy, wheel, buttons);
         self.sync_kbc();
     }
 
