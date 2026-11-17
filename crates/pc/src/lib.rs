@@ -571,6 +571,16 @@ impl Board {
         self.vga.mark_changed();
     }
 
+    /// For each 16 KiB chunk of 0xC0000..0x100000: `Some(writable)` when the
+    /// PAM registers send reads to RAM (a shadowed ROM), `None` when they go
+    /// to ROM.
+    pub fn shadowed_rom(&self) -> [Option<bool>; 16] {
+        std::array::from_fn(|i| {
+            let pam = self.pam(0xc_0000 + i as u32 * 0x4000);
+            (pam & 1 != 0).then_some(pam & 2 != 0)
+        })
+    }
+
     /// Inserts an ISO image into the CD-ROM drive on the secondary master.
     pub fn attach_cdrom(&mut self, path: &str) -> std::io::Result<()> {
         let b = ide::FileBackend::open(path, true)?;

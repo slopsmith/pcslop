@@ -1360,3 +1360,26 @@ fn a_block_compiled_at_the_end_of_the_code_cache_still_reaches_the_runtime() {
     run_jit_with(&mut cpu, &mut bus, |j| j.code_next = crate::layout::CODE_CACHE_END - 16, |_| {});
     assert_eq!(bus.ram.as_slice()[0x3008], 1, "a long block near the end of the cache must translate and run");
 }
+
+#[test]
+fn shadowed_rom_chunks_are_read_without_exits() {
+    let code = [
+        0xa1, 0x00, 0x00, 0x0c, 0x00, // mov eax, [0xc0000]
+        0x8b, 0x1d, 0x00, 0x40, 0x0c, 0x00, // mov ebx, [0xc4000]
+        0x89, 0x0d, 0x10, 0x00, 0x0c, 0x00, // mov [0xc0010], ecx
+        0x89, 0x0d, 0x00, 0x80, 0x0c, 0x00, // mov [0xc8000], ecx
+        0xf4,
+    ];
+    let mut cpu = flat_cpu(0x1000, 0x8000);
+    cpu.regs[1] = 0x5555_aaaa;
+    let mut bus = bus_with(0x1000, &code);
+    bus.ram.as_mut_slice()[0xc0000..0xc0004].copy_from_slice(&0x1122_3344u32.to_le_bytes());
+    bus.ram.as_mut_slice()[0xc4000..0xc4004].copy_from_slice(&0x5566_7788u32.to_le_bytes());
+    let mut chunks = [None; 16];
+    chunks[0] = Some(false);
+    chunks[2] = Some(true);
+    let stats = run_jit_with(&mut cpu, &mut bus, |j| j.set_shadowed_rom(chunks).unwrap(), |_| {});
+    assert_eq!((cpu.regs[0], cpu.regs[3]), (0x1122_3344, 0x5566_7788));
+    assert_eq!(&bus.ram.as_slice()[0xc8000..0xc8004], &0x5555_aaaau32.to_le_bytes());
+    assert_eq!(stats.mmio_exits, 2, "only the unmapped chunk and the write-protected one may reach the bus: {stats:?}");
+}

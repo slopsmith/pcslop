@@ -341,7 +341,9 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
         {
             let t = Instant::now();
             let fb = board.framebuffer();
-            let r = unsafe { j.set_framebuffer(fb) }.and_then(|_| j.run(&mut cpu, &mut board));
+            let r = unsafe { j.set_framebuffer(fb) }
+                .and_then(|_| j.set_shadowed_rom(board.shadowed_rom()))
+                .and_then(|_| j.run(&mut cpu, &mut board));
             time.jit += t.elapsed();
             match r {
                 Ok(jit::RunExit::Kicked) => {}

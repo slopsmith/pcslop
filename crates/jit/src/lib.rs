@@ -322,6 +322,8 @@ pub struct Jit {
     /// Declared last so it is dropped after the vCPU.
     vm: Vm,
     fb: Option<Framebuffer>,
+    ram: usize,
+    shadowed_rom: [Option<bool>; 16],
 }
 
 /// Offset of the two-entry lookup bucket for `key`; the runtime's dispatcher
@@ -437,6 +439,8 @@ impl Jit {
             audit_seen: HashSet::default(),
             vm,
             fb: None,
+            ram: ram as usize,
+            shadowed_rom: [None; 16],
         };
         for t in &mut jit.shadow {
             t.flush(jit.mem.as_mut_slice());
@@ -635,6 +639,27 @@ impl Jit {
         if let Some((ipa, host, len)) = want {
             unsafe { self.vm.map(host as *mut u8, ipa, len, mem::READ)? };
             self.fb = Some(Framebuffer { ipa, host, len, written: false });
+        }
+        Ok(())
+    }
+
+    /// Maps the 16 KiB chunks of 0xC0000..0x100000 that read from RAM, as
+    /// `Board::shadowed_rom` reports them, so translated code reads shadowed
+    /// ROMs without exits; writes exit unless the chunk is writable.
+    pub fn set_shadowed_rom(&mut self, chunks: [Option<bool>; 16]) -> hvf::Result<()> {
+        for (i, &want) in chunks.iter().enumerate() {
+            if want == self.shadowed_rom[i] {
+                continue;
+            }
+            let ipa = 0xc_0000 + i * 0x4000;
+            if self.shadowed_rom[i].is_some() {
+                self.vm.unmap(ipa as u64, 0x4000)?;
+            }
+            if let Some(writable) = want {
+                let flags = if writable { mem::READ | mem::WRITE } else { mem::READ };
+                unsafe { self.vm.map((self.ram + ipa) as *mut u8, ipa as u64, 0x4000, flags)? };
+            }
+            self.shadowed_rom[i] = want;
         }
         Ok(())
     }
