@@ -631,6 +631,11 @@ impl Jit {
             self.pt_watch.watch(cpu, bus, lin);
         }
         let r = self.root;
+        // The TLB may hold the entry this replaces, possibly writable to a page
+        // that is about to become code.
+        if self.shadow[r].maps(self.mem.as_slice(), lin, false) {
+            self.tlbi_page(lin);
+        }
         let leaf = match self.shadow[r].map(self.mem.as_mut_slice(), lin, phys, writable) {
             Some(off) => off,
             None => {
