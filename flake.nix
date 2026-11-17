@@ -12,15 +12,12 @@
     in
     {
       packages.${system} = {
-        # No MP table until the board has a local APIC and I/O APIC; without one,
-        # XP Setup picks the "Standard PC" HAL.
         seabios = (x86pkgs.seabios.override { ___build-type = "qemu"; }).overrideAttrs {
           postConfigure = ''
             cat > .config <<CONFIG
             CONFIG_QEMU=y
             CONFIG_QEMU_HARDWARE=y
             CONFIG_PERMIT_UNALIGNED_PCIROM=y
-            CONFIG_MPTABLE=n
             CONFIG
             make olddefconfig
           '';
