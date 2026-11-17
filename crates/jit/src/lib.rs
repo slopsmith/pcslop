@@ -297,6 +297,9 @@ pub struct Jit {
     /// Measures time spent in the VM and per exit kind (SLOPPER_JIT_PROFILE).
     timing: bool,
     audit: bool,
+    /// Audit every this many runs (the value of SLOPPER_JIT_AUDIT).
+    audit_every: u32,
+    audit_tick: u32,
     audit_seen: HashSet<(usize, u32, u32)>,
     /// Interpreter exits by opcode, when profiling is on.
     interp_profile: Option<HashMap<u16, u64>>,
@@ -378,6 +381,8 @@ impl Jit {
             vm_fill: std::env::var_os("SLOPPER_JIT_VM_FILL").is_some(),
             timing: std::env::var_os("SLOPPER_JIT_PROFILE").is_some(),
             audit: std::env::var_os("SLOPPER_JIT_AUDIT").is_some(),
+            audit_every: std::env::var("SLOPPER_JIT_AUDIT").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1),
+            audit_tick: 0,
             audit_seen: HashSet::default(),
             _vm: vm,
         };
@@ -409,29 +414,42 @@ impl Jit {
         if cpu.cr0 & x86::cpu::cr0::PG == 0 {
             return;
         }
+        self.audit_tick += 1;
+        if self.audit_tick % self.audit_every != 0 {
+            return;
+        }
         let pse = cpu.cr4 & x86::cpu::cr4::PSE != 0;
+        let pge = cpu.cr4 & x86::cpu::cr4::PGE != 0;
         let mut reported = 0;
         for r in 0..2 {
+            let tracked: HashSet<usize> = self.nonglobal[r].iter().copied().collect();
             for (lin, phys, writable, off) in self.shadow[r].leaves(self.mem.as_slice()) {
                 let pde = bus.read32((cpu.cr3 & !0xfff) + (lin >> 22) * 4);
                 let want = if pde & 1 == 0 {
                     None
                 } else if pde & 0x80 != 0 && pse {
-                    Some(((pde & 0xffc0_0000) | (lin & 0x3f_f000), pde))
+                    Some(((pde & 0xffc0_0000) | (lin & 0x3f_f000), pde, pde))
                 } else {
                     let pte = bus.read32((pde & !0xfff) + ((lin >> 12) & 0x3ff) * 4);
-                    (pte & 1 != 0).then_some((pte & !0xfff, pde & pte))
+                    (pte & 1 != 0).then_some((pte & !0xfff, pde & pte, pte))
                 };
-                let bad = match want {
-                    None => true,
-                    Some((p, perms)) => p != phys || (writable && perms & 2 == 0 && r == 1),
+                if writable && self.code_pages.contains_key(&phys) {
+                    let listed = self.writable[r].get(&phys).is_some_and(|l| l.contains(&lin));
+                    eprintln!("AUDIT writable code page: root {r} lin {lin:#010x} phys {phys:#x} listed {listed} x86 {want:x?}");
+                }
+                let why = match want {
+                    None => "not present",
+                    Some((p, _, _)) if p != phys => "other page",
+                    Some((_, perms, _)) if writable && perms & 2 == 0 => "writable",
+                    Some((_, perms, _)) if r == 1 && perms & 4 == 0 => "supervisor page in user tree",
+                    Some((_, _, leaf)) if !(pge && leaf & 0x100 != 0) && !tracked.contains(&off) => "untracked non-global",
+                    _ => continue,
                 };
-                if bad && reported < 10 && self.audit_seen.insert((r, lin, phys)) {
+                if reported < 10 && self.audit_seen.insert((r, lin, phys)) {
                     reported += 1;
                     eprintln!(
-                        "AUDIT root {r} lin {lin:#010x} shadow {phys:#x}{} x86 {want:x?} nonglobal_tracked {} gen {}",
+                        "AUDIT {why}: root {r} lin {lin:#010x} shadow {phys:#x}{} x86 {want:x?} gen {}",
                         if writable { " rw" } else { " ro" },
-                        self.nonglobal[r].contains(&off),
                         cpu.tlb.generation
                     );
                 }
