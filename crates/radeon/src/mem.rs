@@ -84,6 +84,7 @@ impl Radeon {
             let chunk = &buf[done..done + n];
             match self.mc_place(mem, a) {
                 Place::Vram(off) => {
+                    self.vram_written();
                     let vram = self.vga.vram_mut();
                     for (i, &b) in chunk.iter().enumerate() {
                         vram[(off + i) % VRAM_SIZE] = b;

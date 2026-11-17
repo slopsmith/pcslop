@@ -13,6 +13,8 @@
 
 #[cfg(target_os = "macos")]
 pub(crate) mod metal;
+#[cfg(target_os = "macos")]
+mod metal_tex;
 #[cfg(not(target_os = "macos"))]
 #[path = "metal_none.rs"]
 pub(crate) mod metal;
@@ -342,6 +344,7 @@ impl Radeon {
     /// see that drawing finished, calls this first.
     pub fn gpu_sync(&mut self) {
         if let Some(m) = self.metal.as_mut() {
+            m.vram_written();
             let passed = m.sync();
             let r = &mut self.regs[ZB_ZPASS_DATA as usize / 4];
             *r = r.wrapping_add(passed);
@@ -412,7 +415,8 @@ impl Radeon {
                 let t = self.metal.as_ref().map_or(0, |m| m.throttles());
                 let p = self.metal.as_ref().map_or(0, |m| m.pipelines());
                 let ms = self.metal.as_ref().map_or(0, |m| m.gpu_ms());
-                s += &format!(" | metal draws {d} cpu fallbacks {f} waits {w} throttled {t} pipelines {p} gpu ms {ms}")
+                let (tn, tu) = self.metal.as_ref().map_or((0, 0), |m| m.texture_stats());
+                s += &format!(" | metal draws {d} cpu fallbacks {f} waits {w} throttled {t} pipelines {p} gpu ms {ms} metal textures {tn} dxt copies {tu}")
             }
             None => s += " | cpu",
         }
@@ -423,6 +427,14 @@ impl Radeon {
     /// waited for it.
     pub fn metal_stats(&self) -> Option<(u64, u64, u64)> {
         self.metal.as_ref().map(|m| m.stats())
+    }
+
+    /// Notes that the guest or the CP may have written VRAM, so Metal's
+    /// texture copies are checked against it again.
+    pub(crate) fn vram_written(&mut self) {
+        if let Some(m) = self.metal.as_mut() {
+            m.vram_written();
+        }
     }
 
     /// Starts the queued Metal draws without waiting for them.

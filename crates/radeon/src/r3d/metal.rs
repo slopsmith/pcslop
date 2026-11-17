@@ -9,6 +9,7 @@
 //! Draws collect in a command buffer until something needs finished pixels:
 //! see `Radeon::gpu_sync`.
 
+use super::metal_tex::{self, MetalTexture, TexCache};
 use super::{msl, us};
 use super::raster::{Captured, Raster};
 use super::zmask::Fill;
@@ -32,6 +33,9 @@ const MAX_INFLIGHT: usize = 4;
 /// megabyte; past this the cache starts over.
 const MAX_PIPELINES: usize = 1024;
 const ALIGN: usize = 256;
+/// Bytes of a draw's texture and sampler tables at most: 16 maps of 12
+/// levels of 6 faces, and two samplers each.
+const TABLES: usize = 8 * (16 * 12 * 6 + 32);
 /// The render target is attachmentless and covers the whole 4096x4096
 /// coordinate space the scissor allows.
 const TARGET: usize = 4096;
@@ -56,6 +60,12 @@ struct TexDesc {
     off: [u32; 12],
     pitch: [u32; 12],
     slice: [u32; 12],
+    native: u32,
+    first: u32,
+    layers: u32,
+    map: u32,
+    sampler: u32,
+    pad: [u32; 3],
 }
 
 #[repr(C)]
@@ -132,6 +142,8 @@ struct Arena {
     used: usize,
     /// VRAM ranges the command buffer using this arena writes.
     dirty: Vec<(usize, usize)>,
+    /// Textures its draws sample, kept alive until it finishes.
+    keep: Vec<MetalTexture>,
 }
 
 impl Arena {
@@ -181,6 +193,9 @@ pub(crate) struct MetalR3d {
     throttles: u64,
     /// Seconds the GPU spent running finished command buffers.
     gpu_seconds: f64,
+    textures: TexCache,
+    /// False to sample every texture in software, for comparison.
+    native_textures: bool,
 }
 
 // The Metal objects are only touched while the card's owner holds it.
@@ -196,6 +211,14 @@ impl Drop for MetalR3d {
 
 fn bytes_of<T>(v: &T) -> &[u8] {
     unsafe { std::slice::from_raw_parts((v as *const T).cast::<u8>(), size_of::<T>()) }
+}
+
+fn slice_bytes(v: &[u64]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), v.len() * 8) }
+}
+
+fn resource_id(id: MTLResourceID) -> u64 {
+    unsafe { std::mem::transmute(id) }
 }
 
 impl MetalR3d {
@@ -229,6 +252,8 @@ impl MetalR3d {
             waits: 0,
             throttles: 0,
             gpu_seconds: 0.0,
+            textures: TexCache::new(),
+            native_textures: std::env::var("SLOPPER_TEX").as_deref() != Ok("software"),
         })
     }
 
@@ -280,7 +305,7 @@ impl MetalR3d {
             return Some(a);
         }
         let buf = self.device.newBufferWithLength_options(ARENA_SIZE, MTLResourceOptions::StorageModeShared)?;
-        Some(Arena { buf, used: 0, dirty: Vec::new() })
+        Some(Arena { buf, used: 0, dirty: Vec::new(), keep: Vec::new() })
     }
 
     fn open(&mut self) -> Option<&mut Batch> {
@@ -363,10 +388,11 @@ impl MetalR3d {
                 copies.push((i, v));
             }
         }
-        let need = floats.len() + copies.iter().map(|c| c.1.len() + ALIGN).sum::<usize>() + size_of::<Uniforms>() + 4 * ALIGN;
+        let need = floats.len() + copies.iter().map(|c| c.1.len() + ALIGN).sum::<usize>() + size_of::<Uniforms>() + TABLES + 6 * ALIGN;
         if self.batch.as_ref().is_some_and(|b| b.arena.used + need > ARENA_SIZE) {
             self.kick();
         }
+        let (images, samplers) = self.native_textures(r, &mut u);
         let counter = self.counter.clone();
         let vram = self.vram.clone();
         let Some(batch) = self.open() else { return };
@@ -378,6 +404,9 @@ impl MetalR3d {
         }
         let Some(vb) = batch.arena.put(floats) else { return };
         let Some(ub) = batch.arena.put(bytes_of(&u)) else { return };
+        let ids: Vec<u64> = images.iter().map(|t| resource_id(t.gpuResourceID())).collect();
+        let Some(tb) = batch.arena.put(slice_bytes(&ids)) else { return };
+        let Some(sb) = batch.arena.put(slice_bytes(&samplers)) else { return };
         if reads.iter().any(|&(a, b)| batch.written.iter().any(|&(c, d)| a < d && c < b)) {
             if let Some(enc) = batch.enc.take() {
                 enc.endEncoding();
@@ -399,11 +428,61 @@ impl MetalR3d {
             enc.setFragmentBuffer_offset_atIndex(Some(&arena), 0, 2);
             enc.setFragmentBuffer_offset_atIndex(Some(&arena), ub, 3);
             enc.setFragmentBuffer_offset_atIndex(Some(&counter), 0, 4);
+            enc.setFragmentBuffer_offset_atIndex(Some(&arena), tb, 5);
+            enc.setFragmentBuffer_offset_atIndex(Some(&arena), sb, 6);
+            if !images.is_empty() {
+                let refs: Vec<NonNull<ProtocolObject<dyn MTLResource>>> =
+                    images.iter().map(|t| NonNull::from(ProtocolObject::<dyn MTLResource>::from_ref(&**t))).collect();
+                enc.useResources_count_usage_stages(NonNull::new(refs.as_ptr().cast_mut()).unwrap(), refs.len(), MTLResourceUsage::Read, MTLRenderStages::Fragment);
+            }
         }
+        batch.arena.keep.extend(images);
         enc.setViewport(MTLViewport { originX: 0.0, originY: 0.0, width: TARGET as f64, height: TARGET as f64, znear: 0.0, zfar: 1.0 });
         enc.setScissorRect(MTLScissorRect { x: x0 as usize, y: y0 as usize, width: (x1 - x0 + 1) as usize, height: (y1 - y0 + 1) as usize });
         unsafe { enc.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, vertices) };
         self.draws += 1;
+    }
+
+    /// Points the descriptors of the textures Metal can sample at their
+    /// images and samplers, and returns the images and sampler handles the
+    /// draw's tables list.
+    fn native_textures(&mut self, r: &Raster, u: &mut Uniforms) -> (Vec<MetalTexture>, Vec<u64>) {
+        let (mut images, mut samplers) = (Vec::new(), Vec::new());
+        if !self.native_textures {
+            return (images, samplers);
+        }
+        let vram = unsafe { std::slice::from_raw_parts(self.vram.contents().as_ptr().cast::<u8>(), self.vram_len) };
+        for (i, t) in r.textures.iter().enumerate() {
+            let Some(plan) = t.as_ref().and_then(|t| metal_tex::plan(t, self.vram_len)) else { continue };
+            let pair = [false, true].map(|linear| self.textures.sampler(&self.device, plan.sampler, linear));
+            let [Some(near), Some(lin)] = pair else { continue };
+            let Some(imgs) = self.textures.images(&self.device, &self.vram, vram, &plan) else { continue };
+            let d = &mut u.tex[i];
+            d.native = 1;
+            d.first = images.len() as u32;
+            d.layers = plan.layers;
+            d.map = plan.map;
+            d.sampler = samplers.len() as u32;
+            images.extend(imgs.iter().cloned());
+            samplers.push(resource_id(near.gpuResourceID()));
+            samplers.push(resource_id(lin.gpuResourceID()));
+        }
+        (images, samplers)
+    }
+
+    /// Notes that VRAM may have changed outside the Metal pipeline.
+    pub fn vram_written(&mut self) {
+        self.textures.invalidate();
+    }
+
+    /// Samples every texture in software when false.
+    pub fn set_native_textures(&mut self, on: bool) {
+        self.native_textures = on;
+    }
+
+    /// Texture binds sampled by Metal, and DXT textures copied.
+    pub fn texture_stats(&self) -> (u64, u64) {
+        (self.textures.native, self.textures.uploads)
     }
 
     fn uniforms(&self, r: &Raster) -> Uniforms {
@@ -569,6 +648,7 @@ impl MetalR3d {
         }
         arena.used = 0;
         arena.dirty.clear();
+        arena.keep.clear();
         let (start, end) = (cmd.GPUStartTime(), cmd.GPUEndTime());
         if end > start && start > 0.0 {
             self.gpu_seconds += end - start;

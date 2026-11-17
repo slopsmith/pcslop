@@ -122,6 +122,7 @@ impl Radeon {
         dwords.extend(self.mc_read_dwords(mem, base.wrapping_add(rptr * 4), first as usize));
         dwords.extend(self.mc_read_dwords(mem, base, (count - first) as usize));
         self.cp.ring_start = (rptr, size);
+        self.vram_written();
         self.cp.streams.push(Stream { dwords, pos: 0, ring: true });
         true
     }

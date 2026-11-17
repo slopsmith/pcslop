@@ -57,4 +57,10 @@ impl MetalR3d {
     pub fn sync(&mut self) -> u32 {
         0
     }
+
+    pub fn vram_written(&mut self) {}
+
+    pub fn texture_stats(&self) -> (u64, u64) {
+        (0, 0)
+    }
 }

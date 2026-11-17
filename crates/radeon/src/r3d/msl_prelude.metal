@@ -13,6 +13,16 @@ struct TexDesc {
     uint off[12];
     uint pitch[12];
     uint slice[12];
+    uint native, first, layers, map, sampler;
+    uint pad[3];
+};
+
+struct TexSlot { texture2d<float> t; };
+struct SamplerSlot { sampler s; };
+
+struct TexTables {
+    const device TexSlot *images;
+    const device SamplerSlot *samplers;
 };
 
 struct ColourDesc {
@@ -217,7 +227,18 @@ static float4 bilinear(constant TexDesc &t, const device uchar *d, uint level, f
     return top + (bottom - top) * f.y;
 }
 
-static float4 sample_tex(constant TexDesc &t, const device uchar *vram, const device uchar *stage, float4 coords, uint op) {
+static float channel(float4 c, uint m) {
+    return m <= 3 ? c[m] : m == 5 ? 1.0 : 0.0;
+}
+
+// Samples one image of a texture with Metal, as `fetch` and `bilinear` would.
+static float4 native_tap(constant TexDesc &t, TexTables tb, uint level, uint face, float2 st, bool linear) {
+    texture2d<float> img = tb.images[t.first + level * t.layers + face].t;
+    float4 c = img.sample(tb.samplers[t.sampler + (linear ? 1 : 0)].s, st, metal::level(0));
+    return float4(channel(c, t.map & 7), channel(c, (t.map >> 3) & 7), channel(c, (t.map >> 6) & 7), channel(c, (t.map >> 9) & 7));
+}
+
+static float4 sample_tex(constant TexDesc &t, const device uchar *vram, const device uchar *stage, TexTables tb, float4 coords, uint op) {
     float3 str = tex_coords(t, coords, op == 3);
     float2 st = str.xy;
     float2 size = float2(t.width, t.height);
@@ -232,6 +253,7 @@ static float4 sample_tex(constant TexDesc &t, const device uchar *vram, const de
     uint level = 0;
     if (minify && mip != 0) level = min(uint(round(lod)) + ((t.filter >> 17) & 0xf), t.nlevels - 1);
     bool linear = minify ? ((t.filter >> 11) & 3) == 2 : ((t.filter >> 9) & 3) == 2;
+    if (t.native) return native_tap(t, tb, level, t.kind == 2 ? uint(str.z) : 0, st, linear);
     float2 wh = float2(max(t.width >> level, 1u), max(t.height >> level, 1u));
     float2 uv = st * wh;
     int z0 = 0;

@@ -184,6 +184,7 @@ impl Radeon {
     }
 
     pub fn vram_mut(&mut self) -> &mut [u8] {
+        self.vram_written();
         self.vga.vram_mut()
     }
 
@@ -326,6 +327,7 @@ impl Radeon {
             None => (d & mask) >> shift,
             Some(v) => {
                 d = (d & !mask) | ((v << shift) & mask);
+                self.vram_written();
                 self.vga.vram_mut()[a..a + 4].copy_from_slice(&d.to_le_bytes());
                 0
             }

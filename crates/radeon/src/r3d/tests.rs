@@ -728,13 +728,20 @@ mod against_metal {
     /// pixels: every channel within `tolerance`, apart from at most `edges`
     /// pixels where the two rasterizers' subpixel precision differs.
     fn same(scene: impl Fn(&mut Gpu), tolerance: u32, edges: usize) {
+        compare(scene, tolerance, edges, true);
+    }
+
+    /// Like `same`, with Metal's texture sampling on or off, and returns
+    /// how many texture binds Metal sampled.
+    fn compare(scene: impl Fn(&mut Gpu), tolerance: u32, edges: usize, native: bool) -> u64 {
         let mut cpu = Gpu::new();
         scene(&mut cpu);
         let mut gpu = Gpu::new();
         if !gpu.r.use_metal() {
             eprintln!("no Metal device; skipping");
-            return;
+            return 1;
         }
+        gpu.r.metal.as_mut().unwrap().set_native_textures(native);
         scene(&mut gpu);
         gpu.r.gpu_sync();
         let (draws, fallbacks, _) = gpu.r.metal_stats().unwrap();
@@ -754,6 +761,14 @@ mod against_metal {
         }
         assert!(differ <= edges, "{differ} pixels differ");
         assert!(cpu.count(0) < 64 * 64, "the scene drew nothing");
+        gpu.r.metal.as_ref().unwrap().texture_stats().0
+    }
+
+    /// Compares `scene` with Metal sampling its textures and with the shader
+    /// sampling them in software, and returns whether Metal sampled any.
+    fn both_samplers(scene: impl Fn(&mut Gpu), tolerance: u32) -> bool {
+        compare(&scene, tolerance, 0, false);
+        compare(&scene, tolerance, 0, true) > 0
     }
 
     #[test]
@@ -1011,15 +1026,15 @@ mod against_metal {
     fn nearest_bilinear_and_mipmapped_textures_match() {
         let tex = checker(16, 4, &[0x10, 0x80, 0xf0, 0xff], &[0xf0, 0x20, 0x40, 0x80], 4);
         for filter in [0, 2 << 9 | 2 << 11, 2 << 9 | 2 << 11 | 1 << 13] {
-            same(
+            let native = both_samplers(
                 |g| {
                     texture(g, 12, 16, 4, filter, &tex);
                     draw_uv(g, [(0.0, 0.0, 0.0, 0.0), (64.0, 0.0, 1.0, 0.0), (64.0, 64.0, 1.0, 1.0), (0.0, 64.0, 0.0, 1.0)]);
                     draw_uv(g, [(4.0, 4.0, 0.0, 0.0), (12.0, 4.0, 3.0, 0.0), (12.0, 12.0, 3.0, 3.0), (4.0, 12.0, 0.0, 3.0)]);
                 },
                 2,
-                0,
             );
+            assert!(native, "filter {filter:#x} sampled in software");
         }
     }
 
@@ -1027,16 +1042,103 @@ mod against_metal {
     fn texture_formats_match() {
         let dxt1 = [0x00, 0xf8, 0x1f, 0x00, 0b11100100, 0b00011011, 0b10101010, 0b01010101];
         let tex16 = checker(8, 2, &[0x1f, 0xf8], &[0xe0, 0x07], 0);
-        for (format, data) in [(0xf, dxt1.repeat(4)), (6, tex16.clone()), (11, tex16.clone()), (10, tex16)] {
-            same(
-                |g| {
-                    texture(g, format, 8, 0, 0, &data);
+        let dxt3: Vec<u8> = [[0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe], dxt1].concat();
+        let dxt5: Vec<u8> = [[0xf0, 0x20, 0b1000_1000, 0b1100_0110, 0b0111_1010, 0x24, 0x92, 0x49], dxt1].concat();
+        let tex8 = checker(8, 1, &[0x20], &[0xe0], 0);
+        let tex32 = checker(8, 4, &[0x10, 0x80, 0xf0, 0xff], &[0xf0, 0x20, 0x40, 0x80], 0);
+        let tex64 = checker(8, 8, &[0, 0x10, 0, 0x80, 0, 0xf0, 0, 0xff], &[0, 0xf0, 0, 0x20, 0, 0x40, 0, 0x80], 0);
+        let half = checker(8, 8, &[0x00, 0x38, 0x00, 0x34, 0x00, 0x30, 0x00, 0x3c], &[0x00, 0x2c, 0x00, 0x38, 0x00, 0x00, 0x00, 0x3c], 0);
+        let cases = [
+            (0xf, dxt1.repeat(4)),
+            (0x10, dxt3.repeat(4)),
+            (0x11, dxt5.repeat(4)),
+            (0, tex8),
+            (3, tex16.clone()),
+            (6, tex16.clone()),
+            (11, tex16.clone()),
+            (10, tex16),
+            (12, tex32.clone()),
+            (13, tex32),
+            (14, tex64),
+            (0x1a, half),
+        ];
+        for (format, data) in cases {
+            for filter in [0, 2 << 9 | 2 << 11] {
+                let scene = |g: &mut Gpu| {
+                    texture(g, format, 8, 0, filter, &data);
                     draw_uv(g, [(0.0, 0.0, 0.0, 0.0), (64.0, 0.0, 1.0, 0.0), (64.0, 64.0, 1.0, 1.0), (0.0, 64.0, 0.0, 1.0)]);
-                },
-                1,
-                0,
-            );
+                };
+                assert!(both_samplers(scene, 2), "format {format:#x} sampled in software");
+            }
         }
+    }
+
+    #[test]
+    fn signed_textures_match() {
+        let tex = checker(8, 4, &[0x10, 0x80, 0xf0, 0x7f], &[0xf0, 0x20, 0x81, 0x00], 0);
+        for (signed, native) in [(0b1111, true), (0b0110, false)] {
+            let scene = |g: &mut Gpu| {
+                texture(g, 12, 8, 0, 2 << 9 | 2 << 11, &tex);
+                g.w(TX_FORMAT1_0, 12 | 0xa60 << 4 | signed << 5);
+                g.w(GA_ROUND_MODE, 1 << 4);
+                draw_uv(g, [(0.0, 0.0, 0.0, 0.0), (64.0, 0.0, 1.0, 0.0), (64.0, 64.0, 1.0, 1.0), (0.0, 64.0, 0.0, 1.0)]);
+            };
+            assert_eq!(both_samplers(scene, 2), native, "signed {signed:#b}");
+        }
+    }
+
+    #[test]
+    fn wrap_modes_and_border_colours_match() {
+        let tex = checker(8, 4, &[0x10, 0x80, 0xf0, 0xff], &[0xf0, 0x20, 0x40, 0x80], 0);
+        let cases = [
+            (0, 0, true),
+            (1 | 1 << 3, 0, true),
+            (2 | 3 << 3, 0, true),
+            (4 | 5 << 3, 0, true),
+            (6 | 6 << 3, 0xffff_ffff, true),
+            (6 | 2 << 3, 0, true),
+            (6 | 6 << 3, 0xff00_0000, true),
+            (6 | 6 << 3, 0x8040_2010, false),
+            (7 | 7 << 3, 0, false),
+        ];
+        for (wrap, border, native) in cases {
+            for filter in [0, 2 << 9 | 2 << 11] {
+                let scene = |g: &mut Gpu| {
+                    texture(g, 12, 8, 0, wrap | filter, &tex);
+                    g.w(TX_BORDER_COLOR_0, border);
+                    draw_uv(g, [(0.0, 0.0, -1.3, -0.7), (64.0, 0.0, 2.1, -0.7), (64.0, 64.0, 2.1, 1.9), (0.0, 64.0, -1.3, 1.9)]);
+                };
+                assert_eq!(both_samplers(scene, 2), native, "wrap {wrap:#x} border {border:#x}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_dxt_texture_rewritten_in_vram_samples_its_new_texels() {
+        let red = [0x00, 0xf8, 0x00, 0xf8, 0, 0, 0, 0];
+        let green = [0xe0, 0x07, 0xe0, 0x07, 0, 0, 0, 0];
+        let scene = |g: &mut Gpu| {
+            texture(g, 0xf, 8, 0, 0, &red.repeat(4));
+            draw_uv(g, [(0.0, 0.0, 0.0, 0.0), (32.0, 0.0, 1.0, 0.0), (32.0, 64.0, 1.0, 1.0), (0.0, 64.0, 0.0, 1.0)]);
+            g.r.gpu_sync();
+            g.r.vram_mut()[TEXTURE as usize..][..32].copy_from_slice(&green.repeat(4));
+            draw_uv(g, [(32.0, 0.0, 0.0, 0.0), (64.0, 0.0, 1.0, 0.0), (64.0, 64.0, 1.0, 1.0), (32.0, 64.0, 0.0, 1.0)]);
+        };
+        assert!(both_samplers(scene, 1));
+    }
+
+    #[test]
+    fn a_texture_drawn_by_an_earlier_draw_samples_its_pixels() {
+        let scene = |g: &mut Gpu| {
+            g.draw(13, &quad(0.0, 0.0, 8.0, 4.0, RED));
+            g.draw(13, &quad(0.0, 4.0, 8.0, 8.0, [0.0, 0.0, 1.0, 1.0]));
+            texture(g, 12, 8, 0, 0, &[]);
+            g.w(TX_FORMAT0_0, 7 | 7 << 11 | 1 << 31);
+            g.w(TX_FORMAT2_0, PITCH as u32 - 1);
+            g.w(TX_OFFSET_0, VRAM + COLOUR);
+            draw_uv(g, [(16.0, 16.0, 0.0, 0.0), (48.0, 16.0, 1.0, 0.0), (48.0, 48.0, 1.0, 1.0), (16.0, 48.0, 0.0, 1.0)]);
+        };
+        assert!(both_samplers(scene, 0));
     }
 
     #[test]
