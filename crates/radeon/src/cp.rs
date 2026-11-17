@@ -40,9 +40,14 @@ impl Radeon {
         (2u32 << (self.reg(CP_RB_CNTL) & 0x3f).min(26)).min(MAX_RING_DWORDS)
     }
 
-    /// CP_CSQ_CNTL fetches the primary stream by bus mastering.
+    /// The primary stream is fetched by bus mastering: CP_CSQ_MODE, when it
+    /// enables the primary stream, overrides CP_CSQ_CNTL's mode.
     fn primary_bus_master(&self) -> bool {
-        matches!(self.reg(CP_CSQ_CNTL) >> 28, 2 | 4)
+        let mode = self.reg(CP_CSQ_MODE);
+        if mode & CSQ_PRIMARY_ENABLE != 0 {
+            return mode & CSQ_PRIMARY_BM != 0;
+        }
+        matches!(self.reg(CP_CSQ_CNTL) >> 28, 2 | 4 | 6 | 8)
     }
 
     pub(crate) fn cp_rptr(&self) -> u32 {
@@ -169,19 +174,25 @@ impl Radeon {
         }
     }
 
+    fn scratch_written(&mut self, n: u32, mem: &mut dyn BusMemory) {
+        if self.reg(SCRATCH_UMSK) & 1 << n != 0 {
+            let addr = (self.reg(SCRATCH_ADDR) & !3).wrapping_add(4 * n);
+            let v = self.reg(SCRATCH_REG0 + 4 * n);
+            self.mc_write_dword(mem, addr, v);
+        }
+    }
+
     /// Side effects of writing a CP register; false if `reg` has none.
     pub(crate) fn cp_register_written(&mut self, reg: u32, mem: &mut dyn BusMemory) -> bool {
         match reg {
             CP_RB_WPTR => self.cp_write_wptr(mem),
-            CP_CSQ_CNTL => self.run_ring(mem),
+            CP_CSQ_CNTL | CP_CSQ_MODE => self.run_ring(mem),
             CP_IB_BUFSZ => self.run_indirect(mem),
-            SCRATCH_REG0..=SCRATCH_REG7 => {
-                let n = (reg - SCRATCH_REG0) / 4;
-                if self.reg(SCRATCH_UMSK) & 1 << n != 0 {
-                    let addr = (self.reg(SCRATCH_ADDR) & !3).wrapping_add(4 * n);
-                    let v = self.reg(reg);
-                    self.mc_write_dword(mem, addr, v);
-                }
+            SCRATCH_REG0..=SCRATCH_REG7 => self.scratch_written((reg - SCRATCH_REG0) / 4, mem),
+            CP_RESYNC_DATA => {
+                let n = self.reg(CP_RESYNC_ADDR) & 7;
+                self.regs[(SCRATCH_REG0 / 4 + n) as usize] = self.reg(CP_RESYNC_DATA);
+                self.scratch_written(n, mem);
             }
             RBBM_SOFT_RESET => {
                 if self.reg(reg) & (SOFT_RESET_CP | SOFT_RESET_E2) != 0 {

@@ -97,17 +97,24 @@ The supplied ROM (BIOS B8480.002, 2002/12/16) POSTs, sets text mode, and sets VB
 
 ## Linux drivers (Ubuntu 8.04.4)
 
-- **radeonfb:** finds the monitor through our EDID and drives a 1024x768 console. Its fills and scrolls use the 2D engine (`DP_GUI_MASTER_CNTL`, `DP_CNTL`, `SRC_Y_X`, `DST_Y_X`, `DST_HEIGHT_WIDTH`, `DST_WIDTH_HEIGHT`, waiting on `RB2D_DSTCACHE_CTLSTAT` and `RBBM_STATUS`), so scrolling does not work until that exists. `video=radeonfb:noaccel` avoids it.
-- **X with the radeon driver (xf86-video-ati 6.8.0):** reads the ROM's connector table and our EDID, then sets 1024x768x24 with the ARGB hardware cursor. With `NoAccel` and DRI off, the GNOME desktop draws correctly. With the defaults (XAA over the CP, DRI, colour tiling), X sets the mode but draws nothing, and then waits forever on `CP_RB_RPTR` and `GUI_SCRATCH_REG3`.
-- **The radeon DRM:** initializes, loads the R300 microcode through `CP_ME_RAM_*`, and reports `writeback test failed` (no scratch writeback to system memory).
+Our EDID prefers 1440x900 at 60 Hz (CVT reduced blanking, 88.75 MHz) and also lists 640x480, 800x600, 1024x768, 1280x800 and 1280x1024.
 
-What the drivers want next, in order:
+- **radeonfb:** drives a 1440x900 console. Its fills and scrolls run on our 2D engine.
+- **The radeon DRM:** loads the R300 microcode, which we ignore, and its writeback test succeeds. The ring and the indirect buffers sit in the AGP aperture.
+- **X (xf86-video-ati 6.8.0) with an unmodified xorg.conf:** 1440x900x24, DRI on, XAA over the CP, colour tiling on (the driver turns Render acceleration off on R300). GNOME draws correctly: menus, terminal scrolling and window moves. `glxinfo` reports direct rendering with Mesa 7.0.3's R300 driver.
+- **Compiz:** when the session picks Compiz, the whole desktop goes through the 3D engine (vertex and fragment programs into a back buffer), which we do not draw, so the screen stays black. Hardy's compiz-manager skips Compiz with "Found laptop using ati driver" when the guest has a battery, which `--battery` gives it by default.
 
-1. **CP:** the ring (`CP_RB_CNTL`, `CP_RB_BASE`, `CP_RB_RPTR`/`WPTR`, `CP_RB_RPTR_ADDR` writeback), microcode upload, and the scratch registers with their writeback (`SCRATCH_ADDR`, `SCRATCH_UMSK`, `GUI_SCRATCH_REG0..7`).
-2. **2D engine:** the registers listed under radeonfb, plus the brush and source colours, `DP_DATATYPE`, `DP_WRITE_MASK`, `DEFAULT_OFFSET`/`SC_*` clipping, and the 2D and 3D destination cache flushes.
-3. **Colour tiling:** `CRTC_OFFSET_CNTL` tiling, `SURFACE_CNTL` and the eight `SURFACEn_*` ranges, which X sets up by default.
-4. **Interrupts:** `GEN_INT_CNTL`/`GEN_INT_STATUS` on the card's INTA (IRQ 10 here).
-5. **Reads only, already fine as stored values:** CRTC2, the flat panel, LVDS and TMDS, the TV encoder, the overlay (`OV0_*`), capture (`CAP0/1_*`), VIP and `AGP_BASE`.
+What we built for this:
+
+- **CP:** the ring buffer in the memory controller's address space, read when the guest writes `CP_RB_WPTR` (in bus-master mode, `CP_CSQ_CNTL` 2 or 4), with `CP_RB_RPTR_ADDR` writeback; indirect buffers through `CP_IB_BASE`/`CP_IB_BUFSZ`; packets of types 0 to 3; scratch registers written back to `SCRATCH_ADDR` under `SCRATCH_UMSK`. Addresses go to VRAM (`MC_FB_LOCATION`), the AGP aperture (`MC_AGP_LOCATION` and `AGP_BASE`, then the 440BX's GATT), the PCI GART (`AIC_*`) or the bus. Everything runs at once, so engine status, cache flushes and `WAIT_UNTIL` always read idle. 3D packets are skipped.
+- **2D engine:** on the CPU, from MMIO writes and the type-3 2D packets (`PAINT`, `PAINT_MULTI`, `BITBLT`, `BITBLT_MULTI`, `HOSTDATA_BLT`, `POLYLINE`, `POLYSCANLINES`): fills, blits with any ROP3 that overlap either way, host data with mono colour expansion (opaque and transparent), 8x8 mono and colour brushes, lines, the scissor, `DP_WRITE_MASK`, source colour compare, and 8, 16 and 32 bpp.
+- **Interrupts:** vblank and the software interrupt (`SW_INT_FIRE`) in `GEN_INT_STATUS`, on INTA.
+- **Colour tiling:** we keep every surface linear in VRAM. The 2D engine ignores the tiling bits in the pitch-offset registers, the CRTC scans out linearly (with `R300_CRTC_TILE_X0_Y0` as the start when `R300_CRTC_X_Y_MODE_EN` is set), and CPU accesses through the `SURFACE_*` ranges are linear on real hardware anyway. Only the 3D engine and textures will see the real layouts, and those go to Metal.
+- **Hardware I2C engine:** `I2C_CNTL_0`, `I2C_CNTL_1` and `I2C_DATA` run whole transfers to the same EDID.
+
+## Windows XP's built-in ATI driver
+
+On an ACPI-HAL XP with `--gpu radeon`, XP binds its own ATI driver. It resets the SDRAM and waits for `MC_STATUS` power-up, reads EDID by bit-banging `GPIO_VGA_DDC` and `GPIO_DVI_DDC`, and then waits for engine idle on three undocumented registers: `0x790` (low five bits 2), `0x7B0` (low five bits 8) and `0xA10` (low half 0x3333). We report those idle values.
 
 ## Open questions
 

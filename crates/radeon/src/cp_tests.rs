@@ -101,6 +101,15 @@ fn scratch_writes_from_the_cpu_reach_memory_only_when_unmasked() {
 }
 
 #[test]
+fn resync_writes_land_in_the_scratch_register_they_name() {
+    let mut ram = Ram::new();
+    let mut r = card_with_ring(&mut ram);
+    submit(&mut r, &mut ram, &[pkt0(CP_RESYNC_ADDR, 2), 2, 0x77]);
+    assert_eq!(r.mmio_read(SCRATCH_REG0 + 8, 4), 0x77);
+    assert_eq!(ram.get(AGP_BUS + 0x1_0028), 0x77);
+}
+
+#[test]
 fn indirect_buffers_run_from_the_ring() {
     let mut ram = Ram::new();
     let mut r = card_with_ring(&mut ram);
@@ -154,6 +163,18 @@ fn the_ring_waits_while_the_cp_is_disabled() {
     assert_eq!(r.mmio_read(CP_RB_RPTR, 4), 0);
     r.mmio_write(CP_CSQ_CNTL, 4, 0x4000_0000, &mut ram);
     assert_eq!(r.mmio_read(SCRATCH_REG0, 4), 5);
+}
+
+#[test]
+fn every_primary_bus_master_mode_runs_the_ring() {
+    for (cntl, mode) in [(0x2000_0000, 0), (0x6000_0000, 0), (0x8000_0000, 0), (0, CSQ_PRIMARY_ENABLE | CSQ_PRIMARY_BM)] {
+        let mut ram = Ram::new();
+        let mut r = card_with_ring(&mut ram);
+        r.mmio_write(CP_CSQ_CNTL, 4, cntl, &mut ram);
+        r.mmio_write(CP_CSQ_MODE, 4, mode, &mut ram);
+        submit(&mut r, &mut ram, &[pkt0(SCRATCH_REG0, 1), 5]);
+        assert_eq!((cntl, mode, r.mmio_read(SCRATCH_REG0, 4)), (cntl, mode, 5));
+    }
 }
 
 #[test]
