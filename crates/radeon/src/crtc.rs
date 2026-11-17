@@ -3,7 +3,7 @@
 use crate::Radeon;
 use crate::regs::*;
 
-const FRAME_NS: u64 = 1_000_000_000 / 60;
+pub(crate) const FRAME_NS: u64 = 1_000_000_000 / 60;
 const MAX_DIM: u32 = 4096;
 
 /// Scanout parameters of the primary CRTC, decoded from its registers.

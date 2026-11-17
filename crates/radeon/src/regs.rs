@@ -16,6 +16,8 @@ pub const CONFIG_REG_APER_SIZE: u32 = 0x0110;
 pub const RBBM_STATUS: u32 = 0x0e40;
 /// RBBM_STATUS with all 64 FIFO slots free and every engine idle.
 pub const RBBM_FIFOCNT_IDLE: u32 = 0x40;
+/// RBBM_STATUS: some engine is busy (GUI_ACTIVE in AMD's R5xx guide).
+pub const RBBM_ACTIVE: u32 = 1 << 31;
 pub const MEM_VGA_WP_SEL: u32 = 0x0038;
 pub const MEM_VGA_RP_SEL: u32 = 0x003c;
 pub const GEN_INT_CNTL: u32 = 0x0040;
@@ -108,6 +110,8 @@ pub const CP_RESYNC_ADDR: u32 = 0x0778;
 pub const CP_RESYNC_DATA: u32 = 0x077c;
 pub const SCRATCH_ADDR: u32 = 0x0774;
 pub const CP_STAT: u32 = 0x07c0;
+pub const CSF_RING_BUSY: u32 = 1 << 0;
+pub const CP_BUSY: u32 = 1 << 31;
 pub const CP_CSQ_STAT: u32 = 0x07f8;
 pub const SCRATCH_REG0: u32 = 0x15e0;
 pub const SCRATCH_REG7: u32 = 0x15fc;

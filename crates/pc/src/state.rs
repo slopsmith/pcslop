@@ -117,7 +117,7 @@ impl Board {
 
     /// Writes every device's state. Guest RAM and VRAM are left to the caller.
     pub fn save_devices(&mut self, w: &mut Writer) -> Result<()> {
-        self.radeon_write(|card, bus| card.gpu_finish(bus));
+        self.radeon_write(|card, bus| card.finish(bus));
         w.u64(self.now_ns());
         w.put(&self.a20);
         w.put(&self.pci_addr);
@@ -187,10 +187,7 @@ impl Board {
                 r.get(v.as_mut())?;
                 v.mark_changed();
             }
-            Display::Radeon(card) => {
-                r.get(card.as_mut())?;
-                card.vga().mark_changed();
-            }
+            Display::Radeon(card) => r.get(card.as_mut())?,
         }
         r.get(&mut self.ide)?;
         r.get(&mut self.uhci)?;

@@ -36,6 +36,21 @@ pub(crate) struct Cp {
     pub packets: u64,
     /// Type-3 opcodes we skipped, so each is traced once.
     pub skipped: [u64; 4],
+    /// The ring run and the indirect buffers it called, outermost first.
+    /// A save or load only happens while this is empty.
+    #[snap(skip)]
+    streams: Vec<Stream>,
+    /// CP_RB_RPTR where the ring run in `streams[0]` started, and the ring's size.
+    #[snap(skip)]
+    ring_start: (u32, u32),
+}
+
+/// Dwords fetched for the ring or an indirect buffer, and the next packet in them.
+#[derive(Default)]
+struct Stream {
+    dwords: Vec<u32>,
+    pos: usize,
+    ring: bool,
 }
 
 impl Radeon {
@@ -58,10 +73,19 @@ impl Radeon {
     }
 
     pub(crate) fn cp_write_wptr(&mut self, mem: &mut dyn BusMemory) {
-        if self.reg(CP_RB_CNTL) & RB_RPTR_WR_ENA != 0 {
+        if self.defer_ring {
+            self.ring_kicked = true;
+        } else if self.cp_kick(mem) {
+            self.cp_step(mem, &mut || false);
+        }
+    }
+
+    /// Starts a ring run after a CP_RB_WPTR write, as `start_ring` does.
+    pub(crate) fn cp_kick(&mut self, mem: &mut dyn BusMemory) -> bool {
+        if self.reg(CP_RB_CNTL) & RB_RPTR_WR_ENA != 0 && self.cp.streams.is_empty() {
             self.cp.rptr = self.reg(CP_RB_RPTR_WR) & (self.ring_dwords() - 1);
         }
-        self.run_ring(mem);
+        self.start_ring(mem)
     }
 
     pub(crate) fn cp_soft_reset(&mut self) {
@@ -69,16 +93,27 @@ impl Radeon {
         self.engine.host = None;
     }
 
-    /// Executes the ring from CP_RB_RPTR up to CP_RB_WPTR.
+    /// Executes the ring from CP_RB_RPTR up to CP_RB_WPTR. With a worker
+    /// thread, only notes that the worker has something to do.
     pub(crate) fn run_ring(&mut self, mem: &mut dyn BusMemory) {
-        if !self.primary_bus_master() || self.cp.ib_depth > 0 {
-            return;
+        if self.defer_ring {
+            self.ring_kicked = true;
+        } else if self.start_ring(mem) {
+            self.cp_step(mem, &mut || false);
+        }
+    }
+
+    /// Fetches the ring from CP_RB_RPTR up to CP_RB_WPTR for `cp_step`;
+    /// false if there is nothing to run.
+    pub(crate) fn start_ring(&mut self, mem: &mut dyn BusMemory) -> bool {
+        if !self.primary_bus_master() || !self.cp.streams.is_empty() {
+            return false;
         }
         let size = self.ring_dwords();
         let wptr = self.reg(CP_RB_WPTR) & (size - 1);
         let rptr = self.cp.rptr % size;
         if rptr == wptr {
-            return;
+            return false;
         }
         let base = self.reg(CP_RB_BASE) & !3;
         let count = (wptr + size - rptr) % size;
@@ -86,9 +121,52 @@ impl Radeon {
         let first = count.min(size - rptr);
         dwords.extend(self.mc_read_dwords(mem, base.wrapping_add(rptr * 4), first as usize));
         dwords.extend(self.mc_read_dwords(mem, base, (count - first) as usize));
-        let done = self.execute(mem, &dwords);
-        self.gpu_kick();
-        self.cp.rptr = (rptr + done as u32) % size;
+        self.cp.ring_start = (rptr, size);
+        self.cp.streams.push(Stream { dwords, pos: 0, ring: true });
+        true
+    }
+
+    pub(crate) fn cp_drop_run(&mut self) {
+        self.cp.streams.clear();
+        self.cp.ib_depth = 0;
+    }
+
+    /// True while a ring run has packets left.
+    pub(crate) fn cp_running(&self) -> bool {
+        !self.cp.streams.is_empty()
+    }
+
+    /// Runs packets of the ring run and the indirect buffers it calls until
+    /// they end or `pause` says to stop after a packet. True if packets are left.
+    pub(crate) fn cp_step(&mut self, mem: &mut dyn BusMemory, pause: &mut dyn FnMut() -> bool) -> bool {
+        while let Some(top) = self.cp.streams.len().checked_sub(1) {
+            let s = &mut self.cp.streams[top];
+            let Some(len) = packet_len(&s.dwords[s.pos..]) else {
+                self.end_stream(mem);
+                continue;
+            };
+            let (pos, ring) = (s.pos, s.ring);
+            let dwords = std::mem::take(&mut s.dwords);
+            self.packet(mem, &dwords[pos..pos + len]);
+            let s = &mut self.cp.streams[top];
+            s.dwords = dwords;
+            s.pos += len;
+            if ring {
+                let (start, size) = self.cp.ring_start;
+                self.cp.rptr = (start + (pos + len) as u32) % size;
+            }
+            if pause() {
+                if !self.cp.streams.is_empty() {
+                    self.write_back_rptr(mem);
+                    return true;
+                }
+                return false;
+            }
+        }
+        false
+    }
+
+    fn write_back_rptr(&mut self, mem: &mut dyn BusMemory) {
         if self.reg(CP_RB_CNTL) & RB_NO_UPDATE == 0 {
             let addr = self.reg(CP_RB_RPTR_ADDR) & !3;
             let rptr = self.cp.rptr;
@@ -96,7 +174,18 @@ impl Radeon {
         }
     }
 
-    /// Runs the indirect buffer at CP_IB_BASE, CP_IB_BUFSZ dwords long.
+    fn end_stream(&mut self, mem: &mut dyn BusMemory) {
+        let s = self.cp.streams.pop().unwrap();
+        if !s.ring {
+            self.cp.ib_depth -= 1;
+            return;
+        }
+        self.gpu_kick();
+        self.write_back_rptr(mem);
+    }
+
+    /// Queues the indirect buffer at CP_IB_BASE, CP_IB_BUFSZ dwords long, to
+    /// run after the packet that started it.
     fn run_indirect(&mut self, mem: &mut dyn BusMemory) {
         if self.cp.ib_depth >= MAX_IB_DEPTH {
             return;
@@ -105,45 +194,43 @@ impl Radeon {
         let size = (self.reg(CP_IB_BUFSZ) & 0x7f_ffff).min(MAX_IB_DWORDS);
         let dwords = self.mc_read_dwords(mem, base, size as usize);
         self.cp.ib_depth += 1;
-        self.execute(mem, &dwords);
-        self.cp.ib_depth -= 1;
+        self.cp.streams.push(Stream { dwords, pos: 0, ring: false });
+        if self.cp.streams.len() == 1 {
+            self.cp_step(mem, &mut || false);
+        }
     }
 
     /// Executes whole packets from `d` and returns how many dwords they took.
+    #[cfg(test)]
     pub(crate) fn execute(&mut self, mem: &mut dyn BusMemory, d: &[u32]) -> usize {
         let mut i = 0;
-        while i < d.len() {
-            let h = d[i];
-            let count = ((h >> 16) & 0x3fff) as usize + 1;
-            let len = match h >> 30 {
-                0 | 3 => 1 + count,
-                1 => 3,
-                _ => 1,
-            };
-            if i + len > d.len() {
-                break;
-            }
-            let body = &d[i + 1..i + len];
-            match h >> 30 {
-                0 => {
-                    let reg = (h & 0x1fff) << 2;
-                    let one = h & 0x8000 != 0;
-                    for (k, &v) in body.iter().enumerate() {
-                        let r = if one { reg } else { reg + 4 * k as u32 };
-                        self.cp_reg_write(mem, r, v);
-                    }
-                }
-                1 => {
-                    self.cp_reg_write(mem, (h & 0x7ff) << 2, body[0]);
-                    self.cp_reg_write(mem, ((h >> 11) & 0x7ff) << 2, body[1]);
-                }
-                2 => {}
-                _ => self.packet3(mem, (h >> 8) as u8, body),
-            }
-            self.cp.packets += 1;
+        while let Some(len) = packet_len(&d[i..]) {
+            self.packet(mem, &d[i..i + len]);
             i += len;
         }
         i
+    }
+
+    fn packet(&mut self, mem: &mut dyn BusMemory, d: &[u32]) {
+        let h = d[0];
+        let body = &d[1..];
+        match h >> 30 {
+            0 => {
+                let reg = (h & 0x1fff) << 2;
+                let one = h & 0x8000 != 0;
+                for (k, &v) in body.iter().enumerate() {
+                    let r = if one { reg } else { reg + 4 * k as u32 };
+                    self.cp_reg_write(mem, r, v);
+                }
+            }
+            1 => {
+                self.cp_reg_write(mem, (h & 0x7ff) << 2, body[0]);
+                self.cp_reg_write(mem, ((h >> 11) & 0x7ff) << 2, body[1]);
+            }
+            2 => {}
+            _ => self.packet3(mem, (h >> 8) as u8, body),
+        }
+        self.cp.packets += 1;
     }
 
     pub(crate) fn cp_reg_write(&mut self, mem: &mut dyn BusMemory, reg: u32, v: u32) {
@@ -225,4 +312,15 @@ impl Radeon {
         }
         true
     }
+}
+
+/// Dwords in the packet at the start of `d`, or None if `d` holds no whole packet.
+fn packet_len(d: &[u32]) -> Option<usize> {
+    let h = *d.first()?;
+    let len = match h >> 30 {
+        0 | 3 => 2 + ((h >> 16) & 0x3fff) as usize,
+        1 => 3,
+        _ => 1,
+    };
+    (len <= d.len()).then_some(len)
 }

@@ -20,7 +20,8 @@ pub mod uart;
 pub use state::Machine;
 
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use pci::{Bdf, ConfigSpace, PAM0};
@@ -59,14 +60,14 @@ pub enum Gpu {
 
 pub enum Display {
     Std(Box<vga::Vga>),
-    Radeon(Box<radeon::Radeon>),
+    Radeon(Box<radeon::Card>),
 }
 
 impl Display {
-    pub fn vga(&mut self) -> &mut vga::Vga {
+    pub fn with_vga<R>(&mut self, f: impl FnOnce(&mut vga::Vga) -> R) -> R {
         match self {
-            Display::Std(v) => v,
-            Display::Radeon(r) => r.vga(),
+            Display::Std(v) => f(v),
+            Display::Radeon(r) => r.with_vga(f),
         }
     }
 }
@@ -136,6 +137,8 @@ pub struct Board {
     pub post_code: u8,
     /// The ISO in the CD-ROM drive.
     cdrom: Option<String>,
+    /// Set while the Radeon runs its command processor on a thread of its own.
+    gpu_bus: Option<Arc<GpuBusState>>,
 }
 
 const LEGACY_START: u32 = 0xa_0000;
@@ -220,6 +223,7 @@ impl Board {
             reset_requested: false,
             post_code: 0,
             cdrom: None,
+            gpu_bus: None,
         };
         match cfg.gpu {
             Gpu::StdVga => {
@@ -238,7 +242,7 @@ impl Board {
             Gpu::Radeon { rom, trace, metal } => {
                 assert_eq!(cfg.chipset, Chipset::I440bx, "the Radeon sits on the 440BX's AGP bus");
                 let display = pci::radeon(rom.len());
-                let mut card = radeon::Radeon::new(rom);
+                let mut card = radeon::Card::new(rom);
                 if let Some(t) = trace {
                     card.set_trace(t);
                 }
@@ -425,8 +429,9 @@ impl Board {
         }
         if let Display::Radeon(r) = &mut self.display {
             r.set_time(now);
-            if r.fences_pending() {
-                self.radeon_write(|r, bus| r.poll_fences(bus));
+            let written = self.gpu_bus.as_ref().is_some_and(|g| g.any_written.load(Ordering::Acquire));
+            if r.wants_poll() || written {
+                self.radeon_write(|r, bus| r.poll(bus));
             }
         }
         self.sync_sci();
@@ -623,7 +628,7 @@ impl Board {
         let addr = self.mask_a20(addr);
         if (LEGACY_START..LEGACY_END).contains(&addr) {
             if addr < 0xc_0000 {
-                return self.display.vga().mem_read8(addr);
+                return self.display.with_vga(|v| v.mem_read8(addr));
             }
             return if self.pam(addr) & 1 != 0 { self.ram[addr as usize] } else { self.rom_byte(addr) };
         }
@@ -641,12 +646,12 @@ impl Board {
     fn sync_display_bars(&mut self) {
         if let Display::Radeon(r) = &mut self.display {
             let c = &self.pci[DISPLAY].1;
-            r.bars = radeon::Bars {
+            let bars = radeon::Bars {
                 fb: c.read(0x10, 4) & !0xf,
                 io: (c.read(0x14, 4) & !3) as u16,
                 mmio: c.read(0x18, 4) & !0xf,
             };
-            r.config = c.data;
+            r.set_bars(bars, c.data);
         }
     }
 
@@ -779,7 +784,7 @@ impl Board {
         self.code_watch.note_write(addr);
         if (LEGACY_START..LEGACY_END).contains(&addr) {
             if addr < 0xc_0000 {
-                self.display.vga().mem_write8(addr, v);
+                self.display.with_vga(|vga| vga.mem_write8(addr, v));
             } else if self.pam(addr) & 2 != 0 {
                 self.ram[addr as usize] = v;
             }
@@ -914,13 +919,16 @@ impl Board {
         let base = self.pci[DISPLAY].1.mem_bar(0)?;
         match &mut self.display {
             Display::Std(v) => Some((base, v.vram_ptr(), vga::VRAM_SIZE)),
-            Display::Radeon(r) => Some((base, r.vga().vram_ptr(), radeon::APER_SIZE as usize)),
+            Display::Radeon(r) => Some((base, r.vram_ptr(), radeon::APER_SIZE as usize)),
         }
     }
 
     /// Notes that the guest wrote the framebuffer through a direct mapping.
     pub fn framebuffer_written(&mut self) {
-        self.display.vga().mark_changed();
+        match &mut self.display {
+            Display::Std(v) => v.mark_changed(),
+            Display::Radeon(r) => r.mark_changed(),
+        }
     }
 
     /// For each 16 KiB chunk of 0xC0000..0x100000: `Some(writable)` when the
@@ -964,14 +972,31 @@ impl Board {
     }
 
     /// Writes a Radeon register, letting the card reach memory and raise INTA.
-    pub(crate) fn radeon_write(&mut self, f: impl FnOnce(&mut radeon::Radeon, &mut CardBus)) {
+    pub(crate) fn radeon_write(&mut self, f: impl FnOnce(&mut radeon::Card, &mut CardBus)) {
         let aperture = self.aperture();
         let master = self.pci[DISPLAY].1.bus_master();
-        if let Display::Radeon(r) = &mut self.display {
-            let mut bus = CardBus { ram: &mut self.ram[..], watch: &mut self.code_watch, aperture, master };
-            f(r, &mut bus);
+        if let Some(g) = &self.gpu_bus {
+            g.set(aperture, master);
+            g.drain_written(&mut self.code_watch);
         }
-        self.sync_pci_irqs();
+        let Display::Radeon(r) = &mut self.display else { return };
+        let before = r.irq();
+        let mut bus = CardBus { ram: &mut self.ram[..], watch: &mut self.code_watch, aperture, master };
+        f(r, &mut bus);
+        if r.irq() != before || r.take_irq_change() {
+            self.sync_pci_irqs();
+        }
+    }
+
+    /// Runs the Radeon's command processor on a thread of its own from now
+    /// on. `wake` gets this board's thread to call `tick` soon, which then
+    /// raises the interrupts the card's thread asked for.
+    pub fn start_gpu_thread(&mut self, wake: Box<dyn Fn() + Send + Sync>) {
+        let Display::Radeon(r) = &mut self.display else { return };
+        let st = Arc::new(GpuBusState::default());
+        let bus = GpuBus { ram: self.ram.as_mut_ptr(), len: self.ram.len(), st: st.clone() };
+        r.start_thread(Box::new(bus), wake);
+        self.gpu_bus = Some(st);
     }
 
     /// Level of the INTx line of `self.pci[function]`.
@@ -1074,6 +1099,9 @@ impl Drop for Board {
         if let Some((_, a)) = self.ac97.as_mut() {
             a.stop_thread();
         }
+        if let Display::Radeon(r) = &mut self.display {
+            r.stop_thread();
+        }
     }
 }
 
@@ -1106,37 +1134,122 @@ struct CardBus<'a> {
     master: bool,
 }
 
-impl CardBus<'_> {
-    fn ram_addr(&self, addr: u32) -> Option<usize> {
-        let phys = self.aperture.and_then(|a| a.translate(self.ram, addr)).unwrap_or(addr) as usize;
-        (phys < self.ram.len() && self.master).then_some(phys)
+/// RAM offset that the card's bus address `addr` reaches.
+fn card_ram_addr(ram: &[u8], aperture: Option<Aperture>, master: bool, addr: u32) -> Option<usize> {
+    let phys = aperture.and_then(|a| a.translate(ram, addr)).unwrap_or(addr) as usize;
+    (phys < ram.len() && master).then_some(phys)
+}
+
+fn card_read(ram: &[u8], aperture: Option<Aperture>, master: bool, addr: u32, buf: &mut [u8]) {
+    let mut done = 0;
+    while done < buf.len() {
+        let a = addr.wrapping_add(done as u32);
+        let n = (0x1000 - (a & 0xfff) as usize).min(buf.len() - done);
+        match card_ram_addr(ram, aperture, master, a) {
+            Some(p) if p + n <= ram.len() => buf[done..done + n].copy_from_slice(&ram[p..p + n]),
+            _ => buf[done..done + n].fill(0xff),
+        }
+        done += n;
+    }
+}
+
+fn card_write(ram: &mut [u8], aperture: Option<Aperture>, master: bool, addr: u32, buf: &[u8], mut note: impl FnMut(u32)) {
+    let mut done = 0;
+    while done < buf.len() {
+        let a = addr.wrapping_add(done as u32);
+        let n = (0x1000 - (a & 0xfff) as usize).min(buf.len() - done);
+        if let Some(p) = card_ram_addr(ram, aperture, master, a).filter(|p| p + n <= ram.len()) {
+            note(p as u32);
+            ram[p..p + n].copy_from_slice(&buf[done..done + n]);
+        }
+        done += n;
     }
 }
 
 impl radeon::BusMemory for CardBus<'_> {
     fn read(&mut self, addr: u32, buf: &mut [u8]) {
-        let mut done = 0;
-        while done < buf.len() {
-            let a = addr.wrapping_add(done as u32);
-            let n = (0x1000 - (a & 0xfff) as usize).min(buf.len() - done);
-            match self.ram_addr(a) {
-                Some(p) if p + n <= self.ram.len() => buf[done..done + n].copy_from_slice(&self.ram[p..p + n]),
-                _ => buf[done..done + n].fill(0xff),
-            }
-            done += n;
-        }
+        card_read(self.ram, self.aperture, self.master, addr, buf);
     }
 
     fn write(&mut self, addr: u32, buf: &[u8]) {
-        let mut done = 0;
-        while done < buf.len() {
-            let a = addr.wrapping_add(done as u32);
-            let n = (0x1000 - (a & 0xfff) as usize).min(buf.len() - done);
-            if let Some(p) = self.ram_addr(a).filter(|p| p + n <= self.ram.len()) {
-                self.watch.note_write(p as u32);
-                self.ram[p..p + n].copy_from_slice(&buf[done..done + n]);
+        let watch = &mut *self.watch;
+        card_write(self.ram, self.aperture, self.master, addr, buf, |p| watch.note_write(p));
+    }
+}
+
+/// What the board tells the Radeon's worker thread about the bus, and the
+/// pages the worker wrote, which the board passes on to the JIT.
+#[derive(Default)]
+struct GpuBusState {
+    aperture: [AtomicU32; 3],
+    has_aperture: AtomicBool,
+    master: AtomicBool,
+    written: Mutex<Vec<u32>>,
+    any_written: AtomicBool,
+}
+
+impl GpuBusState {
+    fn set(&self, aperture: Option<Aperture>, master: bool) {
+        if let Some(a) = aperture {
+            for (slot, v) in self.aperture.iter().zip([a.base, a.size, a.attbase]) {
+                slot.store(v, Ordering::Relaxed);
             }
-            done += n;
+        }
+        self.has_aperture.store(aperture.is_some(), Ordering::Relaxed);
+        self.master.store(master, Ordering::Release);
+    }
+
+    fn get(&self) -> (Option<Aperture>, bool) {
+        let master = self.master.load(Ordering::Acquire);
+        let [base, size, attbase] = self.aperture.each_ref().map(|a| a.load(Ordering::Relaxed));
+        (self.has_aperture.load(Ordering::Relaxed).then_some(Aperture { base, size, attbase }), master)
+    }
+
+    fn drain_written(&self, watch: &mut CodeWatch) {
+        if self.any_written.swap(false, Ordering::Acquire) {
+            for page in self.written.lock().unwrap().drain(..) {
+                watch.note_write(page);
+            }
+        }
+    }
+}
+
+/// Guest memory as the Radeon's worker thread reaches it. Guest RAM is plain
+/// host memory, so another thread may read and write it.
+struct GpuBus {
+    ram: *mut u8,
+    len: usize,
+    st: Arc<GpuBusState>,
+}
+
+// `ram` stays valid until the board stops the worker in its Drop.
+unsafe impl Send for GpuBus {}
+
+impl GpuBus {
+    fn ram(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ram, self.len) }
+    }
+}
+
+impl radeon::BusMemory for GpuBus {
+    fn read(&mut self, addr: u32, buf: &mut [u8]) {
+        let (aperture, master) = self.st.get();
+        card_read(self.ram(), aperture, master, addr, buf);
+    }
+
+    fn write(&mut self, addr: u32, buf: &[u8]) {
+        let (aperture, master) = self.st.get();
+        let st = self.st.clone();
+        let mut pages = Vec::new();
+        card_write(self.ram(), aperture, master, addr, buf, |p| pages.push(p & !0xfff));
+        if !pages.is_empty() {
+            let mut w = st.written.lock().unwrap();
+            for p in pages {
+                if w.last() != Some(&p) {
+                    w.push(p);
+                }
+            }
+            st.any_written.store(true, Ordering::Release);
         }
     }
 }

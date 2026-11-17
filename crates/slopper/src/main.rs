@@ -27,6 +27,7 @@ struct Args {
     vga_rom: Option<String>,
     gpu_trace: Option<String>,
     gpu_3d_metal: bool,
+    gpu_thread: bool,
     cdrom: Option<String>,
     hda: Option<String>,
     serial: Option<String>,
@@ -122,6 +123,10 @@ struct Cli {
     /// reference. SLOPPER_R3D sets the default.
     #[arg(long = "gpu-3d", value_name = "metal|cpu", value_parser = ["metal", "cpu"])]
     gpu_3d: Option<String>,
+    /// Run the Radeon's command processor on a thread of its own (on, the
+    /// default) or on the emulation thread (off). SLOPPER_GPU_THREAD sets the default.
+    #[arg(long = "gpu-thread", value_name = "on|off", value_parser = ["on", "off"])]
+    gpu_thread: Option<String>,
     /// CD-ROM image on the secondary master.
     #[arg(long, value_name = "ISO")]
     cdrom: Option<String>,
@@ -232,6 +237,7 @@ fn parse_args() -> Result<Args, String> {
         vga_rom: cli.vga_rom,
         gpu_trace: cli.gpu_trace,
         gpu_3d_metal: cli.gpu_3d.or_else(|| std::env::var("SLOPPER_R3D").ok()).as_deref() != Some("cpu"),
+        gpu_thread: !matches!(cli.gpu_thread.or_else(|| std::env::var("SLOPPER_GPU_THREAD").ok()).as_deref(), Some("off" | "0")),
         cdrom: cli.cdrom,
         hda: cli.hda,
         serial: cli.serial,
@@ -521,6 +527,16 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
         let emu = std::thread::current();
         let kicker = jit.as_ref().map(|j| j.kicker());
         board.start_audio_thread(Box::new(move || {
+            emu.unpark();
+            if let Some(k) = &kicker {
+                k.kick();
+            }
+        }));
+    }
+    if args.gpu_thread {
+        let emu = std::thread::current();
+        let kicker = jit.as_ref().map(|j| j.kicker());
+        board.start_gpu_thread(Box::new(move || {
             emu.unpark();
             if let Some(k) = &kicker {
                 k.kick();

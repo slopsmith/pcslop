@@ -6,6 +6,7 @@
 //! those first bytes. The legacy VGA keeps its planes interleaved at the start
 //! of VRAM, as QEMU's stdvga and ati-vga do.
 
+mod card;
 mod cp;
 mod crtc;
 mod ddc;
@@ -18,6 +19,8 @@ pub mod regs;
 mod trace;
 
 #[cfg(test)]
+mod card_tests;
+#[cfg(test)]
 mod cp_tests;
 #[cfg(test)]
 mod engine_tests;
@@ -26,6 +29,7 @@ mod tests;
 
 use std::io::Write;
 
+pub use card::Card;
 pub use crtc::Mode;
 pub use mem::{BusMemory, NoBus};
 use regs::*;
@@ -95,6 +99,14 @@ pub struct Radeon {
     metal: Option<Box<r3d::metal::MetalR3d>>,
     #[snap(skip)]
     fences: r3d::Fences,
+    /// Set while a worker thread runs the ring: ring kicks only set `ring_kicked`.
+    #[snap(skip)]
+    defer_ring: bool,
+    #[snap(skip)]
+    ring_kicked: bool,
+    /// What the worker thread shares without the lock, for status reads.
+    #[snap(skip)]
+    status: std::sync::Arc<card::Status>,
 }
 
 impl Radeon {
@@ -117,6 +129,9 @@ impl Radeon {
             trace: None,
             metal: None,
             fences: r3d::Fences::default(),
+            defer_ring: false,
+            ring_kicked: false,
+            status: Default::default(),
         };
         r.reset();
         r
@@ -365,7 +380,8 @@ impl Radeon {
     }
 
     fn read_reg(&mut self, reg: u32) -> u32 {
-        if idle_polled(reg) {
+        let busy = idle_polled(reg) && self.engine_busy();
+        if idle_polled(reg) && (!self.defer_ring || idle_polled_blind(reg)) {
             self.gpu_sync();
         } else if (SCRATCH_REG0..=SCRATCH_REG7).contains(&reg) && !self.fences.is_empty() {
             let done = self.metal.as_mut().map_or(u64::MAX, |m| m.completed());
@@ -383,13 +399,14 @@ impl Radeon {
             GEN_INT_STATUS => self.gen_int_status(),
             CP_RB_RPTR => self.cp_rptr(),
             I2C_DATA => self.i2c.pop() as u32,
+            CP_STAT if busy => CP_BUSY | CSF_RING_BUSY,
             CP_STAT | CP_CSQ_STAT => 0,
             0x0790 | 0x07b0 | 0x0a10 => IDLE_QUEUE_STATUS.iter().find(|e| e.0 == reg).map_or(0, |e| e.1),
             RB2D_DSTCACHE_CTLSTAT
             | DSTCACHE_CTLSTAT
             | RB3D_DSTCACHE_CTLSTAT
             | R300_RB3D_DSTCACHE_CTLSTAT
-            | R300_RB3D_ZCACHE_CTLSTAT => self.reg(reg) & !CACHE_BUSY,
+            | R300_RB3D_ZCACHE_CTLSTAT => (self.reg(reg) & !CACHE_BUSY) | (busy as u32 * CACHE_BUSY),
             DAC_CNTL => {
                 let v = self.reg(DAC_CNTL);
                 if v & DAC_CMP_EN != 0 {
@@ -424,7 +441,7 @@ impl Radeon {
             CONFIG_APER_SIZE => APER_SIZE,
             CONFIG_REG_1_BASE => self.bars.mmio,
             CONFIG_REG_APER_SIZE => MMIO_SIZE,
-            RBBM_STATUS => RBBM_FIFOCNT_IDLE,
+            RBBM_STATUS => RBBM_FIFOCNT_IDLE | (busy as u32 * RBBM_ACTIVE),
             IDCT_STATUS => self.reg(IDCT_STATUS) | IDCT_IDLE,
             MC_STATUS => self.reg(MC_STATUS) | MC_STATUS_IDLE,
             0x0f00..=0x0ffc => {
@@ -569,10 +586,7 @@ impl Radeon {
 
     /// Level of the card's INTA line.
     pub fn irq(&self) -> bool {
-        self.gen_int_status()
-            & self.reg(GEN_INT_CNTL)
-            & (CRTC_VBLANK_STAT | VSYNC_INT | SW_INT_TEST)
-            != 0
+        irq_level(self.int_status, self.reg(GEN_INT_CNTL), self.vblank_acked[1], self.frame())
     }
 
     /// When the next vertical blank interrupt is due, if one is enabled and not pending.
@@ -591,6 +605,13 @@ impl Radeon {
     }
 }
 
+/// Level of INTA from GEN_INT_STATUS's latched bits, GEN_INT_CNTL, the
+/// frame whose vertical blank was acknowledged last and the current frame.
+fn irq_level(int_status: u32, int_cntl: u32, vblank_acked: u64, frame: u64) -> bool {
+    let vblank = if frame > vblank_acked { VSYNC_INT | CRTC_VBLANK_STAT } else { 0 };
+    (int_status | vblank) & int_cntl & (CRTC_VBLANK_STAT | VSYNC_INT | SW_INT_TEST) != 0
+}
+
 /// SCL and SDA as the card drives them: a line is low only while its output is
 /// enabled with a 0 (A_1 and EN_1 are SCL, A_0 and EN_0 are SDA).
 fn gpio_lines(v: u32) -> (bool, bool) {
@@ -606,6 +627,12 @@ fn gpio_lines(v: u32) -> (bool, bool) {
 fn fence_written(reg: u32, v: u32) -> bool {
     matches!(reg, r3d::regs::ZB_ZPASS_DATA | r3d::regs::ZB_ZPASS_ADDR)
         || (reg == GEN_INT_STATUS && v & SW_INT_FIRE != 0)
+}
+
+/// Idle polls whose busy encoding we do not know. With a worker thread
+/// they wait for it to finish instead of reporting busy.
+fn idle_polled_blind(reg: u32) -> bool {
+    matches!(reg, IDCT_STATUS | 0x0790 | 0x07b0 | 0x0a10)
 }
 
 /// Status registers drivers poll until the engines go idle.
