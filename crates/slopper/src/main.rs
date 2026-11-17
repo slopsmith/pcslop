@@ -1178,7 +1178,7 @@ fn window_loop(tx: Sender<Event>, shared: Arc<Shared>, capture_mode: capture::Ca
             | (window.get_mouse_down(MouseButton::Middle) as u8) << 2;
         let clicked = buttons & 1 != 0 && last_buttons & 1 == 0;
         last_buttons = buttons;
-        let focused = window.is_active() && capture::app_active();
+        let focused = capture::app_active();
         let mut want = shared.mouse_captured.load(Ordering::Relaxed);
         if toggle {
             want = !want;

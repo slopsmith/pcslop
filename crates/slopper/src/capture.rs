@@ -143,8 +143,8 @@ mod host {
         });
     }
 
-    /// Whether this app has the focus. minifb's `is_active` stays true when
-    /// another app is brought to the front.
+    /// Whether this app has the focus. minifb 0.29's macOS `is_active` is
+    /// inverted (it returns true while the window is in the background).
     pub fn app_active() -> bool {
         unsafe {
             let send: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
