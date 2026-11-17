@@ -114,7 +114,17 @@ What we built for this:
 
 ## Windows XP's built-in ATI driver
 
-On an ACPI-HAL XP with `--gpu radeon`, XP binds its own ATI driver. It resets the SDRAM and waits for `MC_STATUS` power-up, reads EDID by bit-banging `GPIO_VGA_DDC` and `GPIO_DVI_DDC`, and then waits for engine idle on three undocumented registers: `0x790` (low five bits 2), `0x7B0` (low five bits 8) and `0xA10` (low half 0x3333). We report those idle values.
+On an ACPI-HAL XP with `--gpu radeon`, XP binds its own driver, "RADEON 9700 PRO Family (Microsoft Corporation)", and asks for a restart. After that it reaches a 1440x900 desktop from our EDID. Fills, blits, `TRANS_BITBLT` and text (`NEXTCHAR`) draw through the CP; icons, caption buttons, title text and theme bitmaps are missing, because they go through `3D_DRAW_IMMD` (AlphaBlend on the 3D engine), which we skip.
+
+What it needs on the way:
+
+- `MC_STATUS` memory power-up after it resets the SDRAM.
+- EDID by bit-banging `GPIO_VGA_DDC` and `GPIO_DVI_DDC` (the hardware I2C engine is there too).
+- An engine-idle wait on three undocumented registers: `0x790` (low five bits 2), `0x7B0` (low five bits 8) and `0xA10` (low half 0x3333). We report those values.
+- The ring in `CP_CSQ_CNTL` mode 8 (primary and indirect bus-master), through the PCI GART (`AIC_*`), with scratch writeback.
+- Fences through `CP_RESYNC_ADDR`/`CP_RESYNC_DATA`, which write a scratch register once the pipeline drains. Without them it decides the CP hung, dumps the queue through `CP_CSQ_ADDR`/`CP_CSQ_DATA` and bugchecks.
+
+Its hottest MMIO polls: `CP_RB_RPTR` (about 900,000 reads while it waited on a fence that never came), then the DDC GPIOs (about 15,000 each).
 
 ## Open questions
 

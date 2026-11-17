@@ -15,6 +15,8 @@ const MAX_IB_DWORDS: u32 = 1 << 20;
 
 pub(crate) mod op {
     pub const NOP: u8 = 0x10;
+    pub const NEXTCHAR: u8 = 0x19;
+    pub const SET_SCISSORS: u8 = 0x1e;
     pub const PAINT: u8 = 0x91;
     pub const BITBLT: u8 = 0x92;
     pub const HOSTDATA_BLT: u8 = 0x94;
@@ -153,6 +155,12 @@ impl Radeon {
     fn packet3(&mut self, mem: &mut dyn BusMemory, opcode: u8, body: &[u32]) {
         match opcode {
             op::NOP => {}
+            op::NEXTCHAR => self.next_char(body),
+            op::SET_SCISSORS => {
+                for (reg, &v) in [SC_TOP_LEFT, SC_BOTTOM_RIGHT].into_iter().zip(body) {
+                    self.cp_reg_write(mem, reg, v);
+                }
+            }
             op::PAINT
             | op::BITBLT
             | op::HOSTDATA_BLT

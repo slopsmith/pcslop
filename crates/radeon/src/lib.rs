@@ -120,6 +120,7 @@ impl Radeon {
             self.engine_register_written(r, 0x1fff_1fff);
         }
         self.regs[DP_WRITE_MASK as usize / 4] = u32::MAX;
+        self.regs[CLR_CMP_MASK as usize / 4] = u32::MAX;
         self.vga.set_bank_window(None);
         self.monitor = ddc::Ddc::default();
     }

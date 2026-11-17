@@ -366,3 +366,15 @@ fn blits_land_at_dst_pitch_offset() {
         3
     );
 }
+
+#[test]
+fn destination_compare_keeps_pixels_of_the_reference_colour() {
+    let (mut r, dt) = engine(6);
+    set_px(&mut r, 4, 0, 1, 5);
+    set_px(&mut r, 4, 0, 0, 9);
+    set_px(&mut r, 4, 1, 0, 9);
+    w(&mut r, CLR_CMP_CLR_DST, 5);
+    w(&mut r, CLR_CMP_CNTL, 4 << 8);
+    copy(&mut r, dt | NO_BRUSH | SRC_COLOR | FROM_VRAM | 0xcc << 16, 3, (0, 0), (0, 1), (2, 1));
+    assert_eq!([px(&r, 4, 0, 1), px(&r, 4, 1, 1)], [5, 9]);
+}

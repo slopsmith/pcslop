@@ -295,3 +295,28 @@ fn hostdata_blt_packets_expand_monochrome_text() {
         [0, 0xff_ffff, 0, 0xff_ffff, 0x77]
     );
 }
+
+#[test]
+fn trans_bitblt_packets_skip_the_source_reference_colour() {
+    let mut ram = Ram::new();
+    let mut r = card_with_ring(&mut ram);
+    r.vram_mut()[..8].copy_from_slice(&[7, 0, 0, 0, 8, 0, 0, 0]);
+    let gmc = GMC_SRC_PITCH_OFFSET_CNTL | GMC_DST_PITCH_OFFSET_CNTL | 15 << 4 | 6 << 8 | 3 << 12 | 0xcc << 16 | 2 << 24;
+    let po = (256 / 64) << 22 | 0xf000_0000 >> 10;
+    submit(&mut r, &mut ram, &[pkt3(cp::op::TRANS_BITBLT, 9), gmc, po, po, 4 | 1 << 24, 7, 0, 0, 1, 2 << 16 | 1]);
+    assert_eq!([px32(&r, 0, 1), px32(&r, 1, 1)], [0, 8]);
+}
+
+#[test]
+fn nextchar_packets_draw_a_glyph_with_the_current_colours() {
+    let mut ram = Ram::new();
+    let mut r = card_with_ring(&mut ram);
+    let gmc = GMC_DST_PITCH_OFFSET_CNTL | 15 << 4 | 6 << 8 | 1 << 14 | 0xcc << 16 | 3 << 24;
+    let po = (256 / 64) << 22 | 0xf000_0000 >> 10;
+    r.mmio_write(DP_GUI_MASTER_CNTL, 4, gmc, &mut ram);
+    r.mmio_write(DST_PITCH_OFFSET, 4, po, &mut ram);
+    r.mmio_write(DP_SRC_FRGD_CLR, 4, 0xaa, &mut ram);
+    r.mmio_write(DP_SRC_BKGD_CLR, 4, 0x11, &mut ram);
+    submit(&mut r, &mut ram, &[pkt3(cp::op::NEXTCHAR, 3), 1 << 16 | 2, 1 << 16 | 4, 0b0110]);
+    assert_eq!([2, 3, 4, 5].map(|x| px32(&r, x, 1)), [0x11, 0xaa, 0xaa, 0x11]);
+}

@@ -87,6 +87,34 @@ impl<'a> Cursor<'a> {
     }
 }
 
+enum Test {
+    Always,
+    Equal(u32),
+    NotEqual(u32),
+}
+
+impl Test {
+    fn holds(&self, v: u32) -> bool {
+        match *self {
+            Test::Always => true,
+            Test::Equal(r) => v == r,
+            Test::NotEqual(r) => v != r,
+        }
+    }
+}
+
+struct Compare {
+    src: Option<Test>,
+    dst: Option<Test>,
+    mask: u32,
+}
+
+impl Compare {
+    fn skips(&self, s: u32, d: u32) -> bool {
+        self.src.as_ref().is_some_and(|t| t.holds(s & self.mask)) || self.dst.as_ref().is_some_and(|t| t.holds(d & self.mask))
+    }
+}
+
 /// Source pixels for one operation.
 enum Src<'a> {
     None,
@@ -435,16 +463,25 @@ impl Radeon {
         self.reg(DP_WRITE_MASK) & pixel_mask(bpp)
     }
 
-    /// CLR_CMP_CNTL's source compare: the reference colour, and whether a
-    /// matching pixel is the one left alone.
-    fn colour_compare(&self) -> Option<(u32, u32, bool)> {
+    /// CLR_CMP_CNTL's source and destination compares. A pixel whose compare
+    /// holds is left alone, which is how X's transparent blits use it.
+    fn colour_compare(&self) -> Option<Compare> {
+        let cntl = self.reg(CLR_CMP_CNTL);
         let mask = self.reg(CLR_CMP_MASK);
-        let reference = self.reg(CLR_CMP_CLR_SRC) & mask;
-        match self.reg(CLR_CMP_CNTL) & 7 {
-            4 => Some((reference, mask, true)),
-            5 => Some((reference, mask, false)),
+        let test = |f: u32, reg: u32| match f & 7 {
+            1 => Some(Test::Always),
+            4 => Some(Test::Equal(self.reg(reg) & mask)),
+            5 => Some(Test::NotEqual(self.reg(reg) & mask)),
             _ => None,
-        }
+        };
+        let (use_src, use_dst) = match (cntl >> 24) & 3 {
+            0 => (false, true),
+            1 => (true, false),
+            _ => (true, true),
+        };
+        let src = test(cntl, CLR_CMP_CLR_SRC).filter(|_| use_src);
+        let dst = test(cntl >> 8, CLR_CMP_CLR_DST).filter(|_| use_dst);
+        (src.is_some() || dst.is_some()).then_some(Compare { src, dst, mask })
     }
 
     /// `rect` cut to the scissor and the engine's coordinate range.
@@ -565,17 +602,16 @@ impl Radeon {
                 } else {
                     0
                 };
-                if need_src
-                    && let Some((reference, cmask, skip_equal)) = compare
-                    && ((s & cmask) == reference) == skip_equal
-                {
-                    continue;
-                }
                 let a = base + y as usize * pitch + x as usize * bpp;
                 let Some(px) = vram.get_mut(a..a + bpp) else {
                     continue;
                 };
                 let d = px.iter().rev().fold(0, |v, &b| v << 8 | b as u32);
+                if let Some(c) = &compare
+                    && c.skips(s, d)
+                {
+                    continue;
+                }
                 let r = (rop3(rop, p, s, d) & mask) | (d & !mask);
                 px.copy_from_slice(&r.to_le_bytes()[..bpp]);
             }
@@ -694,6 +730,17 @@ impl Radeon {
                     self.host_data(data, true);
                 }
             }
+            op::TRANS_BITBLT => {
+                let (Some(cntl), Some(src_ref), Some(dst_ref)) = (next(), next(), next()) else { return };
+                self.regs[CLR_CMP_CNTL as usize / 4] = cntl;
+                self.regs[CLR_CMP_CLR_SRC as usize / 4] = src_ref;
+                self.regs[CLR_CMP_CLR_DST as usize / 4] = dst_ref;
+                while let (Some(s), Some(d), Some(size)) = (next(), next(), next()) {
+                    let (s, (x, y)) = (xy(s), xy(d));
+                    let (w, h) = ((size >> 16 & 0x3fff) as i32, (size & 0x3fff) as i32);
+                    self.blit(Rect { x, y, w, h }, s);
+                }
+            }
             op::POLYLINE => {
                 let mut prev = None;
                 while let Some(p) = next() {
@@ -728,6 +775,14 @@ impl Radeon {
             }
             _ => self.note(&format!("cp: 2D opcode {opcode:#04x} not drawn")),
         }
+    }
+
+    /// NEXTCHAR: a monochrome bitmap drawn with the current colours and ROP.
+    pub(crate) fn next_char(&mut self, body: &[u32]) {
+        let (Some(&pos), Some(&size)) = (body.first(), body.get(1)) else { return };
+        let rect = Rect { x: sext16(pos), y: sext16(pos >> 16), w: (size & 0xffff) as i32, h: (size >> 16 & 0xffff) as i32 };
+        let lsb_first = self.datatype() & 1 << 30 != 0;
+        self.draw(rect, Src::Mono { data: &body[2..], row_bits: rect.w as usize, lsb_first });
     }
 
     /// Applies a 2D packet's SETTINGS and returns where its DATA_BLOCK starts.
