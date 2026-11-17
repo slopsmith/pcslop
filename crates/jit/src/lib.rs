@@ -59,6 +59,7 @@ struct BlockInfo {
     va: u64,
     boundaries: Vec<(u32, u32)>,
     insns: usize,
+    interp_after: Option<usize>,
     /// Executions checked against the interpreter in verify mode.
     verified: u32,
 }
@@ -272,6 +273,7 @@ pub struct Jit {
     shadow_paged: bool,
     code_next: usize,
     blocks: HashMap<u64, BlockInfo>,
+    ahead_cache: HashMap<u64, Ahead>,
     by_va: BTreeMap<u64, u64>,
     code_pages: HashMap<u32, Vec<u64>>,
     /// Times each physical page lost its translations to writes.
@@ -320,6 +322,19 @@ fn block_key(phys: u32, user: bool) -> u64 {
     phys as u64 | (user as u64) << 32
 }
 
+/// How `interp_run` treats the instruction at an address; REP string ops Stop,
+/// since the interpreter would run them to the end.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ahead {
+    Exits,
+    Runs,
+    Stop,
+}
+
+const INTERP_RUN_MAX: usize = 4096;
+const INTERP_RUN_TAIL: usize = 12;
+const INTERP_RUN_SHORT: usize = 4;
+
 /// True for CPU states whose code the translator can run: 32-bit protected
 /// mode at CPL 0 or 3 with flat CS, SS, DS and ES.
 pub fn supported(cpu: &Cpu) -> bool {
@@ -367,6 +382,7 @@ impl Jit {
             shadow_paged: false,
             code_next: layout::CODE_CACHE,
             blocks: HashMap::default(),
+            ahead_cache: HashMap::default(),
             by_va: BTreeMap::new(),
             code_pages: HashMap::default(),
             smc_counts: HashMap::default(),
@@ -811,7 +827,7 @@ impl Jit {
         if self.verify && trusted {
             self.insert_lookup(key, block_va);
         }
-        self.blocks.insert(key, BlockInfo { va: block_va, boundaries: compiled.boundaries, insns: compiled.insns, verified });
+        self.blocks.insert(key, BlockInfo { va: block_va, boundaries: compiled.boundaries, insns: compiled.insns, interp_after: compiled.interp_after, verified });
         self.by_va.insert(block_va, key);
         self.stats.blocks += 1;
         self.stats.translated_insns += compiled.insns as u64;
@@ -943,6 +959,9 @@ impl Jit {
                             }
                             let e = self.step_interp(cpu, bus);
                             if e != interp::Exit::Continue || cpu.halted || !supported(cpu) {
+                                return Ok(RunExit::Interp(e));
+                            }
+                            if let Some(e) = self.interp_run(cpu, bus) {
                                 return Ok(RunExit::Interp(e));
                             }
                             self.check_shadow(cpu, bus);
@@ -1088,6 +1107,54 @@ impl Jit {
         } else {
             *b &= !bit;
         }
+    }
+
+    /// Interprets on while the blocks ahead would soon exit to the interpreter
+    /// again, since a VM round trip costs more than a dozen interpreted steps.
+    fn interp_run<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B) -> Option<interp::Exit> {
+        let mut since_interp = 0;
+        for _ in 0..INTERP_RUN_MAX {
+            if since_interp >= INTERP_RUN_TAIL || (cpu.flag(x86::cpu::flags::IF) && bus.intr()) {
+                break;
+            }
+            since_interp = match self.ahead(cpu, bus) {
+                Ahead::Exits => 0,
+                Ahead::Runs => since_interp + 1,
+                Ahead::Stop => break,
+            };
+            let e = self.step_interp(cpu, bus);
+            if e != interp::Exit::Continue || cpu.halted || !supported(cpu) {
+                return Some(e);
+            }
+        }
+        None
+    }
+
+    /// What the code at EIP would do in the translator.
+    fn ahead<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B) -> Ahead {
+        let Ok(phys) = interp::translate(cpu, bus, cpu.eip, false) else { return Ahead::Stop };
+        let user = cpu.cpl() == 3;
+        let key = block_key(phys, user);
+        let insn = match self.ahead_cache.get(&key) {
+            Some(&a) => a,
+            None => {
+                let Ok(insn) = x86::decode::decode::<()>(true, |i| Ok(bus.read8(phys.wrapping_add(i)))) else { return Ahead::Stop };
+                let a = if insn.rep != x86::decode::Rep::None && matches!(insn.op, 0xa4..=0xa7 | 0xaa..=0xaf) {
+                    Ahead::Stop
+                } else if translate::translatable(&insn, cpu.eip, user) {
+                    Ahead::Runs
+                } else {
+                    Ahead::Exits
+                };
+                if self.ahead_cache.len() >= 1 << 16 {
+                    self.ahead_cache.clear();
+                }
+                self.ahead_cache.insert(key, a);
+                a
+            }
+        };
+        let block_exits = self.blocks.get(&key).and_then(|b| b.interp_after).is_some_and(|n| n <= INTERP_RUN_SHORT);
+        if insn == Ahead::Runs && block_exits { Ahead::Exits } else { insn }
     }
 
     /// Steps the interpreter, and once more while an STI, MOV SS or POP SS

@@ -67,6 +67,8 @@ pub struct Compiled {
     pub has_rep: bool,
     /// The block uses a translation from the latest batch (SLOPPER_JIT_VERIFY=new).
     pub recent: bool,
+    /// The block leaves for the interpreter after this many instructions.
+    pub interp_after: Option<usize>,
 }
 
 struct Emit {
@@ -1831,6 +1833,21 @@ fn is_recent(insn: &Insn) -> bool {
 /// Translates the block starting at `eip`. `byte(eip)` returns the code byte at
 /// a linear address on the block's page or the next one, or `None` where it
 /// cannot. Only an instruction that straddles the page end reads the next page.
+/// Whether the translator handles this instruction rather than exiting to the interpreter.
+pub fn translatable(insn: &Insn, pc: u32, user: bool) -> bool {
+    let mut e = Emit {
+        a: Asm::new(),
+        block_va: 0,
+        dispatch_va: 0x1000,
+        exit_va: 0x2000,
+        page: None,
+        chains: Vec::new(),
+        user,
+        stored: false,
+    };
+    !matches!(e.insn(insn, pc), Step::Unsupported)
+}
+
 pub fn compile(
     eip: u32,
     mut byte: impl FnMut(u32) -> Option<u8>,
@@ -1867,6 +1884,7 @@ pub fn compile(
     e.a.bind(body);
     let mut code_end = eip;
     let mut recent = false;
+    let mut interp_after = None;
     loop {
         let insn = decode::<()>(true, |i| byte(pc.wrapping_add(i)).ok_or(()));
         let Ok(insn) = insn else {
@@ -1874,6 +1892,7 @@ pub fn compile(
                 e.back_to_sti(at, &mut pc, &mut insns, &mut boundaries);
             } else if insns == 0 {
                 e.exit_interp(pc);
+                interp_after = Some(0);
             } else {
                 e.goto(pc);
             }
@@ -1904,6 +1923,7 @@ pub fn compile(
                     e.a.truncate(start);
                     e.chains.retain(|&(w, _)| (w as usize) < start);
                     e.exit_interp(pc);
+                    interp_after = Some(insns);
                     break;
                 }
             }
@@ -1963,6 +1983,7 @@ pub fn compile(
                     e.a.truncate(start);
                     e.chains.retain(|&(w, _)| (w as usize) < start);
                     e.exit_interp(pc);
+                    interp_after = Some(insns);
                 }
                 break;
             }
@@ -1983,5 +2004,5 @@ pub fn compile(
     count.add_imm(Size::X, ICOUNT, ICOUNT, insns as u32);
     let mut code = e.a.finish();
     code[0] = count.code[0];
-    Compiled { code, boundaries, insns, chains: e.chains, has_rep, recent }
+    Compiled { code, boundaries, insns, chains: e.chains, has_rep, recent, interp_after }
 }
