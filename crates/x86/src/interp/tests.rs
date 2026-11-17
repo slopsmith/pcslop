@@ -675,3 +675,9 @@ fn rdmsr_of_an_unknown_msr_raises_gp() {
     mc.cpu.regs[crate::cpu::ECX] = 0x2a;
     assert_eq!(mc.run(&[0x0f, 0x32]), Err(Exception::with_error(vector::GP, 0)));
 }
+
+#[test]
+fn undefined_opcodes_raise_ud() {
+    let mut mc = Machine::new();
+    assert_eq!(mc.run(&[0x0f, 0x3f]), Err(Exception::new(vector::UD)), "CPU-Z probes VIA's ALTINST jump");
+}

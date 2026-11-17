@@ -95,6 +95,19 @@ impl<B: Bus> Ctx<'_, B> {
         if self.cpu.protected_mode() && self.cpu.cpl() != 0 { gp(0) } else { Ok(()) }
     }
 
+    /// Raises #UD, as a real CPU does for opcodes it doesn't define (CPU-Z
+    /// probes VIA's 0F 3F this way), and logs each opcode the first time.
+    fn undefined_opcode<T>(&self) -> Res<T> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEEN: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+        let op = self.insn.op as usize & 0x1ff;
+        if SEEN[op / 64].fetch_or(1 << (op % 64), Ordering::Relaxed) & 1 << (op % 64) == 0 {
+            let Err(Trap::Unimplemented(what)) = self.unimplemented::<()>() else { unreachable!() };
+            eprintln!("#UD for undefined {what} at {:#x}", self.cpu.eip);
+        }
+        ud()
+    }
+
     pub(super) fn unimplemented<T>(&self) -> Res<T> {
         let i = &self.insn;
         let what = if i.has_modrm {
@@ -1208,7 +1221,7 @@ impl<B: Bus> Ctx<'_, B> {
                 let r = (op & 7) as usize;
                 self.cpu.regs[r] = if insn.op32 { self.cpu.regs[r].swap_bytes() } else { self.cpu.regs[r] & 0xffff_0000 };
             }
-            _ => return self.unimplemented(),
+            _ => return self.undefined_opcode(),
         }
         Ok(())
     }
