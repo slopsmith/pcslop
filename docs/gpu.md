@@ -161,6 +161,14 @@ Sniper: Path of Vengeance (LithTech, Direct3D) on Catalyst needed:
 - **Frustum clipping.** Catalyst sets `DX_CLIP_SPACE_DEF` and leaves clipping on, with a guard band of about 3.4 by 4.2 viewports. We only clipped at w = 0, so vertices just in front of the eye but behind the near plane, or lerped onto w = 0, became huge spikes across the screen and their near depth hid the level. Clipping interpolates from the inside vertex, since t computed from a far outside one rounds to 1.
 - **Fog.** Its levels use linear fog by eye distance (`GB_SELECT` 1/(1/W)), with the clear colour as fog colour.
 
+3DMark 2001 (MadOnion) on Catalyst needed, compared against MadOnion's own recording of the demo:
+
+- **Fast Z clears inside the scissor.** Its car chase draws into a 256x256 render target whose Z buffer sits just before the terrain's vertex buffers in VRAM; resolving the Z mask for the whole screen there overwrote them, so the terrain vanished.
+- **Colour clears through the Z buffer** (`ZB_CB_CLEAR`). Without them the bottom half of the screen turned yellow in transitions and the credits, and the Lobby's floor showed green stripes.
+- **The alpha test's own function order** and **dual-math vertex instructions as AMD documents them.** The trees' leaves are alpha-tested billboards whose vertex program uses dual-math multiplies; misread, they took infinities into their positions.
+- **Speed.** In the car chase, from about 9 to 57 frames per second, and in the Lobby from 14 to 40: VGA port writes only for VGA ports, scanout and the display refresh that no longer wait for the command processor or for frames being drawn off screen, each vertex shaded once on several threads from a program decoded once per draw, and texel reads in Metal without per-byte divisions. The Lobby is now bound by the GPU running our fragment shader; the car chase by the command processor thread and the guest.
+- **Open:** its benchmark reports N/A for Lobby (low detail), Nature, both fill rate tests and point sprites although they run and draw, so it gives no overall score. Timing (its frame counter against QueryPerformanceCounter and RDTSC) is the first suspect.
+
 To install it:
 
 1. Boot a fresh `~/xp-acpi.img` clone with `--gpu radeon --vga-rom ROM`, let XP install its ATI and AGP drivers, and click Yes on the restart prompt.
