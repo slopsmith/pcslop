@@ -888,6 +888,7 @@ impl Jit {
             !self.verify,
             user,
             self.self_check.contains(&page),
+            self.verify,
         );
         let bytes = compiled.code.len() * 4;
         if self.code_next + bytes > layout::CODE_CACHE_END {

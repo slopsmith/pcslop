@@ -10,6 +10,7 @@ use x86::decode::{Insn, MemOperand, NO_REG, Rep, decode};
 use crate::runtime::{AF_AUX, Entries, ICOUNT, PF_RESULT, STATE, guest_reg};
 use crate::state::{self, reason};
 
+mod flags;
 mod sse;
 mod system;
 mod x87;
@@ -87,6 +88,8 @@ struct Emit {
     user: bool,
     /// Set by `store`, so a self-checking block can see writes near its own code.
     stored: bool,
+    /// The `flags` bits the current instruction must produce.
+    need: u8,
 }
 
 enum Step {
@@ -290,23 +293,43 @@ impl Emit {
         self.a.eor(Size::W, AF_AUX, AF_AUX, res);
     }
 
+    fn needs(&self, f: u8) -> bool {
+        self.need & f != 0
+    }
+
+    fn result_flags(&mut self, a: Reg, b: Reg, logic: bool) {
+        if self.needs(flags::PF) {
+            self.a.mov(Size::W, PF_RESULT, T_RES);
+        }
+        if self.needs(flags::AF) {
+            if logic {
+                self.a.mov(Size::W, AF_AUX, ZR);
+            } else {
+                self.set_af(a, b, T_RES);
+            }
+        }
+    }
+
     /// Group-1 operation `op` on 32-bit values; result in T_RES, flags in NZCV.
     fn alu32(&mut self, op: usize, a: Reg, b: Reg) -> bool {
+        let nzcv = self.needs(flags::NZCV);
         match op {
-            0 => {
+            0 if nzcv => {
                 self.a.adds(Size::W, T_RES, a, b);
                 self.a.cfinv();
             }
+            0 => self.a.add(Size::W, T_RES, a, b),
             1 | 4 | 6 => {
                 match op {
                     1 => self.a.orr(Size::W, T_RES, a, b),
                     4 => self.a.and(Size::W, T_RES, a, b),
                     _ => self.a.eor(Size::W, T_RES, a, b),
                 }
-                self.a.tst(Size::W, T_RES, T_RES);
-                self.a.cfinv();
-                self.a.mov(Size::W, PF_RESULT, T_RES);
-                self.a.mov(Size::W, AF_AUX, ZR);
+                if nzcv {
+                    self.a.tst(Size::W, T_RES, T_RES);
+                    self.a.cfinv();
+                }
+                self.result_flags(a, b, true);
                 return true;
             }
             2 => {
@@ -315,10 +338,10 @@ impl Emit {
                 self.a.cfinv();
             }
             3 => self.a.sbcs(Size::W, T_RES, a, b),
-            _ => self.a.subs(Size::W, T_RES, a, b),
+            _ if nzcv => self.a.subs(Size::W, T_RES, a, b),
+            _ => self.a.sub(Size::W, T_RES, a, b),
         }
-        self.a.mov(Size::W, PF_RESULT, T_RES);
-        self.set_af(a, b, T_RES);
+        self.result_flags(a, b, false);
         true
     }
 
@@ -331,6 +354,18 @@ impl Emit {
     fn alu_narrow(&mut self, op: usize, a: Reg, b: Reg, shift: u32) -> bool {
         if op == 2 || op == 3 {
             self.adc_sbb_narrow(op == 3, a, b, 32 - shift);
+            return true;
+        }
+        let logic = matches!(op, 1 | 4 | 6);
+        if !self.needs(flags::NZCV) {
+            match op {
+                0 => self.a.add(Size::W, T_RES, a, b),
+                1 => self.a.orr(Size::W, T_RES, a, b),
+                4 => self.a.and(Size::W, T_RES, a, b),
+                6 => self.a.eor(Size::W, T_RES, a, b),
+                _ => self.a.sub(Size::W, T_RES, a, b),
+            }
+            self.result_flags(a, b, logic);
             return true;
         }
         self.a.lsl_imm(Size::W, T_C, a, shift);
@@ -352,12 +387,7 @@ impl Emit {
             _ => self.a.subs(Size::W, T_RES, T_C, T_D),
         }
         self.a.lsr_imm(Size::W, T_RES, T_RES, shift);
-        self.a.mov(Size::W, PF_RESULT, T_RES);
-        if matches!(op, 1 | 4 | 6) {
-            self.a.mov(Size::W, AF_AUX, ZR);
-        } else {
-            self.set_af(a, b, T_RES);
-        }
+        self.result_flags(a, b, logic);
         true
     }
 
@@ -489,6 +519,12 @@ impl Emit {
 
     /// Sets NZCV from T_RES, with x86 CF in T_B and OF in T_C (each 0 or 1).
     fn shift_flags(&mut self) {
+        if !self.needs(flags::NZCV) {
+            if self.needs(flags::PF) {
+                self.a.mov(Size::W, PF_RESULT, T_RES);
+            }
+            return;
+        }
         self.a.tst(Size::W, T_RES, T_RES);
         let ok = self.a.logic_imm(a64::Logic::Eor, Size::W, T_B, T_B, 1);
         assert!(ok);
@@ -532,6 +568,10 @@ impl Emit {
 
     /// Signed 32x32 multiply into `dst`, with x86 IMUL flags.
     fn imul32(&mut self, dst: Reg, a: Reg, b: Reg) {
+        if self.need == 0 {
+            self.a.mul(Size::W, dst, a, b);
+            return;
+        }
         self.a.smull(T_RES, a, b);
         self.a.addsub_ext(Size::X, true, true, ZR, T_RES, T_RES, Extend::Sxtw, 0);
         self.a.cset(Size::W, T_B, Cond::Ne);
@@ -549,6 +589,22 @@ impl Emit {
         if n == 0 {
             if dst != a {
                 self.a.mov(Size::W, dst, a);
+            }
+            return true;
+        }
+        if !self.needs(flags::NZCV) {
+            let out = if self.needs(flags::PF) { T_RES } else { dst };
+            match kind {
+                4 | 6 => self.a.lsl_imm(Size::W, out, a, n),
+                5 => self.a.lsr_imm(Size::W, out, a, n),
+                7 => self.a.asr_imm(Size::W, out, a, n),
+                _ => return false,
+            }
+            if out == T_RES {
+                self.a.mov(Size::W, PF_RESULT, T_RES);
+                if dst != T_RES {
+                    self.a.mov(Size::W, dst, T_RES);
+                }
             }
             return true;
         }
@@ -587,6 +643,7 @@ impl Emit {
     /// back to the interpreter at run time.
     fn string_op(&mut self, insn: &Insn, eip: u32) -> bool {
         let op = insn.op;
+        self.need = flags::ALL;
         if !insn.addr32 || matches!(insn.seg_override, Some(4) | Some(5)) {
             return false;
         }
@@ -799,6 +856,13 @@ impl Emit {
                     }
                     None => self.write_gpr(w, insn.rm(), v),
                 }
+            }
+            0x8b if op32 && insn.mem.is_some() => {
+                let m = insn.mem.unwrap();
+                if !self.ea(insn, &m) {
+                    return Step::Unsupported;
+                }
+                self.load(Width::W, guest_reg(insn.reg()));
             }
             0x8a | 0x8b => {
                 let w = Ow::of(op, op32);
@@ -1103,27 +1167,26 @@ impl Emit {
             }
             0x1b6 | 0x1be => {
                 let signed = op == 0x1be;
+                let to = if op32 { guest_reg(insn.reg()) } else { T_A };
                 match insn.mem {
                     Some(m) => {
                         if !self.ea(insn, &m) {
                             return Step::Unsupported;
                         }
                         if signed {
-                            self.a.ldrs(Width::B, Size::W, T_A, T_ADDR, 0);
+                            self.a.ldrs(Width::B, Size::W, to, T_ADDR, 0);
                         } else {
-                            self.load(Width::B, T_A);
+                            self.load(Width::B, to);
                         }
                     }
                     None => {
-                        self.read_r8(insn.rm(), T_A);
+                        self.read_r8(insn.rm(), to);
                         if signed {
-                            self.a.sxtb(Size::W, T_A, T_A);
+                            self.a.sxtb(Size::W, to, to);
                         }
                     }
                 }
-                if op32 {
-                    self.a.mov(Size::W, guest_reg(insn.reg()), T_A);
-                } else {
+                if !op32 {
                     self.a.bfi(Size::W, guest_reg(insn.reg()), T_A, 0, 16);
                 }
             }
@@ -1200,6 +1263,7 @@ impl Emit {
                 let Some(a) = self.rm_w(insn, w, true) else { return Step::Unsupported };
                 self.a.mov(Size::W, T_E, a);
                 let acc = self.read_gpr(w, 0, T_B);
+                self.need = flags::ALL;
                 self.alu(7, w, acc, T_E);
                 let (differ, done) = (self.a.label(), self.a.label());
                 self.a.b_cond(Cond::Ne, differ);
@@ -1787,21 +1851,40 @@ impl Emit {
     fn inc_dec_narrow(&mut self, dec: bool, a: Reg, width: u32) {
         self.a.mov(Size::W, T_A, a);
         self.a.movz(Size::W, T_B, 1, 0);
-        self.a.cset(Size::W, T_E, Cond::Hs);
+        let nzcv = self.needs(flags::NZCV);
+        if nzcv {
+            self.a.cset(Size::W, T_E, Cond::Hs);
+        }
         self.alu_narrow(if dec { 5 } else { 0 }, T_A, T_B, 32 - width);
-        self.a.rmif(T_E, 63, 0b0010);
+        if nzcv {
+            self.a.rmif(T_E, 63, 0b0010);
+        }
     }
 
     fn inc_dec(&mut self, dec: bool, dst: Reg, src: Reg) {
-        self.a.cset(Size::W, T_B, Cond::Hs);
-        if dec {
-            self.a.subs_imm(Size::W, T_RES, src, 1);
-        } else {
-            self.a.adds_imm(Size::W, T_RES, src, 1);
+        if self.need == 0 {
+            if dec { self.a.sub_imm(Size::W, dst, src, 1) } else { self.a.add_imm(Size::W, dst, src, 1) }
+            return;
         }
-        self.a.rmif(T_B, 63, 0b0010);
-        self.a.mov(Size::W, PF_RESULT, T_RES);
-        self.a.eor(Size::W, AF_AUX, src, T_RES);
+        let nzcv = self.needs(flags::NZCV);
+        if nzcv {
+            self.a.cset(Size::W, T_B, Cond::Hs);
+        }
+        match (dec, nzcv) {
+            (true, true) => self.a.subs_imm(Size::W, T_RES, src, 1),
+            (false, true) => self.a.adds_imm(Size::W, T_RES, src, 1),
+            (true, false) => self.a.sub_imm(Size::W, T_RES, src, 1),
+            (false, false) => self.a.add_imm(Size::W, T_RES, src, 1),
+        }
+        if nzcv {
+            self.a.rmif(T_B, 63, 0b0010);
+        }
+        if self.needs(flags::PF) {
+            self.a.mov(Size::W, PF_RESULT, T_RES);
+        }
+        if self.needs(flags::AF) {
+            self.a.eor(Size::W, AF_AUX, src, T_RES);
+        }
         if dst != T_RES {
             self.a.mov(Size::W, dst, T_RES);
         }
@@ -1809,9 +1892,17 @@ impl Emit {
 
     fn not_neg(&mut self, neg: bool, dst: Reg, src: Reg) {
         if neg {
-            self.a.subs(Size::W, T_RES, ZR, src);
-            self.a.mov(Size::W, PF_RESULT, T_RES);
-            self.a.eor(Size::W, AF_AUX, src, T_RES);
+            if self.needs(flags::NZCV) {
+                self.a.subs(Size::W, T_RES, ZR, src);
+            } else {
+                self.a.sub(Size::W, T_RES, ZR, src);
+            }
+            if self.needs(flags::PF) {
+                self.a.mov(Size::W, PF_RESULT, T_RES);
+            }
+            if self.needs(flags::AF) {
+                self.a.eor(Size::W, AF_AUX, src, T_RES);
+            }
             if dst != T_RES {
                 self.a.mov(Size::W, dst, T_RES);
             }
@@ -1886,8 +1977,36 @@ pub fn translatable(insn: &Insn, pc: u32, user: bool) -> bool {
         chains: Vec::new(),
         user,
         stored: false,
+        need: flags::ALL,
     };
     !matches!(e.insn(insn, pc), Step::Unsupported)
+}
+
+/// The flags each instruction of the block at `eip` must produce. With `exact`,
+/// a rejected instruction keeps them all live, as verify mode compares them all.
+fn flag_needs(eip: u32, byte: &mut impl FnMut(u32) -> Option<u8>, user: bool, exact: bool) -> Vec<u8> {
+    let page = eip & !0xfff;
+    let mut effects = Vec::new();
+    let mut pc = eip;
+    let mut stop_after_next = false;
+    while effects.len() < MAX_INSNS {
+        let Ok(insn) = decode::<()>(true, |i| byte(pc.wrapping_add(i)).ok_or(())) else { break };
+        let end = pc.wrapping_add(insn.len as u32);
+        if end.wrapping_sub(1) & !0xfff != page {
+            break;
+        }
+        let mut e = flags::effect(&insn);
+        if exact && e.flow != flags::Flow::End && !translatable(&insn, pc, user) {
+            e = flags::Effect { reads: flags::ALL, writes: 0, may: 0, flow: flags::Flow::End };
+        }
+        effects.push(e);
+        if stop_after_next || e.flow == flags::Flow::End {
+            break;
+        }
+        stop_after_next = e.flow == flags::Flow::EndAfterNext;
+        pc = end;
+    }
+    flags::needed(&effects)
 }
 
 pub fn compile(
@@ -1899,6 +2018,7 @@ pub fn compile(
     chain: bool,
     user: bool,
     self_check: bool,
+    exact_flags: bool,
 ) -> Compiled {
     let mut e = Emit {
         a: Asm::new(),
@@ -1909,7 +2029,9 @@ pub fn compile(
         chains: Vec::new(),
         user,
         stored: false,
+        need: flags::ALL,
     };
+    let need = if self_check { Vec::new() } else { flag_needs(eip, &mut byte, user, exact_flags) };
     let mut boundaries = Vec::new();
     let mut pc = eip;
     let mut insns = 0;
@@ -1955,6 +2077,7 @@ pub fn compile(
             let tail: Vec<u8> = (page.wrapping_add(0x1000)..end).map(|a| byte(a).unwrap_or(0)).collect();
             let slow = e.a.label();
             e.check_code_bytes(page.wrapping_add(0x1000), &tail, slow);
+            e.need = flags::ALL;
             match e.insn(&insn, pc) {
                 Step::Next => {
                     insns += 1;
@@ -1974,6 +2097,7 @@ pub fn compile(
             break;
         }
         e.stored = false;
+        e.need = need.get(insns).copied().unwrap_or(flags::ALL);
         let step = e.insn(&insn, pc);
         if self_check && e.stored && matches!(step, Step::Next | Step::Sti) {
             // T_ADDR still holds the address of the last store: leave through
