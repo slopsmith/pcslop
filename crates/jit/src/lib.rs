@@ -1500,7 +1500,7 @@ impl Jit {
         }
         let ec = esr >> 26;
         assert!(ec == 0x25, "unhandled fault in translated code: ESR {esr:#x} FAR {far:#x} ELR {elr:#x}");
-        assert!(far >> 32 == 0, "translated code faulted outside the x86 address space: FAR {far:#x}");
+        assert!(far >> 32 == 0, "translated code faulted outside the x86 address space: FAR {far:#x} ELR {elr:#x} ESR {esr:#x}");
         let write = esr & (1 << 6) != 0;
         let mut lin = far as u32;
         if self.shadow[self.root].maps(self.mem.as_slice(), lin, write) {
