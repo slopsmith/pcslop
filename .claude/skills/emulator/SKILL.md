@@ -35,7 +35,7 @@ scripts/vm stop xp
 ```
 
 **Control socket commands:**
-- `screen`, `status`, `regs`, `mem HEXADDR [LEN]`
+- `screen`, `status`, `regs`, `mem HEXADDR [LEN [CR3]]` (CR3 picks the address space; `regs` can be stale while the JIT runs)
 - `profile on|off`, `pause`, `resume`
 - `shot PATH`, `type TEXT`, `serial LINE`, `key NAME[+NAME]`, `down NAME`, `up NAME` (hold a key between them)
 - `mouse DX DY [BUTTONS]`, `tablet X Y [BUTTONS [WHEEL]]`

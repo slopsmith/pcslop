@@ -894,9 +894,16 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                             let mut it = rest.split_whitespace();
                             let addr = it.next().and_then(|a| u32::from_str_radix(a.trim_start_matches("0x"), 16).ok());
                             let len = it.next().and_then(|l| l.parse::<u32>().ok()).unwrap_or(64).min(4096);
+                            let mut other = it.next().and_then(|c| u32::from_str_radix(c.trim_start_matches("0x"), 16).ok()).map(|cr3| {
+                                let mut c = cpu.clone();
+                                c.cr3 = cr3;
+                                c.tlb.flush();
+                                c
+                            });
+                            let space = other.as_mut().unwrap_or(&mut cpu);
                             match addr {
                                 Some(a) => (0..len)
-                                    .map(|i| match x86::interp::translate(&mut cpu, &mut board, a + i, false) {
+                                    .map(|i| match x86::interp::translate(space, &mut board, a + i, false) {
                                         Ok(p) => format!("{:02x}", x86::bus::Bus::read8(&mut board, p)),
                                         Err(_) => "??".into(),
                                     })
@@ -906,7 +913,7 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                                     .map(|(i, c)| format!("{:08x}: {}", a + 16 * i as u32, c.join(" ")))
                                     .collect::<Vec<_>>()
                                     .join("\n"),
-                                None => "usage: mem HEXADDR [LEN]".into(),
+                                None => "usage: mem HEXADDR [LEN [CR3]]".into(),
                             }
                         }
                         _ => format!("unknown query {cmd:?}"),
@@ -1137,7 +1144,7 @@ fn command_event(line: &str) -> Result<Vec<Event>, String> {
         "battery" => vec![Event::Battery(parse_battery(rest.trim())?)],
         "quit" => vec![Event::Quit],
         _ => {
-            return Err("commands: screen | status | regs | mem HEXADDR [LEN] | profile [on|off] | pause | resume | save DIR | load DIR | shot PATH | type TEXT | serial LINE | key NAME[+NAME] | down NAME | up NAME | mouse DX DY [BUTTONS [WHEEL]] | tablet X Y [BUTTONS [WHEEL]] | capture [on|off|toggle] | power | battery [host|off|PERCENT[:ac]] | cdrom [ISO] | eject | stall MS EVERY_MS | quit\n\
+            return Err("commands: screen | status | regs | mem HEXADDR [LEN [CR3]] | profile [on|off] | pause | resume | save DIR | load DIR | shot PATH | type TEXT | serial LINE | key NAME[+NAME] | down NAME | up NAME | mouse DX DY [BUTTONS [WHEEL]] | tablet X Y [BUTTONS [WHEEL]] | capture [on|off|toggle] | power | battery [host|off|PERCENT[:ac]] | cdrom [ISO] | eject | stall MS EVERY_MS | quit\n\
                  down and up press or release one key and hold it in between;\n\
                  mouse sends relative PS/2 motion; tablet moves the USB tablet to guest screen pixel (X, Y);\n\
                  capture sends the window's mouse as PS/2 motion only and drops tablet input;\n\
