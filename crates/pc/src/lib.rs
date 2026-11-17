@@ -1,5 +1,6 @@
 //! An i440FX + PIIX3 PC: memory map, chipset registers and legacy devices.
 
+pub mod fdc;
 pub mod fw_cfg;
 pub mod i8042;
 pub mod pci;
@@ -50,6 +51,7 @@ pub struct Board {
     pci: Vec<(Bdf, ConfigSpace)>,
     pub pic: pic::Pic,
     pub pit: pit::Pit,
+    fdc: fdc::Fdc,
     /// Timer interrupts owed to the guest: Windows counts them to keep time,
     /// so ticks that arrive while one is still pending are delivered later.
     irq0_backlog: u32,
@@ -87,6 +89,7 @@ impl Board {
             ],
             pic: pic::Pic::default(),
             pit: pit::Pit::default(),
+            fdc: fdc::Fdc::default(),
             irq0_backlog: 0,
             rtc: rtc::Rtc::default(),
             fw_cfg: fw_cfg::FwCfg::new(),
@@ -304,6 +307,11 @@ impl Board {
                 self.pit.read(port, now)
             }
             0x70 | 0x71 => self.rtc.read(port),
+            0x3f0..=0x3f5 | 0x3f7 => {
+                let v = self.fdc.read(port);
+                self.pic.set_irq(6, self.fdc.irq());
+                v
+            }
             0x92 => (self.a20 as u8) << 1,
             0x402 => 0xe9,
             0x510 => 0,
@@ -331,6 +339,10 @@ impl Board {
                 self.pit.write(port, v, now)
             }
             0x70 | 0x71 => self.rtc.write(port, v),
+            0x3f0..=0x3f5 | 0x3f7 => {
+                self.fdc.write(port, v);
+                self.pic.set_irq(6, self.fdc.irq());
+            }
             0x80 => self.post_code = v,
             0x92 => {
                 self.a20 = v & 2 != 0;
@@ -390,6 +402,7 @@ impl Board {
         }
         self.pic = pic::Pic::default();
         self.pit = pit::Pit::default();
+        self.fdc = fdc::Fdc::default();
         self.irq0_backlog = 0;
         self.reset_requested = false;
     }
