@@ -309,7 +309,6 @@ mod tests {
     use super::*;
     use crate::Frame;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicU64};
 
     #[test]
     fn parses_listen_addresses() {
@@ -418,8 +417,7 @@ mod tests {
     fn shared_with(pixels: Vec<u32>, w: u32, h: u32) -> Arc<Shared> {
         Arc::new(Shared {
             frame: Mutex::new(Frame { pixels, width: w, height: h, seq: 1 }),
-            done: AtomicBool::new(false),
-            instructions: AtomicU64::new(0),
+            ..Default::default()
         })
     }
 

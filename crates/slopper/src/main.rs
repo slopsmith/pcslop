@@ -1,4 +1,5 @@
 mod audio;
+mod capture;
 mod host_power;
 mod keys;
 mod savestate;
@@ -47,6 +48,7 @@ struct Args {
     net_asked: bool,
     battery: BatterySource,
     load: Option<savestate::Snapshot>,
+    capture_mode: capture::CaptureMode,
 }
 
 #[derive(Clone, Copy)]
@@ -183,6 +185,10 @@ struct Cli {
     /// Start from the snapshot in DIR (made with the control socket's save) instead of booting.
     #[arg(long, value_name = "DIR", conflicts_with = "hda")]
     load: Option<PathBuf>,
+    /// What captures the mouse besides Ctrl+Option+G: key (nothing else), click
+    /// (a click in the window) or auto (a click while the guest has no tablet driver).
+    #[arg(long, value_name = "key|click|auto", default_value = "key", value_parser = capture::parse_mode)]
+    capture_mouse: capture::CaptureMode,
 }
 
 fn parse_board(v: &str) -> Result<pc::Chipset, String> {
@@ -246,6 +252,7 @@ fn parse_args() -> Result<Args, String> {
             cli.battery.unwrap_or(BatterySource::Host)
         },
         load,
+        capture_mode: cli.capture_mouse,
     })
 }
 
@@ -254,7 +261,8 @@ enum Event {
     Type(String),
     /// Bytes for the guest to receive on COM1.
     Serial(Vec<u8>),
-    Mouse(i32, i32, u8),
+    /// PS/2 mouse motion (positive dy is up), wheel detents and buttons.
+    Mouse(i32, i32, i32, u8),
     /// Host pointer: absolute position (0..=`usb::MAX_COORD` on each axis),
     /// relative motion for PS/2, buttons and wheel detents.
     Pointer { x: u16, y: u16, dx: i32, dy: i32, buttons: u8, wheel: i32 },
@@ -277,10 +285,14 @@ struct Frame {
     seq: u64,
 }
 
+#[derive(Default)]
 struct Shared {
     frame: Mutex<Frame>,
     done: AtomicBool,
     instructions: AtomicU64,
+    /// The guest gets relative PS/2 motion only and tablet input is dropped.
+    mouse_captured: AtomicBool,
+    tablet_in_use: AtomicBool,
 }
 
 fn dump(cpu: &Cpu) {
@@ -633,22 +645,24 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                 ScriptAction::Quit => break ExitCode::SUCCESS,
             }
         }
+        shared.tablet_in_use.store(board.tablet_in_use(), Ordering::Relaxed);
         while let Ok(ev) = events.try_recv() {
             match ev {
                 Event::Key(code, down) => board.key(code, down),
                 Event::Type(text) => text.chars().for_each(|c| keyq.push_char(c)),
                 Event::Serial(bytes) => board.serial_input(&bytes),
-                Event::Mouse(dx, dy, b) => board.mouse_motion(dx, dy, 0, b),
+                Event::Mouse(dx, dy, wheel, b) => board.mouse_motion(dx, dy, wheel, b),
                 // A guest with a USB tablet driver gets absolute positions only:
                 // feeding the same motion through PS/2 as well would move the
                 // cursor twice and send every click twice.
                 Event::Pointer { x, y, dx, dy, buttons, wheel } => {
-                    if board.tablet_in_use() {
+                    if board.tablet_in_use() && !shared.mouse_captured.load(Ordering::Relaxed) {
                         board.tablet(x, y, buttons, wheel);
                     } else {
                         board.mouse_motion(dx, dy, wheel, buttons);
                     }
                 }
+                Event::Tablet(..) if shared.mouse_captured.load(Ordering::Relaxed) => {}
                 Event::Tablet(px, py, buttons, wheel) => {
                     let (w, h) = {
                         let f = shared.frame.lock().unwrap();
@@ -794,6 +808,27 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                             Err(e) => e,
                         },
                         "save" | "load" => format!("usage: {cmd} DIR"),
+                        "capture" => {
+                            let c = &shared.mouse_captured;
+                            let now = c.load(Ordering::Relaxed);
+                            let set = match rest.trim() {
+                                "" => Some(now),
+                                "on" => Some(true),
+                                "off" => Some(false),
+                                "toggle" => Some(!now),
+                                _ => None,
+                            };
+                            if let Some(v) = set {
+                                c.store(v, Ordering::Relaxed);
+                            }
+                            if set.is_none() {
+                                "usage: capture [on|off|toggle]".into()
+                            } else if c.load(Ordering::Relaxed) {
+                                "mouse captured: PS/2 motion only, tablet input dropped".into()
+                            } else {
+                                "mouse released".into()
+                            }
+                        }
                         "pause" => {
                             paused = true;
                             "paused".into()
@@ -988,7 +1023,7 @@ fn control_server(path: PathBuf, tx: Sender<Event>) {
 fn run_command(line: &str, tx: &Sender<Event>) -> Option<String> {
     let cmd = line.split_whitespace().next().unwrap_or("");
     let battery_query = cmd == "battery" && line.split_whitespace().nth(1).is_none();
-    if battery_query || matches!(cmd, "screen" | "regs" | "status" | "pause" | "resume" | "mem" | "profile" | "cdrom" | "eject" | "save" | "load") {
+    if battery_query || matches!(cmd, "screen" | "regs" | "status" | "capture" | "pause" | "resume" | "mem" | "profile" | "cdrom" | "eject" | "save" | "load") {
         let (rtx, rrx) = channel();
         tx.send(Event::Query(line.to_string(), rtx)).ok()?;
         let wait = Duration::from_secs(if matches!(cmd, "save" | "load") { 120 } else { 10 });
@@ -1022,9 +1057,10 @@ fn command_event(line: &str) -> Result<Vec<Event>, String> {
         "mouse" => {
             let v: Vec<i32> = rest.split_whitespace().filter_map(|x| x.parse().ok()).collect();
             match v.as_slice() {
-                [dx, dy] => vec![Event::Mouse(*dx, *dy, 0)],
-                [dx, dy, b] => vec![Event::Mouse(*dx, *dy, *b as u8)],
-                _ => return Err("usage: mouse DX DY [BUTTONS]".into()),
+                [dx, dy] => vec![Event::Mouse(*dx, *dy, 0, 0)],
+                [dx, dy, b] => vec![Event::Mouse(*dx, *dy, 0, *b as u8)],
+                [dx, dy, b, w] => vec![Event::Mouse(*dx, *dy, *w, *b as u8)],
+                _ => return Err("usage: mouse DX DY [BUTTONS [WHEEL]]".into()),
             }
         }
         "tablet" => {
@@ -1042,8 +1078,9 @@ fn command_event(line: &str) -> Result<Vec<Event>, String> {
         "battery" => vec![Event::Battery(parse_battery(rest.trim())?)],
         "quit" => vec![Event::Quit],
         _ => {
-            return Err("commands: screen | status | regs | mem HEXADDR [LEN] | profile [on|off] | pause | resume | save DIR | load DIR | shot PATH | type TEXT | serial LINE | key NAME[+NAME] | mouse DX DY [BUTTONS] | tablet X Y [BUTTONS [WHEEL]] | power | battery [host|off|PERCENT[:ac]] | cdrom [ISO] | eject | quit\n\
-                 mouse sends relative PS/2 motion; tablet moves the USB tablet to guest screen pixel (X, Y)".into());
+            return Err("commands: screen | status | regs | mem HEXADDR [LEN] | profile [on|off] | pause | resume | save DIR | load DIR | shot PATH | type TEXT | serial LINE | key NAME[+NAME] | mouse DX DY [BUTTONS [WHEEL]] | tablet X Y [BUTTONS [WHEEL]] | capture [on|off|toggle] | power | battery [host|off|PERCENT[:ac]] | cdrom [ISO] | eject | quit\n\
+                 mouse sends relative PS/2 motion; tablet moves the USB tablet to guest screen pixel (X, Y);\n\
+                 capture sends the window's mouse as PS/2 motion only and drops tablet input".into());
         }
     })
 }
@@ -1061,8 +1098,11 @@ fn stdin_commands(tx: Sender<Event>) {
 }
 
 #[cfg(feature = "window")]
-fn window_loop(tx: Sender<Event>, shared: Arc<Shared>) {
-    use minifb::{KeyRepeat, MouseMode, Window, WindowOptions};
+const RELEASE_HINT: &str = "mouse captured, Ctrl+Option+G releases";
+
+#[cfg(feature = "window")]
+fn window_loop(tx: Sender<Event>, shared: Arc<Shared>, capture_mode: capture::CaptureMode) {
+    use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
     let open = |w: usize, h: usize| {
         let opts = WindowOptions { resize: true, scale_mode: minifb::ScaleMode::AspectRatioStretch, ..Default::default() };
         let (ww, wh) = window_size_for(w, h);
@@ -1078,13 +1118,20 @@ fn window_loop(tx: Sender<Event>, shared: Arc<Shared>) {
     let mut last_mouse: Option<(f32, f32, u8)> = None;
     let mut wheel_acc = 0f32;
     let mut rate_at = (Instant::now(), 0u64);
+    let mut mips = 0.0;
+    let mut grab = capture::Grab::default();
+    let mut motion = capture::Accumulator::default();
+    let mut swallow_g = false;
+    let mut swallow_click = false;
+    let mut last_buttons = 0u8;
     while window.is_open() && !shared.done.load(Ordering::Relaxed) {
         let elapsed = rate_at.0.elapsed();
+        let mut retitle = false;
         if elapsed >= Duration::from_millis(500) {
             let n = shared.instructions.load(Ordering::Relaxed);
-            let mips = n.saturating_sub(rate_at.1) as f64 / elapsed.as_secs_f64() / 1e6;
-            window.set_title(&format!("86slopper | {mips:.1} MIPS"));
+            mips = n.saturating_sub(rate_at.1) as f64 / elapsed.as_secs_f64() / 1e6;
             rate_at = (Instant::now(), n);
+            retitle = true;
         }
         {
             let f = shared.frame.lock().unwrap();
@@ -1105,23 +1152,84 @@ fn window_loop(tx: Sender<Event>, shared: Arc<Shared>) {
         } else {
             window.update();
         }
+
+        let held = |a: Key, b: Key| window.is_key_down(a) || window.is_key_down(b);
+        let hot_mods = held(Key::LeftCtrl, Key::RightCtrl) && held(Key::LeftAlt, Key::RightAlt);
+        let mut toggle = false;
         for k in window.get_keys_pressed(KeyRepeat::No) {
-            if let Some(c) = keys::from_minifb(k) {
+            if k == Key::G && hot_mods {
+                swallow_g = true;
+                toggle = true;
+            } else if let Some(c) = keys::from_minifb(k) {
                 let _ = tx.send(Event::Key(c, true));
             }
         }
         for k in window.get_keys_released() {
+            if k == Key::G && std::mem::take(&mut swallow_g) {
+                continue;
+            }
             if let Some(c) = keys::from_minifb(k) {
                 let _ = tx.send(Event::Key(c, false));
             }
         }
+
+        let buttons = window.get_mouse_down(MouseButton::Left) as u8
+            | (window.get_mouse_down(MouseButton::Right) as u8) << 1
+            | (window.get_mouse_down(MouseButton::Middle) as u8) << 2;
+        let clicked = buttons & 1 != 0 && last_buttons & 1 == 0;
+        last_buttons = buttons;
+        let focused = window.is_active() && capture::app_active();
+        let mut want = shared.mouse_captured.load(Ordering::Relaxed);
+        if toggle {
+            want = !want;
+        }
+        let click_captures = match capture_mode {
+            capture::CaptureMode::Key => false,
+            capture::CaptureMode::Click => true,
+            capture::CaptureMode::Auto => !shared.tablet_in_use.load(Ordering::Relaxed),
+        };
+        if !want && clicked && click_captures && focused && window.get_mouse_pos(MouseMode::Discard).is_some() {
+            want = true;
+            swallow_click = true;
+        }
+        if !focused {
+            want = false;
+        }
+        shared.mouse_captured.store(want, Ordering::Relaxed);
+        if want != grab.is_on() {
+            if want {
+                let (x, y) = window.get_position();
+                let (ww, wh) = window.get_size();
+                grab.engage((x as f64 + ww as f64 / 2.0, y as f64 + TITLE_BAR + wh as f64 / 2.0));
+                motion.clear();
+            } else {
+                grab.release();
+                last_mouse = None;
+            }
+            retitle = true;
+        }
+        if retitle {
+            let state = if grab.is_on() { format!(" | {RELEASE_HINT}") } else { String::new() };
+            window.set_title(&format!("86slopper | {mips:.1} MIPS{state}"));
+        }
+
+        wheel_acc += window.get_scroll_wheel().map_or(0.0, |(_, sy)| sy);
+        let wheel = wheel_acc.trunc();
+        wheel_acc -= wheel;
+        if grab.is_on() {
+            if swallow_click && buttons & 1 == 0 {
+                swallow_click = false;
+            }
+            let buttons = if swallow_click { buttons & !1 } else { buttons };
+            let (hx, hy) = grab.take_motion();
+            let (dx, dy) = motion.add(hx, hy);
+            if dx != 0 || dy != 0 || wheel != 0.0 || Some(buttons) != last_mouse.map(|m| m.2) {
+                let _ = tx.send(Event::Mouse(dx, -dy, wheel as i32, buttons));
+            }
+            last_mouse = Some((0.0, 0.0, buttons));
+            continue;
+        }
         if let Some((x, y)) = window.get_unscaled_mouse_pos(MouseMode::Discard) {
-            let buttons = window.get_mouse_down(minifb::MouseButton::Left) as u8
-                | (window.get_mouse_down(minifb::MouseButton::Right) as u8) << 1
-                | (window.get_mouse_down(minifb::MouseButton::Middle) as u8) << 2;
-            wheel_acc += window.get_scroll_wheel().map_or(0.0, |(_, sy)| sy);
-            let wheel = wheel_acc.trunc();
-            wheel_acc -= wheel;
             if let Some((lx, ly, lb)) = last_mouse
                 && (lx != x || ly != y || lb != buttons || buttons != 0 || wheel != 0.0)
             {
@@ -1140,6 +1248,10 @@ fn window_loop(tx: Sender<Event>, shared: Arc<Shared>) {
     }
     let _ = tx.send(Event::Quit);
 }
+
+/// Height of a standard macOS title bar, in points.
+#[cfg(feature = "window")]
+const TITLE_BAR: f64 = 28.0;
 
 /// A window size for a `w` x `h` picture: the picture's own size, scaled
 /// down to fit the main display if it is larger.
@@ -1228,11 +1340,7 @@ fn main() -> ExitCode {
         BatterySource::Fixed(p) => p,
     };
     let cfg = Config { ram_bytes: args.ram_mb << 20, bios, vgabios, apic: true, chipset, gpu, power };
-    let shared = Arc::new(Shared {
-        frame: Mutex::new(Frame::default()),
-        done: AtomicBool::new(false),
-        instructions: AtomicU64::new(0),
-    });
+    let shared = Arc::new(Shared::default());
     let (tx, rx) = channel();
     let headless = args.headless || !cfg!(feature = "window");
     let control_path = args.control.clone().unwrap_or_else(|| std::env::temp_dir().join(format!("86slopper-{}.sock", std::process::id())));
@@ -1256,6 +1364,7 @@ fn main() -> ExitCode {
         std::thread::spawn(move || vnc::serve(listener, tx, shared, password));
     }
     host_power::poll(HOST_POWER_INTERVAL, tx.clone(), Event::HostPower);
+    let capture_mode = args.capture_mode;
     let emu_shared = shared.clone();
     let emu = std::thread::spawn(move || emulate(args, cfg, rx, emu_shared));
 
@@ -1266,7 +1375,7 @@ fn main() -> ExitCode {
     std::thread::spawn(move || control_server(ctl_path, ctl_tx));
     #[cfg(feature = "window")]
     if !headless {
-        window_loop(tx, shared);
+        window_loop(tx, shared, capture_mode);
     }
     #[cfg(not(feature = "window"))]
     let _ = (tx, shared);
