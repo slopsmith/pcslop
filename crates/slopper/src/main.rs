@@ -969,9 +969,11 @@ fn format_regs(cpu: &Cpu) -> String {
     let s = &cpu.segs;
     format!(
         "eax={:08x} ecx={:08x} edx={:08x} ebx={:08x} esp={:08x} ebp={:08x} esi={:08x} edi={:08x}\n\
-         eip={:08x} eflags={:08x} cs={:04x} ss={:04x} ds={:04x} es={:04x} fs={:04x} cr0={:08x} cr3={:08x}",
+         eip={:08x} eflags={:08x} cs={:04x} ss={:04x} ds={:04x} es={:04x} fs={:04x} cr0={:08x} cr3={:08x}\n\
+         fcw={:04x} fsw={:04x} ftags={:02x} mxcsr={:08x} cr4={:08x}",
         r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7],
-        cpu.eip, cpu.eflags, s[1].selector, s[2].selector, s[3].selector, s[0].selector, s[4].selector, cpu.cr0, cpu.cr3
+        cpu.eip, cpu.eflags, s[1].selector, s[2].selector, s[3].selector, s[0].selector, s[4].selector, cpu.cr0, cpu.cr3,
+        cpu.fpu.cw, cpu.fpu.sw, cpu.fpu.tags, cpu.mxcsr, cpu.cr4
     )
 }
 
@@ -1143,8 +1145,10 @@ fn window_loop(tx: Sender<Event>, shared: Arc<Shared>, capture_mode: capture::Ca
         }
         if (w, h) != window_for && w >= 320 && h >= 200 {
             window_for = (w, h);
-            let Some(new) = open(w, h) else { break };
-            window = new;
+            let (ww, wh) = window_size_for(w, h);
+            let at = window.get_position();
+            capture::set_content_size(window.get_window_handle(), ww as f64, wh as f64);
+            window.set_position(at.0, at.1);
             last_mouse = None;
         }
         if buf.len() == w * h && !buf.is_empty() {

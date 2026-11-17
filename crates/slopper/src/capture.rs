@@ -46,7 +46,7 @@ impl Accumulator {
 }
 
 #[cfg(feature = "window")]
-pub use host::{Grab, app_active};
+pub use host::{Grab, app_active, set_content_size};
 
 #[cfg(feature = "window")]
 mod host {
@@ -154,6 +154,20 @@ mod host {
             }
             let is_active: extern "C" fn(*mut c_void, *mut c_void) -> bool = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
             is_active(app, sel_registerName(c"isActive".as_ptr()))
+        }
+    }
+
+    /// Resizes the content area of the minifb window `window` (its NSWindow)
+    /// in place, so the window keeps its identity for screen recorders.
+    pub fn set_content_size(window: *mut c_void, w: f64, h: f64) {
+        #[repr(C)]
+        struct Size {
+            w: f64,
+            h: f64,
+        }
+        unsafe {
+            let send: extern "C" fn(*mut c_void, *mut c_void, Size) = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+            send(window, sel_registerName(c"setContentSize:".as_ptr()), Size { w, h });
         }
     }
 
