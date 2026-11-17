@@ -94,6 +94,7 @@ shot)
 	[ $# -ge 1 ] || usage
 	out=${2:-$tmp/vm-$1.png}
 	case $out in /*) ;; *) out=$PWD/$out ;; esac
+	rm -f "$out"
 	"$root/scripts/ctl" "$(sock "$1")" "shot $out" >/dev/null
 	for _ in $(seq 25); do
 		[ -s "$out" ] && break

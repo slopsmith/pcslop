@@ -340,13 +340,31 @@ fn save_png(path: &PathBuf, f: &Frame) -> Result<(), String> {
     if f.width == 0 {
         return Err("no picture to save yet".into());
     }
-    let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+    let mut part = path.clone().into_os_string();
+    part.push(".part");
+    let part = PathBuf::from(part);
+    let file = std::fs::File::create(&part).map_err(|e| e.to_string())?;
     let mut enc = png::Encoder::new(std::io::BufWriter::new(file), f.width, f.height);
     enc.set_color(png::ColorType::Rgb);
     enc.set_depth(png::BitDepth::Eight);
     let mut w = enc.write_header().map_err(|e| e.to_string())?;
     let rgb: Vec<u8> = f.pixels.iter().flat_map(|p| [(p >> 16) as u8, (p >> 8) as u8, *p as u8]).collect();
-    w.write_image_data(&rgb).map_err(|e| e.to_string())
+    w.write_image_data(&rgb).map_err(|e| e.to_string())?;
+    w.finish().map_err(|e| e.to_string())?;
+    std::fs::rename(&part, path).map_err(|e| e.to_string())
+}
+
+/// Saves the shown frame on a thread of its own: encoding takes about 30 ms,
+/// which would otherwise stall the guest and lengthen the frame it is drawing.
+fn save_png_in_background(path: PathBuf, shared: &Shared) {
+    let f = {
+        let f = shared.frame.lock().unwrap();
+        Frame { pixels: f.pixels.clone(), width: f.width, height: f.height, seq: f.seq }
+    };
+    std::thread::spawn(move || match save_png(&path, &f) {
+        Ok(()) => eprintln!("saved {}", path.display()),
+        Err(e) => eprintln!("screenshot failed: {e}"),
+    });
 }
 
 /// Steps from a `--script` file, run against the text-mode screen:
@@ -709,13 +727,7 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                     };
                     board.tablet(pixel_to_tablet(px, w), pixel_to_tablet(py, h), buttons, wheel);
                 }
-                Event::Screenshot(path) => {
-                    let f = shared.frame.lock().unwrap();
-                    match save_png(&path, &f) {
-                        Ok(()) => eprintln!("saved {}", path.display()),
-                        Err(e) => eprintln!("screenshot failed: {e}"),
-                    }
-                }
+                Event::Screenshot(path) => save_png_in_background(path, &shared),
                 Event::Query(q, reply) => {
                     let (cmd, rest) = q.split_once(' ').unwrap_or((q.as_str(), ""));
                     let answer = match cmd {
