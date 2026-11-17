@@ -1538,7 +1538,7 @@ impl Bus for Board {
                     r.set_time(self.clock_base + self.start.elapsed().as_nanos() as u64);
                     return self.radeon_write(|r, bus| r.io_write(port - base, size, value, bus));
                 }
-                r.vga_io_write(port, size, value)
+                matches!(port, 0x1ce..=0x1cf | 0x3b0..=0x3df) && r.vga_io_write(port, size, value)
             }
         };
         if ours {
