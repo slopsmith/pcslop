@@ -13,7 +13,9 @@ grep -v '^#' "$dir/index.txt" | head -n "$count" | while read -r rank samples sh
 	ndisasm -b32 -o "0x$eip" "$dir/$rank.x86" | head -n "$insns"
 	echo "--- a64"
 	xxd -p -c 4 "$dir/$rank.a64" | sed 's/\(..\)\(..\)\(..\)\(..\)/0x\1 0x\2 0x\3 0x\4/' |
-		llvm-mc --disassemble -triple=aarch64 2>/dev/null | grep -v '^\s*\.text'
+		llvm-mc --disassemble -triple=aarch64 2>/dev/null | grep -v '^\s*\.text' |
+		awk -v hits="$dir/$rank.hits" 'BEGIN { while ((getline l < hits) > 0) { split(l, f, " "); n[f[1]] = f[2] } }
+			{ printf "%6s %4d %s\n", (NR - 1 in n) ? n[NR - 1] : "", NR - 1, $0 }'
 	echo
 done
 EOF

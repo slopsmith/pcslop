@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Boots a clone of ~/xp-nomp.img with the XP benchmark CD (bench.exe and
+# 7-Zip's benchmark, see bench/xpbench/bench.c), reports the time to an idle
+# desktop, runs D:\run.bat and prints the results it sends to COM1.
+# Usage: scripts/bench-xp [DISK]; VM_BIN picks the emulator binary.
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+disk=${1:-$HOME/xp-nomp.img}
+iso=${BENCH_ISO:-/Volumes/Projects/.workspaces/86slopper/bench/xpbench/bench.iso}
+tmp=$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || echo "${TMPDIR:-/tmp}")
+tmp=${tmp%/}
+name=xpb$$
+img=$tmp/$name.img
+serial=$tmp/$name.serial
+cp -c "$disk" "$img"
+: >"$serial"
+trap '"$root/scripts/vm" stop "$name" >/dev/null 2>&1 || true; rm -f "$img" "$serial"' EXIT
+vm() { "$root/scripts/vm" "$@"; }
+mips() { vm status "$name" | sed -n 's/.*mips \([0-9.]*\).*/\1/p' | cut -d. -f1; }
+start=$(date +%s)
+VM_TIMEOUT=900 vm start "$name" --hda "$img" --cdrom "$iso" --ram 256 --no-net --serial "$serial" >/dev/null
+busy=0 low=0
+for _ in $(seq 300); do
+	sleep 1
+	m=$(mips || echo 0)
+	[ "${m:-0}" -gt 50 ] && busy=1
+	if [ $busy = 1 ] && [ "${m:-0}" -lt 3 ]; then low=$((low + 1)); else low=0; fi
+	[ $low -ge 4 ] && break
+done
+echo "idle desktop after $(($(date +%s) - start - 4)) s"
+vm ctl "$name" "key lwin+r" >/dev/null
+sleep 2
+vm ctl "$name" "type D:\\run.bat" >/dev/null
+sleep 2
+vm ctl "$name" "key enter" >/dev/null
+for _ in $(seq 600); do
+	grep -aq "BENCH-DONE" "$serial" && break
+	sleep 1
+done
+tr -d '\r' <"$serial" | grep -aE "^[a-z].* s |^total|^Avr|^Tot" || cat "$serial"
