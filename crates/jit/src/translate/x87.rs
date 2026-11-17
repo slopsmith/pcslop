@@ -214,8 +214,8 @@ impl Emit {
             }
             K::StMem { double, pop } => {
                 self.x87_need(0, true, bail);
-                self.check_rc_nearest(bail);
                 if double && !self.is_cached(0) {
+                    self.check_rc_nearest(bail);
                     self.fget(0, M, S);
                     self.to_f64(bail, false);
                     self.and_imm(Size::X, T_B, M, 0x7ff);
@@ -230,8 +230,10 @@ impl Emit {
                     self.a.fmov_ws(T_A, FB);
                     let (normal, zero) = (self.a.label(), self.a.label());
                     self.a.ubfx(Size::W, T_B, T_A, 23, 8);
-                    self.a.add_imm(Size::W, T_C, T_B, 1);
+                    self.a.add_imm(Size::W, T_C, T_B, 2);
                     self.a.tbnz(T_C, 8, bail);
+                    self.a.sub_imm(Size::W, T_C, T_B, 1);
+                    self.a.cbz(Size::W, T_C, bail);
                     self.a.cbnz(Size::W, T_B, normal);
                     self.a.lsl_imm(Size::W, T_B, T_A, 1);
                     self.a.cbnz(Size::W, T_B, bail);
@@ -433,7 +435,6 @@ impl Emit {
             }
             K::Sqrt => {
                 self.x87_need(0, true, bail);
-                self.check_rc_nearest(bail);
                 let a = self.st_val(0, bail);
                 self.a.fp1(true, 3, FR, a);
                 self.check_result(FR, None, bail);
@@ -528,6 +529,24 @@ impl Emit {
         self.a.ubfx(Size::W, TOP, SW, 11, 3);
         self.a.ldr(Width::W, TAGS, STATE, state::FTAGS as i32);
         self.a.mrs(SAVED_FPSR, sysreg::FPSR);
+        self.set_rmode(state::FCW, 10);
+    }
+
+    /// Points FPCR's rounding mode at the RC field at bit `shift` of the
+    /// state word at `at` (FCW for x87 code, MXCSR outside it).
+    fn set_rmode(&mut self, at: usize, shift: u32) {
+        let same = self.a.label();
+        self.a.ldr(Width::W, M, STATE, at as i32);
+        self.a.ubfx(Size::W, S, M, shift, 1);
+        self.a.ubfx(Size::W, M, M, shift + 1, 1);
+        self.a.logic_shift(Logic::Orr, false, Size::W, M, M, S, Shift::Lsl, 1);
+        self.a.mrs(S, sysreg::FPCR);
+        self.a.ubfx(Size::X, U, S, 22, 2);
+        self.a.eor(Size::W, U, U, M);
+        self.a.cbz(Size::W, U, same);
+        self.a.bfi(Size::X, S, M, 22, 2);
+        self.a.msr(sysreg::FPCR, S);
+        self.a.bind(same);
     }
 
     /// The slot of ST(i), relative to TOP at the block's first x87 instruction.
@@ -676,6 +695,7 @@ impl Emit {
             self.a.mov_imm(Size::W, U, saved.note.1 as u64);
             self.a.str(Width::W, U, STATE, state::FNOTE as i32);
         }
+        self.set_rmode(state::MXCSR, 13);
         self.x87 = saved;
     }
 
@@ -685,8 +705,10 @@ impl Emit {
         let ok = self.a.label();
         self.a.fmov_xd(T_A, v);
         self.a.ubfx(Size::X, T_B, T_A, 52, 11);
-        self.a.add_imm(Size::W, T_C, T_B, 1);
+        self.a.add_imm(Size::W, T_C, T_B, 2);
         self.a.tbnz(T_C, 11, bail);
+        self.a.sub_imm(Size::W, T_C, T_B, 1);
+        self.a.cbz(Size::W, T_C, bail);
         self.a.cbnz(Size::W, T_B, ok);
         self.a.lsl_imm(Size::X, T_C, T_A, 1);
         self.a.cbnz(Size::X, T_C, bail);
@@ -708,6 +730,17 @@ impl Emit {
         self.a.tbnz(SW, PE_SHIFT, done);
         match op {
             2 | 3 => {
+                let nearest = self.a.label();
+                self.a.ldr(Width::W, T_B, STATE, state::FCW as i32);
+                self.a.ubfx(Size::W, T_B, T_B, 10, 2);
+                self.a.cbz(Size::W, T_B, nearest);
+                self.a.msr(sysreg::FPSR, ZR);
+                self.a.fp2(true, op, E1, x, y);
+                self.a.mrs(T_B, sysreg::FPSR);
+                self.a.ubfx(Size::W, T_B, T_B, 4, 1);
+                self.flag_nonzero_to_pe(T_B);
+                self.a.b(done);
+                self.a.bind(nearest);
                 let sub = op == 3;
                 self.a.fp2(true, 3, E1, FR, x);
                 self.a.fp2(true, 3, E2, FR, E1);
@@ -794,7 +827,7 @@ impl Emit {
         self.a.bind(zero);
     }
 
-    /// Leaves unless the x87 and the SSE rounding control (the FPCR one) are nearest.
+    /// Leaves unless the x87 rounding control is nearest.
     fn check_rc_nearest(&mut self, bail: Label) {
         if self.x87.rc_checked {
             return;
@@ -802,9 +835,6 @@ impl Emit {
         self.x87.rc_checked = true;
         self.a.ldr(Width::W, T_A, STATE, state::FCW as i32);
         self.a.ubfx(Size::W, T_A, T_A, 10, 2);
-        self.a.cbnz(Size::W, T_A, bail);
-        self.a.ldr(Width::W, T_A, STATE, state::MXCSR as i32);
-        self.a.ubfx(Size::W, T_A, T_A, 13, 2);
         self.a.cbnz(Size::W, T_A, bail);
     }
 
@@ -920,7 +950,6 @@ impl Emit {
 
     /// `a` op `b`, or the reverse, by the ModRM operation; result in FR.
     fn arith(&mut self, reg: usize, a: V, b: V, bail: Label) {
-        self.check_rc_nearest(bail);
         let (x, y) = if reg == 5 || reg == 7 { (b, a) } else { (a, b) };
         let op = match reg {
             0 => 2,
@@ -949,8 +978,10 @@ impl Emit {
         self.a.fp1(true, 4, FS, FR);
         self.a.fmov_ws(T_A, FS);
         self.a.ubfx(Size::W, T_B, T_A, 23, 8);
-        self.a.add_imm(Size::W, T_C, T_B, 1);
+        self.a.add_imm(Size::W, T_C, T_B, 2);
         self.a.tbnz(T_C, 8, bail);
+        self.a.sub_imm(Size::W, T_C, T_B, 1);
+        self.a.cbz(Size::W, T_C, bail);
         self.a.cbnz(Size::W, T_B, normal);
         self.a.lsl_imm(Size::W, T_B, T_A, 1);
         self.a.cbnz(Size::W, T_B, bail);

@@ -1041,7 +1041,7 @@ fn random_x87_programs_match_the_interpreter() {
         code.push(0xf4);
         let mem = x87_memory(&mut rng);
         let mut a = flat_cpu(0x1000, 0x8000);
-        a.fpu.cw = [0x37f, 0x27f, 0x07f][round % 3];
+        a.fpu.cw = [0x37f, 0x27f, 0x07f, 0xc7f, 0x77f, 0xb7f][round % 6];
         let mut b = a.clone();
         let mut bus_a = bus_with(0x1000, &code);
         let mut bus_b = bus_with(0x1000, &code);
