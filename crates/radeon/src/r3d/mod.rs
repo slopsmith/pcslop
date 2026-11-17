@@ -378,10 +378,15 @@ impl Radeon {
             op::INDX_BUFFER => {
                 let skip = bits(get(0), 16, 3) as usize;
                 let size = (get(2) & 0x7f_ffff) as usize;
-                let words = self.mc_read_dwords(mem, get(1) & !3, size.min(1 << 22));
-                let words = words.get(skip..).unwrap_or(&[]);
                 let dest = (get(0) & 0x1fff) << 2;
-                if let Some(vf) = self.r3d.pending_indx.take() {
+                // Catalyst starts 16-bit index lists at odd indices by
+                // pointing two bytes into a dword, and the MIN/MAX clamp it
+                // programs only fits the indices read from there.
+                let pending = self.r3d.pending_indx.take();
+                let addr = if pending.is_some() { get(1) } else { get(1) & !3 };
+                let words = self.mc_read_dwords(mem, addr, size.min(1 << 22));
+                let words = words.get(skip..).unwrap_or(&[]);
+                if let Some(vf) = pending {
                     let idx = self.indices(vf, words);
                     self.draw_3d(mem, vf, Verts::Indices(idx));
                 } else {

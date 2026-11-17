@@ -314,6 +314,32 @@ fn indexed_draws_fetch_vertices_from_arrays_of_structures() {
 }
 
 #[test]
+fn an_index_buffer_may_start_two_bytes_into_a_dword() {
+    let mut g = Gpu::new();
+    let (verts, indices) = (0x8000, 0x9000);
+    for (i, d) in quad(0.0, 0.0, 8.0, 8.0, BLUE).iter().flatten().enumerate() {
+        g.ram.0[verts + 4 * i..][..4].copy_from_slice(&f(*d).to_le_bytes());
+    }
+    for (i, x) in [3u16, 0, 1, 2, 0, 2, 3, 0].iter().enumerate() {
+        g.ram.0[indices + 2 * i..][..2].copy_from_slice(&x.to_le_bytes());
+    }
+    let p = [
+        pkt3(0x2f, 3),
+        1,
+        8 | 8 << 8,
+        verts as u32,
+        pkt3(0x36, 1),
+        4 | 1 << 4 | 6 << 16,
+        pkt3(0x33, 3),
+        1 << 31 | VAP_PVS_VECTOR_DATA_REG >> 2,
+        indices as u32 + 2,
+        4,
+    ];
+    g.r.execute(&mut g.ram, &p);
+    assert_eq!(g.count(0xff00_00ff), 64);
+}
+
+#[test]
 fn blits_reach_system_memory_through_the_pci_gart() {
     let mut g = Gpu::new();
     let (table, page) = (0x1000u32, 0x5_0000u32);

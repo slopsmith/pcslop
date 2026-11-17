@@ -169,7 +169,7 @@ To install it:
 
 `crates/radeon/src/r3d` runs the R300's 3D pipeline. Its CPU path draws while the packet executes and is the reference for the Metal backend, which draws the pixels by default (see [Metal backend](#metal-backend)):
 
-- **Packets:** `3D_DRAW_IMMD(_2)`, `3D_DRAW_VBUF(_2)`, `3D_DRAW_INDX(_2)`, `INDX_BUFFER` (indices or any register), `3D_LOAD_VBPNTR` and `3D_DRAW_128`.
+- **Packets:** `3D_DRAW_IMMD(_2)`, `3D_DRAW_VBUF(_2)`, `3D_DRAW_INDX(_2)`, `INDX_BUFFER` (indices, which Catalyst may start two bytes into a dword, or any register), `3D_LOAD_VBPNTR` and `3D_DRAW_128`.
 - **Vertex fetch:** a vertex's dwords come from the packet or from each array of structures in turn, and the PSC (`VAP_PROG_STREAM_CNTL*`) splits them into input vectors: floats, bytes, D3DCOLOR, shorts and packed 10/11-bit formats, with SIGNED and NORMALIZE.
 - **Vertex shader:** the PVS program in vector memory (code at 0, constants at 512), interpreted per vertex: every R3xx vector and math opcode, the macro MAD, dual-math instructions, relative addressing through A0, and saturation. `PVS_BYPASS` passes inputs through. Flow control (loops, JSR) is not implemented.
 - **Setup:** `VAP_OUT_VTX_FMT_*` lays out position, point size, colours and texture coordinates. Triangles are clipped in clip space as `VAP_CLIP_CNTL` and `VAP_CNTL` say: to the near plane (z = 0 with `DX_CLIP_SPACE_DEF`, z = -w without), the far plane z = w and the guard band in `VAP_GB_*_CLIP_ADJ`; with `CLIP_DISABLE` only to w > 0. Then the VTE divides by w and applies the viewport (whose registers have a second address at 0x1D98). Points become sprites, lines become quads; quads, strips, fans and polygons become triangles. Culling follows `SU_CULL_MODE`; polygon offset `SU_POLY_OFFSET_*`.
