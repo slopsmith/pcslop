@@ -22,11 +22,16 @@ vertex VOut vs(uint vid [[vertex_id]], const device float4 *vb [[buffer(0)]]) {
 }
 "#;
 
-fn outputs(slots: &[usize], perspective: bool) -> String {
+/// The vertex outputs: `flat[i]` has a bit for each component of slot `i`
+/// that takes the provoking vertex's value, which goes in `vf{i}`.
+fn outputs(slots: &[usize], perspective: bool, flat: &[u32]) -> String {
     let interp = if perspective { "center_perspective" } else { "center_no_perspective" };
     let mut varyings = format!("    float fog [[{interp}]];\n");
     for (i, _) in slots.iter().enumerate() {
         let _ = writeln!(varyings, "    float4 v{i} [[{interp}]];");
+        if flat.get(i).is_some_and(|&m| m != 0) {
+            let _ = writeln!(varyings, "    float4 vf{i} [[flat]];");
+        }
     }
     let fields = format!("    float4 position [[position]];\n    float z [[center_no_perspective]];\n    float front [[flat]];\n{varyings}");
     format!(
@@ -43,9 +48,9 @@ pub(crate) fn shader(prog: &Program, slots: &[usize], perspective: bool) -> Stri
         let _ = writeln!(copy, "    o.v{i} = v[{}];", 2 + i);
     }
     let mut src = String::from(PRELUDE);
-    src.push_str(&outputs(slots, perspective));
+    src.push_str(&outputs(slots, perspective, &[]));
     src.push_str(&CAPTURED_VS.replace("@COPY@", &copy).replace("@STRIDE@", &(2 + slots.len()).to_string()));
-    src.push_str(&fragment(prog, slots, false));
+    src.push_str(&fragment(prog, slots, &[], false));
     src
 }
 
@@ -53,20 +58,29 @@ pub(crate) fn shader(prog: &Program, slots: &[usize], perspective: bool) -> Stri
 /// `vs` describes.
 pub(crate) fn shader_gpu(prog: &Program, slots: &[usize], perspective: bool, vs: &VsDesc) -> String {
     let mut src = String::from(PRELUDE);
-    src.push_str(&outputs(slots, perspective));
-    src.push_str(&vs.msl(slots));
-    src.push_str(&fragment(prog, slots, true));
+    let flat = vs.flat(slots);
+    src.push_str(&outputs(slots, perspective, &flat));
+    src.push_str(&vs.msl(slots, &flat));
+    src.push_str(&fragment(prog, slots, &flat, true));
     src
 }
 
 /// With `gpu_vertices`, depth comes from the rasterized position, with the
 /// polygon offset applied here, and the face from Metal.
-fn fragment(prog: &Program, slots: &[usize], gpu_vertices: bool) -> String {
+fn fragment(prog: &Program, slots: &[usize], flat: &[u32], gpu_vertices: bool) -> String {
     let mut f = String::from(
         "fragment void fs(VOut in [[stage_in]],\n    device uchar *vram [[buffer(0), raster_order_group(0)]],\n    const device uchar *texmem [[buffer(1)]],\n    const device uchar *stage [[buffer(2)]],\n    constant Uniforms &u [[buffer(3)]],\n    device atomic_uint *counter [[buffer(4)]],\n    const device TexSlot *images [[buffer(5)]],\n    const device SamplerSlot *samplers [[buffer(6)]],\n    bool front_facing [[front_facing]]) {\n    TexTables tb = {images, samplers};\n    float4 t[32];\n    for (uint i = 0; i < 32; i++) t[i] = float4(0);\n",
     );
     for (i, s) in slots.iter().enumerate() {
-        let _ = writeln!(f, "    t[{s}] = in.v{i};");
+        match flat.get(i).copied().unwrap_or(0) {
+            0 => {
+                let _ = writeln!(f, "    t[{s}] = in.v{i};");
+            }
+            m => {
+                let pick = [0, 1, 2, 3].map(|c| if m & (1 << c) != 0 { "true" } else { "false" }).join(", ");
+                let _ = writeln!(f, "    t[{s}] = select(in.v{i}, in.vf{i}, bool4({pick}));");
+            }
+        }
     }
     if gpu_vertices {
         f.push_str("    bool front = front_facing;\n    float depth = poly_offset(u, in.position.z, front);\n");

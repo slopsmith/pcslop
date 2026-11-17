@@ -1294,6 +1294,25 @@ mod against_metal {
         }
     }
 
+    #[test]
+    fn flat_shading_matches() {
+        let strip: Vec<[f32; 8]> = (0..10)
+            .map(|i| {
+                let k = i as f32;
+                v(4.0 + 6.0 * k, if i % 2 == 0 { 8.0 } else { 50.0 + k }, [k / 10.0, 1.0 - k / 10.0, (k * 0.37) % 1.0, 0.2 + k / 20.0])
+            })
+            .collect();
+        for provoking in 0..3u32 {
+            for modes in [0x5, 0x9, 0x6] {
+                let cc = provoking << 16 | 0xaaa0 | modes;
+                assert!(same(|g| {
+                    g.w(GA_COLOR_CONTROL, cc);
+                    g.draw(6, &strip);
+                }, 1, 40) > 0, "colour control {cc:#x}");
+            }
+        }
+    }
+
     fn arrays(g: &mut Gpu, in_vram: bool) {
         let verts = [quad(4.0, 4.0, 30.0, 20.0, RED), quad(20.0, 10.0, 60.0, 60.0, BLUE)].concat();
         let (ram, vram) = (0x8000usize, 0x4_0000usize);

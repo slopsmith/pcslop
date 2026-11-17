@@ -160,9 +160,34 @@ impl VsDesc {
         }
     }
 
+    /// For each of `slots`, the components the RS fills from a colour that
+    /// GA_COLOR_CONTROL shades flat.
+    pub fn flat(&self, slots: &[usize]) -> Vec<u32> {
+        let mut regs = [0u32; 32];
+        for &inst in &self.rs_inst {
+            if (inst >> 3) & 7 != 0 {
+                regs[((inst >> 6) & 31) as usize] = 0;
+            }
+            if (inst >> 14) & 7 != 0 {
+                let ip = self.rs_ip[((inst >> 11) & 7) as usize];
+                let col = ((ip >> 6) & 7).min(3);
+                let rgb = (self.colour_control >> (4 * col)) & 3 == 1;
+                let alpha = (self.colour_control >> (4 * col + 2)) & 3 == 1;
+                let from = match (ip >> 9) & 15 {
+                    0 => 0xf,
+                    1 | 2 => 0x7,
+                    4 | 8 => 0x8,
+                    _ => 0,
+                };
+                regs[((inst >> 17) & 31) as usize] = from & (if rgb { 0x7 } else { 0 } | if alpha { 0x8 } else { 0 });
+            }
+        }
+        slots.iter().map(|&s| regs[s]).collect()
+    }
+
     /// The vertex function `vs` writing `VOutV` with the varyings for the
-    /// pixel stack registers in `slots`.
-    pub fn msl(&self, slots: &[usize]) -> String {
+    /// pixel stack registers in `slots`, flat ones as `flat` says.
+    pub fn msl(&self, slots: &[usize], flat: &[u32]) -> String {
         let mut f = String::from(pvs_msl::HELPERS);
         f.push_str(VS_HELPERS);
         f.push_str("vertex VOutV vs(uint vid [[vertex_id]], const device uint *vram [[buffer(0)]], const device uint *arena [[buffer(1)]],\n    constant VsUniforms &vu [[buffer(2)]], const device float4 *consts [[buffer(3)]]) {\n");
@@ -175,13 +200,13 @@ impl VsDesc {
             let insts: Vec<pvs::Inst> = self.code.chunks_exact(4).map(pvs::decode).collect();
             f.push_str(&pvs_msl::translate(&insts));
         }
-        self.setup(&mut f, slots);
+        self.setup(&mut f, slots, flat);
         f
     }
 
     /// As `setup_vertex` and `Viewport::apply` in mod.rs, and `attrs`,
     /// `flat_shade` and `rs` in raster.rs.
-    fn setup(&self, f: &mut String, slots: &[usize]) {
+    fn setup(&self, f: &mut String, slots: &[usize], flat: &[u32]) {
         let [fmt0, fmt1] = self.fmt;
         let mut slot = 1;
         let mut next = || {
@@ -306,6 +331,9 @@ impl VsDesc {
         for (i, &s) in slots.iter().enumerate() {
             let v = regs.get(s).cloned().flatten().unwrap_or("float4(0.0)".into());
             let _ = writeln!(f, "    out.v{i} = {v};");
+            if flat.get(i).is_some_and(|&m| m != 0) {
+                let _ = writeln!(f, "    out.vf{i} = out.v{i};");
+            }
         }
         f.push_str("    out.z = 0.0;\n    out.front = 0.0;\n    out.fog = fog;\n    return out;\n}\n");
     }
@@ -336,10 +364,15 @@ static float fixedv(uint raw, uint n, bool sgn, bool norm) {
 "#;
 
 /// Triangles of primitive type `prim` over `n` vertices, as positions in
-/// the vertex sequence, in the order the CPU path sets them up.
-pub(crate) fn triangles(prim: u32, n: usize) -> Vec<u32> {
+/// the vertex sequence, in the order the CPU path sets them up but rotated
+/// so that vertex `provoking` of each comes first, where Metal takes flat
+/// values from.
+pub(crate) fn triangles(prim: u32, n: usize, provoking: usize) -> Vec<u32> {
     let mut out = Vec::new();
-    let mut tri = |a: usize, b: usize, c: usize| out.extend([a as u32, b as u32, c as u32]);
+    let mut tri = |a: usize, b: usize, c: usize| {
+        let t = [a as u32, b as u32, c as u32];
+        out.extend([t[provoking], t[(provoking + 1) % 3], t[(provoking + 2) % 3]]);
+    };
     match prim {
         4 => (0..n / 3).for_each(|i| tri(3 * i, 3 * i + 1, 3 * i + 2)),
         5 | 15 => (2..n).for_each(|i| tri(0, i - 1, i)),

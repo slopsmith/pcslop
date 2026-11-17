@@ -822,14 +822,14 @@ impl Radeon {
     }
 
     /// Hands a draw of triangles to the GPU's vertex stage; false if the CPU
-    /// must run its vertices: no Metal, points or lines, or flat shading.
+    /// must run its vertices: no Metal, or points and lines.
     fn gpu_vertices(&mut self, mem: &mut dyn BusMemory, vf: u32, verts: &Verts<'_>) -> bool {
         if !self.metal.as_ref().is_some_and(|m| m.gpu_vertices()) || self.trace.is_some() {
             return false;
         }
         let prim = vf & 15;
         let colour_control = self.reg(GA_COLOR_CONTROL);
-        if !matches!(prim, 4 | 5 | 6 | 13 | 14 | 15) || (0..8).any(|k| (colour_control >> (2 * k)) & 3 == 1) {
+        if !matches!(prim, 4 | 5 | 6 | 13 | 14 | 15) {
             return false;
         }
         let count = ((vf >> 16) as usize).min(MAX_VERTICES);
@@ -888,7 +888,8 @@ impl Radeon {
                 (ids, vsgen::Fetch::Arrays(sizes))
             }
         };
-        job.indices = vsgen::triangles(prim, ids.len()).into_iter().map(|k| ids[k as usize]).collect();
+        let provoking = ((colour_control >> 16) & 3).min(2) as usize;
+        job.indices = vsgen::triangles(prim, ids.len(), provoking).into_iter().map(|k| ids[k as usize]).collect();
         let bypass = self.reg(VAP_CNTL_STATUS) & PVS_BYPASS != 0;
         let code = self.reg(VAP_PVS_CODE_CNTL_0);
         let const_base = bits(self.reg(VAP_PVS_CONST_CNTL), 0, 8) as usize;
