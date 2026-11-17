@@ -361,6 +361,8 @@ pub fn build() -> (Vec<u32>, Entries) {
     a.bfxil(Size::X, r(1), r(0), 0, 12);
     a.ldr(Width::W, r(2), STATE, state::USER as i32);
     a.logic_shift(Logic::Orr, false, Size::X, r(1), r(1), r(2), Shift::Lsl, 32);
+    a.ubfx(Size::X, r(2), r(0), 12, 20);
+    a.logic_shift(Logic::Orr, false, Size::X, r(1), r(1), r(2), Shift::Lsl, 33);
     a.ldr(Width::X, r(2), STATE, state::LOOKUP as i32);
     a.mov_imm(Size::X, r(3), HASH_MUL);
     a.mul(Size::X, r(3), r(1), r(3));

@@ -327,9 +327,10 @@ fn bucket(key: u64) -> usize {
     layout::LOOKUP + ((key.wrapping_mul(runtime::HASH_MUL) >> shift) as usize) * 32
 }
 
-/// Blocks are looked up by physical address plus whether they run at CPL 3.
-fn block_key(phys: u32, user: bool) -> u64 {
-    phys as u64 | (user as u64) << 32
+/// Blocks are looked up by physical address, linear page (their code embeds
+/// linear EIPs) and whether they run at CPL 3.
+fn block_key(phys: u32, lin: u32, user: bool) -> u64 {
+    phys as u64 | (user as u64) << 32 | ((lin >> 12) as u64) << 33
 }
 
 /// How `interp_run` treats the instruction at an address; REP string ops Stop,
@@ -959,7 +960,7 @@ impl Jit {
     }
 
     fn translate_block<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B, eip: u32, phys: u32, user: bool) {
-        let key = block_key(phys, user);
+        let key = block_key(phys, eip, user);
         let page = phys & !0xfff;
         let lin_page = eip & !0xfff;
         let block_va = layout::va(self.code_next);
@@ -996,7 +997,7 @@ impl Jit {
         self.mem.write_words(code_off, &compiled.code);
         self.code_next += bytes.next_multiple_of(16);
         for &(word, target) in &compiled.chains {
-            let target = block_key(page | (target & 0xfff), user);
+            let target = block_key(page | (target & 0xfff), target, user);
             let site = code_off + word as usize * 4;
             match self.blocks.get(&target).map(|b| b.va) {
                 Some(va) if target != key => {
@@ -1183,7 +1184,7 @@ impl Jit {
                             self.stats.stale_blocks += 1;
                             let eip = self.state().eip;
                             if let Ok(phys) = interp::translate(cpu, bus, eip, false) {
-                                self.remove_block(block_key(phys, cpu.cpl() == 3));
+                                self.remove_block(block_key(phys, eip, cpu.cpl() == 3));
                             }
                         }
                         reason::FAULT => {
@@ -1213,7 +1214,7 @@ impl Jit {
         let mut c = cpu.clone();
         self.store_state(&mut c);
         let phys = interp::translate(&mut c.clone(), bus, c.eip, false).ok()?;
-        let key = block_key(phys, cpu.cpl() == 3);
+        let key = block_key(phys, c.eip, cpu.cpl() == 3);
         let block = self.blocks.get(&key)?;
         if block.verified >= VERIFY_RUNS {
             return None;
@@ -1350,7 +1351,7 @@ impl Jit {
             return;
         }
         let Ok(phys) = interp::translate(&mut cpu.clone(), bus, cpu.eip, false) else { return };
-        let key = block_key(phys, cpu.cpl() == 3);
+        let key = block_key(phys, cpu.eip, cpu.cpl() == 3);
         if self.retry.contains(&key) {
             self.remove_block(key);
         }
@@ -1360,7 +1361,7 @@ impl Jit {
     fn ahead<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B) -> Ahead {
         let Ok(phys) = interp::translate(cpu, bus, cpu.eip, false) else { return Ahead::Stop };
         let user = cpu.cpl() == 3;
-        let key = block_key(phys, user);
+        let key = block_key(phys, cpu.eip, user);
         let insn = match self.ahead_cache.get(&key) {
             Some(&a) => a,
             None => {
@@ -1407,7 +1408,7 @@ impl Jit {
             Ok((phys, global)) => {
                 self.map_shadow(bus, cpu, eip, phys, false, global);
                 let user = cpu.cpl() == 3;
-                let key = block_key(phys, user);
+                let key = block_key(phys, eip, user);
                 match self.blocks.get(&key) {
                     Some(b) => {
                         self.stats.lookup_misses += 1;

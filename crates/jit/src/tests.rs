@@ -1228,3 +1228,26 @@ fn x87_results_survive_a_store_into_the_running_code() {
     assert!(stats.smc_invalidations > 0, "the store did not hit the running block: {stats:?}");
     assert_eq!(a.fpu, b.fpu);
 }
+
+#[test]
+fn code_mapped_at_two_linear_addresses_pushes_each_return_address() {
+    let code = [
+        0xe8, 0xfb, 0x0f, 0x00, 0x00, // call 0x2000
+        0x89, 0xc3, // mov ebx, eax
+        0xe8, 0xf4, 0x3f, 0x00, 0x00, // call 0x5000
+        0xf4,
+    ];
+    let thunk = [0xe8, 0x00, 0x00, 0x00, 0x00, 0x58, 0xc3]; // call next; pop eax; ret
+    let mut a = flat_cpu(0x1000, 0x8000);
+    let mut bus_a = bus_with(0x1000, &code);
+    bus_a.ram.as_mut_slice()[0x2000..0x2000 + thunk.len()].copy_from_slice(&thunk);
+    paged(&mut a, &mut bus_a, false);
+    bus_a.ram.as_mut_slice()[0x11014..0x11018].copy_from_slice(&0x2007u32.to_le_bytes());
+    let mut b = a.clone();
+    let mut bus_b = FlatBus { ram: GuestMemory::new(RAM).unwrap() };
+    bus_b.ram.as_mut_slice().copy_from_slice(bus_a.ram.as_slice());
+    run_interp(&mut a, &mut bus_a);
+    run_jit(&mut b, &mut bus_b);
+    assert_eq!((a.regs[3], a.regs[0]), (0x2005, 0x5005));
+    assert_eq!(b.regs, a.regs);
+}
