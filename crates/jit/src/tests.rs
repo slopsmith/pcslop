@@ -408,7 +408,8 @@ fn random_insn(rng: &mut Rng, out: &mut Vec<u8>) {
         out.extend((0x3000 + slot * 4).to_le_bytes());
     };
     match rng.below(40) {
-        38 | 39 => match rng.below(7) {
+        38 | 39 => match rng.below(8) {
+            6 => out.push(0x9e),
             0 => out.extend([[0x06, 0x0e, 0x1e][rng.below(3) as usize], 0x58 + rng.reg()]),
             1 => out.extend([0x0f, [0xa0, 0xa8][rng.below(2) as usize], 0x58 + rng.reg()]),
             2 => {
@@ -981,7 +982,8 @@ fn mem_abs(out: &mut Vec<u8>, op: u8, reg: u8, addr: u32) {
 fn random_x87(rng: &mut Rng, out: &mut Vec<u8>) {
     let i = rng.below(8) as u8;
     let k = rng.below(8);
-    match rng.below(24) {
+    match rng.below(26) {
+        24 => mem_abs(out, 0xdb, [5, 7][rng.below(2) as usize], 0x3540 + 10 * k),
         0 => mem_abs(out, 0xdd, 0, 0x3000 + 8 * k),
         1 => mem_abs(out, 0xd9, 0, 0x3100 + 4 * k),
         2 => mem_abs(out, 0xdb, 0, 0x3200 + 4 * k),
@@ -1040,6 +1042,11 @@ fn x87_memory(rng: &mut Rng) -> Vec<u8> {
         mem[0x200 + 4 * k..0x204 + 4 * k].copy_from_slice(&n.to_le_bytes());
         let q = ((rng.next() as u64) << 32 | rng.next() as u64) as i64 >> rng.below(63);
         mem[0x300 + 8 * k..0x308 + 8 * k].copy_from_slice(&q.to_le_bytes());
+        let low = if rng.below(2) == 0 { 0 } else { rng.next() as u64 & 0x7ff };
+        let mant = (1u64 << 63) | (rng.next() as u64) << 11 | low;
+        let se = (0x3fff - 30 + rng.below(60)) as u16 | (rng.below(2) as u16) << 15;
+        mem[0x540 + 10 * k..0x548 + 10 * k].copy_from_slice(&mant.to_le_bytes());
+        mem[0x548 + 10 * k..0x54a + 10 * k].copy_from_slice(&se.to_le_bytes());
     }
     for (j, cw) in [0x37fu16, 0x27f, 0xf7f, 0x77f, 0xb7f, 0x07f].iter().enumerate() {
         mem[0x500 + 2 * j..0x502 + 2 * j].copy_from_slice(&cw.to_le_bytes());
@@ -1893,6 +1900,8 @@ fn code_rewritten_through_the_aperture_is_translated_again() {
     assert_eq!((cpu.regs[2], cpu.regs[0]), (1, 2));
 }
 
+/// Writes the runtime's code to the file named by RT_OUT, for disassembly:
+/// `RT_OUT=rt.bin cargo test -p jit dump_runtime_code -- --ignored`.
 #[test]
 #[ignore]
 fn dump_runtime_code() {

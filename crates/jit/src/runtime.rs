@@ -428,7 +428,7 @@ pub fn build() -> (Vec<u32>, Entries) {
     a.logic_shift(Logic::Orr, false, Size::X, tag, r(0), tag, Shift::Lsl, 32);
     a.ldr(Width::W, entry, STATE, state::VEPOCH as i32);
     a.logic_shift(Logic::Orr, false, Size::X, tag, tag, entry, Shift::Lsl, 33);
-    a.logic_shift(Logic::Eor, false, Size::W, entry, r(0), r(0), Shift::Lsr, 14);
+    a.logic_shift(Logic::Eor, false, Size::W, entry, r(0), r(0), Shift::Lsr, 16);
     let ok = a.logic_imm(Logic::And, Size::W, entry, entry, layout::VLOOKUP_ENTRIES as u64 - 1);
     assert!(ok);
     a.ldr(Width::X, r(2), STATE, state::VLOOKUP as i32);

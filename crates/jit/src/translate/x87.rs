@@ -90,6 +90,8 @@ enum Src {
 enum K {
     LdMem(Src),
     Ild(Width),
+    Ld80,
+    St80,
     StMem { double: bool, pop: bool },
     Ist { w: Width, pop: bool },
     LdReg(usize),
@@ -130,6 +132,8 @@ fn classify(insn: &Insn) -> Option<K> {
             (3, 0) => K::Ild(Width::W),
             (7, 0) => K::Ild(Width::H),
             (7, 5) => K::Ild(Width::X),
+            (3, 5) => K::Ld80,
+            (3, 7) => K::St80,
             (1, 2 | 3) => K::StMem { double: false, pop: reg == 3 },
             (5, 2 | 3) => K::StMem { double: true, pop: reg == 3 },
             (3, 2 | 3) => K::Ist { w: Width::W, pop: reg == 3 },
@@ -194,6 +198,26 @@ impl Emit {
                 self.load_src(src, FB, bail);
                 self.clear_c1();
                 self.fpush_val(FB);
+            }
+            K::Ld80 => {
+                self.x87_need(7, false, bail);
+                self.a.ldr(Width::X, M, T_ADDR, 0);
+                self.a.ldr(Width::H, S, T_ADDR, 8);
+                self.clear_c1();
+                self.fpush();
+            }
+            K::St80 => {
+                self.x87_need(0, true, bail);
+                let r = self.slot(0);
+                if self.x87.dirty & 1 << r != 0 {
+                    self.f80_from_cache(r);
+                    self.x87.dirty &= !(1 << r);
+                } else {
+                    self.fget(0, M, S);
+                }
+                self.store(Width::X, M);
+                self.a.str(Width::H, S, T_ADDR, 8);
+                self.fpop();
             }
             K::Ild(Width::X) => {
                 self.x87_need(7, false, bail);

@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# CPU benchmarks in Ubuntu 8.04 from a save state with a serial root shell:
+# Python, Perl, bzip2, gzip and md5sum, timed by the guest. Prints one line
+# per benchmark in seconds. Usage: scripts/bench-cpu [STATE_DIR]
+# VM_BIN picks the emulator binary; extra flags go in BENCH_FLAGS.
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+state=${1:-/Volumes/Projects/.workspaces/86slopper/bench/ubuntu-shell}
+name=bench$$
+tmp=$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || echo "${TMPDIR:-/tmp}")
+serial=${tmp%/}/bench-$$.serial
+: >"$serial"
+trap '"$root/scripts/vm" stop "$name" >/dev/null 2>&1 || true; rm -f "$serial"' EXIT
+# shellcheck disable=SC2086
+VM_TIMEOUT=900 "$root/scripts/vm" start "$name" --load "$state" --cdrom ~/Documents/ISOs/ubuntu-8.04.4-desktop-i386.iso \
+	--ram 512 --no-net --serial "$serial" ${BENCH_FLAGS:-} >/dev/null
+sleep 2
+"$root/scripts/vm" ctl "$name" "serial bash /tmp/bench.sh" >/dev/null
+for _ in $(seq 600); do
+	grep -aq "BENCH done" "$serial" && break
+	sleep 1
+done
+grep -a "^BENCH" "$serial" | grep -v done | awk '{printf "%-6s %s s\n", $2, $3; t += $3} END {printf "total  %.2f s\n", t}'

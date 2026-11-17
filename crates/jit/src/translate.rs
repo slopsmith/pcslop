@@ -1430,6 +1430,23 @@ impl Emit {
                     return Step::Unsupported;
                 }
             }
+            0x9e => {
+                self.a.ubfx(Size::W, T_A, guest_reg(0), 8, 8);
+                self.a.ubfx(Size::W, T_C, T_A, 7, 1);
+                self.a.ubfx(Size::W, T_B, T_A, 6, 1);
+                self.a.logic_shift(a64::Logic::Orr, false, Size::W, T_C, T_B, T_C, Shift::Lsl, 1);
+                self.a.ubfx(Size::W, T_B, T_A, 0, 1);
+                let ok = self.a.logic_imm(a64::Logic::Eor, Size::W, T_B, T_B, 1);
+                assert!(ok);
+                self.a.logic_shift(a64::Logic::Orr, false, Size::W, T_C, T_B, T_C, Shift::Lsl, 1);
+                self.a.lsl_imm(Size::W, T_C, T_C, 1);
+                self.a.rmif(T_C, 0, 0b1110);
+                self.a.ubfx(Size::W, T_B, T_A, 2, 1);
+                let ok = self.a.logic_imm(a64::Logic::Eor, Size::W, PF_RESULT, T_B, 1);
+                assert!(ok);
+                let ok = self.a.logic_imm(a64::Logic::And, Size::W, AF_AUX, T_A, x86::cpu::flags::AF as u64);
+                assert!(ok);
+            }
             0x9c if op32 => self.pushf(),
             0x9d if op32 => return self.popf(eip, next),
             0x1ba if insn.reg() >= 4 => {
@@ -2221,7 +2238,7 @@ fn is_recent(insn: &Insn) -> bool {
     let (op, reg, op32) = (insn.op, insn.reg(), insn.op32);
     match op {
     0x1c8..=0x1cf | 0xc0 | 0xd0 | 0xd2 | 0x9c | 0x9d | 0x1ba | 0xf5 | 0xf8 | 0xf9 | 0x118 | 0x11f | 0x12b => true,
-    0x1ae | 0x1a3 | 0x1ab | 0x1b3 | 0x1bb | 0x7a | 0x7b | 0x18a | 0x18b | 0x14a | 0x14b | 0x19a | 0x19b | 0xed => true,
+    0x1ae | 0x1a3 | 0x1ab | 0x1b3 | 0x1bb | 0x7a | 0x7b | 0x18a | 0x18b | 0x14a | 0x14b | 0x19a | 0x19b | 0xed | 0x9e => true,
     0x70..=0x7f | 0x180..=0x18f | 0xe8 | 0xe9 | 0xeb | 0xff if insn.rep != Rep::None => true,
     0x1c0 | 0x1c1 | 0x1b0 | 0x1b1 | 0x1c7 | 0x1a4 | 0x1a5 | 0x1ac | 0x1ad | 0xfb => true,
     0xd8..=0xdf | 0x9b => true,
