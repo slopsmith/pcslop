@@ -106,33 +106,50 @@ impl Radeon {
         let (w, h) = (m.width as usize, m.height as usize);
         out.clear();
         out.resize(w * h, 0);
-        let byte = |i: usize| vram[i % vram.len()] as u32;
-        for y in 0..h {
+        let bytes_pp = match m.bits {
+            8 => 1,
+            15 | 16 => 2,
+            24 => 3,
+            _ => 4,
+        };
+        let row_bytes = w * bytes_pp;
+        let mut wrapped = Vec::new();
+        for (y, row) in out.chunks_exact_mut(w).enumerate() {
             let base = m.offset as usize + y * m.pitch as usize;
-            for (x, px) in out[y * w..(y + 1) * w].iter_mut().enumerate() {
-                *px = match m.bits {
-                    8 => pal[byte(base + x) as usize],
-                    15 => {
-                        let v = byte(base + 2 * x) | byte(base + 2 * x + 1) << 8;
-                        expand5(v >> 10) << 16 | expand5(v >> 5) << 8 | expand5(v)
-                    }
-                    16 => {
-                        let v = byte(base + 2 * x) | byte(base + 2 * x + 1) << 8;
-                        expand5(v >> 11) << 16 | expand6(v >> 5) << 8 | expand5(v)
-                    }
-                    24 => {
-                        let i = base + 3 * x;
-                        byte(i + 2) << 16 | byte(i + 1) << 8 | byte(i)
-                    }
-                    _ => {
-                        let i = base + 4 * x;
-                        byte(i + 2) << 16 | byte(i + 1) << 8 | byte(i)
-                    }
-                };
-            }
+            let src = match vram.get(base..base + row_bytes) {
+                Some(s) => s,
+                None => {
+                    wrapped.clear();
+                    wrapped.extend((base..base + row_bytes).map(|i| vram[i % vram.len()]));
+                    &wrapped
+                }
+            };
+            convert_row(m.bits, src, row, &pal);
         }
         self.draw_cursor(out, &m);
         Some((m.width, m.height))
+    }
+}
+
+fn convert_row(bits: u32, src: &[u8], out: &mut [u32], pal: &[u32; 256]) {
+    match bits {
+        8 => out.iter_mut().zip(src).for_each(|(o, &i)| *o = pal[i as usize]),
+        15 => out.iter_mut().zip(src.chunks_exact(2)).for_each(|(o, b)| {
+            let v = u16::from_le_bytes([b[0], b[1]]) as u32;
+            *o = expand5(v >> 10) << 16 | expand5(v >> 5) << 8 | expand5(v);
+        }),
+        16 => out.iter_mut().zip(src.chunks_exact(2)).for_each(|(o, b)| {
+            let v = u16::from_le_bytes([b[0], b[1]]) as u32;
+            *o = expand5(v >> 11) << 16 | expand6(v >> 5) << 8 | expand5(v);
+        }),
+        24 => out
+            .iter_mut()
+            .zip(src.chunks_exact(3))
+            .for_each(|(o, b)| *o = (b[2] as u32) << 16 | (b[1] as u32) << 8 | b[0] as u32),
+        _ => out
+            .iter_mut()
+            .zip(src.chunks_exact(4))
+            .for_each(|(o, b)| *o = u32::from_le_bytes([b[0], b[1], b[2], 0])),
     }
 }
 

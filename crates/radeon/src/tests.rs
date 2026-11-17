@@ -91,6 +91,22 @@ fn crtc_mode_from_the_vbe_registers_the_rom_writes() {
 }
 
 #[test]
+fn scanout_at_32bpp_wraps_rows_past_the_end_of_vram() {
+    let mut r = card();
+    set_640x480x16(&mut r);
+    r.mmio_write(CRTC_GEN_CNTL, 4, CRTC_EN | CRTC_EXT_DISP_EN | 6 << 8, &mut NoBus);
+    let row = 640 * 4;
+    r.mmio_write(CRTC_OFFSET, 4, (VRAM_SIZE - row - 4) as u32, &mut NoBus);
+    let vram = r.vram_mut();
+    vram[VRAM_SIZE - row - 4..][..4].copy_from_slice(&0xff12_3456u32.to_le_bytes());
+    vram[VRAM_SIZE - 4..].copy_from_slice(&0x00ab_cdefu32.to_le_bytes());
+    vram[..4].copy_from_slice(&0x0065_4321u32.to_le_bytes());
+    let mut out = Vec::new();
+    r.render(&mut out);
+    assert_eq!([out[0], out[640], out[641]], [0x12_3456, 0xab_cdef, 0x65_4321]);
+}
+
+#[test]
 fn palette_registers_reach_the_dac() {
     let mut r = card();
     r.mmio_write(DAC_CNTL, 4, DAC_8BIT_EN, &mut NoBus);
