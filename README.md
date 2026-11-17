@@ -25,6 +25,8 @@ SeaBIOS's debug output (port 0x402) goes to stdout. `slopper --help` lists every
 
 The board always has a CD-ROM drive, empty unless `--cdrom ISO` is given. Swap discs while the guest runs through the control socket (`--control SOCKET`, driven by `scripts/ctl SOCKET COMMAND`): `cdrom ISO` inserts one, `cdrom` alone shows the current one and `eject` empties the drive. The guest sees a medium change, as on a real drive.
 
+`save DIR` on the control socket snapshots the running machine into a directory, with an APFS clone of the disk image; `load DIR` goes back to it, and `--load DIR` starts from it instead of booting. Start with the same `--ram`, sound, network and firmware options as when saving. See [Save states](docs/architecture.md#save-states).
+
 By default the guest runs translated code in the VM and gets an AC'97 sound card, an RTL8139 network card and a battery that mirrors the Mac's. Turn them off with `--no-jit`, `--no-audio`, `--no-net` and `--no-battery`. Sound plays on the Mac's default output device; `--audio-wav out.wav` also records it and `--audio-silent` plays nothing.
 
 `--gpu radeon --vga-rom ROM` swaps the stdvga for an ATI Radeon 9700 on a 440BX board's AGP bus, running the card's own video BIOS, which you supply. `--gpu-trace PATH` logs the card's register accesses. See [docs/gpu.md](docs/gpu.md).

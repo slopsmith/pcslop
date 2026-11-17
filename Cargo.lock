@@ -740,6 +740,7 @@ dependencies = [
  "net",
  "pc",
  "png",
+ "snapshot",
  "usb",
  "x86",
 ]

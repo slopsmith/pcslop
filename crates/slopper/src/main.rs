@@ -1,11 +1,12 @@
 mod audio;
 mod host_power;
 mod keys;
+mod savestate;
 mod vnc;
 
 use std::collections::VecDeque;
 use std::io::BufRead;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -44,6 +45,7 @@ struct Args {
     net: Option<net::user::UserNet>,
     net_asked: bool,
     battery: BatterySource,
+    load: Option<savestate::Snapshot>,
 }
 
 #[derive(Clone, Copy)]
@@ -121,9 +123,9 @@ struct Cli {
     /// Write COM1 to FILE, or to stderr with `-`.
     #[arg(long, value_name = "FILE|-")]
     serial: Option<String>,
-    /// Guest RAM in MiB.
-    #[arg(long = "ram", value_name = "MiB", default_value_t = 256)]
-    ram_mb: u32,
+    /// Guest RAM in MiB [default: 256, or the snapshot's with --load].
+    #[arg(long = "ram", value_name = "MiB")]
+    ram_mb: Option<u32>,
     /// Stop after N instructions.
     #[arg(long, value_name = "N")]
     max_instructions: Option<u64>,
@@ -173,6 +175,9 @@ struct Cli {
     /// No battery: the guest runs on AC power.
     #[arg(long)]
     no_battery: bool,
+    /// Start from the snapshot in DIR (made with the control socket's save) instead of booting.
+    #[arg(long, value_name = "DIR", conflicts_with = "hda")]
+    load: Option<PathBuf>,
 }
 
 fn parse_board(v: &str) -> Result<pc::Chipset, String> {
@@ -202,6 +207,8 @@ fn parse_args() -> Result<Args, String> {
         return Err("--vga-rom and --gpu-trace go with --gpu radeon".into());
     }
     let net_asked = cli.net.is_some();
+    let load = cli.load.as_deref().map(savestate::read).transpose()?;
+    let ram_mb = cli.ram_mb.or(load.as_ref().map(|s| s.machine.ram_bytes >> 20)).unwrap_or(256);
     Ok(Args {
         bios: cli.bios,
         vgabios: cli.vgabios,
@@ -212,7 +219,7 @@ fn parse_args() -> Result<Args, String> {
         cdrom: cli.cdrom,
         hda: cli.hda,
         serial: cli.serial,
-        ram_mb: cli.ram_mb,
+        ram_mb,
         max_instructions: cli.max_instructions,
         headless: cli.headless,
         jit: !cli.no_jit,
@@ -232,6 +239,7 @@ fn parse_args() -> Result<Args, String> {
         } else {
             cli.battery.unwrap_or(BatterySource::Host)
         },
+        load,
     })
 }
 
@@ -414,7 +422,7 @@ impl KeyQueue {
 
 fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: Arc<Shared>) -> ExitCode {
     let mut board = Board::new(board_cfg);
-    if let Some(path) = &args.cdrom
+    if let Some(path) = args.cdrom.as_ref().filter(|_| args.load.is_none())
         && let Err(e) = board.attach_cdrom(path)
     {
         eprintln!("cannot open {path}: {e}");
@@ -472,16 +480,22 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
             }
         });
     }
-    if let Some(cfg) = &args.net {
+    let start_net = {
         let emu = std::thread::current();
         let kicker = jit.as_ref().map(|j| j.kicker());
-        let wake = move || {
-            emu.unpark();
-            if let Some(k) = &kicker {
-                k.kick();
-            }
-        };
-        match net::start_user_network(cfg, Box::new(wake)) {
+        move |cfg: &net::user::UserNet| {
+            let emu = emu.clone();
+            let wake = move || {
+                emu.unpark();
+                if let Some(k) = &kicker {
+                    k.kick();
+                }
+            };
+            net::start_user_network(cfg, Box::new(wake))
+        }
+    };
+    if let Some(cfg) = &args.net {
+        match start_net(cfg) {
             Ok(backend) => board.attach_nic(net::DEFAULT_MAC, backend),
             Err(e) if args.net_asked => {
                 eprintln!("cannot start the network: {e}");
@@ -492,6 +506,19 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
     }
     let mut cpu = Cpu::new();
     cpu.start_host_tsc();
+    let mut media = savestate::Media { hda: args.hda.as_ref().map(PathBuf::from) };
+    if let Some(snap) = args.load.take() {
+        match savestate::restore(&snap, &mut cpu, &mut board, args.cdrom.as_deref().map(Path::new)) {
+            Ok((m, msg)) => {
+                eprintln!("{msg}");
+                media = m;
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     let started = Instant::now();
     let mut executed: u64 = 0;
     let mut keyq = KeyQueue::default();
@@ -740,6 +767,24 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                             }
                             (Some(j), _) => j.profile_report(),
                         },
+                        "save" if !rest.is_empty() => savestate::save(Path::new(rest), &cpu, &mut board, &media).unwrap_or_else(|e| e),
+                        "load" if !rest.is_empty() => match savestate::read(Path::new(rest)).and_then(|s| savestate::restore(&s, &mut cpu, &mut board, None)) {
+                            Ok((m, mut msg)) => {
+                                media = m;
+                                if let Some(j) = jit.as_mut() {
+                                    j.forget_guest();
+                                }
+                                keyq = KeyQueue::default();
+                                if let Some(cfg) = &args.net {
+                                    board.replace_nic_backend(|| start_net(cfg).map_err(|e| eprintln!("cannot restart the network: {e}")).ok());
+                                    msg += ", network card on a fresh user-mode network";
+                                }
+                                eprintln!("{msg}");
+                                msg
+                            }
+                            Err(e) => e,
+                        },
+                        "save" | "load" => format!("usage: {cmd} DIR"),
                         "pause" => {
                             paused = true;
                             "paused".into()
@@ -934,10 +979,11 @@ fn control_server(path: PathBuf, tx: Sender<Event>) {
 fn run_command(line: &str, tx: &Sender<Event>) -> Option<String> {
     let cmd = line.split_whitespace().next().unwrap_or("");
     let battery_query = cmd == "battery" && line.split_whitespace().nth(1).is_none();
-    if battery_query || matches!(cmd, "screen" | "regs" | "status" | "pause" | "resume" | "mem" | "profile" | "cdrom" | "eject") {
+    if battery_query || matches!(cmd, "screen" | "regs" | "status" | "pause" | "resume" | "mem" | "profile" | "cdrom" | "eject" | "save" | "load") {
         let (rtx, rrx) = channel();
         tx.send(Event::Query(line.to_string(), rtx)).ok()?;
-        return Some(rrx.recv_timeout(Duration::from_secs(10)).unwrap_or_else(|_| "no answer".into()));
+        let wait = Duration::from_secs(if matches!(cmd, "save" | "load") { 120 } else { 10 });
+        return Some(rrx.recv_timeout(wait).unwrap_or_else(|_| "no answer".into()));
     }
     Some(match command_event(line) {
         Ok(evs) => {
@@ -987,7 +1033,7 @@ fn command_event(line: &str) -> Result<Vec<Event>, String> {
         "battery" => vec![Event::Battery(parse_battery(rest.trim())?)],
         "quit" => vec![Event::Quit],
         _ => {
-            return Err("commands: screen | status | regs | mem HEXADDR [LEN] | profile [on|off] | pause | resume | shot PATH | type TEXT | serial LINE | key NAME[+NAME] | mouse DX DY [BUTTONS] | tablet X Y [BUTTONS [WHEEL]] | power | battery [host|off|PERCENT[:ac]] | cdrom [ISO] | eject | quit\n\
+            return Err("commands: screen | status | regs | mem HEXADDR [LEN] | profile [on|off] | pause | resume | save DIR | load DIR | shot PATH | type TEXT | serial LINE | key NAME[+NAME] | mouse DX DY [BUTTONS] | tablet X Y [BUTTONS [WHEEL]] | power | battery [host|off|PERCENT[:ac]] | cdrom [ISO] | eject | quit\n\
                  mouse sends relative PS/2 motion; tablet moves the USB tablet to guest screen pixel (X, Y)".into());
         }
     })

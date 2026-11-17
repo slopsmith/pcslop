@@ -17,6 +17,7 @@ ac97 = { path = "../ac97" }
 pc = { path = "../pc" }
 flate2 = "1.1"
 png = "0.18"
+snapshot = { path = "../snapshot" }
 usb = { path = "../usb" }
 jit = { path = "../jit" }
 net = { path = "../net" }
