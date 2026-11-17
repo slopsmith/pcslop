@@ -623,7 +623,9 @@ impl Radeon {
         let pitch = (f0 & (1 << 31) != 0).then(|| bits(f2, 0, 14) + 1);
         let format = f1 & 31;
         let base = off & !31;
-        let mut t = Texture::new(TexMem::Vram(0), width, height, format, levels, pitch);
+        let kind = bits(f1, 25, 2);
+        let depth = 1 << bits(f0, 22, 4);
+        let mut t = Texture::new(TexMem::Vram(0), width, height, format, levels, pitch, kind, depth);
         t.mem = match self.surface_vram(base) {
             Some(o) => TexMem::Vram(o),
             None => {
@@ -633,6 +635,7 @@ impl Radeon {
             }
         };
         t.sel = [bits(f1, 9, 3), bits(f1, 12, 3), bits(f1, 15, 3), bits(f1, 18, 3)];
+        t.signed = bits(f1, 5, 4);
         t.filter = filter;
         t.border = border;
         Some(t)

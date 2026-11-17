@@ -87,19 +87,17 @@ impl Quad<'_> {
             }
             return;
         };
-        let st: Lanes<(f32, f32)> = coords.map(|c| {
-            if op == 3 && c[3] != 0.0 { (c[0] / c[3], c[1] / c[3]) } else { (c[0], c[1]) }
-        });
+        let stc: Lanes<[f32; 3]> = coords.map(|c| tex.coords(c, op == 3));
         let (w, h) = (tex.width as f32, tex.height as f32);
-        let dx = ((st[1].0 - st[0].0) * w, (st[1].1 - st[0].1) * h);
-        let dy = ((st[2].0 - st[0].0) * w, (st[2].1 - st[0].1) * h);
+        let dx = ((stc[1][0] - stc[0][0]) * w, (stc[1][1] - stc[0][1]) * h);
+        let dy = ((stc[2][0] - stc[0][0]) * w, (stc[2][1] - stc[0][1]) * h);
         let rho = (dx.0 * dx.0 + dx.1 * dx.1).max(dy.0 * dy.0 + dy.1 * dy.1);
         let mut lod = if rho > 0.0 { 0.5 * rho.log2() } else { 0.0 };
         if op == 4 || lod_bias_all {
             lod += coords[0][3];
         }
         for l in 0..4 {
-            self.temps[l][dst] = tex.sample(self.vram, st[l].0, st[l].1, lod);
+            self.temps[l][dst] = tex.sample(self.vram, stc[l], lod);
         }
     }
 }

@@ -465,6 +465,65 @@ fn a_texture_map_with_another_logical_id_reads_as_disabled() {
     assert_eq!(g.px(4, 4), 0xff00_0000);
 }
 
+/// A one-texel ARGB8888 map of `kind` (1 volume, 2 cube) whose texels
+/// hold `texels`, one per slice or face, sampled with the vertex colour
+/// as coordinates.
+fn layered_texture(g: &mut Gpu, kind: u32, depth_log2: u32, texels: &[u32], signed: u32) {
+    for (i, &t) in texels.iter().enumerate() {
+        g.put(TEXTURE as usize + 32 * i, t);
+    }
+    g.w(GA_ROUND_MODE, 1 << 4);
+    g.w(TX_FILTER0_0, 2 | 2 << 3 | 2 << 6);
+    g.w(TX_FORMAT0_0, depth_log2 << 22);
+    g.w(TX_FORMAT1_0, 0xa60c | signed << 5 | kind << 25);
+    g.w(TX_OFFSET_0, VRAM + TEXTURE);
+    g.w(TX_ENABLE, 1);
+    g.w(US_TEX_INST_0, 1 << 15);
+    g.fragment(&[PASS_COLOUR], 1);
+}
+
+const FACES: [u32; 6] = [0xff00_0010, 0xff00_0020, 0xff00_0030, 0xff00_0040, 0xff00_0050, 0xff00_0060];
+
+fn cube_scene(g: &mut Gpu) {
+    layered_texture(g, 2, 0, &FACES, 0);
+    let dirs = [[1.0, 0.2, -0.3], [-1.0, 0.1, 0.4], [0.3, 1.0, 0.2], [0.1, -1.0, -0.2], [-0.2, 0.3, 1.0], [0.4, -0.1, -1.0]];
+    for (k, d) in dirs.iter().enumerate() {
+        let x = 10.0 * k as f32;
+        g.draw(13, &quad(x, 0.0, x + 10.0, 10.0, [d[0], d[1], d[2], 1.0]));
+    }
+}
+
+#[test]
+fn a_cube_map_samples_the_face_its_direction_points_at() {
+    let mut g = Gpu::new();
+    cube_scene(&mut g);
+    for (k, &face) in FACES.iter().enumerate() {
+        assert_eq!(g.px(10 * k + 5, 5), face, "face {k}");
+    }
+}
+
+#[test]
+fn a_volume_texture_samples_the_slice_its_r_coordinate_falls_in() {
+    let mut g = Gpu::new();
+    layered_texture(&mut g, 1, 1, &[0xff11_2233, 0xff44_5566], 0);
+    g.draw(13, &quad(0.0, 0.0, 10.0, 10.0, [0.5, 0.5, 0.25, 1.0]));
+    g.draw(13, &quad(10.0, 0.0, 20.0, 10.0, [0.5, 0.5, 0.75, 1.0]));
+    assert_eq!(g.px(5, 5), 0xff11_2233);
+    assert_eq!(g.px(15, 5), 0xff44_5566);
+}
+
+#[test]
+fn signed_components_read_as_twos_complement() {
+    let mut g = Gpu::new();
+    layered_texture(&mut g, 0, 0, &[0x7f_c0_81_40], 0b0110);
+    g.draw(13, &quad(0.0, 0.0, 10.0, 10.0, [0.5, 0.5, 0.0, 1.0]));
+    let c = g.px(5, 5);
+    assert_eq!(c >> 24, 0x7f, "alpha stays unsigned");
+    assert_eq!((c >> 16) & 0xff, 0, "0xc0 is negative and clamps to 0");
+    assert_eq!((c >> 8) & 0xff, 0, "0x81 is -1");
+    assert_eq!(c & 0xff, 0x40, "blue stays unsigned");
+}
+
 /// Linear fog by eye distance, as Sniper: Path of Vengeance sets it up on
 /// Catalyst: half the fog colour at w = 2.
 fn fogged(g: &mut Gpu, function: u32) {
@@ -725,6 +784,11 @@ mod against_metal {
                 64,
             );
         }
+    }
+
+    #[test]
+    fn cube_maps_match() {
+        same(cube_scene, 0, 0);
     }
 
     #[test]

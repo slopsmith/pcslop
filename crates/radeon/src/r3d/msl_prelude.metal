@@ -8,8 +8,11 @@ using namespace metal;
 struct TexDesc {
     uint enabled, stage, base, limit, width, height, format, nlevels, filter, border;
     uint sel[4];
+    uint signed_comps;
+    uint kind, depth;
     uint off[12];
     uint pitch[12];
+    uint slice[12];
 };
 
 struct ColourDesc {
@@ -43,18 +46,20 @@ static uint rd32(const device uchar *d, uint a, uint limit) {
     return rd16(d, a, limit) | rd16(d, a + 2, limit) << 16;
 }
 
-static float un(uint v, uint bits) {
-    return float(v & ((1u << bits) - 1u)) / float((1u << bits) - 1u);
+static float un(uint v, uint bits, bool sgn) {
+    v &= (1u << bits) - 1u;
+    if (sgn && bits > 1) return max(float(int(v << (32 - bits)) >> (32 - bits)) / float((1u << (bits - 1)) - 1u), -1.0);
+    return float(v) / float((1u << bits) - 1u);
 }
 
-static float4 fields(uint v, uint w0, uint w1, uint w2, uint w3) {
+static float4 fields(uint v, uint w0, uint w1, uint w2, uint w3, uint sg) {
     float4 out = float4(0, 0, 0, 1);
     uint shift = 0;
-    out.x = un(v, w0);
+    out.x = un(v, w0, sg & 1);
     shift += w0;
-    if (w1) { out.y = un(v >> shift, w1); shift += w1; }
-    if (w2) { out.z = un(v >> shift, w2); shift += w2; }
-    if (w3) { out.w = un(v >> shift, w3); }
+    if (w1) { out.y = un(v >> shift, w1, sg & 2); shift += w1; }
+    if (w2) { out.z = un(v >> shift, w2, sg & 4); shift += w2; }
+    if (w3) { out.w = un(v >> shift, w3, sg & 8); }
     return out;
 }
 
@@ -114,26 +119,26 @@ static float4 dxt(uint format, const device uchar *d, uint a, uint limit, uint x
     return float4(rgb.z, rgb.y, rgb.x, alpha);
 }
 
-static float4 texel(constant TexDesc &t, const device uchar *d, uint level, uint x, uint y) {
+static float4 texel(constant TexDesc &t, const device uchar *d, uint level, uint x, uint y, uint z) {
     uint2 b = block(t.format);
-    uint a = t.base + t.off[level] + (y / b.y) * t.pitch[level] + (x / b.y) * b.x;
+    uint a = t.base + t.off[level] + z * t.slice[level] + (y / b.y) * t.pitch[level] + (x / b.y) * b.x;
     uint l = t.limit;
     switch (t.format) {
-    case 0: return fields(rd8(d, a, l), 8, 0, 0, 0);
-    case 1: return fields(rd16(d, a, l), 16, 0, 0, 0);
-    case 2: return fields(rd8(d, a, l), 4, 4, 0, 0);
-    case 3: return fields(rd16(d, a, l), 8, 8, 0, 0);
-    case 4: return fields(rd32(d, a, l), 16, 16, 0, 0);
-    case 5: return fields(rd8(d, a, l), 2, 3, 3, 0);
-    case 6: return fields(rd16(d, a, l), 5, 6, 5, 0);
-    case 7: return fields(rd16(d, a, l), 5, 5, 6, 0);
-    case 8: return fields(rd32(d, a, l), 10, 11, 11, 0);
-    case 9: return fields(rd32(d, a, l), 11, 11, 10, 0);
-    case 10: return fields(rd16(d, a, l), 4, 4, 4, 4);
-    case 11: return fields(rd16(d, a, l), 5, 5, 5, 1);
-    case 12: return fields(rd32(d, a, l), 8, 8, 8, 8);
-    case 13: return fields(rd32(d, a, l), 10, 10, 10, 2);
-    case 14: return float4(un(rd16(d, a, l), 16), un(rd16(d, a + 2, l), 16), un(rd16(d, a + 4, l), 16), un(rd16(d, a + 6, l), 16));
+    case 0: return fields(rd8(d, a, l), 8, 0, 0, 0, t.signed_comps);
+    case 1: return fields(rd16(d, a, l), 16, 0, 0, 0, t.signed_comps);
+    case 2: return fields(rd8(d, a, l), 4, 4, 0, 0, t.signed_comps);
+    case 3: return fields(rd16(d, a, l), 8, 8, 0, 0, t.signed_comps);
+    case 4: return fields(rd32(d, a, l), 16, 16, 0, 0, t.signed_comps);
+    case 5: return fields(rd8(d, a, l), 2, 3, 3, 0, t.signed_comps);
+    case 6: return fields(rd16(d, a, l), 5, 6, 5, 0, t.signed_comps);
+    case 7: return fields(rd16(d, a, l), 5, 5, 6, 0, t.signed_comps);
+    case 8: return fields(rd32(d, a, l), 10, 11, 11, 0, t.signed_comps);
+    case 9: return fields(rd32(d, a, l), 11, 11, 10, 0, t.signed_comps);
+    case 10: return fields(rd16(d, a, l), 4, 4, 4, 4, t.signed_comps);
+    case 11: return fields(rd16(d, a, l), 5, 5, 5, 1, t.signed_comps);
+    case 12: return fields(rd32(d, a, l), 8, 8, 8, 8, t.signed_comps);
+    case 13: return fields(rd32(d, a, l), 10, 10, 10, 2, t.signed_comps);
+    case 14: return float4(un(rd16(d, a, l), 16, t.signed_comps & 1), un(rd16(d, a + 2, l), 16, t.signed_comps & 2), un(rd16(d, a + 4, l), 16, t.signed_comps & 4), un(rd16(d, a + 6, l), 16, t.signed_comps & 8));
     case 0xf: case 0x10: case 0x11: return dxt(t.format, d, a, l, x % 4, y % 4);
     case 0x18: return float4(hf(rd16(d, a, l)), 0, 0, 1);
     case 0x19: return float4(hf(rd16(d, a, l)), hf(rd16(d, a + 2, l)), 0, 1);
@@ -141,7 +146,7 @@ static float4 texel(constant TexDesc &t, const device uchar *d, uint level, uint
     case 0x1b: return float4(as_type<float>(rd32(d, a, l)), 0, 0, 1);
     case 0x1c: return float4(as_type<float>(rd32(d, a, l)), as_type<float>(rd32(d, a + 4, l)), 0, 1);
     case 0x1d: return float4(as_type<float>(rd32(d, a, l)), as_type<float>(rd32(d, a + 4, l)), as_type<float>(rd32(d, a + 8, l)), as_type<float>(rd32(d, a + 12, l)));
-    default: return fields(rd32(d, a, l), 8, 8, 8, 8);
+    default: return fields(rd32(d, a, l), 8, 8, 8, 8, t.signed_comps);
     }
 }
 
@@ -165,19 +170,54 @@ static bool wrap(uint mode, int i, uint size, thread uint &out) {
     return true;
 }
 
-static float4 fetch(constant TexDesc &t, const device uchar *d, uint level, int x, int y) {
+static float4 fetch(constant TexDesc &t, const device uchar *d, uint level, int x, int y, int z) {
     uint w = max(t.width >> level, 1u), h = max(t.height >> level, 1u);
-    uint ux, uy;
-    if (wrap(t.filter & 7, x, w, ux) && wrap((t.filter >> 3) & 7, y, h, uy)) {
-        float4 c = texel(t, d, level, ux, uy);
+    uint ux, uy, uz = uint(z);
+    bool zin = t.kind != 1 || wrap((t.filter >> 6) & 7, z, max(t.depth >> level, 1u), uz);
+    if (wrap(t.filter & 7, x, w, ux) && wrap((t.filter >> 3) & 7, y, h, uy) && zin) {
+        float4 c = texel(t, d, level, ux, uy, t.kind == 0 ? 0 : uz);
         return float4(pick(c, t.sel[1]), pick(c, t.sel[2]), pick(c, t.sel[3]), pick(c, t.sel[0]));
     }
     uint b = t.border;
     return float4(float((b >> 16) & 0xff), float((b >> 8) & 0xff), float(b & 0xff), float(b >> 24)) / 255.0;
 }
 
+// As Texture::coords in tex.rs: (s, t, r), or for a cube map the face's
+// (s, t) and its number.
+static float3 tex_coords(constant TexDesc &t, float4 c, bool projected) {
+    if (t.kind == 2) {
+        float3 a = abs(c.xyz);
+        float face, sc, tc, ma;
+        if (a.x >= a.y && a.x >= a.z) {
+            ma = a.x; tc = -c.y;
+            if (c.x >= 0.0) { face = 0; sc = -c.z; } else { face = 1; sc = c.z; }
+        } else if (a.y >= a.z) {
+            ma = a.y; sc = c.x;
+            if (c.y >= 0.0) { face = 2; tc = c.z; } else { face = 3; tc = -c.z; }
+        } else {
+            ma = a.z; tc = -c.y;
+            if (c.z >= 0.0) { face = 4; sc = c.x; } else { face = 5; sc = -c.x; }
+        }
+        if (!(ma > 0.0)) ma = 1.0;
+        return float3((sc / ma + 1.0) / 2.0, (tc / ma + 1.0) / 2.0, face);
+    }
+    return (projected && c.w != 0.0) ? c.xyz / c.w : c.xyz;
+}
+
+static float4 bilinear(constant TexDesc &t, const device uchar *d, uint level, float2 uv, int z) {
+    uv -= 0.5;
+    float2 f0 = floor(uv);
+    float2 f = uv - f0;
+    int x0 = int(f0.x), y0 = int(f0.y);
+    float4 t00 = fetch(t, d, level, x0, y0, z), t10 = fetch(t, d, level, x0 + 1, y0, z);
+    float4 t01 = fetch(t, d, level, x0, y0 + 1, z), t11 = fetch(t, d, level, x0 + 1, y0 + 1, z);
+    float4 top = t00 + (t10 - t00) * f.x, bottom = t01 + (t11 - t01) * f.x;
+    return top + (bottom - top) * f.y;
+}
+
 static float4 sample_tex(constant TexDesc &t, const device uchar *vram, const device uchar *stage, float4 coords, uint op) {
-    float2 st = (op == 3 && coords.w != 0.0) ? coords.xy / coords.w : coords.xy;
+    float3 str = tex_coords(t, coords, op == 3);
+    float2 st = str.xy;
     float2 size = float2(t.width, t.height);
     float2 dx = dfdx(st) * size, dy = dfdy(st) * size;
     float rho = max(dot(dx, dx), dot(dy, dy));
@@ -192,15 +232,20 @@ static float4 sample_tex(constant TexDesc &t, const device uchar *vram, const de
     bool linear = minify ? ((t.filter >> 11) & 3) == 2 : ((t.filter >> 9) & 3) == 2;
     float2 wh = float2(max(t.width >> level, 1u), max(t.height >> level, 1u));
     float2 uv = st * wh;
-    if (!linear) return fetch(t, d, level, int(floor(uv.x)), int(floor(uv.y)));
-    uv -= 0.5;
-    float2 f0 = floor(uv);
-    float2 f = uv - f0;
-    int x0 = int(f0.x), y0 = int(f0.y);
-    float4 t00 = fetch(t, d, level, x0, y0), t10 = fetch(t, d, level, x0 + 1, y0);
-    float4 t01 = fetch(t, d, level, x0, y0 + 1), t11 = fetch(t, d, level, x0 + 1, y0 + 1);
-    float4 top = t00 + (t10 - t00) * f.x, bottom = t01 + (t11 - t01) * f.x;
-    return top + (bottom - top) * f.y;
+    int z0 = 0;
+    float fz = 0.0;
+    if (t.kind == 2) {
+        z0 = int(str.z);
+    } else if (t.kind == 1) {
+        float dd = float(max(t.depth >> level, 1u));
+        float wz = linear ? str.z * dd - 0.5 : floor(str.z * dd);
+        z0 = int(floor(wz));
+        fz = linear ? wz - floor(wz) : 0.0;
+    }
+    if (!linear) return fetch(t, d, level, int(floor(uv.x)), int(floor(uv.y)), z0);
+    float4 a = bilinear(t, d, level, uv, z0);
+    if (fz == 0.0) return a;
+    return a + (bilinear(t, d, level, uv, z0 + 1) - a) * fz;
 }
 
 static float presub(uint op, float a, float b) {

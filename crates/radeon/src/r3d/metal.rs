@@ -50,8 +50,12 @@ struct TexDesc {
     filter: u32,
     border: u32,
     sel: [u32; 4],
+    signed: u32,
+    kind: u32,
+    depth: u32,
     off: [u32; 12],
     pitch: [u32; 12],
+    slice: [u32; 12],
 }
 
 #[repr(C)]
@@ -436,6 +440,12 @@ impl MetalR3d {
             d.filter = t.filter;
             d.border = t.border;
             d.sel = t.sel;
+            d.signed = t.signed;
+            d.kind = t.kind;
+            d.depth = t.depth;
+            for (l, &n) in t.slices.iter().take(12).enumerate() {
+                d.slice[l] = n as u32;
+            }
             for (l, &(off, pitch)) in t.levels.iter().take(12).enumerate() {
                 d.off[l] = off as u32;
                 d.pitch[l] = pitch as u32;
