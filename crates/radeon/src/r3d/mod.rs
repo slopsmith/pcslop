@@ -28,6 +28,78 @@ use tex::{TexMem, Texture};
 
 pub(crate) type V4 = [f32; 4];
 
+/// The smallest w the setup engine divides by; anything nearer is clipped.
+const NEAR_W: f32 = 1e-6;
+
+/// VAP_VTE_CNTL and the viewport transform it enables.
+#[derive(Clone, Copy)]
+struct Viewport {
+    vte: u32,
+    scale: [f32; 3],
+    offset: [f32; 3],
+    ga: (f32, f32),
+}
+
+impl Viewport {
+    /// True if positions arrive in clip space and need the perspective divide.
+    fn clips(&self) -> bool {
+        self.vte & (1 << 8) == 0 && self.vte & (1 << 10) != 0
+    }
+
+    /// Window coordinates and 1/w of a vertex.
+    fn apply(&self, mut v: Vertex) -> Vertex {
+        let vte = self.vte;
+        let w = v.pos[3];
+        let rcp = if vte & (1 << 10) != 0 { if w != 0.0 { 1.0 / w } else { 0.0 } } else { w };
+        let [mut x, mut y, mut z, _] = v.pos;
+        if vte & (1 << 8) == 0 {
+            x *= rcp;
+            y *= rcp;
+        }
+        if vte & (1 << 9) == 0 {
+            z *= rcp;
+        }
+        let mut c = [x, y, z];
+        for (i, c) in c.iter_mut().enumerate() {
+            if vte & (1 << (2 * i)) != 0 {
+                *c *= self.scale[i];
+            }
+            if vte & (2 << (2 * i)) != 0 {
+                *c += self.offset[i];
+            }
+        }
+        v.pos = [c[0] + self.ga.0, c[1] + self.ga.1, c[2], rcp];
+        v
+    }
+}
+
+fn lerp(a: &Vertex, b: &Vertex, t: f32) -> Vertex {
+    let mix = |x: V4, y: V4| [0, 1, 2, 3].map(|i| x[i] + (y[i] - x[i]) * t);
+    Vertex {
+        pos: mix(a.pos, b.pos),
+        colours: [0, 1, 2, 3].map(|i| mix(a.colours[i], b.colours[i])),
+        tex: std::array::from_fn(|i| mix(a.tex[i], b.tex[i])),
+        psize: a.psize,
+    }
+}
+
+/// The part of a clip-space triangle in front of the w = NEAR_W plane, as a
+/// polygon.
+fn clip_near(t: &[Vertex; 3]) -> Vec<Vertex> {
+    let mut out = Vec::with_capacity(4);
+    for i in 0..3 {
+        let (a, b) = (&t[i], &t[(i + 1) % 3]);
+        let (da, db) = (a.pos[3] - NEAR_W, b.pos[3] - NEAR_W);
+        if da >= 0.0 {
+            out.push(*a);
+        }
+        if (da >= 0.0) != (db >= 0.0) {
+            out.push(lerp(a, b, da / (da - db)));
+        }
+    }
+    out
+}
+
 pub(crate) mod op {
     pub const DRAW_VBUF: u8 = 0x28;
     pub const DRAW_IMMD: u8 = 0x29;
@@ -316,46 +388,19 @@ impl Radeon {
                 v.tex[t as usize] = next();
             }
         }
-        self.viewport(&mut v);
         v
     }
 
-    fn viewport(&self, v: &mut Vertex) {
-        let vte = self.reg(VAP_VTE_CNTL);
+    fn viewport(&self) -> Viewport {
         let f = |r: u32| f32::from_bits(self.reg(r));
-        let w = v.pos[3];
-        let rcp = if vte & (1 << 10) != 0 { if w != 0.0 { 1.0 / w } else { 0.0 } } else { w };
-        let [mut x, mut y, mut z, _] = v.pos;
-        if vte & (1 << 8) == 0 {
-            x *= rcp;
-            y *= rcp;
-        }
-        if vte & (1 << 9) == 0 {
-            z *= rcp;
-        }
-        if vte & 1 != 0 {
-            x *= f(VAP_VPORT_XSCALE);
-        }
-        if vte & 2 != 0 {
-            x += f(VAP_VPORT_XOFFSET);
-        }
-        if vte & 4 != 0 {
-            y *= f(VAP_VPORT_YSCALE);
-        }
-        if vte & 8 != 0 {
-            y += f(VAP_VPORT_YOFFSET);
-        }
-        if vte & 16 != 0 {
-            z *= f(VAP_VPORT_ZSCALE);
-        }
-        if vte & 32 != 0 {
-            z += f(VAP_VPORT_ZOFFSET);
-        }
         let ga = self.reg(GA_OFFSET);
         let sub = self.subpixels();
-        x += ((ga & 0xffff) as i16) as f32 / sub;
-        y += ((ga >> 16) as i16) as f32 / sub;
-        v.pos = [x, y, z, rcp];
+        Viewport {
+            vte: self.reg(VAP_VTE_CNTL),
+            scale: [f(VAP_VPORT_XSCALE), f(VAP_VPORT_YSCALE), f(VAP_VPORT_ZSCALE)],
+            offset: [f(VAP_VPORT_XOFFSET), f(VAP_VPORT_YOFFSET), f(VAP_VPORT_ZOFFSET)],
+            ga: (((ga & 0xffff) as i16) as f32 / sub, ((ga >> 16) as i16) as f32 / sub),
+        }
     }
 
     fn subpixels(&self) -> f32 {
@@ -529,10 +574,20 @@ impl Radeon {
         let mut r = self.raster_state(mem);
         let counts = r.tex_counts;
         let gb = self.reg(GB_ENABLE);
+        let vp = self.viewport();
+        let behind = |v: &Vertex| vp.clips() && v.pos[3] < NEAR_W;
         let vram = self.vga.vram_mut();
         let n = vertices.len();
         let tri = |r: &mut Raster, vram: &mut [u8], a: usize, b: usize, c: usize| {
-            r.triangle(vram, [vertices[a], vertices[b], vertices[c]], &counts, true);
+            let t = [vertices[a], vertices[b], vertices[c]];
+            if t.iter().any(behind) {
+                let poly = clip_near(&t);
+                for i in 2..poly.len() {
+                    r.triangle(vram, [poly[0], poly[i - 1], poly[i]].map(|v| vp.apply(v)), &counts, true);
+                }
+            } else {
+                r.triangle(vram, t.map(|v| vp.apply(v)), &counts, true);
+            }
         };
         match prim {
             1 => {
@@ -550,12 +605,13 @@ impl Radeon {
                         }
                     }
                 }
-                for v in &vertices {
+                for v in vertices.iter().filter(|v| !behind(v)) {
+                    let v = vp.apply(*v);
                     let half = match v.psize {
                         Some(s) if s > 0.0 => (s / 2.0, s / 2.0),
                         _ => half,
                     };
-                    r.point(vram, *v, half, &stuff, &pcounts);
+                    r.point(vram, v, half, &stuff, &pcounts);
                 }
             }
             2 | 3 | 12 => {
@@ -567,7 +623,10 @@ impl Radeon {
                     _ => (0..n).map(|i| (i, (i + 1) % n)).collect(),
                 };
                 for (a, b) in pairs {
-                    r.line(vram, vertices[a], vertices[b], half, &counts);
+                    let (a, b) = (vertices[a], vertices[b]);
+                    if !behind(&a) && !behind(&b) {
+                        r.line(vram, vp.apply(a), vp.apply(b), half, &counts);
+                    }
                 }
             }
             4 => (0..n / 3).for_each(|i| tri(&mut r, vram, 3 * i, 3 * i + 1, 3 * i + 2)),

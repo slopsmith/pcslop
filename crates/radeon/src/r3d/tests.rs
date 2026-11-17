@@ -340,3 +340,16 @@ fn the_viewport_takes_effect_through_either_register_address() {
     assert_eq!(g.count(0xffff_0000), 32);
     assert_eq!(g.px(8, 4), 0xffff_0000);
 }
+
+#[test]
+fn triangles_crossing_the_eye_plane_draw_only_their_visible_part() {
+    let mut g = Gpu::new();
+    g.w(VAP_VTE_CNTL, 0xf | 1 << 10);
+    for (reg, val) in [(VAP_VPORT_XSCALE, 32.0), (VAP_VPORT_XOFFSET, 32.0), (VAP_VPORT_YSCALE, 32.0), (VAP_VPORT_YOFFSET, 32.0)] {
+        g.w(reg, f(val));
+    }
+    let at = |x: f32, y: f32, w: f32| [x, y, 0.0, w, 1.0, 0.0, 0.0, 1.0];
+    g.draw(4, &[at(-0.5, -0.5, 1.0), at(0.5, -0.5, 1.0), at(0.0, 1.5, -1.0)]);
+    assert_eq!(g.px(32, 30), 0xffff_0000);
+    assert_eq!(g.px(32, 10), 0);
+}
