@@ -77,6 +77,10 @@ A plain host-side interpreter comes first, for three reasons:
   - Generate our own ACPI tables later, for the ACPI uniprocessor HAL and power-off.
 - **Hot MMIO and ports, handled inside the VM:** APIC TPR (if we move to an APIC HAL), PIC EOI, and PIT counter reads. Everything else exits to the host.
 
+## Remote display (VNC)
+
+`--vnc [ADDR:]PORT` starts an RFB 3.8 server beside the window or `--headless`. It serves the frame that the window shows and `shot` saves. Updates use Raw encoding and carry only the 32x32 tiles that changed since the client's last update. When the guest changes mode, clients that support DesktopSize get the new size; other clients keep their first size, cropped or padded. Keysyms map to PS/2 scancodes for a US layout. The pointer drives the USB tablet, or PS/2 relative motion until the guest's tablet driver runs. `SLOPPER_VNC_PASSWORD` turns on classic VNC authentication (a DES challenge on the first 8 password bytes). It does not encrypt the session.
+
 ## VM runtime layout
 
 These are the starting decisions for phase 3.
