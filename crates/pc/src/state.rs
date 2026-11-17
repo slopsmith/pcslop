@@ -62,6 +62,7 @@ const DEVICES_SCHEMA: u64 = snapshot::mix(
         crate::fw_cfg::FwCfg::SCHEMA,
         crate::i8042::I8042::SCHEMA,
         vga::Vga::SCHEMA,
+        radeon::Radeon::SCHEMA,
         ide::Ide::SCHEMA,
         usb::Uhci::SCHEMA,
         usb::Tablet::SCHEMA,
@@ -116,11 +117,6 @@ impl Board {
 
     /// Writes every device's state. Guest RAM and VRAM are left to the caller.
     pub fn save_devices(&mut self, w: &mut Writer) -> Result<()> {
-        let vga = match &self.display {
-            Display::Std(v) => v,
-            // The Radeon is being rewritten; it needs its own Snap state here.
-            Display::Radeon(_) => return Err(Error::new("save states do not support the Radeon yet")),
-        };
         w.u64(self.now_ns());
         w.put(&self.a20);
         w.put(&self.pci_addr);
@@ -140,7 +136,10 @@ impl Board {
         w.put(&self.com1);
         w.put(&self.fw_cfg);
         w.put(&self.kbc);
-        w.put(vga);
+        match &self.display {
+            Display::Std(v) => w.put(v.as_ref()),
+            Display::Radeon(r) => w.put(r.as_ref()),
+        }
         w.put(&self.ide);
         w.put(&self.uhci);
         put_opt(w, self.uhci.device::<usb::Tablet>(0));
@@ -156,9 +155,6 @@ impl Board {
     /// `Machine`, with the same drives attached. The board's clock carries
     /// on from the snapshot's time, so timers neither fire early nor late.
     pub fn load_devices(&mut self, r: &mut Reader<'_>) -> Result<()> {
-        if let Display::Radeon(_) = self.display {
-            return Err(Error::new("save states do not support the Radeon yet"));
-        }
         let now = r.u64()?;
         r.get(&mut self.a20)?;
         r.get(&mut self.pci_addr)?;
@@ -180,9 +176,15 @@ impl Board {
         r.get(&mut self.com1)?;
         r.get(&mut self.fw_cfg)?;
         r.get(&mut self.kbc)?;
-        if let Display::Std(v) = &mut self.display {
-            r.get(v.as_mut())?;
-            v.mark_changed();
+        match &mut self.display {
+            Display::Std(v) => {
+                r.get(v.as_mut())?;
+                v.mark_changed();
+            }
+            Display::Radeon(card) => {
+                r.get(card.as_mut())?;
+                card.vga().mark_changed();
+            }
         }
         r.get(&mut self.ide)?;
         r.get(&mut self.uhci)?;
@@ -203,11 +205,11 @@ impl Board {
         Ok(())
     }
 
-    /// The stdvga's VRAM, which a snapshot stores beside the device state.
+    /// The display's VRAM, which a snapshot stores beside the device state.
     pub fn vram_mut(&mut self) -> Option<&mut [u8]> {
         match &mut self.display {
             Display::Std(v) => Some(v.vram_mut()),
-            Display::Radeon(_) => None,
+            Display::Radeon(r) => Some(r.vram_mut()),
         }
     }
 
@@ -376,16 +378,25 @@ mod tests {
     }
 
     #[test]
-    fn saving_a_board_with_the_radeon_is_an_error() {
-        let mut b = Board::new(Config {
-            ram_bytes: 64 << 20,
-            bios: vec![0; 0x2_0000],
-            vgabios: None,
-            apic: true,
-            power: battery::Power::default(),
-            chipset: Chipset::I440bx,
-            gpu: Gpu::Radeon { rom: vec![0x55, 0xaa], trace: None },
-        });
-        assert!(b.save_devices(&mut Writer::new()).is_err());
+    fn the_radeon_registers_come_back_after_a_restore() {
+        let radeon = || {
+            Board::new(Config {
+                ram_bytes: 64 << 20,
+                bios: vec![0; 0x2_0000],
+                vgabios: None,
+                apic: true,
+                power: battery::Power::default(),
+                chipset: Chipset::I440bx,
+                gpu: Gpu::Radeon { rom: vec![0x55, 0xaa], trace: None },
+            })
+        };
+        let mut a = radeon();
+        let mut w = Writer::new();
+        a.save_devices(&mut w).unwrap();
+        let mut b = radeon();
+        b.load_devices(&mut Reader::new(&w.buf)).unwrap();
+        let mut w2 = Writer::new();
+        b.save_devices(&mut w2).unwrap();
+        assert_eq!(w.buf.len(), w2.buf.len());
     }
 }

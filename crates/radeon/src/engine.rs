@@ -17,7 +17,7 @@ use crate::{Radeon, VRAM_SIZE};
 
 const COORD_MAX: i32 = 8192;
 
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, snapshot::Snap)]
 pub(crate) struct Surface {
     /// In the memory controller's address space.
     pub offset: u32,
@@ -33,7 +33,7 @@ impl Surface {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, snapshot::Snap)]
 pub(crate) struct Rect {
     pub x: i32,
     pub y: i32,
@@ -42,14 +42,14 @@ pub(crate) struct Rect {
 }
 
 /// A blit waiting for its source pixels through HOST_DATA.
-#[derive(Debug)]
+#[derive(Debug, Default, snapshot::Snap)]
 pub(crate) struct HostBlit {
     rect: Rect,
     data: Vec<u32>,
     needed: usize,
 }
 
-#[derive(Default)]
+#[derive(Default, snapshot::Snap)]
 pub(crate) struct Engine {
     pub dst: Surface,
     pub src: Surface,

@@ -84,8 +84,9 @@ pub fn detailed_timing(t: &Timing, size_mm: (u32, u32)) -> [u8; 18] {
 /// The monitor's EDID EEPROM on the DDC bus.
 pub const EDID_ADDRESS: u8 = 0x50;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, snapshot::Snap)]
 enum State {
+    #[default]
     Idle,
     Address,
     Write,
@@ -94,7 +95,9 @@ enum State {
     Ignore,
 }
 
+#[derive(snapshot::Snap)]
 pub struct Ddc {
+    #[snap(skip)]
     edid: [u8; 128],
     state: State,
     scl: bool,

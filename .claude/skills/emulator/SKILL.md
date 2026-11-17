@@ -56,7 +56,6 @@ scripts/vm stop xp
 - **Limits:**
   - The guest clock resumes as if no time passed.
   - Open network connections reset.
-  - The Radeon can't be saved yet.
   - A snapshot only loads into a build whose devices have the same layout; rebuilding after device changes makes old snapshots refuse to load.
 
 ## Guest images

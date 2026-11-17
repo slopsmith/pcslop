@@ -64,14 +64,19 @@ pub struct Bars {
     pub mmio: u32,
 }
 
+#[derive(snapshot::Snap)]
 pub struct Radeon {
     vga: Vga,
+    #[snap(skip)]
     rom: Vec<u8>,
     regs: Vec<u32>,
     pll: [u32; 64],
+    #[snap(skip)]
     pub bars: Bars,
     /// The PCI configuration space, which MMIO 0xF00..0x1000 mirrors.
+    #[snap(skip)]
     pub config: [u8; 256],
+    #[snap(skip)]
     now_ns: u64,
     /// Frames whose vertical blank CRTC_STATUS and GEN_INT_STATUS have been acknowledged up to.
     vblank_acked: [u64; 2],
@@ -82,6 +87,7 @@ pub struct Radeon {
     i2c: i2c::I2cEngine,
     /// The monitor on the VGA connector's DDC lines.
     monitor: ddc::Ddc,
+    #[snap(skip)]
     trace: Option<Trace>,
 }
 

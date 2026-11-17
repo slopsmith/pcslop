@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use crate::ddc::EDID_ADDRESS;
 use crate::regs::*;
 
-#[derive(Default)]
+#[derive(Default, snapshot::Snap)]
 pub(crate) struct I2cEngine {
     tx: VecDeque<u8>,
     rx: VecDeque<u8>,

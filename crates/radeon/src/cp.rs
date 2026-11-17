@@ -27,7 +27,7 @@ pub(crate) mod op {
     pub const TRANS_BITBLT: u8 = 0x9c;
 }
 
-#[derive(Default)]
+#[derive(Default, snapshot::Snap)]
 pub(crate) struct Cp {
     pub rptr: u32,
     /// Indirect buffers being executed, outermost first.
