@@ -41,6 +41,7 @@ scripts/vm stop xp
 - `mouse DX DY [BUTTONS]`, `tablet X Y [BUTTONS [WHEEL]]`
 - `power`, `battery [host|off|PERCENT[:ac]]`
 - `cdrom [ISO]`, `eject`, `save DIR`, `load DIR`, `quit`
+- `stall MS EVERY_MS` (`stall 0` stops): sleeps the emulation thread, to test devices under load
 
 **Rules that bit agents before:**
 - **Always use your own socket.** `scripts/ctl` without a socket argument talks to the newest emulator on the machine, which may be another agent's or the user's. Keys, `shot`, and once a `quit`, landed in other sessions that way. `scripts/vm` always passes the socket.

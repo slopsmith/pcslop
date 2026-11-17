@@ -557,6 +557,8 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
     };
     let mut next_frame = Instant::now();
     let mut scratch = Vec::new();
+    // Sleeps of the emulation thread that `stall` asks for: how long, how often, and the next one.
+    let mut stall: Option<(Duration, Duration, Instant)> = None;
 
     let code = 'run: loop {
         let mut outcome = None;
@@ -620,6 +622,12 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
         shared.instructions.store(executed + jit_insns, Ordering::Relaxed);
         board.set_irq(13, cpu.ferr_pending);
         board.tick();
+        if let Some((len, every, next)) = stall.as_mut()
+            && Instant::now() >= *next
+        {
+            std::thread::sleep(*len);
+            *next = Instant::now() + *every;
+        }
         if board.reset_requested {
             cpu.reset();
             board.reset();
@@ -829,6 +837,20 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                                 "mouse released".into()
                             }
                         }
+                        "stall" => {
+                            let v: Vec<u64> = rest.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+                            match v.as_slice() {
+                                [0] => {
+                                    stall = None;
+                                    "not stalling".into()
+                                }
+                                &[ms, every] if ms > 0 => {
+                                    stall = Some((Duration::from_millis(ms), Duration::from_millis(every), Instant::now()));
+                                    format!("stalling {ms} ms every {every} ms")
+                                }
+                                _ => "usage: stall MS EVERY_MS | stall 0".into(),
+                            }
+                        }
                         "pause" => {
                             paused = true;
                             "paused".into()
@@ -1025,7 +1047,7 @@ fn control_server(path: PathBuf, tx: Sender<Event>) {
 fn run_command(line: &str, tx: &Sender<Event>) -> Option<String> {
     let cmd = line.split_whitespace().next().unwrap_or("");
     let battery_query = cmd == "battery" && line.split_whitespace().nth(1).is_none();
-    if battery_query || matches!(cmd, "screen" | "regs" | "status" | "capture" | "pause" | "resume" | "mem" | "profile" | "cdrom" | "eject" | "save" | "load") {
+    if battery_query || matches!(cmd, "screen" | "regs" | "status" | "capture" | "pause" | "resume" | "mem" | "profile" | "cdrom" | "eject" | "save" | "load" | "stall") {
         let (rtx, rrx) = channel();
         tx.send(Event::Query(line.to_string(), rtx)).ok()?;
         let wait = Duration::from_secs(if matches!(cmd, "save" | "load") { 120 } else { 10 });
@@ -1080,9 +1102,10 @@ fn command_event(line: &str) -> Result<Vec<Event>, String> {
         "battery" => vec![Event::Battery(parse_battery(rest.trim())?)],
         "quit" => vec![Event::Quit],
         _ => {
-            return Err("commands: screen | status | regs | mem HEXADDR [LEN] | profile [on|off] | pause | resume | save DIR | load DIR | shot PATH | type TEXT | serial LINE | key NAME[+NAME] | mouse DX DY [BUTTONS [WHEEL]] | tablet X Y [BUTTONS [WHEEL]] | capture [on|off|toggle] | power | battery [host|off|PERCENT[:ac]] | cdrom [ISO] | eject | quit\n\
+            return Err("commands: screen | status | regs | mem HEXADDR [LEN] | profile [on|off] | pause | resume | save DIR | load DIR | shot PATH | type TEXT | serial LINE | key NAME[+NAME] | mouse DX DY [BUTTONS [WHEEL]] | tablet X Y [BUTTONS [WHEEL]] | capture [on|off|toggle] | power | battery [host|off|PERCENT[:ac]] | cdrom [ISO] | eject | stall MS EVERY_MS | quit\n\
                  mouse sends relative PS/2 motion; tablet moves the USB tablet to guest screen pixel (X, Y);\n\
-                 capture sends the window's mouse as PS/2 motion only and drops tablet input".into());
+                 capture sends the window's mouse as PS/2 motion only and drops tablet input;\n\
+                 stall sleeps the emulation thread for MS every EVERY_MS, to test devices under load".into());
         }
     })
 }
