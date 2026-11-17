@@ -67,6 +67,8 @@ impl Emit {
         if insn.mem.is_some() && !insn.addr32 {
             return false;
         }
+        self.x87_flush();
+        self.x87 = super::x87::X87Block::default();
         let pfx = prefix(insn);
         let (op, reg, rm) = (insn.op, insn.reg(), insn.rm());
         let scalar = pfx >= F3;

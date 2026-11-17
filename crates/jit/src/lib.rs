@@ -60,6 +60,7 @@ struct BlockInfo {
     boundaries: Vec<(u32, u32)>,
     insns: usize,
     interp_after: Option<usize>,
+    x87: Vec<(u32, translate::X87Snap)>,
     /// Executions checked against the interpreter in verify mode.
     verified: u32,
 }
@@ -547,6 +548,42 @@ impl Jit {
         )
     }
 
+    /// Writes back the x87 state held in registers at the boundary before `pc`
+    /// when the host abandons a block; `xregs` are x2..x4 (TOP, TAGS, SW).
+    fn x87_deopt(&mut self, pc: u64, xregs: [u64; 3]) -> hvf::Result<()> {
+        let Some((&va, &key)) = self.by_va.range(..=pc).next_back() else { return Ok(()) };
+        let b = &self.blocks[&key];
+        let word = ((pc - va) / 4) as u32;
+        let Some(&(start, _)) = b.boundaries.iter().rev().find(|(w, _)| *w <= word) else { return Ok(()) };
+        let Some(&(_, snap)) = b.x87.iter().find(|(w, _)| *w == start) else { return Ok(()) };
+        let top = xregs[0] as usize & 7;
+        for r in 0..8 {
+            if snap.dirty & 1 << r != 0 {
+                let v = f64::from_bits(self.vcpu.simd_reg(8 + r as u32)? as u64);
+                let f = x86::fpu::F80::from_f64(v);
+                let p = (top + r) & 7;
+                let s = self.state();
+                s.mm[p] = f.mant;
+                s.fse[p] = f.se;
+            }
+        }
+        if snap.meta {
+            let s = self.state();
+            s.ftags = xregs[1] as u32;
+            s.fsw = xregs[2] as u32;
+            s.fip = snap.note.0;
+            s.fnote = snap.note.1;
+        }
+        Ok(())
+    }
+
+    /// `x87_deopt` for a FAULT exit, where the runtime saved x0..x17 in `scratch`.
+    fn deopt_at_fault(&mut self, elr: u64) {
+        let s = self.state();
+        let xregs = [s.scratch[2], s.scratch[3], s.scratch[4]];
+        self.x87_deopt(elr, xregs).expect("reading the vCPU's SIMD registers");
+    }
+
     fn sample_pc(&mut self) -> hvf::Result<()> {
         let pc = self.vcpu.reg(reg::PC)?;
         let code = layout::va(layout::CODE_CACHE)..layout::va(layout::CODE_CACHE_END);
@@ -990,7 +1027,7 @@ impl Jit {
         if compiled.retry {
             self.retry.insert(key);
         }
-        self.blocks.insert(key, BlockInfo { va: block_va, boundaries: compiled.boundaries, insns: compiled.insns, interp_after: compiled.interp_after, verified });
+        self.blocks.insert(key, BlockInfo { va: block_va, boundaries: compiled.boundaries, insns: compiled.insns, interp_after: compiled.interp_after, x87: compiled.x87, verified });
         self.by_va.insert(block_va, key);
         self.stats.blocks += 1;
         self.stats.translated_insns += compiled.insns as u64;
@@ -1415,6 +1452,7 @@ impl Jit {
                     // The store may rewrite the running block, so finish it in the
                     // interpreter and continue from fresh translations.
                     let eip = self.eip_at(elr).expect("fault outside any translated block");
+                    self.deopt_at_fault(elr);
                     self.invalidate_code_page(page);
                     self.map_shadow(bus, cpu, lin, phys, write, global);
                     self.tlbi_page(lin);
@@ -1438,6 +1476,7 @@ impl Jit {
             Err(e) => {
                 self.stats.page_faults += 1;
                 let eip = self.eip_at(elr).expect("fault outside any translated block");
+                self.deopt_at_fault(elr);
                 self.state().eip = eip;
                 self.store_state(cpu);
                 let _ = interp::deliver_fault(cpu, bus, e);
@@ -1478,6 +1517,8 @@ impl Jit {
             s.af_aux = af;
             s.icount = icount;
         }
+        let xregs = [self.vcpu.reg(reg::X0 + 2)?, self.vcpu.reg(reg::X0 + 3)?, self.vcpu.reg(reg::X0 + 4)?];
+        self.x87_deopt(pc, xregs)?;
         self.store_state(cpu);
         self.stats.interp_exits += 1;
         let e = self.step_interp(cpu, bus);

@@ -15,6 +15,8 @@ mod sse;
 mod system;
 mod x87;
 
+pub use x87::Snap as X87Snap;
+
 const MAX_INSNS: usize = 64;
 
 const T_ADDR: Reg = Reg(9);
@@ -77,6 +79,8 @@ pub struct Compiled {
     /// Its first instruction runs onto a page that was not mapped; translate
     /// it again once the interpreter has run it.
     pub retry: bool,
+    /// The x87 state held in registers at instruction boundaries (ARM word index).
+    pub x87: Vec<(u32, X87Snap)>,
 }
 
 struct Emit {
@@ -93,6 +97,7 @@ struct Emit {
     stored: bool,
     /// The `flags` bits the current instruction must produce.
     need: u8,
+    x87: x87::X87Block,
 }
 
 enum Step {
@@ -129,6 +134,7 @@ impl Emit {
     }
 
     fn goto(&mut self, eip: u32) {
+        self.x87_flush();
         if self.page == Some(eip & !0xfff) {
             let slow = self.a.label();
             self.a.ldr(Width::W, CHAIN_TMP, STATE, state::PENDING as i32);
@@ -142,6 +148,7 @@ impl Emit {
 
     /// Jumps through the dispatcher even within the page, so it can check for interrupts.
     fn goto_dispatch(&mut self, eip: u32) {
+        self.x87_flush();
         self.a.mov_imm(Size::W, r(0), eip as u64);
         let off = self.branch_offset(self.dispatch_va);
         self.a.b_offset(off);
@@ -151,6 +158,7 @@ impl Emit {
         if eip != r(0) {
             self.a.mov(Size::W, r(0), eip);
         }
+        self.x87_flush();
         let off = self.branch_offset(self.dispatch_va);
         self.a.b_offset(off);
     }
@@ -217,6 +225,7 @@ impl Emit {
     }
 
     fn exit_with(&mut self, eip: u32, why: u32) {
+        self.x87_flush();
         self.a.mov_imm(Size::W, r(0), eip as u64);
         self.a.movz(Size::W, r(1), why, 0);
         let off = self.branch_offset(self.exit_va);
@@ -224,6 +233,7 @@ impl Emit {
     }
 
     fn exit_interp(&mut self, eip: u32) {
+        self.x87_flush();
         self.a.mov_imm(Size::W, r(0), eip as u64);
         self.a.movz(Size::W, r(1), reason::INTERP, 0);
         let off = self.branch_offset(self.exit_va);
@@ -1780,6 +1790,8 @@ impl Emit {
     /// MMX instructions; at run time they leave faulting cases (CR0.EM/TS, a
     /// pending x87 exception) to the interpreter.
     fn mmx(&mut self, insn: &Insn, eip: u32) -> bool {
+        self.x87_flush();
+        self.x87 = x87::X87Block::default();
         const VA: V = V(16);
         const VB: V = V(17);
         let (op, reg, rm) = (insn.op, insn.reg(), insn.rm());
@@ -2109,6 +2121,7 @@ pub fn translatable(insn: &Insn, pc: u32, user: bool) -> bool {
         user,
         stored: false,
         need: flags::ALL,
+        x87: x87::X87Block::default(),
     };
     !matches!(e.insn(insn, pc), Step::Unsupported)
 }
@@ -2161,6 +2174,7 @@ pub fn compile(
         user,
         stored: false,
         need: flags::ALL,
+        x87: x87::X87Block::default(),
     };
     let need = if self_check { Vec::new() } else { flag_needs(eip, &mut byte, user, exact_flags) };
     let mut boundaries = Vec::new();
@@ -2181,6 +2195,8 @@ pub fn compile(
     let mut recent = false;
     let mut interp_after = None;
     let mut retry = false;
+    let mut x87_snaps = Vec::new();
+    let mut sti_x87 = x87::X87Block::default();
     loop {
         let mut missing = false;
         let insn = decode::<()>(true, |i| {
@@ -2190,6 +2206,7 @@ pub fn compile(
         });
         let Ok(insn) = insn else {
             if let Some(at) = sti {
+                e.x87 = sti_x87;
                 e.back_to_sti(at, &mut pc, &mut insns, &mut boundaries);
             } else if insns == 0 {
                 e.exit_interp(pc);
@@ -2201,6 +2218,10 @@ pub fn compile(
             break;
         };
         boundaries.push((e.a.pos() as u32, pc));
+        if let Some(snap) = e.x87.snap() {
+            x87_snaps.push((e.a.pos() as u32, snap));
+        }
+        let x87_before = e.x87;
         has_rep |= insn.rep != Rep::None && matches!(insn.op, 0xa4..=0xa7 | 0xaa..=0xaf);
         let start = e.a.pos();
         let end = pc.wrapping_add(insn.len as u32);
@@ -2209,6 +2230,7 @@ pub fn compile(
         if !on_page(end.wrapping_sub(1)) {
             if sti.is_some() {
                 let at = sti.unwrap();
+                e.x87 = sti_x87;
                 e.back_to_sti(at, &mut pc, &mut insns, &mut boundaries);
                 break;
             }
@@ -2225,12 +2247,14 @@ pub fn compile(
                 Step::Unsupported | Step::Sti => {
                     e.a.truncate(start);
                     e.chains.retain(|&(w, _)| (w as usize) < start);
+                    e.x87 = x87_before;
                     e.exit_interp(pc);
                     interp_after = Some(insns);
                     break;
                 }
             }
             e.a.bind(slow);
+            e.x87 = x87_before;
             e.exit_interp(pc);
             break;
         }
@@ -2255,9 +2279,11 @@ pub fn compile(
         match step {
             Step::Sti if sti.is_none() => {
                 sti = Some((start, pc, insns, boundaries.len() - 1));
+                sti_x87 = x87_before;
                 insns += 1;
                 pc = pc.wrapping_add(insn.len as u32);
                 if insns >= MAX_INSNS || !on_page(pc) {
+                    e.x87 = sti_x87;
                     e.back_to_sti(sti.unwrap(), &mut pc, &mut insns, &mut boundaries);
                     break;
                 }
@@ -2282,10 +2308,12 @@ pub fn compile(
             }
             Step::Unsupported | Step::Sti => {
                 if let Some(at) = sti {
-                    e.back_to_sti(at, &mut pc, &mut insns, &mut boundaries);
+                    e.x87 = sti_x87;
+                e.back_to_sti(at, &mut pc, &mut insns, &mut boundaries);
                 } else {
                     e.a.truncate(start);
                     e.chains.retain(|&(w, _)| (w as usize) < start);
+                    e.x87 = x87_before;
                     e.exit_interp(pc);
                     interp_after = Some(insns);
                 }
@@ -2302,11 +2330,12 @@ pub fn compile(
         e.check_bytes_in_page(eip, &bytes, stale);
         e.a.b(body);
         e.a.bind(stale);
+        e.x87 = x87::X87Block::default();
         e.exit_with(eip, reason::STALE);
     }
     let mut count = Asm::new();
     count.add_imm(Size::X, ICOUNT, ICOUNT, insns as u32);
     let mut code = e.a.finish();
     code[0] = count.code[0];
-    Compiled { code, boundaries, insns, chains: e.chains, has_rep, recent, interp_after, retry }
+    Compiled { code, boundaries, insns, chains: e.chains, has_rep, recent, interp_after, retry, x87: x87_snaps }
 }

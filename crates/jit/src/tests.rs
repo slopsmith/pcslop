@@ -609,6 +609,33 @@ fn code_rewritten_every_iteration_matches_the_interpreter() {
 }
 
 #[test]
+fn rewritten_x87_code_leaves_its_self_checking_block_cleanly() {
+    let code = [
+        0xb9, 0x40, 0, 0, 0, // mov ecx, 64
+        0xd9, 0xee, // fldz
+        0x88, 0x0d, 0x0f, 0x10, 0, 0, // loop: mov [0x100f], cl (imm of the next mov)
+        0xb8, 0, 0, 0, 0, // mov eax, imm32
+        0x01, 0xc3, // add ebx, eax
+        0xdb, 0x05, 0x00, 0x30, 0x00, 0x00, // fild dword [0x3000]
+        0xdd, 0xd9, // fstp st(1)
+        0xff, 0x05, 0x00, 0x30, 0x00, 0x00, // inc dword [0x3000]
+        0x49, // dec ecx
+        0x75, 0xe2, // jnz loop
+        0xf4,
+    ];
+    let mut a = flat_cpu(0x1000, 0x8000);
+    let mut b = a.clone();
+    let mut bus_a = bus_with(0x1000, &code);
+    let mut bus_b = bus_with(0x1000, &code);
+    run_interp(&mut a, &mut bus_a);
+    let stats = run_jit(&mut b, &mut bus_b);
+    assert!(stats.stale_blocks > 0, "the page should have switched to self-checking blocks: {stats:?}");
+    assert_eq!(a.regs, b.regs);
+    assert_eq!(a.fpu, b.fpu, "a stale self-checking block must not lose or misplace cached x87 values");
+    assert!(bus_a.ram.as_slice() == bus_b.ram.as_slice(), "memory differs");
+}
+
+#[test]
 fn atomics_match_the_interpreter_when_the_compare_succeeds() {
     let programs: [&[u8]; 6] = [
         &[0xa1, 0, 0x30, 0, 0, 0xf0, 0x0f, 0xb1, 0x0d, 0, 0x30, 0, 0, 0xf4],
@@ -803,7 +830,11 @@ fn random_x87(rng: &mut Rng, out: &mut Vec<u8>) {
         }
         20 => mem_abs(out, 0xd9, 5, 0x3500 + 2 * (k % 5)),
         21 => mem_abs(out, [0xd9, 0xdd][rng.below(2) as usize], 7, 0x3520 + 2 * k),
-        22 => out.push(0x9b),
+        22 => match rng.below(4) {
+            0 => out.extend([0x0f, 0x6f, modrm_rr(rng.below(8) as u8, rng.below(8) as u8)]),
+            1 => out.extend([0x0f, 0x77]),
+            _ => out.push(0x9b),
+        },
         _ => mem_abs(out, [0xd8, 0xdc][rng.below(2) as usize], [2, 3][rng.below(2) as usize], 0x3100 + 4 * k),
     }
 }
@@ -1173,4 +1204,27 @@ fn iret_within_the_kernel_and_to_user_mode_matches_the_interpreter() {
     assert_eq!(a.eflags & ARITH_MASK, b.eflags & ARITH_MASK);
     assert_eq!(a.segs, b.segs);
     assert!(stats.interp_exits <= 1, "IRET left translated code: {stats:?}");
+}
+
+#[test]
+fn x87_results_survive_a_store_into_the_running_code() {
+    let code = [
+        0xdd, 0x05, 0x00, 0x30, 0, 0, // fld qword [0x3000]
+        0xdc, 0x05, 0x08, 0x30, 0, 0, // fadd qword [0x3008]
+        0xd9, 0xc0, // fld st(0)
+        0xde, 0xc9, // fmulp
+        0xc6, 0x05, 0x1a, 0x10, 0, 0, 0x90, // mov byte [0x101a], 0x90: a store into this page
+        0x90, 0xf4, // nop, hlt
+    ];
+    let mut a = flat_cpu(0x1000, 0x8000);
+    let mut bus_a = bus_with(0x1000, &code);
+    bus_a.ram.as_mut_slice()[0x3000..0x3008].copy_from_slice(&1.5f64.to_le_bytes());
+    bus_a.ram.as_mut_slice()[0x3008..0x3010].copy_from_slice(&2.25f64.to_le_bytes());
+    let mut b = a.clone();
+    let mut bus_b = FlatBus { ram: GuestMemory::new(RAM).unwrap() };
+    bus_b.ram.as_mut_slice().copy_from_slice(bus_a.ram.as_slice());
+    run_interp(&mut a, &mut bus_a);
+    let stats = run_jit(&mut b, &mut bus_b);
+    assert!(stats.smc_invalidations > 0, "the store did not hit the running block: {stats:?}");
+    assert_eq!(a.fpu, b.fpu);
 }
