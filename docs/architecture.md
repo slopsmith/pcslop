@@ -56,7 +56,8 @@ Design rule from these numbers: **anything hot must be handled inside the VM**. 
 2. The eight x86 GPRs stay in fixed ARM registers for the whole block, and EFLAGS and segment state get registers of their own.
 3. The ARM64 emitter is hand-written. LLVM and Cranelift translate too slowly for a JIT like this.
 4. The translator runs in the host process. A missing block costs an exit plus translation time, and that happens rarely once the guest is warm. Block chaining patches branches directly in the code cache, which is shared host/guest memory.
-5. **Self-modifying code:** a physical page with translated code gets a read-only shadow mapping. A write to it faults, which invalidates that page's blocks and maps it writable again.
+5. **Self-modifying code:** a physical page with translated code gets a read-only shadow mapping. A write to it faults, which invalidates that page's blocks; the faulting instruction then finishes in the interpreter, so the rest of a block that rewrote itself is translated again. Writes by the interpreter and by DMA reach the JIT through a per-page watch in the board. Any mapping that replaces a valid shadow entry also invalidates its TLB entry; otherwise a stale writable TLB entry lets code change unnoticed.
+6. **Pages rewritten often** (four invalidations) switch to self-checking blocks instead: they stay writable, and every block compares its own code bytes on entry and asks to be retranslated when they differ. An instruction that straddles a page end is translated too, with a run-time check of its bytes on the second page.
 
 ### Interpreter
 
@@ -87,7 +88,8 @@ These are the starting decisions for phase 3.
 **Stage-1 translation**
 - TTBR0 (`T0SZ = 32`, exactly 4 GiB, 4 KiB granule) is the shadow of the x86 page tables. VA equals the x86 linear address, so a guest load is one ARM load at a zero-extended 32-bit address.
 - TTBR1 maps the runtime and a linear view of x86 physical memory, for the page walker.
-- Shadow entries are filled lazily by the EL1 data-abort handler. Pages start read-only so the first write can set the x86 Dirty bit (the hardware does no A/D updates here). Pages holding translated code stay read-only to catch self-modifying code.
+- Shadow entries are filled lazily by the EL1 data-abort handler, which walks the non-PAE x86 page tables itself (4 KiB and 4 MiB pages), sets Accessed and Dirty as the CPU would, and logs each fill. The host takes the log in at the next exit, for its CR3-switch and self-modifying-code bookkeeping. A missing shadow table, an x86 page fault, a write to a code page or a full log go to the host instead. `SLOPPER_JIT_NO_VM_FILL` sends every fill to the host. Pages start read-only so the first write can set the x86 Dirty bit (the hardware does no A/D updates here). Pages holding translated code stay read-only to catch self-modifying code.
+- There are two shadow trees, one for CPL 0 and one for CPL 3, each with its own ASID. A CR3 load clears only the non-global leaves and keeps the tables and global (kernel) entries. Snapshots of the paging structures let a flush be skipped when nothing changed; after a CR3 switch they count as incomplete until the next full flush.
 - x86 user pages are EL0-accessible and supervisor pages EL1-only. CPL 3 runs at EL0, so the MMU enforces U/S and CR0.WP.
 
 **Register assignment in translated code**
@@ -97,7 +99,7 @@ These are the starting decisions for phase 3.
 - NZCV: x86 CF, ZF, SF and OF, with carry inverted after subtraction (FlagM `CFINV` fixes it up only when needed). PF and AF come from the last result and operands, saved in the state block when a later instruction might read them.
 
 **Control flow**
-- A lookup table in runtime memory maps x86 EIP to translated code. A miss makes a VM exit, the host translates the block into the shared code cache, and the guest resumes.
+- A lookup table in runtime memory maps x86 EIP to translated code: the dispatcher translates EIP to a physical address with `AT S1E1R` and looks the block up in a 2-way table of 2^18 entries indexed by a Fibonacci hash. A miss makes a VM exit, the host translates the block into the shared code cache, and the guest resumes. Jumps within a page are chained directly.
 - Port I/O, unimplemented instructions and mode changes exit to the host. The interpreter runs anything the JIT does not handle: real mode, V86, task switches.
 - Interrupts: the host sets a pending word in the state block, which translated code checks on backward branches and block exits.
 
@@ -114,5 +116,5 @@ These are the starting decisions for phase 3.
 
 - (Decided) x86 CPL 0 runs at EL1 alongside the runtime; vic agreed that the speed is worth the risk.
 
-- Where do the shadow page-table caches live across CR3 switches? The first version flushes them on every CR3 write, which is what a real TLB does.
+- (Decided) Shadow page tables across CR3 switches: one tree per privilege level, kept across switches; only non-global leaves are cleared. Caching a tree per address space would cut the refills further.
 - I-cache maintenance when the host patches code that the guest executes. `CTR_EL0` traps in macOS user space, so we need to read it inside the VM.
