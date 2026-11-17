@@ -99,6 +99,12 @@ pub struct State {
     pub ram_size: u32,
     /// Entries in `layout::FILL_LOG` the host has not taken in yet.
     pub fill_count: u32,
+    /// MMX registers (the x87 significands), and whether MMX instructions may
+    /// run here: CR0.EM and CR0.TS clear, no x87 exception pending.
+    pub mm: [u64; 8],
+    pub mmx_ok: u32,
+    /// Bit n: MM n was written; bit 8: an MMX instruction ran.
+    pub mm_used: u32,
     /// 1 when SSE instructions may run: CR0.TS and CR0.EM clear, CR4.OSFXSR set.
     pub sse_ok: u32,
     pub xmm: [u128; 8],
@@ -128,6 +134,9 @@ pub const BUDGET: usize = offset_of!(State, budget);
 pub const INFO: usize = offset_of!(State, info);
 pub const SCRATCH: usize = offset_of!(State, scratch);
 pub const SSE_OK: usize = offset_of!(State, sse_ok);
+pub const MM: usize = offset_of!(State, mm);
+pub const MMX_OK: usize = offset_of!(State, mmx_ok);
+pub const MM_USED: usize = offset_of!(State, mm_used);
 pub const SHADOW_ROOT: usize = offset_of!(State, shadow_root);
 pub const WALK_CR3: usize = offset_of!(State, walk_cr3);
 pub const WALK_FLAGS: usize = offset_of!(State, walk_flags);

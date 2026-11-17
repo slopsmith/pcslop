@@ -546,6 +546,9 @@ impl Jit {
             s.walk_cr3 = cpu.cr3 & !0xfff;
         }
         let ts_em = x86::cpu::cr0::TS | x86::cpu::cr0::EM;
+        s.mm = std::array::from_fn(|i| cpu.fpu.mm(i));
+        s.mmx_ok = (cpu.cr0 & ts_em == 0 && cpu.fpu.sw & x86::fpu::sw::ES == 0) as u32;
+        s.mm_used = 0;
         s.sse_ok = (cpu.cr0 & ts_em == 0 && cpu.cr4 & x86::cpu::cr4::OSFXSR != 0) as u32;
         s.xmm = cpu.xmm;
     }
@@ -559,6 +562,15 @@ impl Jit {
         cpu.set_flag(x86::cpu::flags::IF, if_flag);
         cpu.set_flag(x86::cpu::flags::DF, df);
         cpu.xmm = s.xmm;
+        let used = s.mm_used;
+        if used != 0 {
+            for i in 0..8 {
+                if used & 1 << i != 0 {
+                    cpu.fpu.set_mm(i, s.mm[i]);
+                }
+            }
+            cpu.fpu.enter_mmx();
+        }
     }
 
     /// Points TTBR0 at the shadow tree for the current CPL, each with its own ASID.

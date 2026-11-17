@@ -648,3 +648,78 @@ fn untranslatable_instruction_across_a_page_end() {
     code.extend([0x0f, 0xa2, 0x40, 0xf4]);
     compare(&code, |_| {});
 }
+
+fn random_mmx(rng: &mut Rng, out: &mut Vec<u8>) {
+    const REG_OPS: [u8; 39] = [
+        0xfc, 0xfd, 0xfe, 0xd4, 0xf8, 0xf9, 0xfa, 0xfb, 0xec, 0xed, 0xdc, 0xdd, 0xe8, 0xe9, 0xd8, 0xd9, 0x74, 0x75, 0x76, 0x64,
+        0x65, 0x66, 0xd5, 0xe0, 0xe3, 0xda, 0xde, 0xea, 0xee, 0x60, 0x61, 0x62, 0x63, 0x67, 0x68, 0x69, 0x6a, 0x6b, 0xe5,
+    ];
+    const MORE_OPS: [u8; 7] = [0xe4, 0xf5, 0xdb, 0xdf, 0xeb, 0xef, 0x6f];
+    let mm = rng.below(8) as u8;
+    match rng.below(6) {
+        0 | 1 => {
+            let all: Vec<u8> = REG_OPS.iter().chain(MORE_OPS.iter()).copied().collect();
+            let op = all[rng.below(all.len() as u32) as usize];
+            out.extend([0x0f, op, modrm_rr(mm, rng.below(8) as u8)]);
+        }
+        2 => {
+            let all: Vec<u8> = REG_OPS.iter().chain(MORE_OPS.iter()).copied().collect();
+            let op = all[rng.below(all.len() as u32) as usize];
+            out.extend([0x0f, op, mm << 3 | 5]);
+            out.extend((0x3000 + rng.below(8) * 8).to_le_bytes());
+        }
+        3 => match rng.below(4) {
+            0 => out.extend([0x0f, 0x6e, modrm_rr(mm, rng.reg())]),
+            1 => out.extend([0x0f, 0x7e, modrm_rr(mm, rng.reg())]),
+            2 => {
+                out.extend([0x0f, 0x7f, mm << 3 | 5]);
+                out.extend((0x3000 + rng.below(8) * 8).to_le_bytes());
+            }
+            _ => out.extend([0x0f, 0x7f, modrm_rr(mm, rng.below(8) as u8)]),
+        },
+        _ => {
+            let (op, sub) = match rng.below(3) {
+                0 => (0x71, [2, 4, 6][rng.below(3) as usize]),
+                1 => (0x72, [2, 4, 6][rng.below(3) as usize]),
+                _ => (0x73, [2, 6][rng.below(2) as usize]),
+            };
+            out.extend([0x0f, op, modrm_rr(sub, mm), rng.below(70) as u8]);
+        }
+    }
+}
+
+#[test]
+fn random_mmx_programs_match_the_interpreter() {
+    let mut rng = Rng(0x3d_f00d);
+    for round in 0..300 {
+        let mut code = Vec::new();
+        for _ in 0..30 {
+            random_mmx(&mut rng, &mut code);
+        }
+        code.push(0xf4);
+        let regs: Vec<u32> = (0..8).map(|_| rng.next()).collect();
+        let mms: Vec<u64> = (0..8).map(|_| (rng.next() as u64) << 32 | rng.next() as u64).collect();
+        let mem: Vec<u8> = (0..64).map(|_| rng.next() as u8).collect();
+        let mut a = flat_cpu(0x1000, 0x8000);
+        for (i, v) in regs.iter().enumerate() {
+            if i != 4 {
+                a.regs[i] = *v;
+            }
+        }
+        for (i, v) in mms.iter().enumerate() {
+            a.fpu.set_mm(i, *v);
+        }
+        let mut b = a.clone();
+        let mut bus_a = bus_with(0x1000, &code);
+        let mut bus_b = bus_with(0x1000, &code);
+        bus_a.ram.as_mut_slice()[0x3000..0x3040].copy_from_slice(&mem);
+        bus_b.ram.as_mut_slice()[0x3000..0x3040].copy_from_slice(&mem);
+        run_interp(&mut a, &mut bus_a);
+        let stats = run_jit(&mut b, &mut bus_b);
+        let hex: Vec<String> = code.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(a.regs, b.regs, "round {round} registers\ncode: {}", hex.join(" "));
+        assert_eq!(a.fpu, b.fpu, "round {round} MMX state\ncode: {}", hex.join(" "));
+        assert!(bus_a.ram.as_slice() == bus_b.ram.as_slice(), "round {round} memory\ncode: {}", hex.join(" "));
+        assert!(stats.interp_exits <= 1, "round {round}: {} interpreter exits\ncode: {}", stats.interp_exits, hex.join(" "));
+    }
+}

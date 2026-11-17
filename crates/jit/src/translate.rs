@@ -4,7 +4,7 @@
 //! registers, so a fault on any access leaves the x86 state of the
 //! instruction's start (apart from NZCV, which a restart recomputes).
 
-use a64::{Asm, Cond, Extend, Label, Reg, Shift, Size, Width, ZR, r};
+use a64::{Asm, Cond, Extend, Label, Narrow, Reg, Shift, Size, V, Width, ZR, r};
 use x86::decode::{Insn, MemOperand, NO_REG, Rep, decode};
 
 use crate::runtime::{AF_AUX, Entries, ICOUNT, PF_RESULT, STATE, guest_reg};
@@ -1321,6 +1321,11 @@ impl Emit {
             }
             0x118 if insn.mem.is_some() && insn.reg() < 4 => {}
             0x11f => {}
+            0x160..=0x17f | 0x1d0..=0x1ff if !insn.opsize_prefix && insn.rep == Rep::None => {
+                if !self.mmx(insn, eip) {
+                    return Step::Unsupported;
+                }
+            }
             0x12b if insn.rep == Rep::None => {
                 let Some(m) = insn.mem else { return Step::Unsupported };
                 if !self.ea(insn, &m) {
@@ -1517,6 +1522,218 @@ impl Emit {
         Step::End
     }
 
+    fn mm_off(n: usize) -> i32 {
+        (state::MM + 8 * n) as i32
+    }
+
+    /// The `rm` MMX operand into `dst` (64 bits, or the low 32 when `half`).
+    fn mm_src_v(&mut self, insn: &Insn, dst: V, half: bool) -> bool {
+        match insn.mem {
+            Some(m) => {
+                if !self.ea(insn, &m) {
+                    return false;
+                }
+                // Through a general register: SIMD loads from MMIO give the
+                // host no syndrome to emulate them with.
+                self.a.ldr(if half { Width::W } else { Width::X }, T_A, T_ADDR, 0);
+                self.a.fmov_dx(dst, T_A);
+            }
+            None => self.a.ldr_d(dst, STATE, Self::mm_off(insn.rm())),
+        }
+        true
+    }
+
+    /// MMX instructions; at run time they leave faulting cases (CR0.EM/TS, a
+    /// pending x87 exception) to the interpreter.
+    fn mmx(&mut self, insn: &Insn, eip: u32) -> bool {
+        const VA: V = V(16);
+        const VB: V = V(17);
+        let (op, reg, rm) = (insn.op, insn.reg(), insn.rm());
+        let three = |op: u16| -> Option<(bool, u32, u32)> {
+            Some(match op {
+                0x1fc => (false, 0, 0b10000),
+                0x1fd => (false, 1, 0b10000),
+                0x1fe => (false, 2, 0b10000),
+                0x1f8 => (true, 0, 0b10000),
+                0x1f9 => (true, 1, 0b10000),
+                0x1fa => (true, 2, 0b10000),
+                0x1ec => (false, 0, 0b00001),
+                0x1ed => (false, 1, 0b00001),
+                0x1dc => (true, 0, 0b00001),
+                0x1dd => (true, 1, 0b00001),
+                0x1e8 => (false, 0, 0b00101),
+                0x1e9 => (false, 1, 0b00101),
+                0x1d8 => (true, 0, 0b00101),
+                0x1d9 => (true, 1, 0b00101),
+                0x174 => (true, 0, 0b10001),
+                0x175 => (true, 1, 0b10001),
+                0x176 => (true, 2, 0b10001),
+                0x164 => (false, 0, 0b00110),
+                0x165 => (false, 1, 0b00110),
+                0x166 => (false, 2, 0b00110),
+                0x1d5 => (false, 1, 0b10011),
+                0x1e0 => (true, 0, 0b00010),
+                0x1e3 => (true, 1, 0b00010),
+                0x1da => (true, 0, 0b01101),
+                0x1de => (true, 0, 0b01100),
+                0x1ea => (false, 1, 0b01101),
+                0x1ee => (false, 1, 0b01100),
+                _ => return None,
+            })
+        };
+        let supported = matches!(op, 0x16e | 0x17e | 0x16f | 0x17f | 0x1db | 0x1df | 0x1eb | 0x1ef | 0x1d4 | 0x1fb)
+            || three(op).is_some()
+            || matches!(op, 0x160..=0x163 | 0x167..=0x16b | 0x1e4 | 0x1e5 | 0x1f5)
+            || (matches!(op, 0x171 | 0x172) && matches!(reg, 2 | 4 | 6) && insn.mem.is_none())
+            || (op == 0x173 && matches!(reg, 2 | 6) && insn.mem.is_none());
+        if !supported {
+            return false;
+        }
+        let ok = self.a.label();
+        self.a.ldr(Width::W, T_B, STATE, state::MMX_OK as i32);
+        self.a.cbnz(Size::W, T_B, ok);
+        self.exit_interp(eip);
+        self.a.bind(ok);
+        let mut written = None;
+        match op {
+            0x16e => {
+                match insn.mem {
+                    Some(m) => {
+                        if !self.ea(insn, &m) {
+                            return false;
+                        }
+                        self.a.ldr(Width::W, T_A, T_ADDR, 0);
+                    }
+                    None => self.a.mov(Size::W, T_A, guest_reg(rm)),
+                }
+                self.a.str(Width::X, T_A, STATE, Self::mm_off(reg));
+                written = Some(reg);
+            }
+            0x17e => {
+                self.a.ldr(Width::X, T_A, STATE, Self::mm_off(reg));
+                match insn.mem {
+                    Some(m) => {
+                        if !self.ea(insn, &m) {
+                            return false;
+                        }
+                        self.store(Width::W, T_A);
+                    }
+                    None => self.a.mov(Size::W, guest_reg(rm), T_A),
+                }
+            }
+            0x16f => {
+                if !self.mm_src_v(insn, VA, false) {
+                    return false;
+                }
+                self.a.str_d(VA, STATE, Self::mm_off(reg));
+                written = Some(reg);
+            }
+            0x17f => {
+                self.a.ldr_d(VA, STATE, Self::mm_off(reg));
+                match insn.mem {
+                    Some(m) => {
+                        if !self.ea(insn, &m) {
+                            return false;
+                        }
+                        self.a.fmov_xd(T_A, VA);
+                        self.a.str(Width::X, T_A, T_ADDR, 0);
+                    }
+                    None => {
+                        self.a.str_d(VA, STATE, Self::mm_off(rm));
+                        written = Some(rm);
+                    }
+                }
+            }
+            0x1db | 0x1df | 0x1eb | 0x1ef | 0x1d4 | 0x1fb => {
+                if !self.mm_src_v(insn, VB, false) {
+                    return false;
+                }
+                self.a.fmov_xd(T_A, VB);
+                self.a.ldr(Width::X, T_C, STATE, Self::mm_off(reg));
+                match op {
+                    0x1db => self.a.and(Size::X, T_C, T_C, T_A),
+                    0x1df => self.a.bic(Size::X, T_C, T_A, T_C),
+                    0x1eb => self.a.orr(Size::X, T_C, T_C, T_A),
+                    0x1d4 => self.a.add(Size::X, T_C, T_C, T_A),
+                    0x1fb => self.a.sub(Size::X, T_C, T_C, T_A),
+                    _ => self.a.eor(Size::X, T_C, T_C, T_A),
+                }
+                self.a.str(Width::X, T_C, STATE, Self::mm_off(reg));
+                written = Some(reg);
+            }
+            0x171 | 0x172 => {
+                let esize = if op == 0x171 { 16 } else { 32 };
+                let n = insn.imm & 0xff;
+                self.a.ldr_d(VA, STATE, Self::mm_off(rm));
+                match reg {
+                    6 if n >= esize => self.a.vec3(false, true, 0, 0b00011, VA, VA, VA),
+                    6 if n > 0 => self.a.shl_v(false, esize, VA, VA, n),
+                    2 if n >= esize => self.a.vec3(false, true, 0, 0b00011, VA, VA, VA),
+                    2 if n > 0 => self.a.shr_v(false, false, esize, VA, VA, n),
+                    4 if n > 0 => self.a.shr_v(false, true, esize, VA, VA, n.min(esize)),
+                    _ => {}
+                }
+                self.a.str_d(VA, STATE, Self::mm_off(rm));
+                written = Some(rm);
+            }
+            0x173 => {
+                let n = insn.imm & 0xff;
+                self.a.ldr(Width::X, T_A, STATE, Self::mm_off(rm));
+                if n >= 64 {
+                    self.a.mov(Size::X, T_A, ZR);
+                } else if n > 0 {
+                    if reg == 6 {
+                        self.a.lsl_imm(Size::X, T_A, T_A, n);
+                    } else {
+                        self.a.lsr_imm(Size::X, T_A, T_A, n);
+                    }
+                }
+                self.a.str(Width::X, T_A, STATE, Self::mm_off(rm));
+                written = Some(rm);
+            }
+            _ => {
+                let low_half = matches!(op, 0x160..=0x162);
+                self.a.ldr_d(VA, STATE, Self::mm_off(reg));
+                if !self.mm_src_v(insn, VB, low_half) {
+                    return false;
+                }
+                match op {
+                    0x160..=0x162 => self.a.zip(false, (op - 0x160) as u32, false, VA, VA, VB),
+                    0x168..=0x16a => self.a.zip(false, (op - 0x168) as u32, true, VA, VA, VB),
+                    0x163 | 0x167 | 0x16b => {
+                        self.a.ins_d1(VA, VB);
+                        let (kind, size) = match op {
+                            0x163 => (Narrow::Sqxtn, 0),
+                            0x167 => (Narrow::Sqxtun, 0),
+                            _ => (Narrow::Sqxtn, 1),
+                        };
+                        self.a.narrow(kind, size, VA, VA);
+                    }
+                    0x1e4 | 0x1e5 => {
+                        self.a.mull(op == 0x1e5, 1, VA, VA, VB);
+                        self.a.shrn(16, VA, VA, 16);
+                    }
+                    0x1f5 => {
+                        self.a.mull(true, 1, VA, VA, VB);
+                        self.a.vec3(true, false, 2, 0b10111, VA, VA, VA);
+                    }
+                    _ => {
+                        let (u, size, opcode) = three(op).expect("checked above");
+                        self.a.vec3(false, u, size, opcode, VA, VA, VB);
+                    }
+                }
+                self.a.str_d(VA, STATE, Self::mm_off(reg));
+                written = Some(reg);
+            }
+        }
+        let bits = 1u64 << 8 | written.map_or(0, |n| 1u64 << n);
+        self.a.ldr(Width::W, T_B, STATE, state::MM_USED as i32);
+        self.a.mov_imm(Size::W, T_C, bits);
+        self.a.orr(Size::W, T_B, T_B, T_C);
+        self.a.str(Width::W, T_B, STATE, state::MM_USED as i32);
+        true
+    }
+
     /// Group-2 shift or rotate by an immediate count.
     fn shift_or_rotate(&mut self, kind: usize, dst: Reg, a: Reg, n: u32) -> bool {
         if kind > 1 {
@@ -1602,6 +1819,7 @@ fn is_recent(insn: &Insn) -> bool {
     match op {
         0x1c8..=0x1cf | 0xc0 | 0xd0 | 0xd2 | 0x9c | 0x9d | 0x1ba | 0xf5 | 0xf8 | 0xf9 | 0x118 | 0x11f | 0x12b => true,
         0x1c0 | 0x1c1 | 0x1b0 | 0x1b1 | 0x1c7 | 0x1a4 | 0x1a5 | 0x1ac | 0x1ad | 0xfb => true,
+        0x160..=0x17f | 0x1d0..=0x1ff => !insn.opsize_prefix && insn.rep == Rep::None,
         0xc1 | 0xd1 | 0xd3 => !op32 || reg < 2,
         0xf6 | 0xf7 => matches!(reg, 2 | 3) && !(op == 0xf7 && op32),
         0x40..=0x4f => !op32,
