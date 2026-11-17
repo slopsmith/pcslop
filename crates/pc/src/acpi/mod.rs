@@ -31,6 +31,18 @@ const RTC_CENTURY: u8 = 0x32;
 /// The ACPI processor ID of the CPU, shared by the DSDT and the MADT.
 const CPU_ID: u8 = 0;
 
+/// Where the board's PCI functions sit: the PIIX3's slot, and whether an
+/// AGP bridge occupies slot 1.
+#[derive(Clone, Copy)]
+pub struct Layout {
+    pub piix: u8,
+    pub agp: bool,
+}
+
+impl Layout {
+    pub const I440FX: Layout = Layout { piix: 1, agp: false };
+}
+
 pub struct Files {
     pub tables: Vec<u8>,
     pub rsdp: Vec<u8>,
@@ -121,8 +133,8 @@ fn facs() -> Vec<u8> {
     t
 }
 
-fn dsdt(ram_bytes: u32) -> Vec<u8> {
-    let body = dsdt::body(ram_bytes);
+fn dsdt(ram_bytes: u32, layout: Layout) -> Vec<u8> {
+    let body = dsdt::body(ram_bytes, layout);
     let mut t = header(b"DSDT", 1, HEADER_LEN + body.len());
     t[HEADER_LEN..].copy_from_slice(&body);
     t
@@ -194,10 +206,10 @@ fn madt() -> Vec<u8> {
 
 /// Builds the ACPI fw_cfg files for a board with `ram_bytes` of RAM below
 /// 4 GiB, with a MADT when it has a local APIC and an I/O APIC.
-pub fn build(ram_bytes: u32, apic: bool) -> Files {
+pub fn build(ram_bytes: u32, apic: bool, layout: Layout) -> Files {
     let mut b = Builder::new();
     let facs = b.push(facs(), 64);
-    let dsdt = b.push(dsdt(ram_bytes), 4);
+    let dsdt = b.push(dsdt(ram_bytes, layout), 4);
     b.checksum(dsdt);
     b.add_table(fadt(), &[(FADT_FIRMWARE_CTRL, facs), (FADT_DSDT, dsdt)]);
     if apic {
@@ -221,7 +233,7 @@ mod tests {
     }
 
     fn load_with(apic: bool) -> Memory {
-        let f = build(512 << 20, apic);
+        let f = build(512 << 20, apic, Layout::I440FX);
         let files = [(TABLES_FILE, f.tables), (RSDP_FILE, f.rsdp)];
         loader::execute(&f.loader, &files, |name, align, zone| {
             let addr = if name == TABLES_FILE { TABLES_AT } else { RSDP_AT };
@@ -330,11 +342,22 @@ mod tests {
     }
 
     fn dsdt_contains(needle: &[u8]) -> bool {
-        dsdt(512 << 20).windows(needle.len()).any(|w| w == needle)
+        dsdt(512 << 20, Layout::I440FX).windows(needle.len()).any(|w| w == needle)
     }
 
     fn s5() -> Vec<u8> {
         aml::name("\\_S5", aml::package([aml::int(0), aml::int(0), aml::int(0), aml::int(0)]))
+    }
+
+    #[test]
+    fn on_the_440bx_the_isa_bridge_moves_and_the_agp_slot_gets_routes() {
+        let bx = dsdt(512 << 20, Layout { piix: 7, agp: true });
+        let has = |needle: &[u8]| bx.windows(needle.len()).any(|w| w == needle);
+        assert!(has(&aml::name("_ADR", aml::int(0x0007_0000))), "the link registers live in the PIIX3's config space");
+        let card_inta = aml::package([aml::int(0xffff), aml::int(0), aml::path("LNKA"), aml::int(0)]);
+        assert!(has(&card_inta), "the AGP card's INTA must follow the board's swizzle");
+        let sci = aml::package([aml::int(0x7_ffff), aml::int(0), aml::path("LNKS"), aml::int(0)]);
+        assert!(has(&sci));
     }
 
     #[test]
@@ -359,7 +382,7 @@ mod tests {
 
     #[test]
     fn dsdt_top_level_package_lengths_cover_the_whole_body() {
-        let t = dsdt(512 << 20);
+        let t = dsdt(512 << 20, Layout::I440FX);
         let body = &t[HEADER_LEN..];
         let mut i = 0;
         while body[i] == 0x10 {

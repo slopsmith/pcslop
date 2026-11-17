@@ -11,13 +11,13 @@ const LINKS: [&str; 4] = ["LNKA", "LNKB", "LNKC", "LNKD"];
 const LINK_IRQS: [u32; 3] = [5, 10, 11];
 const PCI_HOLE_END: u32 = 0xfebf_ffff;
 
-pub fn body(ram_bytes: u32) -> Aml {
+pub fn body(ram_bytes: u32, layout: super::Layout) -> Aml {
     [
         aml::scope("\\_PR", [aml::processor("CPU0", super::CPU_ID, 0, 0, [])]),
         aml::scope(
             "\\_SB",
             [
-                pci_root(ram_bytes),
+                pci_root(ram_bytes, layout),
                 aml::field("PCI0.ISA.P40C", &[("PRQ0", 8), ("PRQ1", 8), ("PRQ2", 8), ("PRQ3", 8)]),
                 link_status_method(),
                 link_current_settings_method(),
@@ -40,7 +40,7 @@ pub fn body(ram_bytes: u32) -> Aml {
     .concat()
 }
 
-fn pci_root(ram_bytes: u32) -> Aml {
+fn pci_root(ram_bytes: u32, layout: super::Layout) -> Aml {
     let crs = res::template([
         res::word_bus_number(0, 0xff),
         res::io(0xcf8, 8),
@@ -56,17 +56,29 @@ fn pci_root(ram_bytes: u32) -> Aml {
             aml::name("_ADR", aml::int(0)),
             aml::name("_UID", aml::int(0)),
             aml::name("_CRS", crs),
-            aml::method("_PRT", 0, false, [aml::ret(routing_table())]),
-            isa_bridge(),
-        ],
+            aml::method("_PRT", 0, false, [aml::ret(routing_table(layout.piix))]),
+            isa_bridge(layout.piix),
+        ]
+        .into_iter()
+        .chain(layout.agp.then(agp_bridge)),
     )
 }
 
+/// The AGP bridge at 00:01 and the card behind it, whose pins the board
+/// swizzles as if the card sat in slot 1.
+fn agp_bridge() -> Aml {
+    let prt = aml::package((0..4u8).map(|pin| {
+        let link = LINKS[pci::pirq_for(1, pin + 1)];
+        aml::package([aml::int(0xffff), aml::int(pin as u64), aml::path(link), aml::int(0)])
+    }));
+    aml::device("AGPB", [aml::name("_ADR", aml::int(0x0001_0000)), aml::method("_PRT", 0, false, [aml::ret(prt)])])
+}
+
 /// One entry per slot and pin, each naming the link its INTx line reaches.
-fn routing_table() -> Aml {
-    aml::package((0..32u8).flat_map(|slot| {
+fn routing_table(piix: u8) -> Aml {
+    aml::package((0..32u8).flat_map(move |slot| {
         (0..4u8).map(move |pin| {
-            let link = if slot == 1 && pin == 0 { "LNKS" } else { LINKS[pci::pirq_for(slot, pin + 1)] };
+            let link = if slot == piix && pin == 0 { "LNKS" } else { LINKS[pci::pirq_for(slot, pin + 1)] };
             aml::package([aml::int((slot as u64) << 16 | 0xffff), aml::int(pin as u64), aml::path(link), aml::int(0)])
         })
     }))
@@ -77,11 +89,11 @@ fn isa_device(name: &str, hid: &str, extra: Vec<Aml>, crs: Vec<Aml>) -> Aml {
     aml::device(name, body)
 }
 
-fn isa_bridge() -> Aml {
+fn isa_bridge(piix: u8) -> Aml {
     aml::device(
         "ISA",
         [
-            aml::name("_ADR", aml::int(0x0001_0000)),
+            aml::name("_ADR", aml::int((piix as u64) << 16)),
             aml::op_region("P40C", RegionSpace::PciConfig, pci::PIRQRC as u64, 4),
             isa_device("KBD", "PNP0303", vec![], vec![res::io(0x60, 1), res::io(0x64, 1), res::irq_no_flags(1)]),
             isa_device("MOU", "PNP0F13", vec![], vec![res::irq_no_flags(12)]),

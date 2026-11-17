@@ -233,7 +233,7 @@ impl Board {
         let e820 = fw_cfg::e820(&[(0, ram_bytes as u64, 1)]);
         b.fw_cfg.add_file("etc/e820", e820);
         b.fw_cfg.set(fw_cfg::key::SMBIOS_ENTRIES, fw_cfg::smbios_fields(SMBIOS));
-        let acpi = acpi::build(ram_bytes, cfg.apic);
+        let acpi = acpi::build(ram_bytes, cfg.apic, acpi::Layout { piix, agp: cfg.chipset == Chipset::I440bx });
         b.fw_cfg.add_file(acpi::TABLES_FILE, acpi.tables);
         b.fw_cfg.add_file(acpi::RSDP_FILE, acpi.rsdp);
         b.fw_cfg.add_file(acpi::LOADER_FILE, acpi.loader);
