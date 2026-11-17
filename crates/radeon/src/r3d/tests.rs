@@ -447,3 +447,325 @@ fn lit_takes_its_dot_products_and_exponent_from_each_operands_w() {
     assert!((0x7f..=0x80).contains(&(p >> 8 & 0xff)));
     assert!((0x3f..=0x40).contains(&(p & 0xff)));
 }
+
+#[cfg(target_os = "macos")]
+mod against_metal {
+    use super::*;
+
+    /// Draws `scene` on the CPU and through Metal and expects the same
+    /// pixels: every channel within `tolerance`, apart from at most `edges`
+    /// pixels where the two rasterizers' subpixel precision differs.
+    fn same(scene: impl Fn(&mut Gpu), tolerance: u32, edges: usize) {
+        let mut cpu = Gpu::new();
+        scene(&mut cpu);
+        let mut gpu = Gpu::new();
+        if !gpu.r.use_metal() {
+            eprintln!("no Metal device; skipping");
+            return;
+        }
+        scene(&mut gpu);
+        gpu.r.gpu_sync();
+        let (draws, fallbacks, _) = gpu.r.metal_stats().unwrap();
+        assert!(draws > 0 && fallbacks == 0, "Metal drew {draws}, left {fallbacks} to the CPU");
+        let mut differ = 0;
+        for y in 0..64 {
+            for x in 0..64 {
+                let (a, b) = (cpu.px(x, y), gpu.px(x, y));
+                let far = [0, 8, 16, 24].iter().any(|s| ((a >> s) & 0xff).abs_diff((b >> s) & 0xff) > tolerance);
+                if far {
+                    differ += 1;
+                    if differ <= 8 {
+                        eprintln!("({x}, {y}): cpu {a:08x} metal {b:08x}");
+                    }
+                }
+            }
+        }
+        assert!(differ <= edges, "{differ} pixels differ");
+        assert!(cpu.count(0) < 64 * 64, "the scene drew nothing");
+    }
+
+    #[test]
+    fn quads_and_shared_edges_match() {
+        same(|g| g.draw(13, &quad(2.0, 3.0, 10.0, 7.0, RED)), 0, 0);
+        same(
+            |g| {
+                g.w(RB3D_BLENDCNTL, 1 | 33 << 16 | 33 << 24);
+                let c = [0.25, 0.0, 0.0, 0.0];
+                let (a, b, d, e) = (v(0.0, 0.0, c), v(37.3, 5.1, c), v(11.7, 40.9, c), v(50.2, 44.4, c));
+                g.draw(4, &[a, b, d, b, e, d]);
+            },
+            1,
+            40,
+        );
+    }
+
+    #[test]
+    fn interpolated_colours_match() {
+        same(|g| g.draw(4, &[v(0.0, 0.0, RED), v(64.0, 0.0, BLUE), v(0.0, 64.0, RED)]), 2, 64);
+    }
+
+    #[test]
+    fn vertex_programs_culling_and_viewports_match() {
+        same(
+            |g| {
+                g.constant(0, [2.0, 2.0, 1.0, 1.0]);
+                g.constant(1, [16.0, 8.0, 0.0, 0.0]);
+                g.vertex_program(&[pvs(4, 2, 0, [src(1, 0), src(2, 0), src(2, 1)]), pvs(3, 2, 1, [src(1, 1), ZERO, ZERO])]);
+                g.draw(13, &quad(0.0, 0.0, 4.0, 4.0, RED));
+            },
+            0,
+            0,
+        );
+        same(
+            |g| {
+                let tri = [v(0.0, 0.0, RED), v(0.0, 20.0, RED), v(20.0, 0.0, RED)];
+                g.w(SU_CULL_MODE, 1);
+                g.draw(4, &tri);
+                g.w(SU_CULL_MODE, 2);
+                g.draw(4, &tri.map(|mut v| {
+                    v[4] = 0.0;
+                    v[6] = 1.0;
+                    v
+                }));
+            },
+            0,
+            40,
+        );
+        same(
+            |g| {
+                g.w(VAP_VTE_CNTL, 0xf | 1 << 10);
+                for (reg, val) in [(VAP_VPORT_XSCALE, 32.0), (VAP_VPORT_XOFFSET, 32.0), (VAP_VPORT_YSCALE, 32.0), (VAP_VPORT_YOFFSET, 32.0)] {
+                    g.w(reg, f(val));
+                }
+                let at = |x: f32, y: f32, w: f32| [x, y, 0.0, w, 1.0, 0.0, 0.0, 1.0];
+                g.draw(4, &[at(-0.5, -0.5, 1.0), at(0.5, -0.5, 1.0), at(0.0, 1.5, -1.0)]);
+            },
+            0,
+            40,
+        );
+    }
+
+    fn depth(g: &mut Gpu, z16: bool) {
+        g.w(ZB_CNTL, 6);
+        g.w(ZB_ZSTENCILCNTL, 1);
+        g.w(ZB_FORMAT, if z16 { 0 } else { 2 });
+        g.w(ZB_DEPTHOFFSET, VRAM + DEPTH);
+        g.w(ZB_DEPTHPITCH, PITCH as u32);
+        g.w(SU_DEPTH_SCALE, f(16_777_215.0));
+        for i in 0..PITCH * 64 {
+            g.put(DEPTH as usize + 4 * i, 0xffff_ffff);
+        }
+    }
+
+    #[test]
+    fn depth_tests_match_in_both_depth_formats() {
+        for z16 in [false, true] {
+            same(
+                |g| {
+                    depth(g, z16);
+                    let at = |z0: f32, z1: f32, c: [f32; 4]| {
+                        let mut q = quad(0.0, 0.0, 40.0, 40.0, c);
+                        for (i, v) in q.iter_mut().enumerate() {
+                            v[2] = if i % 2 == 0 { z0 } else { z1 };
+                        }
+                        q
+                    };
+                    g.draw(13, &at(0.2, 0.8, RED));
+                    g.draw(13, &at(0.8, 0.2, BLUE));
+                },
+                0,
+                64,
+            );
+        }
+    }
+
+    #[test]
+    fn stencil_and_alpha_tests_match() {
+        same(
+            |g| {
+                depth(g, false);
+                g.w(ZB_CNTL, 1);
+                g.w(ZB_ZSTENCILCNTL, 7 << 3 | 2 << 9);
+                g.w(ZB_STENCILREFMASK, 5 | 0xff << 8 | 0xff << 16);
+                g.draw(13, &quad(0.0, 0.0, 20.0, 20.0, RED));
+                g.w(ZB_ZSTENCILCNTL, 3 << 3);
+                g.draw(13, &quad(10.0, 10.0, 40.0, 40.0, BLUE));
+                g.w(ZB_CNTL, 0);
+                g.w(FG_ALPHA_FUNC, 1 << 11 | 4 << 8 | 0x80);
+                g.draw(13, &quad(30.0, 0.0, 60.0, 20.0, [0.0, 1.0, 0.0, 0.25]));
+                g.draw(13, &quad(30.0, 30.0, 60.0, 60.0, [0.0, 1.0, 0.0, 0.75]));
+            },
+            0,
+            0,
+        );
+    }
+
+    #[test]
+    fn blending_rops_masks_and_clip_rules_match() {
+        same(
+            |g| {
+                g.draw(13, &quad(0.0, 0.0, 64.0, 64.0, [0.2, 0.4, 0.6, 0.5]));
+                g.w(RB3D_BLENDCNTL, 1 | 5 << 16 | 6 << 24);
+                g.draw(13, &quad(8.0, 8.0, 40.0, 40.0, [0.9, 0.1, 0.3, 0.7]));
+                g.w(RB3D_BLENDCNTL, 1 | 2 << 12 | 2 << 16 | 2 << 24);
+                g.draw(13, &quad(20.0, 20.0, 60.0, 30.0, [0.1, 0.1, 0.1, 0.1]));
+                g.w(RB3D_BLENDCNTL, 0);
+                g.w(RB3D_ROPCNTL, 4 | 6 << 8);
+                g.draw(13, &quad(0.0, 44.0, 64.0, 52.0, [1.0, 1.0, 0.0, 1.0]));
+                g.w(RB3D_ROPCNTL, 0);
+                g.w(RB3D_COLOR_CHANNEL_MASK, 0b0101);
+                g.draw(13, &quad(0.0, 56.0, 64.0, 64.0, [1.0, 1.0, 1.0, 1.0]));
+                g.w(RB3D_COLOR_CHANNEL_MASK, 0xf);
+                g.w(SC_CLIP_0_A, (SC + 4) | (SC + 4) << 13);
+                g.w(SC_CLIP_0_A + 4, (SC + 12) | (SC + 9) << 13);
+                g.w(SC_CLIP_RULE, 0xaaaa);
+                g.draw(13, &quad(0.0, 0.0, 64.0, 64.0, BLUE));
+            },
+            1,
+            0,
+        );
+    }
+
+    #[test]
+    fn colour_buffer_formats_match() {
+        for (format, pitch) in [(4, PITCH as u32 * 2), (3, PITCH as u32 * 2), (15, PITCH as u32 * 2), (13, PITCH as u32 * 2), (9, PITCH as u32 * 4)] {
+            same(
+                |g| {
+                    g.w(RB3D_COLORPITCH0, pitch | format << 21);
+                    g.draw(4, &[v(0.0, 0.0, RED), v(64.0, 0.0, [0.0, 1.0, 0.5, 0.25]), v(0.0, 64.0, BLUE)]);
+                },
+                0,
+                64,
+            );
+        }
+    }
+
+    fn texture(g: &mut Gpu, format: u32, size: u32, levels: u32, filter: u32, texels: &[u8]) {
+        for (i, b) in texels.iter().enumerate() {
+            g.r.vram_mut()[TEXTURE as usize + i] = *b;
+        }
+        g.w(VAP_PROG_STREAM_CNTL_0, 3 | 3 << 16 | 1 << 24);
+        g.w(VAP_PROG_STREAM_CNTL_0 + 4, 1 | 2 << 8 | 1 << 13);
+        g.w(VAP_PROG_STREAM_CNTL_EXT_0 + 4, 0xfb08);
+        g.w(VAP_VTX_SIZE, 10);
+        g.w(VAP_OUT_VTX_FMT_0, 3);
+        g.w(VAP_OUT_VTX_FMT_1, 2);
+        g.vertex_program(&[pvs(3, 2, 0, [src(1, 0), ZERO, ZERO]), pvs(3, 2, 1, [src(1, 1), ZERO, ZERO]), pvs(3, 2, 2, [src(1, 2), ZERO, ZERO])]);
+        g.w(RS_IP_0, 1 << 16 | 2 << 19 | 4 << 22);
+        g.w(RS_INST_COUNT, 0);
+        g.w(RS_INST_0, 1 << 3 | 1 << 14 | 1 << 17);
+        g.w(TX_FILTER0_0, filter);
+        g.w(TX_FORMAT0_0, (size - 1) | (size - 1) << 11 | levels << 26);
+        g.w(TX_FORMAT1_0, format | 0xa60 << 4);
+        g.w(TX_OFFSET_0, VRAM + TEXTURE);
+        g.w(TX_ENABLE, 1);
+        g.w(US_TEX_INST_0, 1 << 15);
+        let modulate = [1 << 6 | 7 << 26, 4 << 7 | 20 << 14, 1 << 6 | 1 << 24, 9 | 10 << 7 | 16 << 14];
+        g.fragment(&[modulate], 1);
+    }
+
+    fn draw_uv(g: &mut Gpu, pts: [(f32, f32, f32, f32); 4]) {
+        let verts: Vec<f32> = pts.iter().flat_map(|&(x, y, s, t)| [x, y, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0, s, t]).collect();
+        let mut p = vec![pkt3(0x35, 1 + verts.len()), 13 | 3 << 4 | 4 << 16];
+        p.extend(verts.iter().map(|&v| f(v)));
+        g.r.execute(&mut g.ram, &p);
+    }
+
+    fn checker(size: u32, bpp: usize, a: &[u8], b: &[u8], levels: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        for l in 0..=levels {
+            let s = (size >> l).max(1) as usize;
+            let pitch = (s * bpp).next_multiple_of(32);
+            let rows = s;
+            let mut level = vec![0u8; pitch * rows];
+            for y in 0..s {
+                for x in 0..s {
+                    let c = if ((x >> 1) ^ (y >> 1)) & 1 == 0 { a } else { b };
+                    level[y * pitch + x * bpp..][..bpp].copy_from_slice(c);
+                }
+            }
+            out.extend(level);
+            out.resize(out.len().next_multiple_of(32), 0);
+        }
+        out
+    }
+
+    #[test]
+    fn nearest_bilinear_and_mipmapped_textures_match() {
+        let tex = checker(16, 4, &[0x10, 0x80, 0xf0, 0xff], &[0xf0, 0x20, 0x40, 0x80], 4);
+        for filter in [0, 2 << 9 | 2 << 11, 2 << 9 | 2 << 11 | 1 << 13] {
+            same(
+                |g| {
+                    texture(g, 12, 16, 4, filter, &tex);
+                    draw_uv(g, [(0.0, 0.0, 0.0, 0.0), (64.0, 0.0, 1.0, 0.0), (64.0, 64.0, 1.0, 1.0), (0.0, 64.0, 0.0, 1.0)]);
+                    draw_uv(g, [(4.0, 4.0, 0.0, 0.0), (12.0, 4.0, 3.0, 0.0), (12.0, 12.0, 3.0, 3.0), (4.0, 12.0, 0.0, 3.0)]);
+                },
+                2,
+                0,
+            );
+        }
+    }
+
+    #[test]
+    fn texture_formats_match() {
+        let dxt1 = [0x00, 0xf8, 0x1f, 0x00, 0b11100100, 0b00011011, 0b10101010, 0b01010101];
+        let tex16 = checker(8, 2, &[0x1f, 0xf8], &[0xe0, 0x07], 0);
+        for (format, data) in [(0xf, dxt1.repeat(4)), (6, tex16.clone()), (11, tex16.clone()), (10, tex16)] {
+            same(
+                |g| {
+                    texture(g, format, 8, 0, 0, &data);
+                    draw_uv(g, [(0.0, 0.0, 0.0, 0.0), (64.0, 0.0, 1.0, 0.0), (64.0, 64.0, 1.0, 1.0), (0.0, 64.0, 0.0, 1.0)]);
+                },
+                1,
+                0,
+            );
+        }
+    }
+
+    #[test]
+    fn the_fragment_alu_matches() {
+        same(
+            |g| {
+                let rgb_inst = 21 | 20 << 7 | 1 << 14 | 8 << 23;
+                g.fragment(&[[32 | 7 << 26, rgb_inst, 1 << 24, 17 | 17 << 7 | 16 << 14]], 0);
+                g.w(US_ALU_CONST_R_0, 0xbf_0000);
+                g.draw(13, &quad(0.0, 0.0, 30.0, 30.0, RED));
+                g.w(US_ALU_CONST_R_0, 0x3f_0000);
+                g.draw(13, &quad(30.0, 30.0, 60.0, 60.0, RED));
+            },
+            0,
+            0,
+        );
+    }
+
+    #[test]
+    fn point_sprites_and_lines_match() {
+        same(|g| textured_sprite(g, 3, 0), 0, 0);
+        same(
+            |g| {
+                g.w(GA_LINE_CNTL, 32);
+                g.draw(3, &[v(2.0, 2.0, RED), v(60.0, 20.0, BLUE), v(10.0, 60.0, RED)]);
+            },
+            2,
+            40,
+        );
+    }
+
+    #[test]
+    fn occlusion_counts_match() {
+        let mut counts = Vec::new();
+        for metal in [false, true] {
+            let mut g = Gpu::new();
+            if metal && !g.r.use_metal() {
+                return;
+            }
+            depth(&mut g, false);
+            g.w(ZB_ZPASS_DATA, 0);
+            g.draw(13, &quad(0.0, 0.0, 10.0, 10.0, RED));
+            g.draw(13, &quad(5.0, 5.0, 20.0, 20.0, RED));
+            g.w(ZB_ZPASS_ADDR, 0x9000);
+            counts.push(u32::from_le_bytes(g.ram.0[0x9000..0x9004].try_into().unwrap()));
+        }
+        assert_eq!(counts[0], counts[1]);
+    }
+}

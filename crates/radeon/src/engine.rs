@@ -385,6 +385,7 @@ impl Radeon {
     }
 
     fn copy_from_vram(&mut self, rect: Rect, (sx, sy): (i32, i32), mem: &mut dyn BusMemory) {
+        self.gpu_sync();
         let Some(bpp) = bytes_per_pixel(self.datatype()) else {
             return;
         };
@@ -549,6 +550,7 @@ impl Radeon {
     /// Writes `rect` through the scissor with the current ROP, brush and
     /// write mask, taking source pixels from `src`.
     fn draw(&mut self, rect: Rect, src: Src, mem: &mut dyn BusMemory) {
+        self.gpu_sync();
         let Some(bpp) = bytes_per_pixel(self.datatype()) else {
             return;
         };

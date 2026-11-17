@@ -11,6 +11,12 @@
 //! Packet layouts follow AMD's R5xx Acceleration guide (v1.5, section 6.2.3)
 //! and registers its R3xx 3D register reference.
 
+#[cfg(target_os = "macos")]
+pub(crate) mod metal;
+#[cfg(not(target_os = "macos"))]
+#[path = "metal_none.rs"]
+pub(crate) mod metal;
+mod msl;
 mod pvs;
 mod raster;
 pub(crate) mod regs;
@@ -22,7 +28,7 @@ mod tests;
 
 use crate::Radeon;
 use crate::mem::BusMemory;
-use raster::{ColourBuffer, DepthBuffer, Raster, Vertex};
+use raster::{Captured, ColourBuffer, DepthBuffer, Raster, Vertex};
 use regs::*;
 use tex::{TexMem, Texture};
 
@@ -125,11 +131,14 @@ pub(crate) struct ThreeD {
     /// VAP_VF_CNTL of a 3D_DRAW_INDX that waits for INDX_BUFFER's indices.
     pending_indx: Option<u32>,
     pub draws: u64,
+    /// CRTC_OFFSET writes, which is how drivers flip buffers.
+    #[snap(skip)]
+    pub flips: u64,
 }
 
 impl Default for ThreeD {
     fn default() -> Self {
-        ThreeD { vecmem: vec![0; VECMEM_DWORDS], vec_ptr: 0, pending_indx: None, draws: 0 }
+        ThreeD { vecmem: vec![0; VECMEM_DWORDS], vec_ptr: 0, pending_indx: None, draws: 0, flips: 0 }
     }
 }
 
@@ -157,6 +166,46 @@ fn fixed(raw: u32, n: u32, signed: bool, normalize: bool) -> f32 {
 }
 
 impl Radeon {
+    /// Draws the 3D engine's pixels with Metal from now on, if this Mac can.
+    pub fn use_metal(&mut self) -> bool {
+        self.metal = metal::MetalR3d::new(self.vga.vram_mut()).map(Box::new);
+        self.metal.is_some()
+    }
+
+    /// Waits until every queued Metal draw has reached VRAM. Everything that
+    /// reads or writes VRAM outside the Metal pipeline, or lets the guest
+    /// see that drawing finished, calls this first.
+    pub fn gpu_sync(&mut self) {
+        if let Some(m) = self.metal.as_mut() {
+            let passed = m.sync();
+            let r = &mut self.regs[ZB_ZPASS_DATA as usize / 4];
+            *r = r.wrapping_add(passed);
+        }
+    }
+
+    /// The 3D engine's counters for the status report.
+    pub fn describe(&self) -> String {
+        let mut s = format!("radeon: 3d draws {} flips {}", self.r3d.draws, self.r3d.flips);
+        match self.metal_stats() {
+            Some((d, f, w)) => s += &format!(" | metal draws {d} cpu fallbacks {f} waits {w}"),
+            None => s += " | cpu",
+        }
+        s
+    }
+
+    /// Draws Metal took, draws it left to the CPU, and how often the CPU
+    /// waited for it.
+    pub fn metal_stats(&self) -> Option<(u64, u64, u64)> {
+        self.metal.as_ref().map(|m| m.stats())
+    }
+
+    /// Starts the queued Metal draws without waiting for them.
+    pub(crate) fn gpu_kick(&mut self) {
+        if let Some(m) = self.metal.as_mut() {
+            m.kick();
+        }
+    }
+
     pub(crate) fn r3d_register_written(&mut self, reg: u32, v: u32) -> bool {
         match reg {
             VAP_VPORT_ALIAS..=VAP_VPORT_ALIAS_END => {
@@ -166,6 +215,10 @@ impl Radeon {
                 self.regs[(reg - VAP_VPORT_XSCALE + VAP_VPORT_ALIAS) as usize / 4] = v;
             }
             VAP_PVS_VECTOR_INDX_REG => self.r3d.vec_ptr = (v & 0x7ff) * 4,
+            crate::regs::CRTC_OFFSET => {
+                self.r3d.flips += 1;
+                return false;
+            }
             VAP_PVS_VECTOR_DATA_REG | VAP_PVS_VECTOR_DATA_REG_128 => {
                 let p = self.r3d.vec_ptr as usize % VECMEM_DWORDS;
                 self.r3d.vecmem[p] = v;
@@ -565,6 +618,7 @@ impl Radeon {
             textures,
             zpass: self.reg(ZB_ZPASS_DATA),
             pixels: 0,
+            capture: None,
         }
     }
 
@@ -597,6 +651,15 @@ impl Radeon {
             })
             .collect();
         let mut r = self.raster_state(mem);
+        let pipeline = self.metal.as_mut().and_then(|m| {
+            let cap = Captured::new(&r.rs_inst);
+            let p = m.prepare(&r, &cap)?;
+            r.capture = Some(cap);
+            Some(p)
+        });
+        if pipeline.is_none() {
+            self.gpu_sync();
+        }
         let counts = r.tex_counts;
         let gb = self.reg(GB_ENABLE);
         let vp = self.viewport();
@@ -673,6 +736,13 @@ impl Radeon {
                 tri(&mut r, vram, a, c, d);
             }),
             _ => {}
+        }
+        if let (Some(cap), Some(p), Some(m)) = (r.capture.take(), pipeline, self.metal.as_mut()) {
+            m.draw(&r, &cap, &p);
+            if cap.vertices > 0 {
+                self.vga.touch();
+            }
+            return;
         }
         self.regs[ZB_ZPASS_DATA as usize / 4] = r.zpass;
         if self.trace.is_some() {

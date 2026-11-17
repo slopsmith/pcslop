@@ -25,6 +25,7 @@ struct Args {
     radeon: bool,
     vga_rom: Option<String>,
     gpu_trace: Option<String>,
+    gpu_3d_metal: bool,
     cdrom: Option<String>,
     hda: Option<String>,
     serial: Option<String>,
@@ -114,6 +115,10 @@ struct Cli {
     /// Log the Radeon's register accesses to FILE.
     #[arg(long, value_name = "FILE")]
     gpu_trace: Option<String>,
+    /// Where the Radeon's 3D engine draws: metal (the default) or cpu, the
+    /// reference. SLOPPER_R3D sets the default.
+    #[arg(long = "gpu-3d", value_name = "metal|cpu", value_parser = ["metal", "cpu"])]
+    gpu_3d: Option<String>,
     /// CD-ROM image on the secondary master.
     #[arg(long, value_name = "ISO")]
     cdrom: Option<String>,
@@ -216,6 +221,7 @@ fn parse_args() -> Result<Args, String> {
         radeon,
         vga_rom: cli.vga_rom,
         gpu_trace: cli.gpu_trace,
+        gpu_3d_metal: cli.gpu_3d.or_else(|| std::env::var("SLOPPER_R3D").ok()).as_deref() != Some("cpu"),
         cdrom: cli.cdrom,
         hda: cli.hda,
         serial: cli.serial,
@@ -713,6 +719,9 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                             if let Some(a) = board.describe_audio() {
                                 out += &format!("\n{a}");
                             }
+                            if let Some(g) = board.describe_gpu() {
+                                out += &format!("\n{g}");
+                            }
                             if let Some(l) = &board.lapic {
                                 let (a, b) = (l.stats, last_apic);
                                 let r = |x: u64, y: u64| (x - y) as f64 / span;
@@ -1209,7 +1218,7 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            pc::Gpu::Radeon { rom, trace }
+            pc::Gpu::Radeon { rom, trace, metal: args.gpu_3d_metal }
         }
         _ => pc::Gpu::StdVga,
     };

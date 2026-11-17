@@ -91,6 +91,8 @@ pub struct Radeon {
     monitor: ddc::Ddc,
     #[snap(skip)]
     trace: Option<Trace>,
+    #[snap(skip)]
+    metal: Option<Box<r3d::metal::MetalR3d>>,
 }
 
 impl Radeon {
@@ -111,6 +113,7 @@ impl Radeon {
             r3d: r3d::ThreeD::default(),
             monitor: ddc::Ddc::default(),
             trace: None,
+            metal: None,
         };
         r.reset();
         r
@@ -359,6 +362,9 @@ impl Radeon {
     }
 
     fn read_reg(&mut self, reg: u32) -> u32 {
+        if idle_polled(reg) {
+            self.gpu_sync();
+        }
         match reg {
             CRTC_STATUS => {
                 let saved = if self.frame() > self.vblank_acked[0] {
@@ -424,6 +430,9 @@ impl Radeon {
     }
 
     fn write_reg(&mut self, reg: u32, v: u32, mask: u32, mem: &mut dyn BusMemory) {
+        if fence_written(reg, v & mask) {
+            self.gpu_sync();
+        }
         let old = self.reg(reg);
         let new = (old & !mask) | (v & mask);
         match reg {
@@ -570,4 +579,31 @@ impl Radeon {
 fn gpio_lines(v: u32) -> (bool, bool) {
     let low = |a: u32, en: u32| v & en != 0 && v & a == 0;
     (!low(GPIO_A_1, GPIO_EN_1), !low(GPIO_A_0, GPIO_EN_0))
+}
+
+/// Writes that tell the guest its earlier drawing finished: scratch
+/// registers and fences, software interrupts, WAIT_UNTIL and the occlusion
+/// counter.
+fn fence_written(reg: u32, v: u32) -> bool {
+    matches!(reg, SCRATCH_REG0..=SCRATCH_REG7 | CP_RESYNC_DATA | WAIT_UNTIL | r3d::regs::ZB_ZPASS_DATA | r3d::regs::ZB_ZPASS_ADDR)
+        || (reg == GEN_INT_STATUS && v & SW_INT_FIRE != 0)
+}
+
+/// Status registers drivers poll until the engines go idle.
+fn idle_polled(reg: u32) -> bool {
+    matches!(
+        reg,
+        RBBM_STATUS
+            | CP_STAT
+            | CP_CSQ_STAT
+            | RB2D_DSTCACHE_CTLSTAT
+            | DSTCACHE_CTLSTAT
+            | RB3D_DSTCACHE_CTLSTAT
+            | R300_RB3D_DSTCACHE_CTLSTAT
+            | R300_RB3D_ZCACHE_CTLSTAT
+            | IDCT_STATUS
+            | 0x0790
+            | 0x07b0
+            | 0x0a10
+    )
 }

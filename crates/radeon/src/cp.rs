@@ -86,6 +86,7 @@ impl Radeon {
         dwords.extend(self.mc_read_dwords(mem, base.wrapping_add(rptr * 4), first as usize));
         dwords.extend(self.mc_read_dwords(mem, base, (count - first) as usize));
         let done = self.execute(mem, &dwords);
+        self.gpu_kick();
         self.cp.rptr = (rptr + done as u32) % size;
         if self.reg(CP_RB_CNTL) & RB_NO_UPDATE == 0 {
             let addr = self.reg(CP_RB_RPTR_ADDR) & !3;

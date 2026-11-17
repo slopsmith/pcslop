@@ -49,8 +49,10 @@ pub enum Gpu {
     /// QEMU's stdvga at 00:02, running `vgabios`.
     #[default]
     StdVga,
-    /// An ATI Radeon 9700 on the AGP bus, running the card's own ROM.
-    Radeon { rom: Vec<u8>, trace: Option<Box<dyn Write + Send>> },
+    /// An ATI Radeon 9700 on the AGP bus, running the card's own ROM, with
+    /// its 3D engine drawing through Metal when `metal` is set and the Mac
+    /// supports it, and on the CPU otherwise.
+    Radeon { rom: Vec<u8>, trace: Option<Box<dyn Write + Send>>, metal: bool },
 }
 
 pub enum Display {
@@ -227,12 +229,15 @@ impl Board {
                 }
                 b.pci.push((Bdf::new(0, 2, 0), display));
             }
-            Gpu::Radeon { rom, trace } => {
+            Gpu::Radeon { rom, trace, metal } => {
                 assert_eq!(cfg.chipset, Chipset::I440bx, "the Radeon sits on the 440BX's AGP bus");
                 let display = pci::radeon(rom.len());
                 let mut card = radeon::Radeon::new(rom);
                 if let Some(t) = trace {
                     card.set_trace(t);
+                }
+                if metal && !card.use_metal() {
+                    eprintln!("radeon: Metal is not available; the 3D engine draws on the CPU");
                 }
                 b.display = Display::Radeon(Box::new(card));
                 b.pci.push((Bdf::new(1, 0, 0), display));
@@ -277,6 +282,13 @@ impl Board {
     /// The sound card's state, for debugging.
     pub fn describe_audio(&self) -> Option<String> {
         self.ac97.as_ref().map(|(_, a)| a.describe())
+    }
+
+    pub fn describe_gpu(&self) -> Option<String> {
+        match &self.display {
+            Display::Radeon(card) => Some(card.describe()),
+            Display::Std(_) => None,
+        }
     }
 
     /// I/O BAR `bar` of the AC'97 controller, if the guest has it decoded.
@@ -1726,7 +1738,7 @@ mod tests {
             apic: true,
             power: battery::Power::default(),
             chipset: Chipset::I440bx,
-            gpu: Gpu::Radeon { rom: vec![0x55, 0xaa], trace: None },
+            gpu: Gpu::Radeon { rom: vec![0x55, 0xaa], trace: None, metal: false },
         })
     }
 

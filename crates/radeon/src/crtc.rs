@@ -91,6 +91,7 @@ impl Radeon {
     }
 
     pub(crate) fn render_extended(&mut self, out: &mut Vec<u32>) -> Option<(u32, u32)> {
+        self.gpu_sync();
         let ctl = self.reg(CRTC_GEN_CNTL);
         if ctl & CRTC_EN == 0 || self.reg(CRTC_EXT_CNTL) & CRTC_DISPLAY_DIS != 0 {
             return None;

@@ -65,6 +65,40 @@ pub(crate) struct Raster {
     pub textures: [Option<Texture>; 16],
     pub zpass: u32,
     pub pixels: u64,
+    /// When set, triangles are set up and appended here instead of drawn.
+    pub capture: Option<Captured>,
+}
+
+/// Triangles set up for another rasterizer: per vertex, window x, y, z
+/// (after polygon offset) and the 1/w the CPU path interpolates with, the
+/// face, and the pixel stack registers in `slots` as the RS fills them.
+#[derive(Default)]
+pub(crate) struct Captured {
+    pub slots: Vec<usize>,
+    pub floats: Vec<f32>,
+    pub vertices: usize,
+}
+
+impl Captured {
+    pub fn new(rs_inst: &[u32]) -> Self {
+        let mut slots = Vec::new();
+        for &inst in rs_inst {
+            if (inst >> 3) & 7 != 0 {
+                slots.push(((inst >> 6) & 31) as usize);
+            }
+            if (inst >> 14) & 7 != 0 {
+                slots.push(((inst >> 17) & 31) as usize);
+            }
+        }
+        slots.sort_unstable();
+        slots.dedup();
+        Captured { slots, floats: Vec::new(), vertices: 0 }
+    }
+
+    /// Floats per vertex.
+    pub fn stride(&self) -> usize {
+        8 + 4 * self.slots.len()
+    }
 }
 
 fn factor(f: u32, k: usize, s: V4, d: V4, cc: V4, alpha: bool) -> f32 {
@@ -199,7 +233,7 @@ impl Raster {
         self.clip_rule >> n & 1 != 0
     }
 
-    fn bounds(&self) -> [i32; 4] {
+    pub fn bounds(&self) -> [i32; 4] {
         let [x0, y0, x1, y1] = self.scissor;
         [x0.max(0), y0.max(0), x1.min(4095), y1.min(4095)]
     }
@@ -291,6 +325,19 @@ impl Raster {
         let q = v.map(|v| if self.perspective { v.pos[3] } else { 1.0 });
         let z = v.map(|v| v.pos[2]);
         let z = self.offset_depth(z, &p, area, front);
+        if self.capture.is_some() {
+            let temps = attrs.map(|a| self.rs(&a));
+            let cap = self.capture.as_mut().unwrap();
+            for k in 0..3 {
+                cap.floats.extend_from_slice(&[p[k].0 as f32 / 16.0, p[k].1 as f32 / 16.0, z[k], q[k]]);
+                cap.floats.extend_from_slice(&[front as u32 as f32, 0.0, 0.0, 0.0]);
+                for &s in &cap.slots {
+                    cap.floats.extend_from_slice(&temps[k][s]);
+                }
+            }
+            cap.vertices += 3;
+            return;
+        }
 
         let [bx0, by0, bx1, by1] = self.bounds();
         let minx = (p.iter().map(|p| p.0).min().unwrap() >> 4).max(bx0 as i64) as i32 & !1;
