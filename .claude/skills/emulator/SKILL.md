@@ -39,7 +39,7 @@ scripts/vm stop xp
 - `shot PATH`, `type TEXT`, `serial LINE`, `key NAME[+NAME]`
 - `mouse DX DY [BUTTONS]`, `tablet X Y [BUTTONS [WHEEL]]`
 - `power`, `battery [host|off|PERCENT[:ac]]`
-- `cdrom [ISO]`, `eject`, `quit`
+- `cdrom [ISO]`, `eject`, `save DIR`, `load DIR`, `quit`
 
 **Rules that bit agents before:**
 - **Always use your own socket.** `scripts/ctl` without a socket argument talks to the newest emulator on the machine, which may be another agent's or the user's. Keys, `shot`, and once a `quit`, landed in other sessions that way. `scripts/vm` always passes the socket.
@@ -47,6 +47,17 @@ scripts/vm stop xp
 - **`shot` with a relative path** writes into the emulator's working directory, which may be the repo root. Use absolute paths; `scripts/vm shot` does.
 - **Kill only your own runs.** `scripts/vm stop` kills by socket path. Never `pkill -f slopper` or anything broad.
 - **Defaults.** The JIT, AC'97 sound, the RTL8139 network card and the battery mirror are on by default. `scripts/vm start` adds `--no-audio`, so tests don't play sound on the user's Mac; set `VM_AUDIO=1` to keep sound. Opt-outs: `--no-jit`, `--no-net`, `--no-battery`. `slopper --help` lists everything.
+
+## Save states: skip repeated boots
+
+- **Save:** `scripts/vm ctl NAME "save $SCRATCH/snap"` takes about 0.2 s. It writes `state.bin` plus an APFS clone of the disk (`hda.img`).
+- **Start from it:** `scripts/vm start NAME2 --load $SCRATCH/snap`. Each load runs on a fresh copy of `hda.img`, so one snapshot can be restored any number of times. `load DIR` on the control socket restores into a running emulator.
+- **When to use it:** before a long reproduction, save just before the interesting moment (a driver loading, an install step), then re-run from there instead of booting each time.
+- **Limits:**
+  - The guest clock resumes as if no time passed.
+  - Open network connections reset.
+  - The Radeon can't be saved yet.
+  - A snapshot only loads into a build whose devices have the same layout; rebuilding after device changes makes old snapshots refuse to load.
 
 ## Guest images
 
