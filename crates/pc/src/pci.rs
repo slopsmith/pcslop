@@ -27,7 +27,7 @@ impl ConfigSpace {
         c
     }
 
-    fn set_mask32(&mut self, off: usize, mask: u32) {
+    pub fn set_mask32(&mut self, off: usize, mask: u32) {
         self.writable[off..off + 4].copy_from_slice(&mask.to_le_bytes());
     }
 
@@ -83,6 +83,25 @@ impl ConfigSpace {
         self.data[off..off + 2].copy_from_slice(&v.to_le_bytes());
     }
 
+    pub fn set32(&mut self, off: usize, v: u32) {
+        self.data[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    /// Makes `[off, off + len)` read-only.
+    pub fn lock(&mut self, off: usize, len: usize) {
+        self.writable[off..off + len].fill(0);
+    }
+
+    /// Links a capability with `id` at `off` into the capability list, and
+    /// returns `off` back.
+    pub fn add_capability(&mut self, off: usize, id: u8) -> usize {
+        self.data[off] = id;
+        self.data[off + 1] = self.data[CAP_PTR];
+        self.data[CAP_PTR] = off as u8;
+        self.data[STATUS] |= STATUS_CAP_LIST;
+        off
+    }
+
     pub fn read(&self, off: usize, size: usize) -> u32 {
         let mut v = 0u32;
         for i in 0..size {
@@ -100,6 +119,12 @@ impl ConfigSpace {
     }
 }
 
+const STATUS: usize = 0x06;
+const STATUS_CAP_LIST: u8 = 0x10;
+const CAP_PTR: usize = 0x34;
+pub const CAP_PM: u8 = 0x01;
+pub const CAP_AGP: u8 = 0x02;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BarKind {
     Io,
@@ -107,11 +132,19 @@ pub enum BarKind {
     MemPrefetch,
 }
 
-/// Identifies a function on bus 0.
+/// Identifies a function. Bus 1 is the AGP bus behind the 440BX's bridge,
+/// whatever number software gives it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Bdf {
+    pub bus: u8,
     pub dev: u8,
     pub func: u8,
+}
+
+impl Bdf {
+    pub const fn new(bus: u8, dev: u8, func: u8) -> Self {
+        Bdf { bus, dev, func }
+    }
 }
 
 pub fn host_bridge() -> ConfigSpace {
@@ -119,6 +152,124 @@ pub fn host_bridge() -> ConfigSpace {
     // SeaBIOS only takes its QEMU paths when it sees QEMU's subsystem IDs.
     c.set16(0x2c, 0x1af4);
     c.set16(0x2e, 0x1100);
+    c
+}
+
+fn qemu_subsystem(c: &mut ConfigSpace) {
+    c.set16(0x2c, 0x1af4);
+    c.set16(0x2e, 0x1100);
+}
+
+/// 82443BX host bridge registers (440BX datasheet, section 3.3).
+pub mod bx {
+    pub const APBASE: usize = 0x10;
+    pub const NBXCFG: usize = 0x50;
+    /// NBXCFG: Aperture Access Global Enable.
+    pub const APERTURE_ENABLE: u32 = 1 << 9;
+    pub const DRB: usize = 0x60;
+    pub const ACAPID: usize = 0xa0;
+    pub const AGPSTAT: usize = 0xa4;
+    pub const AGPCMD: usize = 0xa8;
+    pub const AGPCTRL: usize = 0xb0;
+    pub const APSIZE: usize = 0xb4;
+    pub const ATTBASE: usize = 0xb8;
+    /// APSIZE as a 440BX board's firmware sets it: a 64 MiB aperture.
+    pub const APSIZE_64M: u8 = 0x30;
+}
+
+/// The 440BX host bridge, 8086:7190, with AGP enabled (PMCR.AGP_DIS = 0).
+pub fn i440bx_host(ram_bytes: u32) -> ConfigSpace {
+    let mut c = ConfigSpace::new(0x8086, 0x7190, 0x06_00_00, 0x03, 0x00);
+    // SeaBIOS only takes its QEMU paths when it sees QEMU's subsystem IDs.
+    qemu_subsystem(&mut c);
+    c.set16(0x04, 0x0006);
+    c.data[0x06] = 0x10;
+    c.data[0x07] = 0x02;
+    c.lock(0x2c, 4);
+    c.add_bar(0, BarKind::MemPrefetch, 4 << 20);
+    let cap = c.add_capability(bx::ACAPID, CAP_AGP);
+    c.data[cap + 2] = 0x10;
+    c.set32(bx::AGPSTAT, 0x1f00_0203);
+    c.lock(bx::ACAPID, 8);
+    c.set_mask32(bx::AGPCMD, 0x0000_0303);
+    c.set_mask32(bx::AGPCTRL, 0x0000_a080);
+    c.writable[bx::APSIZE] = 0x3f;
+    c.lock(bx::APSIZE + 1, 3);
+    c.set_mask32(bx::ATTBASE, 0xffff_f000);
+    // Each DRAM row boundary counts 8 MiB units; all RAM sits in row 0.
+    let rows = (ram_bytes >> 23).min(0xff) as u8;
+    c.data[bx::DRB..bx::DRB + 8].fill(rows);
+    c.data[bx::APSIZE] = bx::APSIZE_64M;
+    i440bx_update(&mut c);
+    c
+}
+
+/// Applies APSIZE to the bits of APBASE that software may write.
+pub fn i440bx_update(c: &mut ConfigSpace) {
+    let mask = 0xf000_0000 | ((c.data[bx::APSIZE] as u32 & 0x3f) << 22);
+    c.set_mask32(bx::APBASE, mask);
+    let v = c.read(bx::APBASE, 4);
+    c.set32(bx::APBASE, (v & mask) | 8);
+}
+
+/// Bus address and size of the graphics aperture while it decodes.
+pub fn i440bx_aperture(c: &ConfigSpace) -> Option<(u32, u32)> {
+    let size = 0x1000_0000u32 >> (c.data[bx::APSIZE] & 0x3f).count_ones();
+    let enabled = c.read(bx::NBXCFG, 4) & bx::APERTURE_ENABLE != 0;
+    c.mem_bar(0).filter(|_| enabled).map(|base| (base, size))
+}
+
+/// The 440BX's PCI-to-PCI bridge to AGP, 8086:7191 (datasheet, section 3.4).
+pub fn i440bx_agp_bridge() -> ConfigSpace {
+    let mut c = ConfigSpace::new(0x8086, 0x7191, 0x06_04_00, 0x03, 0x01);
+    c.writable[0x04] = 0x1f;
+    c.data[0x06] = 0x20;
+    c.data[0x07] = 0x02;
+    c.lock(0x3c, 1);
+    c.lock(0x40, 0xc0);
+    c.writable[0x19] = 0xff;
+    c.writable[0x1a] = 0xff;
+    c.writable[0x1b] = 0xff;
+    c.data[0x1c] = 0xf0;
+    c.writable[0x1c] = 0xf0;
+    c.writable[0x1d] = 0xf0;
+    c.set16(0x1e, 0x02a0);
+    for off in [0x20, 0x24] {
+        c.set16(off, 0xfff0);
+        c.set_mask32(off, 0xfff0_fff0);
+    }
+    c.data[BRIDGE_CONTROL] = 0x80;
+    c.writable[BRIDGE_CONTROL] = 0x0f;
+    c
+}
+
+pub const SECONDARY_BUS: usize = 0x19;
+pub const BRIDGE_CONTROL: usize = 0x3e;
+/// Bridge control: forward the legacy VGA ranges to the secondary bus.
+pub const BRIDGE_VGA: u8 = 0x08;
+
+/// The Radeon 9700's function: VRAM, I/O and MMIO BARs, the expansion ROM,
+/// and power management and AGP 3.0 capabilities at 0x50 and 0x58, where
+/// R300 cards have them.
+pub fn radeon(rom_len: usize) -> ConfigSpace {
+    let mut c = ConfigSpace::new(radeon::PCI_VENDOR, radeon::PCI_DEVICE, radeon::PCI_CLASS, 0x00, 0x00);
+    c.set16(0x2c, 0x1002);
+    c.set16(0x2e, 0x0002);
+    c.writable[0x04] |= 0x04;
+    c.data[INTERRUPT_PIN] = 1;
+    c.add_bar(0, BarKind::MemPrefetch, radeon::VRAM_SIZE as u32);
+    c.add_bar(1, BarKind::Io, radeon::IO_SIZE);
+    c.add_bar(2, BarKind::Mem, radeon::MMIO_SIZE);
+    c.add_rom_bar((rom_len as u32).next_power_of_two().max(0x2_0000));
+    c.lock(0x40, 0xc0);
+    let pm = c.add_capability(0x50, CAP_PM);
+    c.set16(pm + 2, 0x0602);
+    c.writable[pm + 4] = 0x03;
+    let agp = c.add_capability(0x58, CAP_AGP);
+    c.data[agp + 2] = 0x30;
+    // AGP 2.0 signalling on a 440BX: 1x, 2x and 4x, fast writes, sideband.
+    c.set32(agp + 4, 0x1f00_0217);
+    c.set_mask32(agp + 8, 0x0000_0317);
     c
 }
 
@@ -229,5 +380,71 @@ mod tests {
         assert_eq!(pirq_route(0x0a), Some(10));
         assert_eq!(pirq_route(0x02), None);
         assert_eq!(pirq_route(0x0d), None);
+    }
+
+    fn capabilities(c: &ConfigSpace) -> Vec<(usize, u8)> {
+        let mut caps = Vec::new();
+        let mut p = c.data[CAP_PTR] as usize;
+        while p != 0 {
+            caps.push((p, c.data[p]));
+            p = c.data[p + 1] as usize;
+        }
+        caps
+    }
+
+    #[test]
+    fn i440bx_aperture_size_follows_apsize() {
+        let mut c = i440bx_host(512 << 20);
+        assert_eq!(c.read(0, 4), 0x7190_8086);
+        assert_eq!(capabilities(&c), vec![(0xa0, CAP_AGP)]);
+        assert_eq!(c.read(bx::ACAPID, 4), 0x0010_0002);
+        c.write(bx::APBASE, 4, 0xffff_ffff);
+        assert_eq!(c.read(bx::APBASE, 4), 0xfc00_0008);
+        c.write(bx::APSIZE, 1, 0x3f);
+        i440bx_update(&mut c);
+        c.write(bx::APBASE, 4, 0xffff_ffff);
+        assert_eq!(c.read(bx::APBASE, 4), 0xffc0_0008);
+        c.write(bx::AGPSTAT, 4, 0);
+        assert_eq!(c.read(bx::AGPSTAT, 4), 0x1f00_0203);
+        assert_eq!(c.data[bx::DRB + 7], 64);
+    }
+
+    #[test]
+    fn i440bx_aperture_decodes_once_enabled() {
+        let mut c = i440bx_host(256 << 20);
+        c.write(bx::APBASE, 4, 0xe000_0000);
+        assert_eq!(i440bx_aperture(&c), None);
+        c.write(bx::NBXCFG, 4, bx::APERTURE_ENABLE);
+        assert_eq!(i440bx_aperture(&c), Some((0xe000_0000, 64 << 20)));
+    }
+
+    #[test]
+    fn agp_bridge_is_a_pci_bridge() {
+        let mut c = i440bx_agp_bridge();
+        assert_eq!(c.read(0, 4), 0x7191_8086);
+        assert_eq!(c.read(0x08, 4) >> 8, 0x06_04_00);
+        assert_eq!(c.data[0x0e], 1);
+        c.write(0x18, 4, 0xffff_ffff);
+        assert_eq!(c.read(0x18, 4), 0xffff_ff00);
+        c.write(0x20, 4, 0xffff_ffff);
+        assert_eq!(c.read(0x20, 4), 0xfff0_fff0);
+        c.write(BRIDGE_CONTROL, 1, 0xff);
+        assert_eq!(c.data[BRIDGE_CONTROL], 0x8f);
+    }
+
+    #[test]
+    fn radeon_bars_rom_and_capabilities() {
+        let mut c = radeon(53 << 10);
+        assert_eq!(c.read(0, 4), 0x4e44_1002);
+        assert_eq!(c.read(0x08, 4) >> 8, 0x03_00_00);
+        for (bar, size) in [(0x10, 0xf800_0008), (0x14, 0xffff_ff01), (0x18, 0xffff_0000), (0x30, 0xfffe_0001)] {
+            c.write(bar, 4, 0xffff_ffff);
+            assert_eq!(c.read(bar, 4), size, "BAR at {bar:#x}");
+        }
+        assert_eq!(capabilities(&c), vec![(0x58, CAP_AGP), (0x50, CAP_PM)]);
+        assert_eq!(c.data[0x5a], 0x30);
+        c.write(0x60, 4, 0xffff_ffff);
+        assert_eq!(c.read(0x60, 4), 0x317);
+        assert_eq!(c.data[INTERRUPT_PIN], 1);
     }
 }

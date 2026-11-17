@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 ac97 = { path = "../ac97" }
 ide = { path = "../ide" }
+radeon = { path = "../radeon" }
 usb = { path = "../usb" }
 vga = { path = "../vga" }
 x86 = { path = "../x86" }

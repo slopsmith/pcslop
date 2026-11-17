@@ -394,6 +394,7 @@ version = "0.1.0"
 dependencies = [
  "ac97",
  "ide",
+ "radeon",
  "usb",
  "vga",
  "x86",

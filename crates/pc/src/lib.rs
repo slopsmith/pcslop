@@ -26,6 +26,40 @@ pub struct Config {
     pub vgabios: Option<Vec<u8>>,
     /// Adds a local APIC and an I/O APIC.
     pub apic: bool,
+    pub chipset: Chipset,
+    pub gpu: Gpu,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Chipset {
+    /// 440FX: the PIIX3 at 00:01, the display at 00:02.
+    #[default]
+    I440fx,
+    /// 440BX: its AGP bridge at 00:01 leads to bus 1, and the PIIX3 moves to 00:07.
+    I440bx,
+}
+
+#[derive(Default)]
+pub enum Gpu {
+    /// QEMU's stdvga at 00:02, running `vgabios`.
+    #[default]
+    StdVga,
+    /// An ATI Radeon 9700 on the AGP bus, running the card's own ROM.
+    Radeon { rom: Vec<u8>, trace: Option<Box<dyn Write + Send>> },
+}
+
+pub enum Display {
+    Std(Box<vga::Vga>),
+    Radeon(Box<radeon::Radeon>),
+}
+
+impl Display {
+    pub fn vga(&mut self) -> &mut vga::Vga {
+        match self {
+            Display::Std(v) => v,
+            Display::Radeon(r) => r.vga(),
+        }
+    }
 }
 
 /// Physical pages holding translated code, and the ones written since the JIT last looked.
@@ -72,7 +106,8 @@ pub struct Board {
     pub com1: uart::Uart,
     pub fw_cfg: fw_cfg::FwCfg,
     pub kbc: i8042::I8042,
-    pub vga: vga::Vga,
+    pub display: Display,
+    chipset: Chipset,
     pub ide: ide::Ide,
     pub uhci: usb::Uhci,
     pub pm: pm::Pm,
@@ -86,11 +121,14 @@ pub struct Board {
 }
 
 const LEGACY_START: u32 = 0xa_0000;
+const HOST: usize = 0;
 const PIIX3_ISA: usize = 1;
 const IDE: usize = 2;
 const DISPLAY: usize = 3;
 const UHCI: usize = 4;
 const PM: usize = 5;
+/// Only on the 440BX.
+const AGP_BRIDGE: usize = 6;
 const UHCI_PORTS: u16 = 32;
 const LEGACY_END: u32 = 0x10_0000;
 /// The I/O APIC input that ISA IRQ 0 drives. QEMU wires it the same way
@@ -115,6 +153,14 @@ impl Board {
     pub fn new(cfg: Config) -> Self {
         assert!(cfg.bios.len().is_power_of_two() && cfg.bios.len() >= 0x2_0000, "BIOS must be a power of two >= 128 KiB");
         let ram_bytes = cfg.ram_bytes;
+        let piix = match cfg.chipset {
+            Chipset::I440fx => 1,
+            Chipset::I440bx => 7,
+        };
+        let host = match cfg.chipset {
+            Chipset::I440fx => pci::host_bridge(),
+            Chipset::I440bx => pci::i440bx_host(ram_bytes),
+        };
         let mut b = Board {
             ram: ram::Ram::new(ram_bytes as usize),
             code_watch: CodeWatch { bits: vec![0; (ram_bytes as usize >> 12).div_ceil(64)], written: Vec::new() },
@@ -124,9 +170,9 @@ impl Board {
             pci_irqs: 0,
             sci: false,
             pci: vec![
-                (Bdf { dev: 0, func: 0 }, pci::host_bridge()),
-                (Bdf { dev: 1, func: 0 }, pci::piix3_isa()),
-                (Bdf { dev: 1, func: 1 }, pci::piix3_ide()),
+                (Bdf::new(0, 0, 0), host),
+                (Bdf::new(0, piix, 0), pci::piix3_isa()),
+                (Bdf::new(0, piix, 1), pci::piix3_ide()),
             ],
             pic: pic::Pic::default(),
             lapic: cfg.apic.then(apic::LocalApic::default),
@@ -138,7 +184,8 @@ impl Board {
             com1: uart::Uart::new(Box::new(std::io::sink())),
             fw_cfg: fw_cfg::FwCfg::new(),
             kbc: i8042::I8042::default(),
-            vga: vga::Vga::new(),
+            display: Display::Std(Box::new(vga::Vga::new())),
+            chipset: cfg.chipset,
             ide: ide::Ide::new(),
             uhci: usb::Uhci::new(),
             pm: pm::Pm::default(),
@@ -149,19 +196,37 @@ impl Board {
             reset_requested: false,
             post_code: 0,
         };
-        let mut display = pci::ConfigSpace::new(vga::PCI_VENDOR, vga::PCI_DEVICE, 0x03_00_00, 0x02, 0x00);
-        display.set16(0x2c, 0x1af4);
-        display.set16(0x2e, 0x1100);
-        display.add_bar(0, pci::BarKind::MemPrefetch, vga::VRAM_SIZE as u32);
-        if let Some(rom) = cfg.vgabios {
-            let size = (rom.len() as u32).next_power_of_two().max(0x800);
-            display.add_rom_bar(size);
-            b.vgabios = rom;
-            b.vgabios.resize(size as usize, 0xff);
+        match cfg.gpu {
+            Gpu::StdVga => {
+                let mut display = pci::ConfigSpace::new(vga::PCI_VENDOR, vga::PCI_DEVICE, 0x03_00_00, 0x02, 0x00);
+                display.set16(0x2c, 0x1af4);
+                display.set16(0x2e, 0x1100);
+                display.add_bar(0, pci::BarKind::MemPrefetch, vga::VRAM_SIZE as u32);
+                if let Some(rom) = cfg.vgabios {
+                    let size = (rom.len() as u32).next_power_of_two().max(0x800);
+                    display.add_rom_bar(size);
+                    b.vgabios = rom;
+                    b.vgabios.resize(size as usize, 0xff);
+                }
+                b.pci.push((Bdf::new(0, 2, 0), display));
+            }
+            Gpu::Radeon { rom, trace } => {
+                assert_eq!(cfg.chipset, Chipset::I440bx, "the Radeon sits on the 440BX's AGP bus");
+                let display = pci::radeon(rom.len());
+                let mut card = radeon::Radeon::new(rom);
+                if let Some(t) = trace {
+                    card.set_trace(t);
+                }
+                b.display = Display::Radeon(Box::new(card));
+                b.pci.push((Bdf::new(1, 0, 0), display));
+            }
         }
-        b.pci.push((Bdf { dev: 2, func: 0 }, display));
-        b.pci.push((Bdf { dev: 1, func: 2 }, pci::piix3_uhci()));
-        b.pci.push((Bdf { dev: 1, func: 3 }, pm::config_space()));
+        b.pci.push((Bdf::new(0, piix, 2), pci::piix3_uhci()));
+        b.pci.push((Bdf::new(0, piix, 3), pm::config_space()));
+        if cfg.chipset == Chipset::I440bx {
+            b.pci.push((Bdf::new(0, 1, 0), pci::i440bx_agp_bridge()));
+        }
+        b.sync_display_bars();
         b.uhci.attach(0, Box::new(usb::Tablet::new()));
         b.setup_cmos(ram_bytes);
         b.fw_cfg.set(fw_cfg::key::RAM_SIZE, (ram_bytes as u64).to_le_bytes().to_vec());
@@ -187,7 +252,7 @@ impl Board {
         c.add_bar(1, pci::BarKind::Io, ac97::NABM_LEN as u32);
         c.writable[0x04] |= 0x04;
         c.data[pci::INTERRUPT_PIN] = 1;
-        self.pci.push((Bdf { dev: 4, func: 0 }, c));
+        self.pci.push((Bdf::new(0, 4, 0), c));
         self.ac97 = Some((self.pci.len() - 1, ac97::Ac97::new(out)));
     }
 
@@ -423,7 +488,7 @@ impl Board {
         let addr = self.mask_a20(addr);
         if (LEGACY_START..LEGACY_END).contains(&addr) {
             if addr < 0xc_0000 {
-                return self.vga.mem_read8(addr);
+                return self.display.vga().mem_read8(addr);
             }
             return if self.pam(addr) & 1 != 0 { self.ram[addr as usize] } else { self.rom_byte(addr) };
         }
@@ -434,39 +499,142 @@ impl Board {
         if addr >= bios_base {
             return self.bios[(addr - bios_base) as usize];
         }
-        self.mmio_read(addr)
+        self.mmio_read(addr, 1) as u8
     }
 
-    fn display(&self) -> &ConfigSpace {
-        &self.pci[DISPLAY].1
+    /// Keeps the Radeon's view of its BARs and configuration space current.
+    fn sync_display_bars(&mut self) {
+        if let Display::Radeon(r) = &mut self.display {
+            let c = &self.pci[DISPLAY].1;
+            r.bars = radeon::Bars {
+                fb: c.read(0x10, 4) & !0xf,
+                io: (c.read(0x14, 4) & !3) as u16,
+                mmio: c.read(0x18, 4) & !0xf,
+            };
+            r.config = c.data;
+        }
     }
 
-    fn mmio_read(&mut self, addr: u32) -> u8 {
+    /// True if `addr` is above RAM and below the BIOS, where only PCI devices decode.
+    fn is_mmio(&self, addr: u32) -> bool {
+        addr as usize >= self.ram.len() && addr < 0u32.wrapping_sub(self.bios.len() as u32) && addr >= LEGACY_END
+    }
+
+    /// Reads `size` bytes (1, 2 or 4) of a PCI memory range.
+    fn mmio_read(&mut self, addr: u32, size: u8) -> u32 {
         if let Some(v) = self.apic_read(addr & !3) {
-            return (v >> (8 * (addr & 3))) as u8;
+            return (v >> (8 * (addr & 3))) & (u32::MAX >> (32 - 8 * size as u32));
         }
-        if let Some(base) = self.display().mem_bar(0)
-            && (base..base + vga::VRAM_SIZE as u32).contains(&addr)
-        {
-            return self.vga.vram()[(addr - base) as usize];
+        let now = self.now_ns();
+        let c = &self.pci[DISPLAY].1;
+        let (fb, regs, rom) = (c.mem_bar(0), c.mem_bar(2), c.rom_bar());
+        match &mut self.display {
+            Display::Std(vga) => {
+                if let Some(base) = fb
+                    && (base..base + vga::VRAM_SIZE as u32).contains(&addr)
+                {
+                    return bytes_le(size, |i| vga.vram().get((addr - base) as usize + i).copied().unwrap_or(0xff));
+                }
+            }
+            Display::Radeon(r) => {
+                if let Some(base) = fb
+                    && (base..base + radeon::VRAM_SIZE as u32).contains(&addr)
+                {
+                    let off = radeon::Radeon::fb_offset(addr - base);
+                    return bytes_le(size, |i| r.vram()[(off + i) % radeon::VRAM_SIZE]);
+                }
+                if let Some(base) = regs
+                    && (base..base + radeon::MMIO_SIZE).contains(&addr)
+                {
+                    r.set_time(now);
+                    return r.mmio_read(addr - base, size);
+                }
+                if let Some(base) = rom
+                    && (base..base + 0x2_0000).contains(&addr)
+                {
+                    let rom = r.rom();
+                    return bytes_le(size, |i| rom.get((addr - base) as usize + i).copied().unwrap_or(0xff));
+                }
+            }
         }
-        if let Some(base) = self.display().rom_bar()
+        if let Display::Std(_) = self.display
+            && let Some(base) = rom
             && (base..base + self.vgabios.len() as u32).contains(&addr)
         {
-            return self.vgabios[(addr - base) as usize];
+            return bytes_le(size, |i| self.vgabios.get((addr - base) as usize + i).copied().unwrap_or(0xff));
         }
-        0xff
+        if let Some(phys) = self.gart(addr) {
+            return bytes_le(size, |i| self.ram.get(phys as usize + i).copied().unwrap_or(0xff));
+        }
+        u32::MAX >> (32 - 8 * size as u32)
     }
 
-    fn mmio_write(&mut self, addr: u32, v: u8) {
-        if self.apic_write(addr, v as u32, 1) {
+    fn mmio_write(&mut self, addr: u32, size: u8, v: u32) {
+        if self.apic_write(addr, v, size) {
             return;
         }
-        if let Some(base) = self.display().mem_bar(0)
-            && (base..base + vga::VRAM_SIZE as u32).contains(&addr)
-        {
-            self.vga.vram_mut()[(addr - base) as usize] = v;
+        let now = self.now_ns();
+        let c = &self.pci[DISPLAY].1;
+        let (fb, regs) = (c.mem_bar(0), c.mem_bar(2));
+        match &mut self.display {
+            Display::Std(vga) => {
+                if let Some(base) = fb
+                    && (base..base + vga::VRAM_SIZE as u32).contains(&addr)
+                {
+                    let vram = vga.vram_mut();
+                    for i in 0..size as usize {
+                        if let Some(b) = vram.get_mut((addr - base) as usize + i) {
+                            *b = (v >> (8 * i)) as u8;
+                        }
+                    }
+                    return;
+                }
+            }
+            Display::Radeon(r) => {
+                if let Some(base) = fb
+                    && (base..base + radeon::VRAM_SIZE as u32).contains(&addr)
+                {
+                    let off = radeon::Radeon::fb_offset(addr - base);
+                    let vram = r.vram_mut();
+                    for i in 0..size as usize {
+                        vram[(off + i) % radeon::VRAM_SIZE] = (v >> (8 * i)) as u8;
+                    }
+                    return;
+                }
+                if let Some(base) = regs
+                    && (base..base + radeon::MMIO_SIZE).contains(&addr)
+                {
+                    r.set_time(now);
+                    r.mmio_write(addr - base, size, v);
+                    return;
+                }
+            }
         }
+        if let Some(phys) = self.gart(addr) {
+            for i in 0..size as u32 {
+                let a = phys + i;
+                if (a as usize) < self.ram.len() {
+                    self.code_watch.note_write(a);
+                    self.ram[a as usize] = (v >> (8 * i)) as u8;
+                }
+            }
+        }
+    }
+
+    // GATT entries are a page address with bit 0 as the valid bit, as Linux's intel-agp writes them.
+    fn gart(&self, addr: u32) -> Option<u32> {
+        if self.chipset != Chipset::I440bx {
+            return None;
+        }
+        let host = &self.pci[HOST].1;
+        let (base, size) = pci::i440bx_aperture(host)?;
+        let off = addr.wrapping_sub(base);
+        if off >= size {
+            return None;
+        }
+        let entry_addr = (host.read(pci::bx::ATTBASE, 4) & !0xfff) as usize + (off >> 12) as usize * 4;
+        let entry = u32::from_le_bytes(self.ram.get(entry_addr..entry_addr + 4)?.try_into().unwrap());
+        (entry & 1 != 0).then_some((entry & !0xfff) | (off & 0xfff))
     }
 
     fn write_slow(&mut self, addr: u32, v: u8) {
@@ -474,7 +642,7 @@ impl Board {
         self.code_watch.note_write(addr);
         if (LEGACY_START..LEGACY_END).contains(&addr) {
             if addr < 0xc_0000 {
-                self.vga.mem_write8(addr, v);
+                self.display.vga().mem_write8(addr, v);
             } else if self.pam(addr) & 2 != 0 {
                 self.ram[addr as usize] = v;
             }
@@ -483,7 +651,7 @@ impl Board {
         if (addr as usize) < self.ram.len() {
             self.ram[addr as usize] = v;
         } else {
-            self.mmio_write(addr, v);
+            self.mmio_write(addr, 1, v as u32);
         }
     }
 
@@ -494,13 +662,20 @@ impl Board {
         self.a20_enabled() && end <= self.ram.len() as u64 && (end <= LEGACY_START as u64 || addr >= LEGACY_END)
     }
 
-    fn pci_function(&mut self) -> Option<&mut ConfigSpace> {
+    // Index into `self.pci`. Bus 1 is whatever number the AGP bridge's secondary bus register holds.
+    fn pci_function(&self) -> Option<usize> {
         let a = self.pci_addr;
-        if a & 0x8000_0000 == 0 || (a >> 16) & 0xff != 0 {
+        if a & 0x8000_0000 == 0 {
             return None;
         }
-        let bdf = Bdf { dev: ((a >> 11) & 0x1f) as u8, func: ((a >> 8) & 7) as u8 };
-        self.pci.iter_mut().find(|(b, _)| *b == bdf).map(|(_, c)| c)
+        let bus = ((a >> 16) & 0xff) as u8;
+        let bus = match bus {
+            0 => 0,
+            n if self.chipset == Chipset::I440bx && self.pci[AGP_BRIDGE].1.data[pci::SECONDARY_BUS] == n => 1,
+            _ => return None,
+        };
+        let bdf = Bdf::new(bus, ((a >> 11) & 0x1f) as u8, ((a >> 8) & 7) as u8);
+        self.pci.iter().position(|(b, _)| *b == bdf)
     }
 
     fn io_read8(&mut self, port: u16) -> u8 {
@@ -582,24 +757,33 @@ impl Board {
 
     /// Draws the display into `out` as 0x00RRGGBB pixels.
     pub fn render(&mut self, out: &mut Vec<u32>) -> Option<(u32, u32)> {
-        self.vga.render(out)
+        match &mut self.display {
+            Display::Std(v) => v.render(out),
+            Display::Radeon(r) => r.render(out),
+        }
     }
 
     /// True if the picture may differ from the last time this was asked.
     pub fn display_changed(&mut self) -> bool {
-        self.vga.take_changed()
+        match &mut self.display {
+            Display::Std(v) => v.take_changed(),
+            Display::Radeon(r) => r.take_changed(),
+        }
     }
 
     /// The display's linear framebuffer: its guest physical base, host memory
     /// and size, while the guest has it decoded.
     pub fn framebuffer(&mut self) -> Option<(u32, *mut u8, usize)> {
-        let base = self.display().mem_bar(0)?;
-        Some((base, self.vga.vram_ptr(), vga::VRAM_SIZE))
+        let base = self.pci[DISPLAY].1.mem_bar(0)?;
+        match &mut self.display {
+            Display::Std(v) => Some((base, v.vram_ptr(), vga::VRAM_SIZE)),
+            Display::Radeon(_) => None,
+        }
     }
 
     /// Notes that the guest wrote the framebuffer through a direct mapping.
     pub fn framebuffer_written(&mut self) {
-        self.vga.mark_changed();
+        self.display.vga().mark_changed();
     }
 
     /// For each 16 KiB chunk of 0xC0000..0x100000: `Some(writable)` when the
@@ -644,7 +828,9 @@ impl Board {
             if pin == 0 || !self.intx(i) {
                 continue;
             }
-            let pirq = pci::pirq_for(bdf.dev, pin);
+            // Behind the AGP bridge at slot 1, INTx swizzles by the device number.
+            let (slot, pin) = if bdf.bus == 0 { (bdf.dev, pin) } else { (1, pin + bdf.dev) };
+            let pirq = pci::pirq_for(slot, pin);
             pirqs |= 1 << pirq;
             if let Some(irq) = pci::pirq_route(route[pirq]) {
                 levels |= 1 << irq;
@@ -685,6 +871,9 @@ impl Board {
         }
         self.ioapic = ioapic::IoApic::default();
         self.pci_irqs = 0;
+        if let Display::Radeon(r) = &mut self.display {
+            r.reset();
+        }
         self.uhci.reset();
         if let Some((_, a)) = self.ac97.as_mut() {
             a.reset();
@@ -698,6 +887,10 @@ impl Board {
         self.irq0_backlog = 0;
         self.reset_requested = false;
     }
+}
+
+fn bytes_le(size: u8, mut byte: impl FnMut(usize) -> u8) -> u32 {
+    (0..size as usize).fold(0, |v, i| v | (byte(i) as u32) << (8 * i))
 }
 
 struct RamDma<'a>(&'a mut [u8], &'a mut CodeWatch);
@@ -768,6 +961,9 @@ impl Bus for Board {
             let a = addr as usize;
             return u16::from_le_bytes([self.ram[a], self.ram[a + 1]]);
         }
+        if self.is_mmio(addr) {
+            return self.mmio_read(addr, 2) as u16;
+        }
         u16::from_le_bytes([self.read_slow(addr), self.read_slow(addr.wrapping_add(1))])
     }
 
@@ -782,6 +978,9 @@ impl Bus for Board {
         {
             return v;
         }
+        if self.is_mmio(addr) {
+            return self.mmio_read(addr, 4);
+        }
         let b = [0, 1, 2, 3].map(|i| self.read_slow(addr.wrapping_add(i)));
         u32::from_le_bytes(b)
     }
@@ -794,6 +993,9 @@ impl Bus for Board {
             let a = addr as usize;
             self.ram[a..a + 2].copy_from_slice(&value.to_le_bytes());
             return;
+        }
+        if self.is_mmio(addr) {
+            return self.mmio_write(addr, 2, value as u32);
         }
         for (i, b) in value.to_le_bytes().into_iter().enumerate() {
             self.write_slow(addr.wrapping_add(i as u32), b);
@@ -812,6 +1014,9 @@ impl Bus for Board {
         if self.apic_write(addr, value, 4) {
             return;
         }
+        if self.is_mmio(addr) {
+            return self.mmio_write(addr, 4, value);
+        }
         for (i, b) in value.to_le_bytes().into_iter().enumerate() {
             self.write_slow(addr.wrapping_add(i as u32), b);
         }
@@ -820,9 +1025,23 @@ impl Bus for Board {
     fn io_read(&mut self, port: u16, size: u8) -> u32 {
         if matches!(port, 0x1ce..=0x1cf | 0x3b0..=0x3df) {
             let now = self.now_ns();
-            if let Some(v) = self.vga.io_read(port, size, now) {
+            let v = match &mut self.display {
+                Display::Std(vga) => vga.io_read(port, size, now),
+                Display::Radeon(r) => {
+                    r.set_time(now);
+                    r.vga_io_read(port, size)
+                }
+            };
+            if let Some(v) = v {
                 return v;
             }
+        }
+        if let Display::Radeon(r) = &mut self.display
+            && let Some(base) = self.pci[DISPLAY].1.io_bar(1)
+            && (base..base.wrapping_add(radeon::IO_SIZE as u16)).contains(&port)
+        {
+            r.set_time(self.start.elapsed().as_nanos() as u64);
+            return r.io_read(port - base, size);
         }
         if let Some(base) = self.pci[UHCI].1.io_bar(4)
             && (base..base + UHCI_PORTS).contains(&port)
@@ -860,7 +1079,7 @@ impl Bus for Board {
             0xcfc..=0xcff => {
                 let off = (self.pci_addr & 0xfc) as usize + (port - 0xcfc) as usize;
                 return match self.pci_function() {
-                    Some(f) => f.read(off, size as usize),
+                    Some(f) => self.pci[f].1.read(off, size as usize),
                     None => u32::MAX >> (32 - 8 * size as u32),
                 };
             }
@@ -874,7 +1093,20 @@ impl Bus for Board {
     }
 
     fn io_write(&mut self, port: u16, size: u8, value: u32) {
-        if self.vga.io_write(port, size, value) {
+        let ours = match &mut self.display {
+            Display::Std(vga) => vga.io_write(port, size, value),
+            Display::Radeon(r) => {
+                if let Some(base) = self.pci[DISPLAY].1.io_bar(1)
+                    && (base..base.wrapping_add(radeon::IO_SIZE as u16)).contains(&port)
+                {
+                    r.set_time(self.start.elapsed().as_nanos() as u64);
+                    r.io_write(port - base, size, value);
+                    return;
+                }
+                r.vga_io_write(port, size, value)
+            }
+        };
+        if ours {
             return;
         }
         if let Some(base) = self.pci[UHCI].1.io_bar(4)
@@ -928,7 +1160,13 @@ impl Bus for Board {
             0xcfc..=0xcff => {
                 let off = (self.pci_addr & 0xfc) as usize + (port - 0xcfc) as usize;
                 if let Some(f) = self.pci_function() {
-                    f.write(off, size as usize, value);
+                    self.pci[f].1.write(off, size as usize, value);
+                    if f == HOST && self.chipset == Chipset::I440bx {
+                        pci::i440bx_update(&mut self.pci[HOST].1);
+                    }
+                    if f == DISPLAY {
+                        self.sync_display_bars();
+                    }
                 }
                 self.sync_pci_irqs();
                 return;
@@ -999,7 +1237,7 @@ mod tests {
     use super::*;
 
     fn board() -> Board {
-        Board::new(Config { ram_bytes: 1 << 20, bios: vec![0; 0x2_0000], vgabios: None, apic: true })
+        Board::new(Config { ram_bytes: 1 << 20, bios: vec![0; 0x2_0000], vgabios: None, apic: true, chipset: Chipset::I440fx, gpu: Gpu::StdVga })
     }
 
     #[test]
@@ -1098,5 +1336,68 @@ mod tests {
         b.set_irq(11, false);
         b.write32(apic::DEFAULT_BASE + apic::reg::EOI, 0);
         assert!(!b.intr());
+    }
+
+    fn bx_board() -> Board {
+        Board::new(Config {
+            ram_bytes: 64 << 20,
+            bios: vec![0; 0x2_0000],
+            vgabios: None,
+            apic: true,
+            chipset: Chipset::I440bx,
+            gpu: Gpu::Radeon { rom: vec![0x55, 0xaa], trace: None },
+        })
+    }
+
+    fn config_read(b: &mut Board, bus: u32, dev: u32, off: u32) -> u32 {
+        b.io_write(0xcf8, 4, 0x8000_0000 | bus << 16 | dev << 11 | off);
+        b.io_read(0xcfc, 4)
+    }
+
+    fn config_write(b: &mut Board, bus: u32, dev: u32, off: u32, v: u32) {
+        b.io_write(0xcf8, 4, 0x8000_0000 | bus << 16 | dev << 11 | off);
+        b.io_write(0xcfc, 4, v);
+    }
+
+    #[test]
+    fn agp_bus_answers_at_the_bridge_secondary_number() {
+        let mut b = bx_board();
+        assert_eq!(config_read(&mut b, 0, 0, 0), 0x7190_8086);
+        assert_eq!(config_read(&mut b, 0, 1, 0), 0x7191_8086);
+        assert_eq!(config_read(&mut b, 0, 7, 0), 0x7000_8086);
+        assert_eq!(config_read(&mut b, 1, 0, 0), u32::MAX);
+        config_write(&mut b, 0, 1, 0x18, 0x0002_0200);
+        assert_eq!(config_read(&mut b, 2, 0, 0), 0x4e44_1002);
+        assert_eq!(config_read(&mut b, 1, 0, 0), u32::MAX);
+    }
+
+    #[test]
+    fn radeon_mmio_takes_whole_dwords() {
+        let mut b = bx_board();
+        config_write(&mut b, 0, 1, 0x18, 0x0001_0100);
+        config_write(&mut b, 1, 0, 0x10, 0xe000_0000);
+        config_write(&mut b, 1, 0, 0x18, 0xfe00_0000);
+        config_write(&mut b, 1, 0, 0x04, 0x0003);
+        b.write32(0xfe00_0010, 0x1234_5678);
+        assert_eq!(b.read32(0xfe00_0010), 0x1234_5678);
+        assert_eq!(b.read32(0xfe00_0100), 0xe000_0000);
+        assert_eq!(b.read16(0xfe00_0f02), 0x4e44);
+        b.write32(0xe000_1000, 0xcafe_f00d);
+        assert_eq!(b.read8(0xe000_1001), 0xf0);
+    }
+
+    #[test]
+    fn gart_aperture_maps_pages_through_attbase() {
+        let mut b = bx_board();
+        config_write(&mut b, 0, 0, 0x10, 0xe000_0000);
+        config_write(&mut b, 0, 0, pci::bx::ATTBASE as u32, 0x0010_0000);
+        b.write32(0x0010_0004, 0x0020_0001);
+        assert_eq!(b.read32(0xe000_1010), u32::MAX);
+        config_write(&mut b, 0, 0, pci::bx::NBXCFG as u32, pci::bx::APERTURE_ENABLE);
+        b.write32(0x0020_0010, 0xabcd_ef01);
+        assert_eq!(b.read32(0xe000_1010), 0xabcd_ef01);
+        b.write16(0xe000_1012, 0x5555);
+        assert_eq!(b.read32(0x0020_0010), 0x5555_ef01);
+        assert_eq!(b.read32(0xe000_2000), u32::MAX);
     }
 }

@@ -18,6 +18,10 @@ use x86::interp::{Exit, step};
 struct Args {
     bios: String,
     vgabios: Option<String>,
+    board: Option<pc::Chipset>,
+    radeon: bool,
+    vga_rom: Option<String>,
+    gpu_trace: Option<String>,
     cdrom: Option<String>,
     hda: Option<String>,
     serial: Option<String>,
@@ -35,7 +39,8 @@ struct Args {
     audio_silent: bool,
 }
 
-const USAGE: &str = "usage: slopper --bios <bios.bin> [--vgabios <vgabios.bin>] [--cdrom <iso>] [--hda <img>] \
+const USAGE: &str = "usage: slopper --bios <bios.bin> [--vgabios <vgabios.bin>] [--board fx|bx] \
+[--gpu stdvga|radeon --vga-rom <rom> [--gpu-trace PATH]] [--cdrom <iso>] [--hda <img>] \
 [--serial PATH|-] [--ram MiB] [--headless] [--jit] [--screenshot SECONDS:PATH]... [--exit-on-text TEXT] [--script FILE] [--control SOCKET] [--vnc [ADDR:]PORT] \
 [--audio ac97 [--audio-wav PATH] [--audio-silent]] [--max-instructions N]";
 
@@ -43,6 +48,10 @@ fn parse_args() -> Result<Args, String> {
     let mut args = Args {
         bios: String::new(),
         vgabios: None,
+        board: None,
+        radeon: false,
+        vga_rom: None,
+        gpu_trace: None,
         cdrom: None,
         hda: None,
         serial: None,
@@ -65,6 +74,22 @@ fn parse_args() -> Result<Args, String> {
         match a.as_str() {
             "--bios" => args.bios = value()?,
             "--vgabios" => args.vgabios = Some(value()?),
+            "--board" => {
+                args.board = Some(match value()?.as_str() {
+                    "fx" => pc::Chipset::I440fx,
+                    "bx" => pc::Chipset::I440bx,
+                    _ => return Err("--board takes fx or bx".into()),
+                })
+            }
+            "--gpu" => {
+                args.radeon = match value()?.as_str() {
+                    "stdvga" => false,
+                    "radeon" => true,
+                    _ => return Err("--gpu takes stdvga or radeon".into()),
+                }
+            }
+            "--vga-rom" => args.vga_rom = Some(value()?),
+            "--gpu-trace" => args.gpu_trace = Some(value()?),
             "--cdrom" => args.cdrom = Some(value()?),
             "--hda" => args.hda = Some(value()?),
             "--serial" => args.serial = Some(value()?),
@@ -98,6 +123,16 @@ fn parse_args() -> Result<Args, String> {
     }
     if !args.audio && (args.audio_wav.is_some() || args.audio_silent) {
         return Err("--audio-wav and --audio-silent need --audio ac97".into());
+    }
+    if args.radeon {
+        if args.board == Some(pc::Chipset::I440fx) {
+            return Err("--gpu radeon needs the 440BX's AGP bus, so it cannot go with --board fx".into());
+        }
+        if args.vga_rom.is_none() {
+            return Err("--gpu radeon needs --vga-rom with the card's video BIOS".into());
+        }
+    } else if args.vga_rom.is_some() || args.gpu_trace.is_some() {
+        return Err("--vga-rom and --gpu-trace go with --gpu radeon".into());
     }
     Ok(args)
 }
@@ -918,7 +953,28 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let cfg = Config { ram_bytes: args.ram_mb << 20, bios, vgabios, apic: true };
+    let gpu = match (&args.radeon, &args.vga_rom) {
+        (true, Some(path)) => {
+            let rom = match read(path) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let trace = match args.gpu_trace.as_deref().map(std::fs::File::create).transpose() {
+                Ok(f) => f.map(|f| Box::new(std::io::LineWriter::new(f)) as Box<dyn std::io::Write + Send>),
+                Err(e) => {
+                    eprintln!("cannot create the GPU trace: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            pc::Gpu::Radeon { rom, trace }
+        }
+        _ => pc::Gpu::StdVga,
+    };
+    let chipset = args.board.unwrap_or(if args.radeon { pc::Chipset::I440bx } else { pc::Chipset::I440fx });
+    let cfg = Config { ram_bytes: args.ram_mb << 20, bios, vgabios, apic: true, chipset, gpu };
     let shared = Arc::new(Shared {
         frame: Mutex::new(Frame::default()),
         done: AtomicBool::new(false),
