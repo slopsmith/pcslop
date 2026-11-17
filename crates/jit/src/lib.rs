@@ -67,6 +67,9 @@ struct BlockInfo {
 
 /// Invalidations after which a page switches to self-checking blocks.
 const SELF_CHECK_AFTER: u32 = 4;
+/// More than any block's code. Blocks branch to the runtime with B, which
+/// reaches 128 MiB, so none may start closer than this to the cache's end.
+const MAX_BLOCK_BYTES: usize = 256 << 10;
 
 /// Executions of each block that verify mode checks before running it freely.
 const VERIFY_RUNS: u32 = 3;
@@ -1009,6 +1012,9 @@ impl Jit {
     }
 
     fn translate_block<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B, eip: u32, phys: u32, user: bool) {
+        if self.code_next + MAX_BLOCK_BYTES > layout::CODE_CACHE_END {
+            self.reset_code_cache();
+        }
         let key = block_key(phys, eip, user);
         let page = phys & !0xfff;
         let lin_page = eip & !0xfff;

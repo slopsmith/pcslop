@@ -1327,3 +1327,17 @@ fn framebuffer_writes_skip_the_host_and_are_reported_once() {
     assert_eq!(stats.mmio_exits, 0, "framebuffer stores must not leave the VM, or drawing crawls: {stats:?}");
     assert_eq!(reports, [true, false], "the display must redraw after writes, and only then");
 }
+
+#[test]
+fn a_block_compiled_at_the_end_of_the_code_cache_still_reaches_the_runtime() {
+    let mut code = Vec::new();
+    for _ in 0..31 {
+        code.extend([0xd9, 0x03, 0xd9, 0x5b, 0x04]); // fld dword [ebx]; fstp dword [ebx+4]
+    }
+    code.extend([0xff, 0x43, 0x08, 0xf4]); // inc dword [ebx+8]; hlt
+    let mut cpu = flat_cpu(0x1000, 0x8000);
+    cpu.regs[3] = 0x3000;
+    let mut bus = bus_with(0x1000, &code);
+    run_jit_with(&mut cpu, &mut bus, |j| j.code_next = crate::layout::CODE_CACHE_END - 16, |_| {});
+    assert_eq!(bus.ram.as_slice()[0x3008], 1, "a long block near the end of the cache must translate and run");
+}
