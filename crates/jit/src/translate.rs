@@ -766,7 +766,7 @@ impl Emit {
             return if self.sse(insn, eip) { Step::Next } else { Step::Unsupported };
         }
         let string = matches!(op, 0xa4..=0xa7 | 0xaa..=0xaf);
-        if insn.rep != Rep::None && !(op == 0x90 || string) {
+        if insn.rep != Rep::None && !(matches!(op, 0x90 | 0xc2 | 0xc3) || string) {
             return Step::Unsupported;
         }
         match op {

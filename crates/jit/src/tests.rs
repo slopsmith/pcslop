@@ -182,6 +182,21 @@ fn call_and_return() {
 }
 
 #[test]
+fn rep_ret_runs_translated() {
+    let code = [
+        0xb9, 0x40, 0, 0, 0, // mov ecx, 64
+        0xe8, 0x04, 0, 0, 0, // call +4
+        0x49, // dec ecx
+        0x75, 0xf8, // jnz -8
+        0xf4, // hlt
+        0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, // inc eax, past the interpreter's tail
+        0xf3, 0xc3, // repz ret
+    ];
+    let stats = compare(&code, |_| {});
+    assert!(stats.interp_exits < 8, "glibc returns with repz ret, so each one leaving translated code is slow: {stats:?}");
+}
+
+#[test]
 fn popf_changes_to_ac_and_id_reach_the_cpu() {
     let code = [
         0x9c, // pushfd
