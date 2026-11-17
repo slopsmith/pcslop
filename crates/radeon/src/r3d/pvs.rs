@@ -32,22 +32,109 @@ pub(crate) struct Program<'a> {
     pub const_base: usize,
 }
 
+/// A source operand with its fields pulled out of the instruction word.
 #[derive(Clone, Copy)]
-struct Src(u32);
+struct Src {
+    class: u8,
+    base: i32,
+    /// The address register component added to `base`, if relative.
+    rel: Option<u8>,
+    /// Per component: 0-3 a register component, 4 zero, 5 one.
+    swizzle: [u8; 4],
+    negate: [bool; 4],
+    abs: bool,
+}
 
 impl Src {
-    fn class(self) -> u32 {
-        self.0 & 3
-    }
-    fn index(self, a0: &[i32; 4]) -> usize {
-        let base = ((self.0 >> 5) & 0xff) as i32;
-        let rel = if self.0 & (1 << 4) != 0 { a0[(self.0 >> 29 & 3) as usize] } else { 0 };
-        (base + rel).max(0) as usize
+    fn new(s: u32) -> Self {
+        Src {
+            class: (s & 3) as u8,
+            base: ((s >> 5) & 0xff) as i32,
+            rel: (s & (1 << 4) != 0).then_some(((s >> 29) & 3) as u8),
+            swizzle: [0, 1, 2, 3].map(|c| match (s >> (13 + 3 * c)) & 7 {
+                sw @ 0..=3 => sw as u8,
+                5 => 5,
+                _ => 4,
+            }),
+            negate: [0, 1, 2, 3].map(|c| s & (1 << (25 + c)) != 0),
+            abs: s & (1 << 3) != 0,
+        }
     }
 }
 
+#[derive(Clone, Copy)]
+struct Dst {
+    /// PVS_DST_REG_TYPE: 0 temporary, 1 A0, 2 output, 3 output with x
+    /// replicated, 4 alternate temporary, 5 input.
+    kind: u8,
+    base: i32,
+    rel: Option<u8>,
+    mask: u8,
+    sat: bool,
+}
+
+#[derive(Clone, Copy)]
+enum Engine {
+    Vector(u32),
+    Math(u32),
+    Macro(u32),
+}
+
+/// The math half of a dual-math instruction: two scalars from `src`'s X
+/// and Y swizzles, written to one component of an alternate temporary.
+#[derive(Clone, Copy)]
+struct DualMath {
+    src: Src,
+    op: u32,
+    index: usize,
+    comp: usize,
+    sat: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Inst {
+    engine: Engine,
+    src: [Src; 3],
+    dst: Dst,
+    dual: Option<DualMath>,
+}
+
+fn decode(d: &[u32]) -> Inst {
+    let d0 = d[0];
+    let op = d0 & 0x3f;
+    let engine = if d0 & (1 << 6) != 0 {
+        Engine::Math(op)
+    } else if d0 & (1 << 7) != 0 {
+        Engine::Macro(op)
+    } else {
+        Engine::Vector(op)
+    };
+    let dst = Dst {
+        kind: ((d0 >> 8) & 0xf) as u8,
+        base: ((d0 >> 13) & 0x7f) as i32,
+        rel: (d0 & (1 << 31) != 0).then_some(((d0 >> 29) & 3) as u8),
+        mask: ((d0 >> 20) & 0xf) as u8,
+        sat: if d0 & (1 << 6) != 0 { d0 & (1 << 25) != 0 } else { d0 & (1 << 24) != 0 },
+    };
+    let s = d[3];
+    let dual = (matches!(engine, Engine::Vector(_)) && d0 & (1 << 28) != 0).then(|| DualMath {
+        src: Src::new(s),
+        op: (s >> 21) & 0xf | ((s >> 2) & 1) << 4,
+        index: ((s >> 19) & 3) as usize,
+        comp: ((s >> 27) & 3) as usize,
+        sat: d0 & (1 << 25) != 0,
+    });
+    Inst { engine, src: [Src::new(d[1]), Src::new(d[2]), Src::new(d[3])], dst, dual }
+}
+
+/// A program decoded once for a draw, with its constants as floats.
+pub(crate) struct Decoded {
+    insts: Vec<Inst>,
+    consts: Vec<V4>,
+}
+
 struct Machine<'a> {
-    prog: &'a Program<'a>,
+    prog: &'a Decoded,
     temps: [V4; TEMPS],
     alt: [V4; TEMPS],
     inputs: [V4; INPUTS],
@@ -56,55 +143,57 @@ struct Machine<'a> {
 }
 
 impl Machine<'_> {
-    fn constant(&self, i: usize) -> V4 {
-        let v = (CONST_START + self.prog.const_base + i) * 4;
-        match self.prog.mem.get(v..v + 4) {
-            Some(d) => [0, 1, 2, 3].map(|c| f32::from_bits(d[c])),
-            None => [0.0; 4],
-        }
+    fn index(&self, base: i32, rel: Option<u8>) -> usize {
+        let rel = rel.map_or(0, |c| self.a0[c as usize]);
+        base.saturating_add(rel).max(0) as usize
     }
 
-    fn read(&self, s: Src) -> V4 {
-        let i = s.index(&self.a0);
-        let reg = match s.class() {
+    #[inline(always)]
+    fn register(&self, s: &Src) -> V4 {
+        let i = self.index(s.base, s.rel);
+        match s.class {
             0 => self.temps.get(i).copied(),
             1 => self.inputs.get(i).copied(),
-            2 => Some(self.constant(i)),
+            2 => self.prog.consts.get(i).copied(),
             _ => self.alt.get(i).copied(),
         }
-        .unwrap_or([0.0; 4]);
-        let abs = s.0 & (1 << 3) != 0;
-        [0, 1, 2, 3].map(|c| {
-            let mut v = match (s.0 >> (13 + 3 * c)) & 7 {
-                sw @ 0..=3 => reg[sw as usize],
-                5 => 1.0,
-                _ => 0.0,
-            };
-            if abs {
-                v = v.abs();
-            }
-            if s.0 & (1 << (25 + c)) != 0 {
-                v = -v;
-            }
-            v
-        })
+        .unwrap_or([0.0; 4])
     }
 
-    fn write(&mut self, d0: u32, v: V4) {
-        let mut index = ((d0 >> 13) & 0x7f) as i32;
-        if d0 & (1 << 31) != 0 {
-            index += self.a0[(d0 >> 29 & 3) as usize];
+    #[inline(always)]
+    fn component(s: &Src, reg: &V4, c: usize) -> f32 {
+        let mut v = match s.swizzle[c] {
+            sw @ 0..=3 => reg[sw as usize],
+            5 => 1.0,
+            _ => 0.0,
+        };
+        if s.abs {
+            v = v.abs();
         }
-        let index = index.max(0) as usize;
-        let mask = (d0 >> 20) & 0xf;
-        let sat = if d0 & (1 << 6) != 0 { d0 & (1 << 25) != 0 } else { d0 & (1 << 24) != 0 };
-        let v = if sat { v.map(|x| x.clamp(0.0, 1.0)) } else { v };
-        let kind = (d0 >> 8) & 0xf;
-        let reg = match kind {
+        if s.negate[c] {
+            v = -v;
+        }
+        v
+    }
+
+    #[inline(always)]
+    fn read(&self, s: &Src) -> V4 {
+        let reg = self.register(s);
+        let mut v = [0.0; 4];
+        for (c, x) in v.iter_mut().enumerate() {
+            *x = Self::component(s, &reg, c);
+        }
+        v
+    }
+
+    fn write(&mut self, d: &Dst, v: V4) {
+        let index = self.index(d.base, d.rel);
+        let v = if d.sat { v.map(|x| x.clamp(0.0, 1.0)) } else { v };
+        let reg = match d.kind {
             0 => self.temps.get_mut(index),
             1 => {
                 for c in 0..4 {
-                    if mask & (1 << c) != 0 {
+                    if d.mask & (1 << c) != 0 {
                         self.a0[c] = v[c].floor() as i32;
                     }
                 }
@@ -117,66 +206,33 @@ impl Machine<'_> {
         };
         let Some(reg) = reg else { return };
         for c in 0..4 {
-            if mask & (1 << c) != 0 {
-                reg[c] = if kind == 3 { v[0] } else { v[c] };
+            if d.mask & (1 << c) != 0 {
+                reg[c] = if d.kind == 3 { v[0] } else { v[c] };
             }
         }
     }
 
-    fn step(&mut self, d: &[u32]) {
-        let d0 = d[0];
-        let (a, b, c) = (self.read(Src(d[1])), self.read(Src(d[2])), self.read(Src(d[3])));
-        let op = d0 & 0x3f;
-        let vector_op = d0 & (3 << 6) == 0;
-        let side = (vector_op && d0 & (1 << 28) != 0).then(|| self.dual_math(d0, d[3]));
-        let v = if d0 & (1 << 6) != 0 {
-            math(op, a, b, c)
-        } else if d0 & (1 << 7) != 0 {
-            Some(if op == 1 { mad2x(a, b, c) } else { mad(a, b, c) })
-        } else {
-            vector(op, a, b, c)
+    fn dual_math(&self, m: &DualMath) -> Option<f32> {
+        let reg = self.register(&m.src);
+        let (x, y) = (Self::component(&m.src, &reg, 0), Self::component(&m.src, &reg, 1));
+        let r = math(m.op, [x; 4], [y; 4], [y; 4])?[0];
+        Some(if m.sat { r.clamp(0.0, 1.0) } else { r })
+    }
+
+    fn step(&mut self, inst: &Inst) {
+        let (a, b, c) = (self.read(&inst.src[0]), self.read(&inst.src[1]), self.read(&inst.src[2]));
+        let side = inst.dual.and_then(|m| self.dual_math(&m).map(|v| (m.index, m.comp, v)));
+        let v = match inst.engine {
+            Engine::Math(op) => math(op, a, b, c),
+            Engine::Macro(op) => Some(if op == 1 { mad2x(a, b, c) } else { mad(a, b, c) }),
+            Engine::Vector(op) => vector(op, a, b, c),
         };
         if let Some(v) = v {
-            self.write(d0, v);
+            self.write(&inst.dst, v);
         }
-        if let Some(Some((index, comp, m))) = side {
+        if let Some((index, comp, m)) = side {
             self.alt[index][comp] = m;
         }
-    }
-
-    /// The math half of a dual-math instruction: its alternate temporary,
-    /// the component it writes and the value.
-    fn dual_math(&self, d0: u32, s: u32) -> Option<(usize, usize, f32)> {
-        let src = Src(s);
-        let i = src.index(&self.a0);
-        let reg = match src.class() {
-            0 => self.temps.get(i).copied(),
-            1 => self.inputs.get(i).copied(),
-            2 => Some(self.constant(i)),
-            _ => self.alt.get(i).copied(),
-        }
-        .unwrap_or([0.0; 4]);
-        let scalar = |k: u32| {
-            let mut v = match (s >> (13 + 3 * k)) & 7 {
-                sw @ 0..=3 => reg[sw as usize],
-                5 => 1.0,
-                _ => 0.0,
-            };
-            if s & (1 << 3) != 0 {
-                v = v.abs();
-            }
-            if s & (1 << (25 + k)) != 0 {
-                v = -v;
-            }
-            v
-        };
-        let (x, y) = (scalar(0), scalar(1));
-        let op = (s >> 21) & 0xf | ((s >> 2) & 1) << 4;
-        let mut m = math(op, [x; 4], [y; 4], [y; 4])?[0];
-        if d0 & (1 << 25) != 0 {
-            m = m.clamp(0.0, 1.0);
-        }
-        Some((((s >> 19) & 3) as usize, ((s >> 27) & 3) as usize, m))
     }
 }
 
@@ -262,6 +318,27 @@ fn math(op: u32, a: V4, b: V4, c: V4) -> Option<V4> {
 }
 
 impl Program<'_> {
+    /// Decodes the instructions from PVS_FIRST_INST to PVS_LAST_INST, in the
+    /// order they run, and the constants from the constant base on.
+    pub fn decode(&self) -> Decoded {
+        let (first, last) = (self.first % CODE_SLOTS, self.last % CODE_SLOTS);
+        let mut insts = Vec::new();
+        let mut i = first;
+        loop {
+            let Some(inst) = self.mem.get(4 * i..4 * i + 4) else { break };
+            insts.push(decode(inst));
+            if i == last {
+                break;
+            }
+            i = (i + 1) % CODE_SLOTS;
+        }
+        let start = (CONST_START + self.const_base) * 4;
+        let consts = self.mem.get(start..).unwrap_or(&[]).chunks_exact(4).map(|d| [0, 1, 2, 3].map(|c| f32::from_bits(d[c]))).collect();
+        Decoded { insts, consts }
+    }
+}
+
+impl Decoded {
     /// Runs the program on one vertex's inputs and returns its outputs.
     pub fn run(&self, inputs: &[V4; INPUTS]) -> [V4; OUTPUTS] {
         let mut m = Machine {
@@ -272,15 +349,8 @@ impl Program<'_> {
             out: [[0.0, 0.0, 0.0, 1.0]; OUTPUTS],
             a0: [0; 4],
         };
-        let (first, last) = (self.first % CODE_SLOTS, self.last % CODE_SLOTS);
-        let mut i = first;
-        loop {
-            let Some(inst) = self.mem.get(4 * i..4 * i + 4) else { break };
+        for inst in &self.insts {
             m.step(inst);
-            if i == last {
-                break;
-            }
-            i = (i + 1) % CODE_SLOTS;
         }
         m.out
     }

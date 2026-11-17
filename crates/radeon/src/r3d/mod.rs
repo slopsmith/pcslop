@@ -828,6 +828,7 @@ impl Radeon {
             const_base: bits(self.reg(VAP_PVS_CONST_CNTL), 0, 8) as usize,
         };
         let psc = self.psc();
+        let program = program.decode();
         let shade = |d: &Vec<u32>| {
             let inputs = psc.inputs(d);
             if bypass { std::array::from_fn(|i| inputs[i]) } else { program.run(&inputs) }
