@@ -1,6 +1,6 @@
 //! MC146818-compatible RTC and CMOS RAM (Motorola MC146818A datasheet).
-//! Time comes from the host clock; alarms and update interrupts are not
-//! implemented yet, but the periodic interrupt is.
+//! Time comes from the host clock. The periodic, alarm and update-ended
+//! interrupts are implemented.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -11,8 +11,12 @@ pub const REG_D: usize = 0x0d;
 
 const B_24H: u8 = 0x02;
 const B_BINARY: u8 = 0x04;
+const B_UIE: u8 = 0x10;
+const B_AIE: u8 = 0x20;
 const B_PIE: u8 = 0x40;
 const B_SET: u8 = 0x80;
+const C_UF: u8 = 0x10;
+const C_AF: u8 = 0x20;
 const C_PF: u8 = 0x40;
 const C_IRQF: u8 = 0x80;
 const CENTURY: usize = 0x32;
@@ -25,6 +29,8 @@ pub struct Rtc {
     /// Seconds added to the host clock by guest writes to the time registers.
     offset: i64,
     next_periodic_ns: u64,
+    /// The RTC second the update and alarm checks last saw.
+    last_second: Option<i64>,
 }
 
 impl Default for Rtc {
@@ -33,7 +39,7 @@ impl Default for Rtc {
         ram[REG_A] = 0x26;
         ram[REG_B] = B_24H;
         ram[REG_D] = 0x80;
-        Rtc { ram, index: 0, offset: 0, next_periodic_ns: 0 }
+        Rtc { ram, index: 0, offset: 0, next_periodic_ns: 0, last_second: None }
     }
 }
 
@@ -146,8 +152,20 @@ impl Rtc {
         Some(1_000_000_000u64 * (1 << (rate - 1)) / 32_768)
     }
 
-    /// Returns true when the periodic interrupt should be raised on IRQ 8.
+    /// Returns true when an interrupt should be raised on IRQ 8.
     pub fn poll(&mut self, now_ns: u64) -> bool {
+        let periodic = self.poll_periodic(now_ns);
+        // Reading the host clock costs a time zone lookup, so skip it while nothing listens.
+        let second = if self.ram[REG_B] & (B_UIE | B_AIE) != 0 {
+            self.poll_second(Self::host_seconds())
+        } else {
+            self.last_second = None;
+            false
+        };
+        periodic || second
+    }
+
+    fn poll_periodic(&mut self, now_ns: u64) -> bool {
         let Some(period) = self.periodic_ns() else {
             self.next_periodic_ns = 0;
             return false;
@@ -162,6 +180,44 @@ impl Rtc {
         self.next_periodic_ns = now_ns + period;
         self.ram[REG_C] |= C_PF | C_IRQF;
         true
+    }
+
+    /// Sets the update-ended and alarm flags once per RTC second, given the
+    /// host clock in local seconds.
+    fn poll_second(&mut self, host_seconds: i64) -> bool {
+        if self.ram[REG_B] & (B_UIE | B_AIE) == 0 || self.ram[REG_B] & B_SET != 0 {
+            self.last_second = None;
+            return false;
+        }
+        let now = host_seconds + self.offset;
+        if self.last_second.is_none_or(|s| s == now) {
+            self.last_second = Some(now);
+            return false;
+        }
+        self.last_second = Some(now);
+        let secs = now.rem_euclid(86_400) as u32;
+        let mut flags = C_UF;
+        let wanted = [(0x01, secs % 60), (0x03, secs / 60 % 60), (0x05, secs / 3600)];
+        if wanted.iter().all(|&(reg, v)| {
+            let alarm = self.ram[reg];
+            alarm & 0xc0 == 0xc0 || self.alarm_value(reg, alarm) == v
+        }) {
+            flags |= C_AF;
+        }
+        let enabled = (self.ram[REG_B] & B_UIE != 0 && flags & C_UF != 0) || (self.ram[REG_B] & B_AIE != 0 && flags & C_AF != 0);
+        self.ram[REG_C] |= flags;
+        if enabled {
+            self.ram[REG_C] |= C_IRQF;
+        }
+        enabled
+    }
+
+    fn alarm_value(&self, reg: usize, raw: u8) -> u32 {
+        if reg == 0x05 && self.ram[REG_B] & B_24H == 0 {
+            let h = self.dec(raw & 0x7f) % 12;
+            return h + if raw & 0x80 != 0 { 12 } else { 0 };
+        }
+        self.dec(raw)
     }
 
     pub fn read(&mut self, port: u16) -> u8 {
@@ -244,6 +300,46 @@ mod tests {
         rtc.write(0x71, 0x20);
         rtc.write(0x70, 0x09);
         assert_eq!(rtc.read(0x71), 0x03);
+    }
+
+    #[test]
+    fn update_interrupt_fires_once_per_second() {
+        let mut rtc = Rtc::default();
+        rtc.ram[REG_B] |= B_UIE;
+        assert!(!rtc.poll_second(100));
+        assert!(!rtc.poll_second(100));
+        assert!(rtc.poll_second(101));
+        rtc.write(0x70, REG_C as u8);
+        assert_eq!(rtc.read(0x71) & (C_IRQF | C_UF), C_IRQF | C_UF);
+        assert_eq!(rtc.read(0x71), 0);
+        assert!(!rtc.poll_second(101));
+    }
+
+    #[test]
+    fn update_flag_without_interrupt_when_only_alarm_is_enabled() {
+        let mut rtc = Rtc::default();
+        rtc.ram[REG_B] = B_24H | B_BINARY | B_AIE;
+        rtc.ram[0x01] = 59;
+        rtc.ram[0x03] = 0;
+        rtc.ram[0x05] = 0;
+        rtc.offset = 0;
+        assert!(!rtc.poll_second(86_400 - 2));
+        assert!(!rtc.poll_second(86_400 - 1));
+        rtc.write(0x70, REG_C as u8);
+        assert_eq!(rtc.read(0x71), C_UF);
+        assert!(rtc.poll_second(86_400 + 59));
+        assert_eq!(rtc.read(0x71) & (C_IRQF | C_AF), C_IRQF | C_AF);
+    }
+
+    #[test]
+    fn alarm_dont_care_bytes_match_every_second() {
+        let mut rtc = Rtc::default();
+        rtc.ram[REG_B] |= B_AIE;
+        for reg in [0x01, 0x03, 0x05] {
+            rtc.ram[reg] = 0xff;
+        }
+        assert!(!rtc.poll_second(7));
+        assert!(rtc.poll_second(8));
     }
 
     #[test]
