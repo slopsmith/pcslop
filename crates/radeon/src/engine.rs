@@ -229,7 +229,7 @@ impl Radeon {
     }
 
     /// Side effects of writing a 2D engine register; false if `reg` has none.
-    pub(crate) fn engine_register_written(&mut self, reg: u32, v: u32) -> bool {
+    pub(crate) fn engine_register_written(&mut self, reg: u32, v: u32, mem: &mut dyn BusMemory) -> bool {
         let e = &mut self.engine;
         match reg {
             DP_GUI_MASTER_CNTL | DP_GUI_MASTER_CNTL_C => self.gui_master_written(v),
@@ -264,20 +264,20 @@ impl Radeon {
             DST_HEIGHT => e.height = (v & 0x3fff) as i32,
             DST_HEIGHT_WIDTH | DST_HEIGHT_WIDTH_8 => {
                 (e.height, e.width) = ((v >> 16 & 0x3fff) as i32, (v & 0x3fff) as i32);
-                self.blit_from_registers();
+                self.blit_from_registers(mem);
             }
             DST_WIDTH_HEIGHT => {
                 (e.width, e.height) = ((v >> 16 & 0x3fff) as i32, (v & 0x3fff) as i32);
-                self.blit_from_registers();
+                self.blit_from_registers(mem);
             }
             DST_LINE_START => e.line = (sext16(v), sext16(v >> 16)),
             DST_LINE_END => {
                 let from = e.line;
                 let to = (sext16(v), sext16(v >> 16));
-                self.line(from, to);
+                self.line(from, to, mem);
                 self.engine.line = to;
             }
-            HOST_DATA0..=HOST_DATA_LAST => self.host_data(&[v], reg == HOST_DATA_LAST),
+            HOST_DATA0..=HOST_DATA_LAST => self.host_data(&[v], reg == HOST_DATA_LAST, mem),
             _ => return false,
         }
         true
@@ -285,7 +285,7 @@ impl Radeon {
 
     /// Starts the blit that DST_WIDTH_HEIGHT and friends trigger, honouring
     /// DP_CNTL: a right-to-left or bottom-to-top blit names its far edge.
-    fn blit_from_registers(&mut self) {
+    fn blit_from_registers(&mut self, mem: &mut dyn BusMemory) {
         let e = &self.engine;
         let ctl = self.reg(DP_CNTL);
         let (w, h) = (e.width, e.height);
@@ -298,15 +298,15 @@ impl Radeon {
             y += 1 - h;
             sy += 1 - h;
         }
-        self.blit(Rect { x, y, w, h }, (sx, sy));
+        self.blit(Rect { x, y, w, h }, (sx, sy), mem);
     }
 
-    fn blit(&mut self, rect: Rect, src: (i32, i32)) {
+    fn blit(&mut self, rect: Rect, src: (i32, i32), mem: &mut dyn BusMemory) {
         if rect.w <= 0 || rect.h <= 0 {
             return;
         }
         if matches!(self.src_source(), 3 | 4) && uses_src(self.rop()) {
-            self.finish_host_blit();
+            self.finish_host_blit(mem);
             let needed = self.host_dwords(rect);
             self.engine.host = Some(HostBlit {
                 rect,
@@ -316,9 +316,9 @@ impl Radeon {
             return;
         }
         if uses_src(self.rop()) && self.src_source() == 2 {
-            self.copy_from_vram(rect, src);
+            self.copy_from_vram(rect, src, mem);
         } else {
-            self.draw(rect, Src::None);
+            self.draw(rect, Src::None, mem);
         }
     }
 
@@ -337,17 +337,17 @@ impl Radeon {
         }
     }
 
-    fn host_data(&mut self, data: &[u32], last: bool) {
+    fn host_data(&mut self, data: &[u32], last: bool, mem: &mut dyn BusMemory) {
         let Some(hb) = self.engine.host.as_mut() else {
             return;
         };
         hb.data.extend_from_slice(data);
         if last || hb.data.len() >= hb.needed {
-            self.finish_host_blit();
+            self.finish_host_blit(mem);
         }
     }
 
-    fn finish_host_blit(&mut self) {
+    fn finish_host_blit(&mut self, mem: &mut dyn BusMemory) {
         let Some(hb) = self.engine.host.take() else {
             return;
         };
@@ -366,6 +366,7 @@ impl Radeon {
                     row_bits,
                     lsb_first,
                 },
+                mem,
             );
         } else {
             let bytes: Vec<u8> = hb.data.iter().flat_map(|d| d.to_le_bytes()).collect();
@@ -375,22 +376,34 @@ impl Radeon {
                     data: &bytes,
                     stride: w,
                 },
+                mem,
             );
         }
     }
 
-    fn copy_from_vram(&mut self, rect: Rect, (sx, sy): (i32, i32)) {
+    fn copy_from_vram(&mut self, rect: Rect, (sx, sy): (i32, i32), mem: &mut dyn BusMemory) {
         let Some(bpp) = bytes_per_pixel(self.datatype()) else {
             return;
         };
         let src = self.engine.src;
-        let base = self.vram_of(src.offset);
         let pitch = src.pitch as usize;
         let (w, h) = (rect.w as usize, rect.h as usize);
         if self.simple_copy(rect, (sx, sy), bpp) {
             return;
         }
-        let vram = self.vga.vram();
+        let staged = match self.surface_vram(src.offset) {
+            Some(_) => None,
+            None => {
+                let first = sy.max(0) as usize;
+                let mut buf = vec![0; h * pitch];
+                self.mc_read(mem, src.offset.wrapping_add((first * pitch) as u32), &mut buf);
+                Some((first, buf))
+            }
+        };
+        let (data, base): (&[u8], usize) = match &staged {
+            Some((first, buf)) => (buf, 0usize.wrapping_sub(first * pitch)),
+            None => (self.vga.vram(), self.vram_of(src.offset)),
+        };
         let mut pixels = vec![0u8; w * h * bpp];
         for j in 0..h {
             let row = sy + j as i32;
@@ -402,9 +415,9 @@ impl Radeon {
                 if col < 0 {
                     continue;
                 }
-                let a = base + row as usize * pitch + col as usize * bpp;
-                if a + bpp <= vram.len() {
-                    pixels[(j * w + i) * bpp..][..bpp].copy_from_slice(&vram[a..a + bpp]);
+                let a = base.wrapping_add(row as usize * pitch + col as usize * bpp);
+                if let Some(px) = data.get(a..a + bpp) {
+                    pixels[(j * w + i) * bpp..][..bpp].copy_from_slice(px);
                 }
             }
         }
@@ -414,6 +427,7 @@ impl Radeon {
                 data: &pixels,
                 stride: w,
             },
+            mem,
         );
     }
 
@@ -434,7 +448,9 @@ impl Radeon {
             return false;
         }
         let (src, dst) = (self.engine.src, self.engine.dst);
-        let (sbase, dbase) = (self.vram_of(src.offset), self.vram_of(dst.offset));
+        let (Some(sbase), Some(dbase)) = (self.surface_vram(src.offset), self.surface_vram(dst.offset)) else {
+            return false;
+        };
         let (sp, dp) = (src.pitch as usize, dst.pitch as usize);
         let row_bytes = clip.w as usize * bpp;
         let last = |base: usize, pitch: usize, x: i32, y: i32| {
@@ -529,7 +545,7 @@ impl Radeon {
 
     /// Writes `rect` through the scissor with the current ROP, brush and
     /// write mask, taking source pixels from `src`.
-    fn draw(&mut self, rect: Rect, src: Src) {
+    fn draw(&mut self, rect: Rect, src: Src, mem: &mut dyn BusMemory) {
         let Some(bpp) = bytes_per_pixel(self.datatype()) else {
             return;
         };
@@ -540,8 +556,9 @@ impl Radeon {
         let mask = self.write_mask(bpp);
         let compare = self.colour_compare();
         let dst = self.engine.dst;
-        let base = self.vram_of(dst.offset);
         let pitch = dst.pitch as usize;
+        let in_vram = self.surface_vram(dst.offset);
+        let base = in_vram.unwrap_or(0);
         let need_pat = uses_pat(rop);
         let need_src = uses_src(rop);
         let mono = (self.datatype() >> 16) & 3;
@@ -551,6 +568,7 @@ impl Radeon {
             && !need_src
             && rop == 0xf0
             && mask == pmask
+            && in_vram.is_some()
             && self.fill_fast(clip, base, pitch, bpp)
         {
             return;
@@ -562,7 +580,19 @@ impl Radeon {
                 .map(|i| self.pattern(clip.x + (i % 8), clip.y + (i / 8), bpp))
                 .collect(),
         };
-        let vram = self.vga.vram_mut();
+        let first_row = clip.y as usize * pitch;
+        let mut staged = match in_vram {
+            Some(_) => None,
+            None => {
+                let mut buf = vec![0; clip.h as usize * pitch];
+                self.mc_read(mem, dst.offset.wrapping_add(first_row as u32), &mut buf);
+                Some(buf)
+            }
+        };
+        let (vram, base): (&mut [u8], usize) = match &mut staged {
+            Some(buf) => (buf, 0usize.wrapping_sub(first_row)),
+            None => (self.vga.vram_mut(), base),
+        };
         for j in 0..clip.h {
             let y = clip.y + j;
             let row = (y - rect.y) as usize;
@@ -602,8 +632,8 @@ impl Radeon {
                 } else {
                     0
                 };
-                let a = base + y as usize * pitch + x as usize * bpp;
-                let Some(px) = vram.get_mut(a..a + bpp) else {
+                let a = base.wrapping_add(y as usize * pitch + x as usize * bpp);
+                let Some(px) = vram.get_mut(a..a.wrapping_add(bpp)) else {
                     continue;
                 };
                 let d = px.iter().rev().fold(0, |v, &b| v << 8 | b as u32);
@@ -615,6 +645,9 @@ impl Radeon {
                 let r = (rop3(rop, p, s, d) & mask) | (d & !mask);
                 px.copy_from_slice(&r.to_le_bytes()[..bpp]);
             }
+        }
+        if let Some(buf) = staged {
+            self.mc_write(mem, dst.offset.wrapping_add(first_row as u32), &buf);
         }
     }
 
@@ -636,7 +669,7 @@ impl Radeon {
 
     /// A line from `from` to `to` without its last pixel, as the engine draws
     /// DST_LINE_START to DST_LINE_END.
-    fn line(&mut self, from: (i32, i32), to: (i32, i32)) {
+    fn line(&mut self, from: (i32, i32), to: (i32, i32), mem: &mut dyn BusMemory) {
         let (mut x, mut y) = from;
         let (dx, dy) = ((to.0 - x).abs(), -(to.1 - y).abs());
         let (stepx, stepy) = (if x < to.0 { 1 } else { -1 }, if y < to.1 { 1 } else { -1 });
@@ -663,7 +696,7 @@ impl Radeon {
             if let Some(c) = colour {
                 self.regs[DP_BRUSH_FRGD_CLR as usize / 4] = c;
                 self.regs[DP_DATATYPE as usize / 4] = (saved_type & !0xf00) | 13 << 8;
-                self.draw(Rect { x, y, w: 1, h: 1 }, Src::None);
+                self.draw(Rect { x, y, w: 1, h: 1 }, Src::None, mem);
             }
             let e2 = 2 * err;
             if e2 >= dy {
@@ -692,7 +725,7 @@ impl Radeon {
             op::PAINT_MULTI => {
                 while let (Some(pos), Some(size)) = (next(), next()) {
                     let ((x, y), (w, h)) = (xy(pos), xy(size));
-                    self.blit(Rect { x, y, w, h }, (0, 0));
+                    self.blit(Rect { x, y, w, h }, (0, 0), mem);
                 }
             }
             op::PAINT => {
@@ -706,6 +739,7 @@ impl Radeon {
                             h: b - y,
                         },
                         (0, 0),
+                        mem,
                     );
                 }
             }
@@ -713,7 +747,7 @@ impl Radeon {
                 while let (Some(s), Some(d), Some(size)) = (next(), next(), next()) {
                     let (s, (x, y)) = (xy(s), xy(d));
                     let (w, h) = ((size >> 16 & 0x3fff) as i32, (size & 0x3fff) as i32);
-                    self.blit(Rect { x, y, w, h }, s);
+                    self.blit(Rect { x, y, w, h }, s, mem);
                 }
             }
             op::HOSTDATA_BLT => {
@@ -726,8 +760,8 @@ impl Radeon {
                 while let (Some(pos), Some(size), Some(n)) = (c.next(), c.next(), c.next()) {
                     let ((y, x), (h, w)) = (xy(pos), xy(size));
                     let data = c.take((n & 0x3fff) as usize);
-                    self.blit(Rect { x, y, w, h }, (0, 0));
-                    self.host_data(data, true);
+                    self.blit(Rect { x, y, w, h }, (0, 0), mem);
+                    self.host_data(data, true, mem);
                 }
             }
             op::TRANS_BITBLT => {
@@ -738,7 +772,7 @@ impl Radeon {
                 while let (Some(s), Some(d), Some(size)) = (next(), next(), next()) {
                     let (s, (x, y)) = (xy(s), xy(d));
                     let (w, h) = ((size >> 16 & 0x3fff) as i32, (size & 0x3fff) as i32);
-                    self.blit(Rect { x, y, w, h }, s);
+                    self.blit(Rect { x, y, w, h }, s, mem);
                 }
             }
             op::POLYLINE => {
@@ -746,7 +780,7 @@ impl Radeon {
                 while let Some(p) = next() {
                     let (y, x) = xy(p);
                     if let Some(from) = prev {
-                        self.line(from, (x, y));
+                        self.line(from, (x, y), mem);
                     }
                     prev = Some((x, y));
                 }
@@ -769,6 +803,7 @@ impl Radeon {
                                 h,
                             },
                             (0, 0),
+                            mem,
                         );
                     }
                 }
@@ -778,11 +813,11 @@ impl Radeon {
     }
 
     /// NEXTCHAR: a monochrome bitmap drawn with the current colours and ROP.
-    pub(crate) fn next_char(&mut self, body: &[u32]) {
+    pub(crate) fn next_char(&mut self, body: &[u32], mem: &mut dyn BusMemory) {
         let (Some(&pos), Some(&size)) = (body.first(), body.get(1)) else { return };
         let rect = Rect { x: sext16(pos), y: sext16(pos >> 16), w: (size & 0xffff) as i32, h: (size >> 16 & 0xffff) as i32 };
         let lsb_first = self.datatype() & 1 << 30 != 0;
-        self.draw(rect, Src::Mono { data: &body[2..], row_bits: rect.w as usize, lsb_first });
+        self.draw(rect, Src::Mono { data: &body[2..], row_bits: rect.w as usize, lsb_first }, mem);
     }
 
     /// Applies a 2D packet's SETTINGS and returns where its DATA_BLOCK starts.

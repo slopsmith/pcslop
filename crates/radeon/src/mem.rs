@@ -111,6 +111,17 @@ impl Radeon {
         self.mc_write(mem, addr, &v.to_le_bytes());
     }
 
+    /// VRAM offset of a surface at `mc`, or None if the memory controller
+    /// sends it to system memory through the AGP aperture or the PCI GART.
+    pub(crate) fn surface_vram(&self, mc: u32) -> Option<usize> {
+        let (agp, agp_end) = location(self.reg(MC_AGP_LOCATION));
+        let (lo, hi) = (self.reg(AIC_LO_ADDR), self.reg(AIC_HI_ADDR));
+        let gart = self.reg(AIC_CNTL) & PCIGART_TRANSLATE_EN != 0 && (lo..=hi).contains(&mc);
+        let (fb, fb_end) = location(self.reg(MC_FB_LOCATION));
+        let in_fb = (fb..=fb_end).contains(&mc);
+        (in_fb || !((agp..=agp_end).contains(&mc) || gart)).then(|| self.vram_of(mc))
+    }
+
     /// VRAM offset of a surface the 2D engine addresses in the memory controller's space.
     pub(crate) fn vram_of(&self, mc: u32) -> usize {
         let (fb, _) = location(self.reg(MC_FB_LOCATION));

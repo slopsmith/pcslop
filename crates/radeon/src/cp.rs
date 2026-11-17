@@ -153,9 +153,13 @@ impl Radeon {
     }
 
     fn packet3(&mut self, mem: &mut dyn BusMemory, opcode: u8, body: &[u32]) {
+        if self.trace.is_some() {
+            let words: Vec<String> = body.iter().take(12).map(|w| format!("{w:08x}")).collect();
+            self.note(&format!("cp: packet3 {opcode:#04x} [{}]", words.join(" ")));
+        }
         match opcode {
             op::NOP => {}
-            op::NEXTCHAR => self.next_char(body),
+            op::NEXTCHAR => self.next_char(body, mem),
             op::SET_SCISSORS => {
                 for (reg, &v) in [SC_TOP_LEFT, SC_BOTTOM_RIGHT].into_iter().zip(body) {
                     self.cp_reg_write(mem, reg, v);
@@ -169,6 +173,7 @@ impl Radeon {
             | op::PAINT_MULTI
             | op::BITBLT_MULTI
             | op::TRANS_BITBLT => self.packet_2d(mem, opcode, body),
+            _ if self.packet_3d(mem, opcode, body) => {}
             _ => {
                 let (word, bit) = (opcode as usize / 64, 1u64 << (opcode % 64));
                 if self.cp.skipped[word] & bit == 0 {

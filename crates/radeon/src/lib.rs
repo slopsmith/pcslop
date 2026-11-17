@@ -13,6 +13,7 @@ mod engine;
 mod i2c;
 mod mem;
 mod names;
+mod r3d;
 pub mod regs;
 mod trace;
 
@@ -85,6 +86,7 @@ pub struct Radeon {
     cp: cp::Cp,
     engine: engine::Engine,
     i2c: i2c::I2cEngine,
+    r3d: r3d::ThreeD,
     /// The monitor on the VGA connector's DDC lines.
     monitor: ddc::Ddc,
     #[snap(skip)]
@@ -106,6 +108,7 @@ impl Radeon {
             cp: cp::Cp::default(),
             engine: engine::Engine::default(),
             i2c: i2c::I2cEngine::default(),
+            r3d: r3d::ThreeD::default(),
             monitor: ddc::Ddc::default(),
             trace: None,
         };
@@ -121,9 +124,10 @@ impl Radeon {
         self.cp = cp::Cp::default();
         self.engine = engine::Engine::default();
         self.i2c = i2c::I2cEngine::default();
+        self.r3d = r3d::ThreeD::default();
         for r in [DEFAULT_SC_BOTTOM_RIGHT, SC_BOTTOM_RIGHT] {
             self.regs[r as usize / 4] = 0x1fff_1fff;
-            self.engine_register_written(r, 0x1fff_1fff);
+            self.engine_register_written(r, 0x1fff_1fff, &mut NoBus);
         }
         self.regs[DP_WRITE_MASK as usize / 4] = u32::MAX;
         self.regs[CLR_CMP_MASK as usize / 4] = u32::MAX;
@@ -461,7 +465,11 @@ impl Radeon {
             I2C_DATA => return self.i2c.push(new as u8),
             _ => {}
         }
-        if self.cp_register_written(reg, mem) || self.engine_register_written(reg, new) {
+        if self.cp_register_written(reg, mem)
+            || self.engine_register_written(reg, new, mem)
+            || self.r3d_register_written(reg, new)
+            || self.zpass_written(reg, new, mem)
+        {
             return;
         }
         match reg {
@@ -546,9 +554,9 @@ impl Radeon {
         (enabled && !self.irq()).then(|| self.next_frame_ns())
     }
 
-    /// Commands and 2D operations run so far.
-    pub fn stats(&self) -> (u64, u64) {
-        (self.cp.packets, self.engine.ops)
+    /// Commands, 2D operations and 3D draws run so far.
+    pub fn stats(&self) -> (u64, u64, u64) {
+        (self.cp.packets, self.engine.ops, self.r3d.draws)
     }
 
     pub fn take_changed(&mut self) -> bool {
