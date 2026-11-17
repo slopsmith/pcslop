@@ -42,6 +42,10 @@ impl MetalR3d {
         false
     }
 
+    pub fn gpu_ms(&self) -> u64 {
+        0
+    }
+
     pub fn throttles(&self) -> u64 {
         0
     }

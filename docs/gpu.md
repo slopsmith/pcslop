@@ -188,7 +188,7 @@ Still missing: the vertex shader on the GPU, HiZ (`3D_CLEAR_HIZ` does nothing, w
 
 ### Metal backend
 
-`--gpu-3d metal` (the default) or `--gpu-3d cpu`, also set by `SLOPPER_R3D`, picks the backend; `status` reports draws, CPU fallbacks and waits.
+`--gpu-3d metal` (the default) or `--gpu-3d cpu`, also set by `SLOPPER_R3D`, picks the backend; `status` reports draws, CPU fallbacks, waits, kicks throttled by the in-flight limit, pipelines and the milliseconds the GPU spent on finished command buffers (two samples give how busy the GPU is).
 
 - **Split:** the CPU still fetches vertices, runs the vertex program (once per distinct index of an indexed draw, and on up to eight threads for draws of 2,048 vertices or more), clips, culls, applies polygon offset, flat shading and the RS, and turns points and lines into triangles. `Raster::triangle` captures the window-space triangles, with the pixel stack registers the RS fills, instead of scan-converting them. Metal rasterizes them in an attachmentless 4096x4096 pass with the scissor as its scissor rectangle.
 - **VRAM** is one `MTLBuffer` over the card's memory (`newBufferWithBytesNoCopy`, page aligned, shared storage), so Metal reads textures and writes pixels where the CRTC, the 2D engine and the guest see them, with no copies.

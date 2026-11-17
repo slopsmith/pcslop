@@ -411,7 +411,8 @@ impl Radeon {
             Some((d, f, w)) => {
                 let t = self.metal.as_ref().map_or(0, |m| m.throttles());
                 let p = self.metal.as_ref().map_or(0, |m| m.pipelines());
-                s += &format!(" | metal draws {d} cpu fallbacks {f} waits {w} throttled {t} pipelines {p}")
+                let ms = self.metal.as_ref().map_or(0, |m| m.gpu_ms());
+                s += &format!(" | metal draws {d} cpu fallbacks {f} waits {w} throttled {t} pipelines {p} gpu ms {ms}")
             }
             None => s += " | cpu",
         }

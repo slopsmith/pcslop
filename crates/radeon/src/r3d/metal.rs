@@ -179,6 +179,8 @@ pub(crate) struct MetalR3d {
     waits: u64,
     /// Kicks that waited because MAX_INFLIGHT command buffers were queued.
     throttles: u64,
+    /// Seconds the GPU spent running finished command buffers.
+    gpu_seconds: f64,
 }
 
 // The Metal objects are only touched while the card's owner holds it.
@@ -226,6 +228,7 @@ impl MetalR3d {
             fallbacks: 0,
             waits: 0,
             throttles: 0,
+            gpu_seconds: 0.0,
         })
     }
 
@@ -527,6 +530,11 @@ impl MetalR3d {
         self.pipelines.len()
     }
 
+    /// Milliseconds the GPU spent on finished work.
+    pub fn gpu_ms(&self) -> u64 {
+        (self.gpu_seconds * 1000.0) as u64
+    }
+
     pub fn throttles(&self) -> u64 {
         self.throttles
     }
@@ -561,6 +569,10 @@ impl MetalR3d {
         }
         arena.used = 0;
         arena.dirty.clear();
+        let (start, end) = (cmd.GPUStartTime(), cmd.GPUEndTime());
+        if end > start && start > 0.0 {
+            self.gpu_seconds += end - start;
+        }
         if self.free.len() <= MAX_INFLIGHT {
             self.free.push(arena);
         }
