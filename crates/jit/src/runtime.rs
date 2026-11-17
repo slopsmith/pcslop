@@ -62,7 +62,7 @@ fn store_guest(a: &mut Asm, nzcv_from_spsr: Option<Reg>) {
     match nzcv_from_spsr {
         Some(spsr) => {
             let ok = a.logic_imm(Logic::And, Size::W, r(9), spsr, 0xf000_0000);
-            debug_assert!(ok);
+            assert!(ok);
         }
         None => a.mrs(r(9), sysreg::NZCV),
     }
@@ -103,7 +103,7 @@ fn try_fill(a: &mut Asm, fail: Label) {
     let phys = r(14);
     let logic = |a: &mut Asm, op: Logic, sz: Size, rd: Reg, rn: Reg, imm: u64| {
         let ok = a.logic_imm(op, sz, rd, rn, imm);
-        debug_assert!(ok);
+        assert!(ok);
     };
     a.mrs(esr, sysreg::ESR_EL1);
     a.ubfx(Size::X, t6, esr, 26, 6);

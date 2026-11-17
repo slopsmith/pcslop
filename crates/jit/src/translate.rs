@@ -381,7 +381,7 @@ impl Emit {
         }
         self.a.ubfx(Size::W, T_D, T_C, width, 1);
         let ok = self.a.logic_imm(a64::Logic::Eor, Size::W, T_D, T_D, 1);
-        debug_assert!(ok);
+        assert!(ok);
         self.a.rmif(T_D, 63, 0b0010);
         self.a.ubfx(Size::W, T_RES, T_C, 0, width);
         self.a.mov(Size::W, PF_RESULT, T_RES);
@@ -485,7 +485,7 @@ impl Emit {
     fn shift_flags(&mut self) {
         self.a.tst(Size::W, T_RES, T_RES);
         let ok = self.a.logic_imm(a64::Logic::Eor, Size::W, T_B, T_B, 1);
-        debug_assert!(ok);
+        assert!(ok);
         self.a.logic_shift(a64::Logic::Orr, false, Size::W, T_C, T_C, T_B, Shift::Lsl, 1);
         self.a.rmif(T_C, 0, 0b0011);
         self.a.mov(Size::W, PF_RESULT, T_RES);
@@ -494,7 +494,7 @@ impl Emit {
     fn shift_cl(&mut self, kind: usize, a: Reg) {
         let n = T_D;
         let ok = self.a.logic_imm(a64::Logic::And, Size::W, n, guest_reg(1), 31);
-        debug_assert!(ok);
+        assert!(ok);
         match kind {
             4 | 6 => {
                 self.a.lslv(Size::W, T_RES, a, n);
@@ -517,7 +517,7 @@ impl Emit {
             }
         }
         let ok = self.a.logic_imm(a64::Logic::And, Size::W, T_B, T_B, 1);
-        debug_assert!(ok);
+        assert!(ok);
         if matches!(kind, 4 | 6) {
             self.a.eor(Size::W, T_C, T_C, T_B);
         }
@@ -567,7 +567,7 @@ impl Emit {
         }
         self.a.tst(Size::W, T_RES, T_RES);
         let ok = self.a.logic_imm(a64::Logic::Eor, Size::W, T_B, T_B, 1);
-        debug_assert!(ok);
+        assert!(ok);
         self.a.logic_shift(a64::Logic::Orr, false, Size::W, T_C, T_C, T_B, Shift::Lsl, 1);
         self.a.rmif(T_C, 0, 0b0011);
         self.a.mov(Size::W, PF_RESULT, T_RES);
@@ -886,7 +886,7 @@ impl Emit {
                 let Some(a) = self.rm_w(insn, Ow::D, true) else { return Step::Unsupported };
                 let skip = self.a.label();
                 let ok = self.a.logic_imm(a64::Logic::And, Size::W, T_D, guest_reg(1), 31);
-                debug_assert!(ok);
+                assert!(ok);
                 self.a.cbz(Size::W, T_D, skip);
                 self.shift_cl(insn.reg(), a);
                 self.write_rm(insn, Ow::D, T_RES);
@@ -1146,7 +1146,7 @@ impl Emit {
                 let Some(a) = self.rm_w(insn, Ow::D, true) else { return Step::Unsupported };
                 let skip = self.a.label();
                 let ok = self.a.logic_imm(a64::Logic::And, Size::W, T_D, guest_reg(1), 31);
-                debug_assert!(ok);
+                assert!(ok);
                 self.a.cbz(Size::W, T_D, skip);
                 if insn.reg() == 0 {
                     self.a.neg(Size::W, T_D, T_D);
@@ -1246,7 +1246,7 @@ impl Emit {
                 } else {
                     let skip = self.a.label();
                     let ok = self.a.logic_imm(a64::Logic::And, Size::W, T_D, guest_reg(1), 31);
-                    debug_assert!(ok);
+                    assert!(ok);
                     self.a.cbz(Size::W, T_D, skip);
                     self.a.movz(Size::W, T_C, 32, 0);
                     self.a.sub(Size::W, T_C, T_C, T_D);
@@ -1262,7 +1262,7 @@ impl Emit {
                     }
                     self.a.orr(Size::W, T_RES, T_RES, T_A);
                     let ok = self.a.logic_imm(a64::Logic::And, Size::W, T_B, T_B, 1);
-                    debug_assert!(ok);
+                    assert!(ok);
                     self.double_shift_done(insn);
                     self.a.bind(skip);
                 }
@@ -1306,11 +1306,11 @@ impl Emit {
                         _ => (a64::Logic::Eor, 1u64 << bit),
                     };
                     let ok = self.a.logic_imm(logic, Size::W, T_RES, a, imm);
-                    debug_assert!(ok);
+                    assert!(ok);
                     self.write_rm(insn, w, T_RES);
                 }
                 let ok = self.a.logic_imm(a64::Logic::Eor, Size::W, T_B, T_B, 1);
-                debug_assert!(ok);
+                assert!(ok);
                 self.a.lsl_imm(Size::W, T_B, T_B, 1);
                 self.a.rmif(T_B, 0, 0b0010);
             }
@@ -1330,7 +1330,7 @@ impl Emit {
                 self.a.ldr(Width::W, T_B, STATE, state::SSE_OK as i32);
                 self.a.cbz(Size::W, T_B, slow);
                 let ok = self.a.logic_imm(a64::Logic::And, Size::W, T_B, T_ADDR, 15);
-                debug_assert!(ok);
+                assert!(ok);
                 self.a.cbnz(Size::W, T_B, slow);
                 let x = (state::XMM + 16 * insn.reg()) as i32;
                 self.a.ldr(Width::X, T_B, STATE, x);
@@ -1365,14 +1365,14 @@ impl Emit {
             Some(n) => self.a.movz(Size::W, T_D, n & 31, 0),
             None => {
                 let ok = self.a.logic_imm(a64::Logic::And, Size::W, T_D, guest_reg(1), 31);
-                debug_assert!(ok);
+                assert!(ok);
                 self.a.cbz(Size::W, T_D, skip);
             }
         }
         match kind {
             0 | 1 => {
                 let ok = self.a.logic_imm(a64::Logic::And, Size::W, T_E, T_D, bits as u64 - 1);
-                debug_assert!(ok);
+                assert!(ok);
                 self.a.movz(Size::W, T_C, bits, 0);
                 self.a.sub(Size::W, T_C, T_C, T_E);
                 if kind == 0 {
@@ -1420,7 +1420,7 @@ impl Emit {
             }
         }
         let ok = self.a.logic_imm(a64::Logic::And, Size::W, T_B, T_B, 1);
-        debug_assert!(ok);
+        assert!(ok);
         self.a.lsl_imm(Size::W, T_E, T_RES, 32 - bits);
         self.a.tst(Size::W, T_E, T_E);
         self.cf_of_flags();
@@ -1433,7 +1433,7 @@ impl Emit {
     /// Sets ARM C and V from x86 CF in T_B and OF in T_C (each 0 or 1); N and Z stay.
     fn cf_of_flags(&mut self) {
         let ok = self.a.logic_imm(a64::Logic::Eor, Size::W, T_B, T_B, 1);
-        debug_assert!(ok);
+        assert!(ok);
         self.a.logic_shift(a64::Logic::Orr, false, Size::W, T_C, T_C, T_B, Shift::Lsl, 1);
         self.a.rmif(T_C, 0, 0b0011);
     }
@@ -1442,7 +1442,7 @@ impl Emit {
         use x86::cpu::flags;
         self.a.ldr(Width::W, T_A, STATE, state::EFLAGS_REST as i32);
         let ok = self.a.logic_imm(a64::Logic::And, Size::W, T_A, T_A, !(flags::RF as u64) & 0xffff_ffff);
-        debug_assert!(ok);
+        assert!(ok);
         for (c, bit) in [(Cond::Mi, 7), (Cond::Eq, 6), (Cond::Lo, 0), (Cond::Vs, 11)] {
             self.a.cset(Size::W, T_B, c);
             self.a.logic_shift(a64::Logic::Orr, false, Size::W, T_A, T_A, T_B, Shift::Lsl, bit);
@@ -1452,12 +1452,12 @@ impl Emit {
             self.a.logic_shift(a64::Logic::Eor, false, Size::W, T_B, T_B, T_B, Shift::Lsr, sh);
         }
         let ok = self.a.logic_imm(a64::Logic::And, Size::W, T_B, T_B, 1);
-        debug_assert!(ok);
+        assert!(ok);
         let ok = self.a.logic_imm(a64::Logic::Eor, Size::W, T_B, T_B, 1);
-        debug_assert!(ok);
+        assert!(ok);
         self.a.logic_shift(a64::Logic::Orr, false, Size::W, T_A, T_A, T_B, Shift::Lsl, 2);
         let ok = self.a.logic_imm(a64::Logic::And, Size::W, T_B, AF_AUX, flags::AF as u64);
-        debug_assert!(ok);
+        assert!(ok);
         self.a.orr(Size::W, T_A, T_A, T_B);
         self.a.ldr(Width::W, T_B, STATE, state::IF_FLAG as i32);
         self.a.logic_shift(a64::Logic::Orr, false, Size::W, T_A, T_A, T_B, Shift::Lsl, 9);
@@ -1489,16 +1489,16 @@ impl Emit {
         self.a.logic_shift(a64::Logic::Orr, false, Size::W, T_C, T_B, T_C, Shift::Lsl, 1);
         self.a.ubfx(Size::W, T_B, T_A, 0, 1);
         let ok = self.a.logic_imm(a64::Logic::Eor, Size::W, T_B, T_B, 1);
-        debug_assert!(ok);
+        assert!(ok);
         self.a.logic_shift(a64::Logic::Orr, false, Size::W, T_C, T_B, T_C, Shift::Lsl, 1);
         self.a.ubfx(Size::W, T_B, T_A, 11, 1);
         self.a.logic_shift(a64::Logic::Orr, false, Size::W, T_C, T_B, T_C, Shift::Lsl, 1);
         self.a.rmif(T_C, 0, 0b1111);
         self.a.ubfx(Size::W, T_B, T_A, 2, 1);
         let ok = self.a.logic_imm(a64::Logic::Eor, Size::W, PF_RESULT, T_B, 1);
-        debug_assert!(ok);
+        assert!(ok);
         let ok = self.a.logic_imm(a64::Logic::And, Size::W, AF_AUX, T_A, flags::AF as u64);
-        debug_assert!(ok);
+        assert!(ok);
         self.a.ubfx(Size::W, T_B, T_A, 10, 1);
         self.a.str(Width::W, T_B, STATE, state::DF as i32);
         if self.user {
