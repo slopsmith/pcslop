@@ -1,11 +1,13 @@
-//! Rectangle encodings for framebuffer updates: Raw and ZRLE (RFC 6143
-//! section 7.7.6).
+//! Rectangle encodings for framebuffer updates: Raw, ZRLE (RFC 6143 section
+//! 7.7.6) and lossless Tight (the community RFB specification, rfbproto,
+//! "Tight Encoding").
 
 use flate2::{Compress, Compression, FlushCompress};
 
 use super::proto::{self, PixelFormat, Rect};
 
 pub const ENC_RAW: i32 = proto::ENC_RAW;
+pub const ENC_TIGHT: i32 = 7;
 pub const ENC_ZRLE: i32 = 16;
 const ENC_COMPRESS_LEVEL_0: i32 = -256;
 const ENC_COMPRESS_LEVEL_9: i32 = -247;
@@ -13,18 +15,30 @@ const ENC_COMPRESS_LEVEL_9: i32 = -247;
 const ZRLE_TILE: usize = 64;
 const ZRLE_MAX_PALETTE: usize = 127;
 
+const TIGHT_MAX_WIDTH: usize = 2048;
+const TIGHT_MAX_PIXELS: usize = 65536;
+const TIGHT_MIN_TO_COMPRESS: usize = 12;
+const TIGHT_FILL: u8 = 0x80;
+const TIGHT_EXPLICIT_FILTER: u8 = 0x40;
+const TIGHT_FILTER_PALETTE: u8 = 1;
+const TIGHT_STREAM_FULL: usize = 0;
+const TIGHT_STREAM_MONO: usize = 1;
+const TIGHT_STREAM_PALETTE: usize = 2;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Raw,
     Zrle,
+    Tight,
 }
 
 /// Encodes update rectangles in the encoding the client prefers, keeping the
-/// zlib stream that ZRLE carries across a whole connection.
+/// zlib streams that ZRLE and Tight carry across a whole connection.
 pub struct Encoder {
     pub kind: Kind,
     level: u32,
     zrle: Option<Compress>,
+    tight: [Option<Compress>; 4],
     palette: Palette,
     tile: Vec<u32>,
     data: Vec<u8>,
@@ -36,6 +50,7 @@ impl Encoder {
             kind: Kind::Raw,
             level: 6,
             zrle: None,
+            tight: [None, None, None, None],
             palette: Palette::new(),
             tile: Vec::new(),
             data: Vec::new(),
@@ -51,6 +66,7 @@ impl Encoder {
             .find_map(|&e| match e {
                 ENC_RAW => Some(Kind::Raw),
                 ENC_ZRLE => Some(Kind::Zrle),
+                ENC_TIGHT => Some(Kind::Tight),
                 _ => None,
             })
             .unwrap_or(Kind::Raw);
@@ -59,11 +75,32 @@ impl Encoder {
         }
     }
 
+    /// Splits rectangles into the pieces this encoding sends, each of which
+    /// becomes one rectangle of the update.
+    pub fn split(&self, rects: Vec<Rect>) -> Vec<Rect> {
+        if self.kind != Kind::Tight {
+            return rects;
+        }
+        let mut out = Vec::new();
+        for r in rects {
+            for x in (0..r.w as usize).step_by(TIGHT_MAX_WIDTH) {
+                let w = TIGHT_MAX_WIDTH.min(r.w as usize - x);
+                let band = (TIGHT_MAX_PIXELS / w).max(1);
+                for y in (0..r.h as usize).step_by(band) {
+                    let h = band.min(r.h as usize - y);
+                    out.push(Rect { x: r.x + x as u16, y: r.y + y as u16, w: w as u16, h: h as u16 });
+                }
+            }
+        }
+        out
+    }
+
     /// Appends rectangle `r` of `pixels`, a picture `stride` pixels wide.
     pub fn rect(&mut self, out: &mut Vec<u8>, pf: &PixelFormat, pixels: &[u32], stride: usize, r: Rect) {
         match self.kind {
             Kind::Raw => proto::raw_rect(out, pf, pixels, stride, r),
             Kind::Zrle => self.zrle_rect(out, pf, pixels, stride, r),
+            Kind::Tight => self.tight_rect(out, pf, pixels, stride, r),
         }
     }
 
@@ -94,6 +131,51 @@ impl Encoder {
         let len = (out.len() - len_at - 4) as u32;
         out[len_at..len_at + 4].copy_from_slice(&len.to_be_bytes());
     }
+
+    fn tight_rect(&mut self, out: &mut Vec<u8>, pf: &PixelFormat, pixels: &[u32], stride: usize, r: Rect) {
+        proto::rect_header(out, r, ENC_TIGHT);
+        let tpixel = TPixel::new(pf);
+        self.cut(pixels, stride, r.x as usize, r.y as usize, r.w as usize, r.h as usize);
+        let (w, h) = (r.w as usize, r.h as usize);
+        self.palette.clear();
+        let indexed = self.tile.iter().all(|&p| self.palette.index(p, 256).is_some());
+        let colors = self.palette.colors.len();
+        self.data.clear();
+        let stream = if indexed && colors == 1 {
+            out.push(TIGHT_FILL);
+            tpixel.put(self.tile[0], out);
+            return;
+        } else if indexed && colors == 2 {
+            out.extend([(TIGHT_STREAM_MONO as u8) << 4 | TIGHT_EXPLICIT_FILTER, TIGHT_FILTER_PALETTE, 1]);
+            self.palette.colors.iter().for_each(|&c| tpixel.put(c, out));
+            for row in self.tile.chunks(w) {
+                pack_indices(row.iter().map(|&p| self.palette.index(p, 256).unwrap()), 1, &mut self.data);
+            }
+            TIGHT_STREAM_MONO
+        } else if indexed {
+            out.extend([(TIGHT_STREAM_PALETTE as u8) << 4 | TIGHT_EXPLICIT_FILTER, TIGHT_FILTER_PALETTE, (colors - 1) as u8]);
+            self.palette.colors.iter().for_each(|&c| tpixel.put(c, out));
+            for &p in &self.tile {
+                self.data.push(self.palette.index(p, 256).unwrap());
+            }
+            TIGHT_STREAM_PALETTE
+        } else {
+            out.push((TIGHT_STREAM_FULL as u8) << 4);
+            self.data.reserve(w * h * tpixel.len);
+            self.tile.iter().for_each(|&p| tpixel.put(p, &mut self.data));
+            TIGHT_STREAM_FULL
+        };
+        if self.data.len() < TIGHT_MIN_TO_COMPRESS {
+            out.extend_from_slice(&self.data);
+            return;
+        }
+        let level = self.level;
+        let z = self.tight[stream].get_or_insert_with(|| Compress::new(Compression::new(level), true));
+        let mut packed = Vec::with_capacity(self.data.len() / 2 + 64);
+        deflate(z, &self.data, &mut packed);
+        tight_length(packed.len(), out);
+        out.extend_from_slice(&packed);
+    }
 }
 
 // Ends with a sync flush so the client can decode everything before the next message.
@@ -112,6 +194,18 @@ fn deflate(z: &mut Compress, input: &[u8], out: &mut Vec<u8>) {
     }
 }
 
+// 7 bits per byte, low bits first; the top bit says another byte follows.
+fn tight_length(len: usize, out: &mut Vec<u8>) {
+    debug_assert!(len < 1 << 22);
+    if len < 0x80 {
+        out.push(len as u8);
+    } else if len < 0x4000 {
+        out.extend([len as u8 | 0x80, (len >> 7) as u8]);
+    } else {
+        out.extend([len as u8 | 0x80, (len >> 7) as u8 | 0x80, (len >> 14) as u8]);
+    }
+}
+
 // Most significant bit first, each row padded to a whole byte.
 fn pack_indices(indices: impl Iterator<Item = u8>, bits: u32, out: &mut Vec<u8>) {
     let (mut acc, mut n) = (0u8, 0);
@@ -125,6 +219,29 @@ fn pack_indices(indices: impl Iterator<Item = u8>, bits: u32, out: &mut Vec<u8>)
     }
     if n > 0 {
         out.push(acc);
+    }
+}
+
+// Tight's TPIXEL: red, green, blue bytes for 24-bit colour in 32-bit pixels.
+struct TPixel {
+    pf: PixelFormat,
+    rgb: bool,
+    len: usize,
+}
+
+impl TPixel {
+    fn new(pf: &PixelFormat) -> TPixel {
+        let rgb = pf.true_color && pf.bpp == 32 && pf.depth == 24 && pf.max == [255; 3];
+        TPixel { pf: *pf, rgb, len: if rgb { 3 } else { pf.bpp as usize / 8 } }
+    }
+
+    fn put(&self, p: u32, out: &mut Vec<u8>) {
+        if self.rgb {
+            out.extend([(p >> 16) as u8, (p >> 8) as u8, p as u8]);
+        } else {
+            let (b, n) = self.pf.pixel_bytes(p);
+            out.extend_from_slice(&b[..n]);
+        }
     }
 }
 
@@ -375,6 +492,59 @@ mod tests {
         (r, img)
     }
 
+    // An independent decoder written from rfbproto, for RGB TPIXELs. Also
+    // returns how many bytes of `msg` the rectangle took.
+    fn decode_tight(zs: &mut [Inflater; 4], msg: &[u8]) -> (Rect, Vec<u32>, usize) {
+        let (r, enc) = rect_header(msg);
+        assert_eq!(enc, ENC_TIGHT);
+        let mut d = &msg[12..];
+        let n = r.w as usize * r.h as usize;
+        let rgb = |b: &[u8]| u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
+        let ctl = d[0];
+        d = &d[1..];
+        if ctl == TIGHT_FILL {
+            return (r, vec![rgb(d); n], 16);
+        }
+        let stream = (ctl >> 4 & 3) as usize;
+        let mut palette = Vec::new();
+        if ctl & TIGHT_EXPLICIT_FILTER != 0 {
+            assert_eq!(d[0], TIGHT_FILTER_PALETTE);
+            let colors = d[1] as usize + 1;
+            palette = d[2..2 + 3 * colors].chunks(3).map(rgb).collect();
+            d = &d[2 + 3 * colors..];
+        }
+        let row_bytes = match palette.len() {
+            0 => r.w as usize * 3,
+            2 => (r.w as usize).div_ceil(8),
+            _ => r.w as usize,
+        };
+        let raw_len = row_bytes * r.h as usize;
+        let (data, used) = if raw_len < TIGHT_MIN_TO_COMPRESS {
+            (d[..raw_len].to_vec(), raw_len)
+        } else {
+            let (mut len, mut i) = (0usize, 0);
+            loop {
+                len |= ((d[i] & 0x7f) as usize) << (7 * i);
+                i += 1;
+                if d[i - 1] & 0x80 == 0 || i == 3 {
+                    break;
+                }
+            }
+            (zs[stream].inflate(&d[i..i + len]), i + len)
+        };
+        assert_eq!(data.len(), raw_len);
+        let px = match palette.len() {
+            0 => data.chunks(3).map(rgb).collect(),
+            2 => data
+                .chunks(row_bytes)
+                .flat_map(|row| (0..r.w as usize).map(move |x| (row[x / 8] >> (7 - x % 8)) & 1))
+                .map(|i| palette[i as usize])
+                .collect(),
+            _ => data.iter().map(|&i| palette[i as usize]).collect(),
+        };
+        (r, px, msg.len() - d.len() + used)
+    }
+
     fn picture(w: usize, h: usize) -> Vec<u32> {
         (0..w * h)
             .map(|i| {
@@ -402,10 +572,10 @@ mod tests {
     #[test]
     fn picks_the_first_known_encoding_in_client_order() {
         let mut e = Encoder::new();
-        e.set_encodings(&[5, ENC_ZRLE, ENC_RAW]);
+        e.set_encodings(&[5, ENC_TIGHT, ENC_ZRLE, ENC_RAW]);
+        assert_eq!(e.kind, Kind::Tight);
+        e.set_encodings(&[ENC_ZRLE, ENC_TIGHT]);
         assert_eq!(e.kind, Kind::Zrle);
-        e.set_encodings(&[ENC_RAW, ENC_ZRLE]);
-        assert_eq!(e.kind, Kind::Raw);
         e.set_encodings(&[-223, 5]);
         assert_eq!(e.kind, Kind::Raw);
     }
@@ -478,6 +648,71 @@ mod tests {
         let mut out = Vec::new();
         CPixel::new(&PixelFormat::NATIVE).put(0x112233, &mut out);
         assert_eq!(out, [0x33, 0x22, 0x11]);
+    }
+
+    #[test]
+    fn tight_round_trips_every_kind_of_rect() {
+        let (w, h) = (300, 170);
+        let px = picture(w, h);
+        let mut e = Encoder::new();
+        e.set_encodings(&[ENC_TIGHT]);
+        let mut zs = [Inflater::new(), Inflater::new(), Inflater::new(), Inflater::new()];
+        let cases = [
+            Rect { x: 0, y: 0, w: 40, h: 30 },
+            Rect { x: 80, y: 0, w: 40, h: 30 },
+            Rect { x: 120, y: 0, w: 40, h: 30 },
+            whole(w, h),
+            Rect { x: 1, y: 1, w: 2, h: 1 },
+        ];
+        for r in cases {
+            let mut out = Vec::new();
+            e.rect(&mut out, &PixelFormat::NATIVE, &px, w, r);
+            let (got, img, used) = decode_tight(&mut zs, &out);
+            assert_eq!((got, used), (r, out.len()));
+            assert_eq!(img, crop(&px, w, r));
+        }
+    }
+
+    #[test]
+    fn tight_chooses_fill_mono_palette_and_full_colour() {
+        let mut e = Encoder::new();
+        e.set_encodings(&[ENC_TIGHT]);
+        let control = |e: &mut Encoder, px: &[u32]| {
+            let mut out = Vec::new();
+            e.rect(&mut out, &PixelFormat::NATIVE, px, 64, whole(64, px.len() / 64));
+            out[12]
+        };
+        assert_eq!(control(&mut e, &[7; 64 * 4]), TIGHT_FILL);
+        let mono: Vec<u32> = (0..64 * 4).map(|i| i as u32 & 1).collect();
+        assert_eq!(control(&mut e, &mono), 0x50);
+        let pal: Vec<u32> = (0..64 * 4).map(|i| i as u32 % 9).collect();
+        assert_eq!(control(&mut e, &pal), 0x60);
+        let full: Vec<u32> = (0..64 * 8).map(|i| i as u32 * 77).collect();
+        assert_eq!(control(&mut e, &full), 0x00);
+    }
+
+    #[test]
+    fn tight_splits_rects_to_its_size_limits() {
+        let mut e = Encoder::new();
+        e.set_encodings(&[ENC_TIGHT]);
+        let parts = e.split(vec![whole(2500, 100)]);
+        assert!(parts.iter().all(|r| r.w as usize <= TIGHT_MAX_WIDTH && r.w as usize * r.h as usize <= TIGHT_MAX_PIXELS));
+        assert_eq!(parts.iter().map(|r| r.w as usize * r.h as usize).sum::<usize>(), 2500 * 100);
+        e.set_encodings(&[ENC_ZRLE]);
+        assert_eq!(e.split(vec![whole(2500, 100)]), [whole(2500, 100)]);
+    }
+
+    #[test]
+    fn tight_lengths_use_seven_bits_per_byte() {
+        let enc = |n| {
+            let mut v = Vec::new();
+            tight_length(n, &mut v);
+            v
+        };
+        assert_eq!(enc(0x7f), [0x7f]);
+        assert_eq!(enc(0x80), [0x80, 0x01]);
+        assert_eq!(enc(0x3fff), [0xff, 0x7f]);
+        assert_eq!(enc(0x4000), [0x80, 0x80, 0x01]);
     }
 
     #[test]

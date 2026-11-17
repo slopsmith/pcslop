@@ -282,11 +282,11 @@ impl Session {
         } else {
             self.view.clone_from(&self.sent);
         }
-        let rects = if full {
+        let rects = self.encoder.split(if full {
             vec![Rect { x: 0, y: 0, w: w as u16, h: h as u16 }]
         } else {
             proto::changed_rects(&self.sent, &self.view, w, h)
-        };
+        });
         self.sent_seq = Some(self.frame_seq);
         if rects.is_empty() {
             return false;
