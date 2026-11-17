@@ -341,10 +341,21 @@ pub fn build() -> (Vec<u32>, Entries) {
     a.cbnz(Size::X, r(4), translate);
     a.br(r(5));
     a.bind(translate);
+    let (probe, probe_done, translated) = (a.label(), a.label(), a.label());
+    a.at_s1e1r(r(0));
+    a.isb();
+    a.mrs(r(1), sysreg::PAR_EL1);
+    a.tbz(r(1), 0, translated);
+    // The code page is not in the shadow tree: a load from it lets the fault
+    // handler fill it, or resume at `miss` when the x86 page tables lack it.
+    a.bind(probe);
+    a.ldr(Width::B, ZR, r(0), 0);
+    a.bind(probe_done);
     a.at_s1e1r(r(0));
     a.isb();
     a.mrs(r(1), sysreg::PAR_EL1);
     a.tbnz(r(1), 0, miss);
+    a.bind(translated);
     a.ubfx(Size::X, r(1), r(1), 12, 36);
     a.lsl_imm(Size::X, r(1), r(1), 12);
     a.bfxil(Size::X, r(1), r(0), 0, 12);
@@ -387,11 +398,20 @@ pub fn build() -> (Vec<u32>, Entries) {
         a.bind(label);
         save_scratch(&mut a);
         if why == reason::FAULT {
-            let slow = a.label();
+            let (slow, report) = (a.label(), a.label());
             try_fill(&mut a, slow);
             restore_scratch(&mut a);
             a.eret();
             a.bind(slow);
+            a.mrs(r(2), sysreg::ELR_EL1);
+            a.adr(r(3), probe);
+            a.cmp(Size::X, r(2), r(3));
+            a.b_cond(Cond::Ne, report);
+            a.adr(r(2), miss);
+            a.msr(sysreg::ELR_EL1, r(2));
+            restore_scratch(&mut a);
+            a.eret();
+            a.bind(report);
         }
         a.mrs(r(0), sysreg::ESR_EL1);
         a.mrs(r(1), sysreg::FAR_EL1);
