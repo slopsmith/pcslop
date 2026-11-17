@@ -65,6 +65,8 @@ pub struct Compiled {
     pub chains: Vec<(u32, u32)>,
     /// The block contains a REP string instruction.
     pub has_rep: bool,
+    /// The block uses a translation from the latest batch (SLOPPER_JIT_VERIFY=new).
+    pub recent: bool,
 }
 
 struct Emit {
@@ -1594,6 +1596,20 @@ impl Emit {
     }
 }
 
+/// Instructions whose translations are new enough to verify on their own.
+fn is_recent(insn: &Insn) -> bool {
+    let (op, reg, op32) = (insn.op, insn.reg(), insn.op32);
+    match op {
+        0x1c8..=0x1cf | 0xc0 | 0xd0 | 0xd2 | 0x9c | 0x9d | 0x1ba | 0xf5 | 0xf8 | 0xf9 | 0x118 | 0x11f | 0x12b => true,
+        0x1c0 | 0x1c1 | 0x1b0 | 0x1b1 | 0x1c7 | 0x1a4 | 0x1a5 | 0x1ac | 0x1ad | 0xfb => true,
+        0xc1 | 0xd1 | 0xd3 => !op32 || reg < 2,
+        0xf6 | 0xf7 => matches!(reg, 2 | 3) && !(op == 0xf7 && op32),
+        0x40..=0x4f => !op32,
+        0xff => reg < 2 && !op32,
+        _ => false,
+    }
+}
+
 /// Translates the block starting at `eip`. `byte(eip)` returns the code byte at
 /// a linear address on the block's page or the next one, or `None` where it
 /// cannot. Only an instruction that straddles the page end reads the next page.
@@ -1632,6 +1648,7 @@ pub fn compile(
     }
     e.a.bind(body);
     let mut code_end = eip;
+    let mut recent = false;
     loop {
         let insn = decode::<()>(true, |i| byte(pc.wrapping_add(i)).ok_or(()));
         let Ok(insn) = insn else {
@@ -1649,6 +1666,7 @@ pub fn compile(
         let start = e.a.pos();
         let end = pc.wrapping_add(insn.len as u32);
         code_end = code_end.max(end);
+        recent |= is_recent(&insn) || !on_page(end.wrapping_sub(1));
         if !on_page(end.wrapping_sub(1)) {
             if sti.is_some() {
                 let at = sti.unwrap();
@@ -1747,5 +1765,5 @@ pub fn compile(
     count.add_imm(Size::X, ICOUNT, ICOUNT, insns as u32);
     let mut code = e.a.finish();
     code[0] = count.code[0];
-    Compiled { code, boundaries, insns, chains: e.chains, has_rep }
+    Compiled { code, boundaries, insns, chains: e.chains, has_rep, recent }
 }

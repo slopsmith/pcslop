@@ -294,6 +294,8 @@ pub struct Jit {
     /// Fills shadow entries inside the VM (SLOPPER_JIT_VM_FILL). Off by default:
     /// XP's first boot can hang with it.
     pub vm_fill: bool,
+    /// Verify only blocks with recent translations (SLOPPER_JIT_VERIFY=new).
+    verify_recent_only: bool,
     /// Measures time spent in the VM and per exit kind (SLOPPER_JIT_PROFILE).
     timing: bool,
     audit: bool,
@@ -379,6 +381,7 @@ impl Jit {
             interp_profile: std::env::var_os("SLOPPER_JIT_PROFILE").map(|_| HashMap::default()),
             verify: std::env::var_os("SLOPPER_JIT_VERIFY").is_some(),
             vm_fill: std::env::var_os("SLOPPER_JIT_VM_FILL").is_some(),
+            verify_recent_only: std::env::var("SLOPPER_JIT_VERIFY").is_ok_and(|v| v == "new"),
             timing: std::env::var_os("SLOPPER_JIT_PROFILE").is_some(),
             audit: std::env::var_os("SLOPPER_JIT_AUDIT").is_some(),
             audit_every: std::env::var("SLOPPER_JIT_AUDIT").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1),
@@ -792,8 +795,9 @@ impl Jit {
         }
         // REP string ops can run for millions of iterations; replaying them on
         // the verifier's overlay is too slow, so those blocks are trusted.
-        let verified = if compiled.has_rep { VERIFY_RUNS } else { 0 };
-        if self.verify && compiled.has_rep {
+        let trusted = compiled.has_rep || (self.verify_recent_only && !compiled.recent);
+        let verified = if trusted { VERIFY_RUNS } else { 0 };
+        if self.verify && trusted {
             self.insert_lookup(key, block_va);
         }
         self.blocks.insert(key, BlockInfo { va: block_va, boundaries: compiled.boundaries, insns: compiled.insns, verified });
@@ -891,7 +895,7 @@ impl Jit {
             if let Some(exp) = expected {
                 let why = self.state().reason;
                 let budget_spent = self.state().budget == 0;
-                let left_early = why == reason::INTERP && self.state().eip != exp.cpu.eip;
+                let left_early = self.state().eip != exp.cpu.eip;
                 if exit.ec() == Some(0x16) && ((why == reason::PENDING && budget_spent) || why == reason::INTERP) && !left_early {
                     self.check_block(cpu, bus, exp);
                     if why == reason::PENDING {
