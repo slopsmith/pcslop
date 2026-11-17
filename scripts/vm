@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# Runs 86slopper in the background for agents and scripts. See
+# .claude/skills/emulator/SKILL.md for how to use it.
+set -euo pipefail
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+refs=${VM_REFS:-$root/references}
+[ -e "$refs/seabios" ] || refs=/Volumes/Projects/86slopper/references
+bin=${VM_BIN:-$root/target/vm/slopper}
+
+usage() {
+	cat <<EOF
+usage: scripts/vm build
+       scripts/vm start NAME [slopper options...]
+       scripts/vm ctl NAME COMMAND...
+       scripts/vm shot NAME [PATH]
+       scripts/vm wait-text NAME TEXT [SECONDS]
+       scripts/vm status NAME
+       scripts/vm log NAME [LINES]
+       scripts/vm stop NAME
+
+build      builds inside nix develop into target/work and installs a signed copy at $bin
+start      starts NAME headless in the background, without sound unless VM_AUDIO=1, killed
+           after VM_TIMEOUT seconds (default 1800); waits up to 20 s for its control socket
+ctl        sends control-socket commands (scripts/ctl) to NAME
+shot       saves a screenshot (default \$TMPDIR/vm-NAME.png) and prints its path
+wait-text  polls NAME's text screen until TEXT shows up, for at most SECONDS (default 60)
+status     prints the status report
+log        prints the last LINES (default 30) of NAME's log
+stop       quits NAME, killing it after 5 s if it does not exit
+
+Each run uses \$TMPDIR/vm-NAME.sock and \$TMPDIR/vm-NAME.log.
+EOF
+	exit 2
+}
+
+sock() { echo "${TMPDIR%/}/vm-$1.sock"; }
+log() { echo "${TMPDIR%/}/vm-$1.log"; }
+
+alive() { pgrep -f -- "--control $(sock "$1")" >/dev/null; }
+
+cmd=${1:-}
+[ -n "$cmd" ] || usage
+shift
+
+case $cmd in
+build)
+	cd "$root"
+	nix develop . -c env CARGO_TARGET_DIR="$root/target/work" cargo build --release -p slopper
+	mkdir -p "$(dirname "$bin")"
+	cp "$root/target/work/release/slopper" "$bin"
+	codesign -s - -f --entitlements "$root/scripts/hypervisor.entitlements" "$bin" 2>/dev/null
+	echo "$bin"
+	;;
+start)
+	[ $# -ge 1 ] || usage
+	name=$1
+	shift
+	[ -x "$bin" ] || { echo "no emulator at $bin; run scripts/vm build" >&2; exit 1; }
+	if alive "$name"; then
+		echo "$name is already running; scripts/vm stop $name first" >&2
+		exit 1
+	fi
+	s=$(sock "$name")
+	l=$(log "$name")
+	rm -f "$s"
+	extra=()
+	[ "${VM_AUDIO:-0}" = 1 ] || extra+=(--no-audio)
+	nohup timeout "${VM_TIMEOUT:-1800}" "$bin" \
+		--bios "$refs/seabios/share/seabios/bios.bin" \
+		--vgabios "$refs/seavgabios/share/seabios/vgabios.bin" \
+		--headless --control "$s" "${extra[@]}" "$@" </dev/null >"$l" 2>&1 &
+	for _ in $(seq 100); do
+		[ -S "$s" ] && { echo "started $name: socket $s, log $l"; exit 0; }
+		kill -0 $! 2>/dev/null || break
+		sleep 0.2
+	done
+	echo "$name did not open its control socket; last lines of $l:" >&2
+	tail -n 20 "$l" >&2
+	exit 1
+	;;
+ctl)
+	[ $# -ge 2 ] || usage
+	name=$1
+	shift
+	exec "$root/scripts/ctl" "$(sock "$name")" "$@"
+	;;
+shot)
+	[ $# -ge 1 ] || usage
+	out=${2:-${TMPDIR%/}/vm-$1.png}
+	case $out in /*) ;; *) out=$PWD/$out ;; esac
+	"$root/scripts/ctl" "$(sock "$1")" "shot $out" >/dev/null
+	for _ in $(seq 25); do
+		[ -s "$out" ] && break
+		sleep 0.2
+	done
+	echo "$out"
+	;;
+wait-text)
+	[ $# -ge 2 ] || usage
+	deadline=$((SECONDS + ${3:-60}))
+	while [ $SECONDS -lt $deadline ]; do
+		"$root/scripts/ctl" "$(sock "$1")" screen 2>/dev/null | grep -qF -- "$2" && { echo "found"; exit 0; }
+		alive "$1" || { echo "$1 is not running" >&2; exit 1; }
+		sleep 1
+	done
+	echo "timed out waiting for \"$2\"" >&2
+	exit 1
+	;;
+status)
+	[ $# -ge 1 ] || usage
+	exec "$root/scripts/ctl" "$(sock "$1")" status
+	;;
+log)
+	[ $# -ge 1 ] || usage
+	tail -n "${2:-30}" "$(log "$1")"
+	;;
+stop)
+	[ $# -ge 1 ] || usage
+	"$root/scripts/ctl" "$(sock "$1")" quit >/dev/null 2>&1 || true
+	for _ in $(seq 25); do
+		alive "$1" || { echo "stopped $1"; exit 0; }
+		sleep 0.2
+	done
+	pkill -f -- "--control $(sock "$1")" || true
+	echo "killed $1"
+	;;
+*)
+	usage
+	;;
+esac
