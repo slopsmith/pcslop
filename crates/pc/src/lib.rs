@@ -8,6 +8,7 @@ pub mod pic;
 pub mod pit;
 pub mod ram;
 pub mod rtc;
+pub mod uart;
 
 use std::io::Write;
 use std::time::Instant;
@@ -58,6 +59,8 @@ pub struct Board {
     /// so ticks that arrive while one is still pending are delivered later.
     irq0_backlog: u32,
     pub rtc: rtc::Rtc,
+    /// COM1 at 0x3F8, IRQ 4.
+    pub com1: uart::Uart,
     pub fw_cfg: fw_cfg::FwCfg,
     pub kbc: i8042::I8042,
     pub vga: vga::Vga,
@@ -111,6 +114,7 @@ impl Board {
             fdc: fdc::Fdc::default(),
             irq0_backlog: 0,
             rtc: rtc::Rtc::default(),
+            com1: uart::Uart::new(Box::new(std::io::sink())),
             fw_cfg: fw_cfg::FwCfg::new(),
             kbc: i8042::I8042::default(),
             vga: vga::Vga::new(),
@@ -217,6 +221,12 @@ impl Board {
             self.kbc.reset_requested = false;
             self.reset_requested = true;
         }
+    }
+
+    /// Feeds bytes to the guest through COM1.
+    pub fn serial_input(&mut self, bytes: &[u8]) {
+        self.com1.send(bytes);
+        self.pic.set_irq(4, self.com1.irq());
     }
 
     pub fn key(&mut self, code: u16, pressed: bool) {
@@ -355,6 +365,11 @@ impl Board {
                 v
             }
             0x92 => (self.a20 as u8) << 1,
+            0x3f8..=0x3ff => {
+                let v = self.com1.read(port - 0x3f8);
+                self.pic.set_irq(4, self.com1.irq());
+                v
+            }
             0x402 => 0xe9,
             0x510 => 0,
             0x511 => self.fw_cfg.read_data(),
@@ -386,6 +401,10 @@ impl Board {
                 self.pic.set_irq(6, self.fdc.irq());
             }
             0x80 => self.post_code = v,
+            0x3f8..=0x3ff => {
+                self.com1.write(port - 0x3f8, v);
+                self.pic.set_irq(4, self.com1.irq());
+            }
             0x92 => {
                 self.a20 = v & 2 != 0;
                 if v & 1 != 0 {
@@ -479,6 +498,7 @@ impl Board {
         self.uhci.reset();
         self.pit = pit::Pit::default();
         self.fdc = fdc::Fdc::default();
+        self.com1.reset();
         self.irq0_backlog = 0;
         self.reset_requested = false;
     }
