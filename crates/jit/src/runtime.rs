@@ -16,6 +16,9 @@ pub const AF_AUX: Reg = Reg(18);
 pub const STATE: Reg = Reg(28);
 pub const ICOUNT: Reg = Reg(17);
 
+/// 2^64 / golden ratio, for the block lookup's Fibonacci hash.
+pub const HASH_MUL: u64 = 0x9e37_79b9_7f4a_7c15;
+
 /// Offsets (from the start of the runtime region) of entry points that
 /// translated code branches to.
 #[derive(Clone, Copy, Debug)]
@@ -325,10 +328,17 @@ pub fn build() -> (Vec<u32>, Entries) {
     a.ldr(Width::W, r(2), STATE, state::USER as i32);
     a.logic_shift(Logic::Orr, false, Size::X, r(1), r(1), r(2), Shift::Lsl, 32);
     a.ldr(Width::X, r(2), STATE, state::LOOKUP as i32);
-    a.logic_shift(Logic::Eor, false, Size::X, r(3), r(1), r(1), Shift::Lsr, 13);
-    a.ubfx(Size::X, r(3), r(3), 0, layout::LOOKUP_ENTRIES.trailing_zeros());
-    a.addsub_ext(Size::X, false, false, r(2), r(2), r(3), Extend::Uxtx, 4);
+    a.mov_imm(Size::X, r(3), HASH_MUL);
+    a.mul(Size::X, r(3), r(1), r(3));
+    a.lsr_imm(Size::X, r(3), r(3), 64 - (layout::LOOKUP_ENTRIES.trailing_zeros() - 1));
+    a.add_shift(Size::X, r(2), r(2), r(3), Shift::Lsl, 5);
+    let second = a.label();
     a.ldp(Size::X, r(4), r(5), r(2), 0);
+    a.eor(Size::X, r(4), r(4), r(1));
+    a.cbnz(Size::X, r(4), second);
+    a.br(r(5));
+    a.bind(second);
+    a.ldp(Size::X, r(4), r(5), r(2), 16);
     a.eor(Size::X, r(4), r(4), r(1));
     a.cbnz(Size::X, r(4), miss);
     a.br(r(5));

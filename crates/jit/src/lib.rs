@@ -230,6 +230,8 @@ pub struct Stats {
     pub mmio_exits: u64,
     pub smc_invalidations: u64,
     pub stale_blocks: u64,
+    /// MISS exits for blocks that exist but had lost their lookup slot.
+    pub lookup_misses: u64,
     /// Shadow entries filled inside the VM without an exit.
     pub vm_fills: u64,
     pub flushes: u64,
@@ -299,8 +301,11 @@ pub struct Jit {
     _vm: Vm,
 }
 
-fn hash(key: u64) -> usize {
-    ((key ^ (key >> 13)) as usize) & (layout::LOOKUP_ENTRIES - 1)
+/// Offset of the two-entry lookup bucket for `key`; the runtime's dispatcher
+/// computes the same Fibonacci hash.
+fn bucket(key: u64) -> usize {
+    let shift = 64 - (layout::LOOKUP_ENTRIES.trailing_zeros() - 1);
+    layout::LOOKUP + ((key.wrapping_mul(runtime::HASH_MUL) >> shift) as usize) * 32
 }
 
 /// Blocks are looked up by physical address plus whether they run at CPL 3.
@@ -678,10 +683,12 @@ impl Jit {
     }
 
     fn clear_lookup(&mut self, key: u64) {
-        let off = layout::LOOKUP + hash(key) * 16;
-        let slot = &mut self.mem.as_mut_slice()[off..off + 16];
-        if u64::from_le_bytes(slot[..8].try_into().unwrap()) == key {
-            slot.fill(0xff);
+        let b = bucket(key);
+        for off in [b, b + 16] {
+            let slot = &mut self.mem.as_mut_slice()[off..off + 16];
+            if u64::from_le_bytes(slot[..8].try_into().unwrap()) == key {
+                slot.fill(0xff);
+            }
         }
     }
 
@@ -787,11 +794,19 @@ impl Jit {
         }
     }
 
+    /// Puts `key` first in its bucket; the entry it displaces moves to the second slot.
     fn insert_lookup(&mut self, key: u64, va: u64) {
-        let off = layout::LOOKUP + hash(key) * 16;
-        let slot = &mut self.mem.as_mut_slice()[off..off + 16];
-        slot[..8].copy_from_slice(&key.to_le_bytes());
-        slot[8..].copy_from_slice(&va.to_le_bytes());
+        let b = bucket(key);
+        let m = self.mem.as_mut_slice();
+        let first = u64::from_le_bytes(m[b..b + 8].try_into().unwrap());
+        if first != key {
+            let second = u64::from_le_bytes(m[b + 16..b + 24].try_into().unwrap());
+            if second != key {
+                m.copy_within(b..b + 16, b + 16);
+            }
+        }
+        m[b..b + 8].copy_from_slice(&key.to_le_bytes());
+        m[b + 8..b + 16].copy_from_slice(&va.to_le_bytes());
     }
 
     fn eip_at(&self, elr: u64) -> Option<u32> {
@@ -1059,6 +1074,7 @@ impl Jit {
                 let key = block_key(phys, user);
                 match self.blocks.get(&key) {
                     Some(b) => {
+                        self.stats.lookup_misses += 1;
                         if !self.verify || b.verified >= VERIFY_RUNS {
                             let va = b.va;
                             self.insert_lookup(key, va);
