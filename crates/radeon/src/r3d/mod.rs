@@ -315,7 +315,11 @@ impl Radeon {
     pub fn describe(&self) -> String {
         let mut s = format!("radeon: 3d draws {} flips {}", self.r3d.draws, self.r3d.flips);
         match self.metal_stats() {
-            Some((d, f, w)) => s += &format!(" | metal draws {d} cpu fallbacks {f} waits {w}"),
+            Some((d, f, w)) => {
+                let t = self.metal.as_ref().map_or(0, |m| m.throttles());
+                let p = self.metal.as_ref().map_or(0, |m| m.pipelines());
+                s += &format!(" | metal draws {d} cpu fallbacks {f} waits {w} throttled {t} pipelines {p}")
+            }
             None => s += " | cpu",
         }
         s

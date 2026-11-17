@@ -9,11 +9,11 @@
 //! Draws collect in a command buffer until something needs finished pixels:
 //! see `Radeon::gpu_sync`.
 
-use super::msl;
+use super::{msl, us};
 use super::raster::{Captured, Raster};
 use super::zmask::Fill;
 use super::tex::{TexMem, Texture};
-use objc2::rc::Retained;
+use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::*;
@@ -24,6 +24,13 @@ use std::ptr::NonNull;
 /// Pixel stack registers a draw may interpolate; more go to the CPU.
 const MAX_SLOTS: usize = 24;
 const ARENA_SIZE: usize = 32 << 20;
+/// Command buffers in flight at most. Each holds an arena, so this bounds
+/// the memory a GPU that falls behind the guest can tie up; past it, a kick
+/// waits for the oldest one, as a driver's ring would fill up on the card.
+const MAX_INFLIGHT: usize = 4;
+/// Pipelines kept at most. Each compiled variant costs the driver about a
+/// megabyte; past this the cache starts over.
+const MAX_PIPELINES: usize = 1024;
 const ALIGN: usize = 256;
 /// The render target is attachmentless and covers the whole 4096x4096
 /// coordinate space the scissor allows.
@@ -162,6 +169,8 @@ pub(crate) struct MetalR3d {
     draws: u64,
     fallbacks: u64,
     waits: u64,
+    /// Kicks that waited because MAX_INFLIGHT command buffers were queued.
+    throttles: u64,
 }
 
 // The Metal objects are only touched while the card's owner holds it.
@@ -200,25 +209,23 @@ impl MetalR3d {
             draws: 0,
             fallbacks: 0,
             waits: 0,
+            throttles: 0,
         })
     }
 
     /// The pipeline for a fragment program, built from MSL the first time.
+    /// The key holds only the instructions the program runs, as the MSL
+    /// does: drivers leave stale words in the slots around a program, and
+    /// keying on them built a new pipeline for every combination.
     fn pipeline(&mut self, r: &Raster, slots: &[usize]) -> Option<Pipeline> {
-        let us = &r.us;
-        let mut key = vec![r.perspective as u32, slots.len() as u32];
-        key.extend(slots.iter().map(|&s| s as u32));
-        for n in &us.nodes {
-            let (ts, tl) = n.tex.unwrap_or((usize::MAX, 0));
-            key.extend([n.alu.0 as u32, n.alu.1 as u32, ts as u32, tl as u32]);
-        }
-        key.push(u32::MAX);
-        key.extend(&us.tex);
-        key.extend(us.alu.iter().flatten());
+        let key = pipeline_key(&r.us, slots, r.perspective);
         if let Some(p) = self.pipelines.get(&key) {
             return p.clone();
         }
-        let built = self.build(&msl::shader(us, slots, r.perspective));
+        if self.pipelines.len() >= MAX_PIPELINES {
+            self.pipelines.clear();
+        }
+        let built = self.build(&msl::shader(&r.us, slots, r.perspective));
         if built.is_none() {
             eprintln!("radeon: Metal pipeline failed; drawing on the CPU instead");
         }
@@ -279,7 +286,7 @@ impl MetalR3d {
     }
 
     /// The pipeline for a draw, or None if the CPU must draw it.
-    pub fn prepare(&mut self, r: &Raster, cap: &Captured) -> Option<Pipeline> {
+    fn prepare_inner(&mut self, r: &Raster, cap: &Captured) -> Option<Pipeline> {
         let copies: usize = r.textures.iter().map(|t| match t {
             Some(Texture { mem: TexMem::Copy(v), .. }) => v.len() + ALIGN,
             _ => 0,
@@ -296,7 +303,7 @@ impl MetalR3d {
     }
 
     /// Queues the captured triangles of a draw.
-    pub fn draw(&mut self, r: &Raster, cap: &Captured, pipeline: &Pipeline) {
+    fn draw_inner(&mut self, r: &Raster, cap: &Captured, pipeline: &Pipeline) {
         let [x0, y0, x1, y1] = r.bounds();
         if cap.vertices == 0 || x0 > x1 || y0 > y1 {
             return;
@@ -454,7 +461,7 @@ impl MetalR3d {
 
     /// Queues a write of `value` into each `bpp`-byte pixel of `f`, after
     /// the draws queued so far. False if the CPU must do it.
-    pub fn fill(&mut self, f: Fill, bpp: usize, value: u32) -> bool {
+    fn fill_inner(&mut self, f: Fill, bpp: usize, value: u32) -> bool {
         let Some(pipeline) = self.fill_pipeline() else { return false };
         let vram = self.vram.clone();
         let Some(batch) = self.open() else { return false };
@@ -479,13 +486,21 @@ impl MetalR3d {
         self.batch.is_some() || !self.inflight.is_empty()
     }
 
+    pub fn pipelines(&self) -> usize {
+        self.pipelines.len()
+    }
+
+    pub fn throttles(&self) -> u64 {
+        self.throttles
+    }
+
     pub fn stats(&self) -> (u64, u64, u64) {
         (self.draws, self.fallbacks, self.waits)
     }
 
     /// Submits the queued draws without waiting for them and returns the
     /// serial number of the last command buffer submitted.
-    pub fn kick(&mut self) -> u64 {
+    fn kick_inner(&mut self) -> u64 {
         if let Some(mut b) = self.batch.take() {
             if let Some(enc) = b.enc.take() {
                 enc.endEncoding();
@@ -493,6 +508,12 @@ impl MetalR3d {
             b.cmd.commit();
             self.committed += 1;
             self.inflight.push_back((b.cmd, b.arena, self.committed));
+        }
+        while self.inflight.len() > MAX_INFLIGHT {
+            let (cmd, arena, serial) = self.inflight.pop_front().unwrap();
+            self.throttles += 1;
+            cmd.waitUntilCompleted();
+            self.retire(&cmd, arena, serial);
         }
         self.committed
     }
@@ -502,13 +523,15 @@ impl MetalR3d {
             eprintln!("radeon: Metal command buffer failed: {}", e.localizedDescription());
         }
         arena.used = 0;
-        self.free.push(arena);
+        if self.free.len() <= MAX_INFLIGHT {
+            self.free.push(arena);
+        }
         self.completed = serial;
     }
 
     /// The serial number of the last command buffer that has finished,
     /// without waiting.
-    pub fn completed(&mut self) -> u64 {
+    fn completed_inner(&mut self) -> u64 {
         while let Some((cmd, _, _)) = self.inflight.front() {
             if !matches!(cmd.status(), MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error) {
                 break;
@@ -522,7 +545,7 @@ impl MetalR3d {
     /// Submits the queued draws, waits for every draw to finish, and returns
     /// how many pixels passed the depth and stencil tests since the last
     /// call.
-    pub fn sync(&mut self) -> u32 {
+    fn sync_inner(&mut self) -> u32 {
         self.kick();
         if self.inflight.is_empty() {
             return 0;
@@ -540,6 +563,56 @@ impl MetalR3d {
         }
     }
 
+}
+
+
+/// Metal returns autoreleased objects (command buffers, encoders, pass
+/// descriptors). The command processor thread has no run loop to drain them,
+/// so every entry point runs in its own pool; without one, each command
+/// buffer and the commands encoded into it lived until the thread exited.
+impl MetalR3d {
+    pub fn prepare(&mut self, r: &Raster, cap: &Captured) -> Option<Pipeline> {
+        autoreleasepool(|_| self.prepare_inner(r, cap))
+    }
+
+    pub fn draw(&mut self, r: &Raster, cap: &Captured, pipeline: &Pipeline) {
+        autoreleasepool(|_| self.draw_inner(r, cap, pipeline))
+    }
+
+    pub fn fill(&mut self, f: Fill, bpp: usize, value: u32) -> bool {
+        autoreleasepool(|_| self.fill_inner(f, bpp, value))
+    }
+
+    pub fn kick(&mut self) -> u64 {
+        autoreleasepool(|_| self.kick_inner())
+    }
+
+    pub fn completed(&mut self) -> u64 {
+        autoreleasepool(|_| self.completed_inner())
+    }
+
+    pub fn sync(&mut self) -> u32 {
+        autoreleasepool(|_| self.sync_inner())
+    }
+}
+
+pub(crate) fn pipeline_key(us: &us::Program, slots: &[usize], perspective: bool) -> Vec<u32> {
+    let mut key = vec![perspective as u32, slots.len() as u32];
+    key.extend(slots.iter().map(|&s| s as u32));
+    for n in &us.nodes {
+        if let Some((start, len)) = n.tex {
+            let tex = us.tex.get(start..(start + len).min(us.tex.len())).unwrap_or(&[]);
+            key.push(tex.len() as u32);
+            key.extend(tex);
+        } else {
+            key.push(0);
+        }
+        let (start, len) = n.alu;
+        let alu = us.alu.get(start..(start + len).min(us.alu.len())).unwrap_or(&[]);
+        key.push(alu.len() as u32);
+        key.extend(alu.iter().flatten());
+    }
+    key
 }
 
 fn colour_bpp(format: u32) -> usize {

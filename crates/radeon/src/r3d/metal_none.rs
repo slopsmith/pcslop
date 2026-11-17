@@ -34,6 +34,14 @@ impl MetalR3d {
         false
     }
 
+    pub fn pipelines(&self) -> usize {
+        0
+    }
+
+    pub fn throttles(&self) -> u64 {
+        0
+    }
+
     pub fn stats(&self) -> (u64, u64, u64) {
         (0, 0, 0)
     }

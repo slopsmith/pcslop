@@ -993,3 +993,20 @@ fn the_zmask_is_ignored_without_fast_fill() {
     g.draw(13, &at_depth(0.5, RED));
     assert_eq!(g.count(0xffff_0000), 0);
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn pipeline_key_ignores_instruction_slots_the_program_does_not_run() {
+    use super::metal::pipeline_key;
+    use super::us::{Node, Program};
+    let program = |stale: u32| Program {
+        nodes: vec![Node { alu: (2, 1), tex: Some((1, 1)) }],
+        tex: (0..32).map(|i| if i == 1 { 0x1234 } else { stale + i }).collect(),
+        alu: (0..64).map(|i| if i == 2 { [1, 2, 3, 4] } else { [stale; 4] }).collect(),
+        consts: Vec::new(),
+    };
+    assert_eq!(pipeline_key(&program(0), &[0], true), pipeline_key(&program(0xdead), &[0], true));
+    let mut other = program(0);
+    other.alu[2][1] = 5;
+    assert_ne!(pipeline_key(&program(0), &[0], true), pipeline_key(&other, &[0], true));
+}
