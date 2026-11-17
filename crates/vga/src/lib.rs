@@ -51,6 +51,8 @@ pub struct Vga {
     latch: [u8; 4],
     vbe: vbe::Vbe,
     retrace_toggle: u8,
+    /// Whether ports 0x1CE/0x1CF answer with the Bochs VBE registers.
+    dispi: bool,
     frames: u64,
     scratch: Vec<u32>,
     pixels: Vec<u8>,
@@ -65,8 +67,13 @@ impl Default for Vga {
 
 impl Vga {
     pub fn new() -> Self {
+        Self::with_vram(VRAM_SIZE, true)
+    }
+
+    /// A VGA with `vram_size` bytes of VRAM, and the Bochs VBE registers only if `dispi` is set.
+    pub fn with_vram(vram_size: usize, dispi: bool) -> Self {
         Vga {
-            vram: vram::Vram::new(VRAM_SIZE),
+            vram: vram::Vram::new(vram_size),
             misc: 0,
             feature: 0,
             subsys: 0,
@@ -90,6 +97,7 @@ impl Vga {
             latch: [0; 4],
             vbe: vbe::Vbe::new(),
             retrace_toggle: 0,
+            dispi,
             frames: 0,
             scratch: Vec::new(),
             pixels: Vec::new(),
@@ -132,7 +140,7 @@ impl Vga {
     /// None if the port is not ours. `now_ns` drives retrace timing.
     pub fn io_read(&mut self, port: u16, size: u8, now_ns: u64) -> Option<u32> {
         match port {
-            0x1ce | 0x1cf => Some(self.vbe_read(port) as u32),
+            0x1ce | 0x1cf if self.dispi => Some(self.vbe_read(port) as u32),
             0x3b0..=0x3df => {
                 let mut v = 0;
                 for i in 0..size.clamp(1, 4) as u16 {
@@ -146,9 +154,8 @@ impl Vga {
 
     /// False if the port is not ours.
     pub fn io_write(&mut self, port: u16, size: u8, value: u32) -> bool {
-        self.changed = true;
         match port {
-            0x1ce | 0x1cf => self.vbe_write(port, value as u16),
+            0x1ce | 0x1cf if self.dispi => self.vbe_write(port, value as u16),
             0x3b0..=0x3df => {
                 for i in 0..size.clamp(1, 4) as u16 {
                     self.port_write8(port + i, (value >> (8 * i)) as u8);
@@ -156,6 +163,7 @@ impl Vga {
             }
             _ => return false,
         }
+        self.changed = true;
         true
     }
 
