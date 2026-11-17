@@ -422,7 +422,17 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                                 cpu.halted,
                                 format_regs(&cpu)
                             );
-                            out += &format!("\n{host} timer backlog {}", board.timer_backlog());
+                            let [m, sl] = board.pic.registers();
+                            out += &format!(
+                                "\n{host} timer backlog {} pic irr/isr/imr {:02x}/{:02x}/{:02x} {:02x}/{:02x}/{:02x}",
+                                board.timer_backlog(),
+                                m.0,
+                                m.1,
+                                m.2,
+                                sl.0,
+                                sl.1,
+                                sl.2
+                            );
                             if let Some(j) = jit.as_mut() {
                                 let (a, b) = (j.stats, last_stats);
                                 let r = |x: u64, y: u64| (x - y) as f64 / span;

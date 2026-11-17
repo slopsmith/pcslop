@@ -190,6 +190,11 @@ impl Pic {
         }
     }
 
+    /// IRR, ISR and IMR of the master and slave, for debugging.
+    pub fn registers(&self) -> [(u8, u8, u8); 2] {
+        self.chips.each_ref().map(|c| (c.irr, c.isr, c.imr))
+    }
+
     /// True while an edge on `irq` (master PIC) is latched but not yet acknowledged.
     pub fn requested(&self, irq: u8) -> bool {
         self.chips[0].irr & (1 << irq) != 0
