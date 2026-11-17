@@ -5,8 +5,11 @@
 //! never write the Z buffer: Catalyst does this for OpenGL.
 //!
 //! We keep the Z buffer uncompressed, so the first draw that reads it with
-//! FAST_FILL on writes the clear value into every cleared block and marks
-//! the block uncompressed. Mask semantics, and the block a dword covers, as
+//! FAST_FILL on writes the clear value into every cleared block inside the
+//! scissor and marks the block uncompressed. The mask has no idea of the
+//! Z buffer's height and one mask serves whichever Z buffer is bound: the
+//! card only ever touches blocks it draws into, so filling blocks outside
+//! the scissor ran past small Z buffers into whatever followed them. Mask semantics, and the block a dword covers, as
 //! Mesa's r300 driver (r300_blit.c, r300_texture_desc.c; Marek Olšák and
 //! the Mesa authors) describes them for R300's two Z pipes: one dword per
 //! 32x16 pixels, row by row across `ZB_ZMASK_PITCH`.
@@ -64,7 +67,9 @@ impl Radeon {
         let mask_pitch = (self.reg(ZB_ZMASK_PITCH) & 0x3ffe) as usize;
         let bpp = if self.reg(ZB_FORMAT) & 15 < 2 { 2 } else { 4 };
         let value = self.reg(ZB_DEPTHCLEARVALUE);
-        let fills = take_cleared(&mut self.r3d.zmask, base, pitch, mask_pitch, bpp);
+        let offset = if self.reg(GB_TILE_CONFIG) & (1 << 16) != 0 { 1088 } else { 1440 };
+        let scissor = self.rect(SC_SCISSOR0, SC_SCISSOR1, offset);
+        let fills = take_cleared(&mut self.r3d.zmask, base, pitch, mask_pitch, bpp, scissor);
         let vram_len = self.vga.vram_mut().len();
         let fills: Vec<Fill> = fills.into_iter().filter_map(|f| clip(f, vram_len)).collect();
         if fills.is_empty() {
@@ -85,31 +90,39 @@ impl Radeon {
     }
 }
 
-/// Marks every cleared dword uncompressed and returns the Z buffer rows it
-/// covered, with blocks next to each other in a row merged.
-pub(crate) fn take_cleared(z: &mut ZMask, base: usize, pitch: usize, mask_pitch: usize, bpp: usize) -> Vec<Fill> {
-    z.cleared = false;
+/// Marks every cleared dword whose block meets `scissor` (inclusive x0, y0,
+/// x1, y1 in pixels) uncompressed and returns the Z buffer rows it covered
+/// inside the scissor, with blocks next to each other in a row merged.
+pub(crate) fn take_cleared(z: &mut ZMask, base: usize, pitch: usize, mask_pitch: usize, bpp: usize, scissor: [i32; 4]) -> Vec<Fill> {
     let per_row = mask_pitch / BLOCK_W;
     if per_row == 0 || pitch == 0 {
         return Vec::new();
     }
+    let [sx0, sy0, sx1, sy1] = scissor.map(|v| v.max(0) as usize);
+    let (sx1, sy1) = ((sx1 + 1).min(pitch), sy1 + 1);
     let mut fills: Vec<Fill> = Vec::new();
+    let mut left = false;
     for (d, w) in z.words.iter_mut().enumerate() {
         if *w != 0 {
             continue;
         }
-        *w = u32::MAX;
         let (bx, by) = (d % per_row * BLOCK_W, d / per_row * BLOCK_H);
-        if bx >= pitch {
+        let (x0, x1) = (bx.max(sx0), (bx + BLOCK_W).min(sx1));
+        let (y0, y1) = (by.max(sy0), (by + BLOCK_H).min(sy1));
+        if x0 >= x1 || y0 >= y1 {
+            left = true;
             continue;
         }
-        let width = BLOCK_W.min(pitch - bx) * bpp;
-        let offset = base + (by * pitch + bx) * bpp;
+        *w = u32::MAX;
+        let width = (x1 - x0) * bpp;
+        let offset = base + (y0 * pitch + x0) * bpp;
+        let rows = y1 - y0;
         match fills.last_mut() {
-            Some(f) if f.offset + f.width == offset && f.rows == BLOCK_H => f.width += width,
-            _ => fills.push(Fill { offset, stride: pitch * bpp, width, rows: BLOCK_H }),
+            Some(f) if f.offset + f.width == offset && f.rows == rows => f.width += width,
+            _ => fills.push(Fill { offset, stride: pitch * bpp, width, rows }),
         }
     }
+    z.cleared = left;
     fills
 }
 
@@ -134,12 +147,14 @@ pub(crate) fn fill_cpu(vram: &mut [u8], f: Fill, bpp: usize, value: u32) {
 mod tests {
     use super::*;
 
+    const EVERYWHERE: [i32; 4] = [0, 0, 8191, 8191];
+
     #[test]
     fn each_dword_covers_32x16_pixels_row_by_row_and_neighbours_merge() {
         let mut z = ZMask::default();
         z.clear(1, 2, 0);
         z.clear(45, 1, 0);
-        let fills = take_cleared(&mut z, 0x1000, 1440, 1440, 4);
+        let fills = take_cleared(&mut z, 0x1000, 1440, 1440, 4, EVERYWHERE);
         assert_eq!(
             fills,
             [
@@ -147,7 +162,7 @@ mod tests {
                 Fill { offset: 0x1000 + 16 * 1440 * 4, stride: 1440 * 4, width: 32 * 4, rows: 16 },
             ]
         );
-        assert!(take_cleared(&mut z, 0x1000, 1440, 1440, 4).is_empty());
+        assert!(take_cleared(&mut z, 0x1000, 1440, 1440, 4, EVERYWHERE).is_empty());
     }
 
     #[test]
@@ -157,6 +172,18 @@ mod tests {
         assert!(!z.cleared);
         z.clear(0, 0xa05, 0);
         z.clear(0, 0xa05, u32::MAX);
-        assert!(take_cleared(&mut z, 0, 1440, 1440, 4).is_empty());
+        assert!(take_cleared(&mut z, 0, 1440, 1440, 4, EVERYWHERE).is_empty());
+    }
+
+    #[test]
+    fn only_blocks_inside_the_scissor_are_filled_and_the_rest_stay_cleared() {
+        let mut z = ZMask::default();
+        z.clear(0, 4096, 0);
+        let fills = take_cleared(&mut z, 0x1000, 288, 256, 4, [0, 0, 255, 255]);
+        let end = fills.iter().map(|f| f.offset + (f.rows - 1) * f.stride + f.width).max().unwrap();
+        assert_eq!(end, 0x1000 + (255 * 288 + 256) * 4, "nothing past the 256x256 scissor");
+        assert!(z.cleared);
+        let rest = take_cleared(&mut z, 0x1000, 640, 640, 4, [0, 0, 639, 479]);
+        assert!(!rest.is_empty());
     }
 }
