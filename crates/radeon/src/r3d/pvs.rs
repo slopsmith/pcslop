@@ -15,6 +15,10 @@ use super::V4;
 
 /// Where the 2.6.24 DRM and Mesa upload constants in vector memory.
 pub(crate) const CONST_START: usize = 512;
+/// R300's code memory is a ring of 256 instructions: XP's ATI driver
+/// uploads a program that does not fit before slot 255 in two pieces, the
+/// rest from slot 0, and sets PVS_FIRST_INST past PVS_LAST_INST.
+pub(crate) const CODE_SLOTS: usize = 256;
 pub(crate) const TEMPS: usize = 64;
 pub(crate) const INPUTS: usize = 32;
 pub(crate) const OUTPUTS: usize = 16;
@@ -237,9 +241,15 @@ impl Program<'_> {
             out: [[0.0, 0.0, 0.0, 1.0]; OUTPUTS],
             a0: [0; 4],
         };
-        let last = self.last.min(self.mem.len() / 4 - 1);
-        for i in self.first..=last {
-            m.step(&self.mem[4 * i..4 * i + 4]);
+        let (first, last) = (self.first % CODE_SLOTS, self.last % CODE_SLOTS);
+        let mut i = first;
+        loop {
+            let Some(inst) = self.mem.get(4 * i..4 * i + 4) else { break };
+            m.step(inst);
+            if i == last {
+                break;
+            }
+            i = (i + 1) % CODE_SLOTS;
         }
         m.out
     }

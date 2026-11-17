@@ -514,6 +514,32 @@ fn indx_buffer_streams_a_vertex_program_into_vector_memory() {
     assert_eq!(g.px(16, 8), 0xffff_0000);
 }
 
+/// The transform from the test above, uploaded as Catalyst uploads a program
+/// that runs past the last code slot: its first instruction in slot 255 and
+/// its second in slot 0.
+fn wrapped_program(g: &mut Gpu) {
+    g.constant(0, [2.0, 2.0, 1.0, 1.0]);
+    g.constant(1, [16.0, 8.0, 0.0, 0.0]);
+    let code = [pvs(4, 2, 0, [src(1, 0), src(2, 0), src(2, 1)]), pvs(3, 2, 1, [src(1, 1), ZERO, ZERO])];
+    for (slot, inst) in [(255, code[0]), (0, code[1])] {
+        g.w(VAP_PVS_VECTOR_INDX_REG, slot);
+        for d in inst {
+            g.w(VAP_PVS_VECTOR_DATA_REG, d);
+        }
+    }
+    g.w(VAP_PVS_CODE_CNTL_0, 255);
+    g.draw(13, &quad(0.0, 0.0, 4.0, 4.0, RED));
+}
+
+#[test]
+fn a_vertex_program_wraps_from_the_last_code_slot_to_the_first() {
+    let mut g = Gpu::new();
+    wrapped_program(&mut g);
+    assert_eq!(g.count(0xffff_0000), 64);
+    assert_eq!(g.px(16, 8), 0xffff_0000);
+    assert_eq!(g.px(23, 15), 0xffff_0000);
+}
+
 #[test]
 fn draw_128_takes_indices_when_its_walk_says_so() {
     let mut g = Gpu::new();
@@ -623,6 +649,7 @@ mod against_metal {
             0,
             0,
         );
+        same(wrapped_program, 0, 0);
         same(
             |g| {
                 let tri = [v(0.0, 0.0, RED), v(0.0, 20.0, RED), v(20.0, 0.0, RED)];
