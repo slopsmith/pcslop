@@ -42,6 +42,8 @@ struct Uniforms {
     uint fog;
     float fog_factor;
     float fog_colour[3];
+    uint poly_enable;
+    float poly[4];
 };
 
 static uint rd8(const device uchar *d, uint a, uint limit) {
@@ -498,22 +500,11 @@ static void backend(constant Uniforms &u, device uchar *vram, device atomic_uint
     }
 }
 
-struct VOut {
-    float4 position [[position]];
-    float z [[center_no_perspective]];
-    float front [[flat]];
-    @VARYINGS@
-};
-
-vertex VOut vs(uint vid [[vertex_id]], const device float4 *vb [[buffer(0)]]) {
-    const device float4 *v = vb + vid * @STRIDE@;
-    float4 p = v[0];
-    float w = (@PERSPECTIVE@ && p.w > 0.0) ? 1.0 / p.w : 1.0;
-    VOut o;
-    o.position = float4((p.x / 2048.0 - 1.0) * w, (1.0 - p.y / 2048.0) * w, 0.0, w);
-    o.z = p.z;
-    o.front = v[1].x;
-    o.fog = v[1].y;
-    @COPY@
-    return o;
+// As Raster::offset_depth in raster.rs, whose slopes are per 1/16 pixel.
+static float poly_offset(constant Uniforms &u, float z, bool front) {
+    if ((u.poly_enable & (front ? 1u : 2u)) == 0) return z;
+    float scale = front ? u.poly[0] : u.poly[2], offset = front ? u.poly[1] : u.poly[3];
+    float ds = u.depth_scale != 0.0 ? u.depth_scale : 16777215.0;
+    float slope = max(abs(dfdx(z)), abs(dfdy(z))) / 16.0;
+    return z + (scale * slope * ds + offset) / ds;
 }

@@ -727,21 +727,26 @@ mod against_metal {
     /// Draws `scene` on the CPU and through Metal and expects the same
     /// pixels: every channel within `tolerance`, apart from at most `edges`
     /// pixels where the two rasterizers' subpixel precision differs.
-    fn same(scene: impl Fn(&mut Gpu), tolerance: u32, edges: usize) {
-        compare(scene, tolerance, edges, true);
+    /// Also draws through Metal with the vertex programs on the CPU, and
+    /// returns how many draws the GPU's vertex stage took.
+    fn same(scene: impl Fn(&mut Gpu), tolerance: u32, edges: usize) -> u64 {
+        compare(&scene, tolerance, edges, true, false);
+        compare(&scene, tolerance, edges, true, true).1
     }
 
-    /// Like `same`, with Metal's texture sampling on or off, and returns
-    /// how many texture binds Metal sampled.
-    fn compare(scene: impl Fn(&mut Gpu), tolerance: u32, edges: usize, native: bool) -> u64 {
+    /// Like `same`, with Metal's texture sampling and vertex stage on or
+    /// off, and returns how many texture binds Metal sampled and how many
+    /// draws its vertex stage took.
+    fn compare(scene: impl Fn(&mut Gpu), tolerance: u32, edges: usize, native: bool, gpu_vertices: bool) -> (u64, u64) {
         let mut cpu = Gpu::new();
         scene(&mut cpu);
         let mut gpu = Gpu::new();
         if !gpu.r.use_metal() {
             eprintln!("no Metal device; skipping");
-            return 1;
+            return (1, 1);
         }
         gpu.r.metal.as_mut().unwrap().set_native_textures(native);
+        gpu.r.metal.as_mut().unwrap().set_gpu_vertices(gpu_vertices);
         scene(&mut gpu);
         gpu.r.gpu_sync();
         let (draws, fallbacks, _) = gpu.r.metal_stats().unwrap();
@@ -761,19 +766,20 @@ mod against_metal {
         }
         assert!(differ <= edges, "{differ} pixels differ");
         assert!(cpu.count(0) < 64 * 64, "the scene drew nothing");
-        gpu.r.metal.as_ref().unwrap().texture_stats().0
+        let m = gpu.r.metal.as_ref().unwrap();
+        (m.texture_stats().0, m.vertex_draws())
     }
 
     /// Compares `scene` with Metal sampling its textures and with the shader
     /// sampling them in software, and returns whether Metal sampled any.
     fn both_samplers(scene: impl Fn(&mut Gpu), tolerance: u32) -> bool {
-        compare(&scene, tolerance, 0, false);
-        compare(&scene, tolerance, 0, true) > 0
+        compare(&scene, tolerance, 0, false, true);
+        compare(&scene, tolerance, 0, true, true).0 > 0
     }
 
     #[test]
     fn quads_and_shared_edges_match() {
-        same(|g| g.draw(13, &quad(2.0, 3.0, 10.0, 7.0, RED)), 0, 0);
+        assert!(same(|g| g.draw(13, &quad(2.0, 3.0, 10.0, 7.0, RED)), 0, 0) > 0, "the GPU shaded no vertices");
         same(
             |g| {
                 g.w(RB3D_BLENDCNTL, 1 | 33 << 16 | 33 << 24);
@@ -1223,8 +1229,119 @@ mod against_metal {
         g.w(SCRATCH_REG0, 9);
         assert_eq!(scratch_in_memory(&g), 9);
     }
-}
 
+    fn at(x: f32, y: f32, z: f32, w: f32, c: [f32; 4]) -> [f32; 8] {
+        [x, y, z, w, c[0], c[1], c[2], c[3]]
+    }
+
+    #[test]
+    fn clipping_matches() {
+        for disable in [false, true] {
+            same(
+                |g| {
+                    clip_space(g);
+                    g.w(VAP_CNTL, DX_CLIP_SPACE_DEF);
+                    if disable {
+                        g.w(VAP_CLIP_CNTL, CLIP_DISABLE);
+                    }
+                    g.draw(4, &[at(-1.0, -1.0, 0.5, 1.0, RED), at(1.0, -1.0, 0.5, 1.0, BLUE), at(0.0, 1.0, -0.5, 1.0, RED)]);
+                },
+                2,
+                40,
+            );
+        }
+        same(
+            |g| {
+                clip_space(g);
+                g.draw(4, &[at(-1.0, -1.0, -0.5, 1.0, RED), at(1.0, -1.0, -0.5, 1.0, RED), at(0.0, 1.0, -0.9, 1.0, RED)]);
+                g.draw(4, &[at(-1.0, -1.0, 0.5, 1.0, BLUE), at(1.0, -1.0, 0.5, 1.0, BLUE), at(0.0, 1.0, 1.5, 1.0, BLUE)]);
+            },
+            2,
+            40,
+        );
+        same(
+            |g| {
+                clip_space(g);
+                g.draw(4, &[at(-0.5, -0.5, 0.2, 1.0, RED), at(0.5, -0.5, 0.2, 1.0, BLUE), at(0.0, 1.5, 0.3, -1.0, RED)]);
+                g.draw(4, &[at(-2.0, -2.0, 0.5, 4.0, BLUE), at(3.0, -1.0, 1.0, 2.0, RED), at(0.0, 2.5, 1.5, 3.0, [0.0, 1.0, 0.0, 1.0])]);
+            },
+            2,
+            40,
+        );
+        same(
+            |g| {
+                clip_space(g);
+                g.w(VAP_GB_HORZ_CLIP_ADJ, f(2.0));
+                g.w(VAP_GB_VERT_CLIP_ADJ, f(2.0));
+                g.draw(4, &[at(-1.0, -1.0, 0.5, 1.0, RED), at(1.0e12, -1.0, 0.5, 1.0, BLUE), at(-1.0, 1.0e12, 0.5, 1.0, RED)]);
+            },
+            2,
+            40,
+        );
+    }
+
+    #[test]
+    fn primitive_types_match() {
+        let fan: Vec<[f32; 8]> = (0..12)
+            .map(|i| {
+                let a = i as f32 * 0.9;
+                let r = 28.0 * (1.0 - i as f32 * 0.04);
+                v(32.0 + r * a.cos(), 32.0 + r * a.sin(), [i as f32 / 12.0, 0.5, 1.0 - i as f32 / 12.0, 1.0])
+            })
+            .collect();
+        for prim in [4, 5, 6, 13, 14, 15] {
+            assert!(same(|g| g.draw(prim, &fan), 2, 60) > 0, "prim {prim}");
+        }
+    }
+
+    fn arrays(g: &mut Gpu, in_vram: bool) {
+        let verts = [quad(4.0, 4.0, 30.0, 20.0, RED), quad(20.0, 10.0, 60.0, 60.0, BLUE)].concat();
+        let (ram, vram) = (0x8000usize, 0x4_0000usize);
+        for (i, d) in verts.iter().flatten().enumerate() {
+            let b = f(*d).to_le_bytes();
+            if in_vram {
+                g.r.vram_mut()[vram + 4 * i..][..4].copy_from_slice(&b);
+            } else {
+                g.ram.0[ram + 4 * i..][..4].copy_from_slice(&b);
+            }
+        }
+        let addr = if in_vram { VRAM + vram as u32 } else { ram as u32 };
+        let indexed = [pkt3(0x2f, 3), 1, 8 | 8 << 8, addr, pkt3(0x39, 4), 4 | 1 << 4 | 6 << 16, 5 << 16 | 4, 5 << 16 | 6, 6 << 16 | 7];
+        g.r.execute(&mut g.ram, &indexed);
+        g.r.execute(&mut g.ram, &[pkt3(0x39, 1), 13 | 2 << 4 | 4 << 16]);
+    }
+
+    #[test]
+    fn vertex_arrays_in_vram_and_system_memory_match() {
+        for in_vram in [false, true] {
+            assert!(same(|g| arrays(g, in_vram), 0, 0) > 0);
+        }
+    }
+
+    #[test]
+    fn polygon_offset_and_solid_colours_match() {
+        same(
+            |g| {
+                depth(g, false);
+                g.w(SU_POLY_OFFSET_ENABLE, 3);
+                g.w(SU_POLY_OFFSET_FRONT_SCALE, f(4.0));
+                g.w(SU_POLY_OFFSET_FRONT_OFFSET, f(64.0));
+                g.w(SU_POLY_OFFSET_BACK_SCALE, f(4.0));
+                g.w(SU_POLY_OFFSET_BACK_OFFSET, f(64.0));
+                let slanted = |c: [f32; 4]| [at(0.0, 0.0, 0.2, 1.0, c), at(64.0, 0.0, 0.6, 1.0, c), at(64.0, 64.0, 0.4, 1.0, c), at(0.0, 64.0, 0.3, 1.0, c)];
+                g.draw(13, &slanted(RED));
+                g.w(SU_POLY_OFFSET_ENABLE, 0);
+                g.draw(13, &slanted(BLUE));
+                g.w(GA_SOLID_RG, 0x0800_0400);
+                g.w(GA_SOLID_BA, 0x0c00_1000);
+                g.w(GA_COLOR_CONTROL, 0xaaa8);
+                g.draw(13, &quad(40.0, 40.0, 60.0, 60.0, RED));
+            },
+            1,
+            0,
+        );
+    }
+}
 
 fn stale_depth_with_a_cleared_zmask(g: &mut Gpu, fast_fill: bool) {
     g.w(ZB_CNTL, 6);

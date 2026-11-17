@@ -3,37 +3,77 @@
 //! textures, constants and the back end state left to a uniform buffer.
 
 use super::us::Program;
+use super::vsgen::VsDesc;
 use std::fmt::Write;
 
 const PRELUDE: &str = include_str!("msl_prelude.metal");
 
-/// Generates the vertex and fragment functions (`vs` and `fs`) for a draw
-/// whose rasterizer fills pixel stack registers `slots`.
-pub(crate) fn shader(prog: &Program, slots: &[usize], perspective: bool) -> String {
+const CAPTURED_VS: &str = r#"
+vertex VOut vs(uint vid [[vertex_id]], const device float4 *vb [[buffer(0)]]) {
+    const device float4 *v = vb + vid * @STRIDE@;
+    float4 p = v[0];
+    float w = (PERSPECTIVE && p.w > 0.0) ? 1.0 / p.w : 1.0;
+    VOut o;
+    o.position = float4((p.x / 2048.0 - 1.0) * w, (1.0 - p.y / 2048.0) * w, 0.0, w);
+    o.z = p.z;
+    o.front = v[1].x;
+    o.fog = v[1].y;
+@COPY@    return o;
+}
+"#;
+
+fn outputs(slots: &[usize], perspective: bool) -> String {
     let interp = if perspective { "center_perspective" } else { "center_no_perspective" };
     let mut varyings = format!("    float fog [[{interp}]];\n");
-    let mut copy = String::new();
     for (i, _) in slots.iter().enumerate() {
         let _ = writeln!(varyings, "    float4 v{i} [[{interp}]];");
+    }
+    let fields = format!("    float4 position [[position]];\n    float z [[center_no_perspective]];\n    float front [[flat]];\n{varyings}");
+    format!(
+        "#define PERSPECTIVE {perspective}\nstruct VOut {{\n{fields}}};\nstruct VOutV {{\n{fields}    float clip [[clip_distance]] [2];\n}};\n"
+    )
+}
+
+/// Generates the vertex and fragment functions (`vs` and `fs`) for a draw
+/// of triangles the CPU set up, whose rasterizer fills pixel stack
+/// registers `slots`.
+pub(crate) fn shader(prog: &Program, slots: &[usize], perspective: bool) -> String {
+    let mut copy = String::new();
+    for (i, _) in slots.iter().enumerate() {
         let _ = writeln!(copy, "    o.v{i} = v[{}];", 2 + i);
     }
-    let mut src = PRELUDE
-        .replace("@VARYINGS@", &varyings)
-        .replace("@COPY@", &copy)
-        .replace("@STRIDE@", &(2 + slots.len()).to_string())
-        .replace("@PERSPECTIVE@", if perspective { "true" } else { "false" });
-    src.push_str(&fragment(prog, slots));
+    let mut src = String::from(PRELUDE);
+    src.push_str(&outputs(slots, perspective));
+    src.push_str(&CAPTURED_VS.replace("@COPY@", &copy).replace("@STRIDE@", &(2 + slots.len()).to_string()));
+    src.push_str(&fragment(prog, slots, false));
     src
 }
 
-fn fragment(prog: &Program, slots: &[usize]) -> String {
+/// Generates `vs` and `fs` for a draw whose vertices the GPU processes, as
+/// `vs` describes.
+pub(crate) fn shader_gpu(prog: &Program, slots: &[usize], perspective: bool, vs: &VsDesc) -> String {
+    let mut src = String::from(PRELUDE);
+    src.push_str(&outputs(slots, perspective));
+    src.push_str(&vs.msl(slots));
+    src.push_str(&fragment(prog, slots, true));
+    src
+}
+
+/// With `gpu_vertices`, depth comes from the rasterized position, with the
+/// polygon offset applied here, and the face from Metal.
+fn fragment(prog: &Program, slots: &[usize], gpu_vertices: bool) -> String {
     let mut f = String::from(
-        "fragment void fs(VOut in [[stage_in]],\n    device uchar *vram [[buffer(0), raster_order_group(0)]],\n    const device uchar *texmem [[buffer(1)]],\n    const device uchar *stage [[buffer(2)]],\n    constant Uniforms &u [[buffer(3)]],\n    device atomic_uint *counter [[buffer(4)]],\n    const device TexSlot *images [[buffer(5)]],\n    const device SamplerSlot *samplers [[buffer(6)]]) {\n    TexTables tb = {images, samplers};\n    float4 t[32];\n    for (uint i = 0; i < 32; i++) t[i] = float4(0);\n",
+        "fragment void fs(VOut in [[stage_in]],\n    device uchar *vram [[buffer(0), raster_order_group(0)]],\n    const device uchar *texmem [[buffer(1)]],\n    const device uchar *stage [[buffer(2)]],\n    constant Uniforms &u [[buffer(3)]],\n    device atomic_uint *counter [[buffer(4)]],\n    const device TexSlot *images [[buffer(5)]],\n    const device SamplerSlot *samplers [[buffer(6)]],\n    bool front_facing [[front_facing]]) {\n    TexTables tb = {images, samplers};\n    float4 t[32];\n    for (uint i = 0; i < 32; i++) t[i] = float4(0);\n",
     );
     for (i, s) in slots.iter().enumerate() {
         let _ = writeln!(f, "    t[{s}] = in.v{i};");
     }
-    f.push_str("    float4 out = float4(0);\n    float depth = in.z;\n    bool killed = false;\n");
+    if gpu_vertices {
+        f.push_str("    bool front = front_facing;\n    float depth = poly_offset(u, in.position.z, front);\n");
+    } else {
+        f.push_str("    bool front = in.front != 0.0;\n    float depth = in.z;\n");
+    }
+    f.push_str("    float4 out = float4(0);\n    bool killed = false;\n");
     for node in &prog.nodes {
         if let Some((start, len)) = node.tex {
             for i in start..start + len {
@@ -48,7 +88,7 @@ fn fragment(prog: &Program, slots: &[usize]) -> String {
         }
     }
     f.push_str(
-        "    int x = int(in.position.x), y = int(in.position.y);\n    if (killed || x < 0 || y < 0 || !inside_clip(u, x, y)) return;\n    backend(u, vram, counter, uint(x), uint(y), blend_fog(u, out, in.fog), depth, in.front != 0.0);\n}\n",
+        "    int x = int(in.position.x), y = int(in.position.y);\n    if (killed || x < 0 || y < 0 || !inside_clip(u, x, y)) return;\n    backend(u, vram, counter, uint(x), uint(y), blend_fog(u, out, in.fog), depth, front);\n}\n",
     );
     f
 }

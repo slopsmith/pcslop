@@ -60,6 +60,18 @@ impl MetalR3d {
 
     pub fn vram_written(&mut self) {}
 
+    pub fn draw_vertices(&mut self, _r: &Raster, _slots: &[usize], _vs: &super::vsgen::VsDesc, _job: &super::vsgen::VertexJob) -> bool {
+        false
+    }
+
+    pub fn gpu_vertices(&self) -> bool {
+        false
+    }
+
+    pub fn vertex_draws(&self) -> u64 {
+        0
+    }
+
     pub fn texture_stats(&self) -> (u64, u64) {
         (0, 0)
     }

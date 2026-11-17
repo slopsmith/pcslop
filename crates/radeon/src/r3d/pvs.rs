@@ -34,15 +34,15 @@ pub(crate) struct Program<'a> {
 
 /// A source operand with its fields pulled out of the instruction word.
 #[derive(Clone, Copy)]
-struct Src {
-    class: u8,
-    base: i32,
+pub(crate) struct Src {
+    pub class: u8,
+    pub base: i32,
     /// The address register component added to `base`, if relative.
-    rel: Option<u8>,
+    pub rel: Option<u8>,
     /// Per component: 0-3 a register component, 4 zero, 5 one.
-    swizzle: [u8; 4],
-    negate: [bool; 4],
-    abs: bool,
+    pub swizzle: [u8; 4],
+    pub negate: [bool; 4],
+    pub abs: bool,
 }
 
 impl Src {
@@ -63,18 +63,18 @@ impl Src {
 }
 
 #[derive(Clone, Copy)]
-struct Dst {
+pub(crate) struct Dst {
     /// PVS_DST_REG_TYPE: 0 temporary, 1 A0, 2 output, 3 output with x
     /// replicated, 4 alternate temporary, 5 input.
-    kind: u8,
-    base: i32,
-    rel: Option<u8>,
-    mask: u8,
-    sat: bool,
+    pub kind: u8,
+    pub base: i32,
+    pub rel: Option<u8>,
+    pub mask: u8,
+    pub sat: bool,
 }
 
 #[derive(Clone, Copy)]
-enum Engine {
+pub(crate) enum Engine {
     Vector(u32),
     Math(u32),
     Macro(u32),
@@ -83,23 +83,23 @@ enum Engine {
 /// The math half of a dual-math instruction: two scalars from `src`'s X
 /// and Y swizzles, written to one component of an alternate temporary.
 #[derive(Clone, Copy)]
-struct DualMath {
-    src: Src,
-    op: u32,
-    index: usize,
-    comp: usize,
-    sat: bool,
+pub(crate) struct DualMath {
+    pub src: Src,
+    pub op: u32,
+    pub index: usize,
+    pub comp: usize,
+    pub sat: bool,
 }
 
 #[derive(Clone, Copy)]
-struct Inst {
-    engine: Engine,
-    src: [Src; 3],
-    dst: Dst,
-    dual: Option<DualMath>,
+pub(crate) struct Inst {
+    pub engine: Engine,
+    pub src: [Src; 3],
+    pub dst: Dst,
+    pub dual: Option<DualMath>,
 }
 
-fn decode(d: &[u32]) -> Inst {
+pub(crate) fn decode(d: &[u32]) -> Inst {
     let d0 = d[0];
     let op = d0 & 0x3f;
     let engine = if d0 & (1 << 6) != 0 {
@@ -129,8 +129,8 @@ fn decode(d: &[u32]) -> Inst {
 
 /// A program decoded once for a draw, with its constants as floats.
 pub(crate) struct Decoded {
-    insts: Vec<Inst>,
-    consts: Vec<V4>,
+    pub insts: Vec<Inst>,
+    pub consts: Vec<V4>,
 }
 
 struct Machine<'a> {

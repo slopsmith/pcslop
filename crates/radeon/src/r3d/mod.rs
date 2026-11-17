@@ -20,17 +20,21 @@ mod metal_tex;
 pub(crate) mod metal;
 mod msl;
 mod pvs;
+mod pvs_msl;
+#[cfg(all(test, target_os = "macos"))]
+mod pvs_tests;
 mod raster;
 pub(crate) mod regs;
 mod tex;
 mod us;
+mod vsgen;
 mod zmask;
 
 #[cfg(test)]
 mod tests;
 
 use crate::Radeon;
-use crate::mem::BusMemory;
+use crate::mem::{BusMemory, Place};
 use raster::{Captured, ColourBuffer, DepthBuffer, Raster, Vertex};
 use regs::*;
 use tex::{TexMem, Texture};
@@ -416,7 +420,8 @@ impl Radeon {
                 let p = self.metal.as_ref().map_or(0, |m| m.pipelines());
                 let ms = self.metal.as_ref().map_or(0, |m| m.gpu_ms());
                 let (tn, tu) = self.metal.as_ref().map_or((0, 0), |m| m.texture_stats());
-                s += &format!(" | metal draws {d} cpu fallbacks {f} waits {w} throttled {t} pipelines {p} gpu ms {ms} metal textures {tn} dxt copies {tu}")
+                let vd = self.metal.as_ref().map_or(0, |m| m.vertex_draws());
+                s += &format!(" | metal draws {d} gpu vertices {vd} cpu fallbacks {f} waits {w} throttled {t} pipelines {p} gpu ms {ms} metal textures {tn} dxt copies {tu}")
             }
             None => s += " | cpu",
         }
@@ -816,9 +821,119 @@ impl Radeon {
         }
     }
 
+    /// Hands a draw of triangles to the GPU's vertex stage; false if the CPU
+    /// must run its vertices: no Metal, points or lines, or flat shading.
+    fn gpu_vertices(&mut self, mem: &mut dyn BusMemory, vf: u32, verts: &Verts<'_>) -> bool {
+        if !self.metal.as_ref().is_some_and(|m| m.gpu_vertices()) || self.trace.is_some() {
+            return false;
+        }
+        let prim = vf & 15;
+        let colour_control = self.reg(GA_COLOR_CONTROL);
+        if !matches!(prim, 4 | 5 | 6 | 13 | 14 | 15) || (0..8).any(|k| (colour_control >> (2 * k)) & 3 == 1) {
+            return false;
+        }
+        let count = ((vf >> 16) as usize).min(MAX_VERTICES);
+        let mut job = vsgen::VertexJob {
+            indices: Vec::new(),
+            immediate: Vec::new(),
+            arrays: Vec::new(),
+            consts: Vec::new(),
+            uniforms: vsgen::VsUniforms::default(),
+            cull: self.reg(SU_CULL_MODE),
+            reads: Vec::new(),
+        };
+        let (ids, fetch): (Vec<u32>, vsgen::Fetch) = match verts {
+            Verts::Immediate(data) => {
+                let size = (self.reg(VAP_VTX_SIZE) & 0x7f).max(1) as usize;
+                let n = data.len().div_ceil(size).min(count);
+                job.immediate = data[..data.len().min(n * size)].to_vec();
+                job.immediate.resize(n * size, 0);
+                ((0..n as u32).collect(), vsgen::Fetch::Immediate(size as u32))
+            }
+            Verts::List | Verts::Indices(_) => {
+                let ids: Vec<u32> = match verts {
+                    Verts::Indices(i) => {
+                        let (lo, hi) = (self.reg(VAP_VF_MIN_VTX_INDX) & 0xff_ffff, self.reg(VAP_VF_MAX_VTX_INDX) & 0xff_ffff);
+                        let hi = if hi == 0 { 0xff_ffff } else { hi };
+                        i.iter().map(|&x| x.clamp(lo, hi.max(lo))).collect()
+                    }
+                    _ => (0..count as u32).collect(),
+                };
+                let (lo, hi) = (ids.iter().copied().min().unwrap_or(0) as usize, ids.iter().copied().max().unwrap_or(0) as usize);
+                let mut sizes = Vec::new();
+                for a in 0..((self.reg(VAP_VTX_NUM_ARRAYS) & 31) as usize).min(16) {
+                    let attr_reg = VAP_VTX_AOS_ATTR01 + 12 * (a / 2) as u32;
+                    let attr = self.reg(attr_reg) >> (16 * (a % 2) as u32);
+                    let addr = self.reg(attr_reg + 4 + 4 * (a % 2) as u32) & !3;
+                    let (n, stride) = (bits(attr, 0, 7) as usize, bits(attr, 8, 7) as usize);
+                    let end = hi * stride + n;
+                    if end > 1 << 22 {
+                        return false;
+                    }
+                    let last = addr.wrapping_add(4 * end.max(1) as u32 - 4);
+                    let src = match (self.mc_place(mem, addr), self.mc_place(mem, last)) {
+                        (Place::Vram(off), Place::Vram(o)) if o == off + 4 * end.max(1) - 4 => {
+                            job.reads.push((off, off + 4 * end));
+                            vsgen::ArraySrc::Vram(off / 4)
+                        }
+                        _ => {
+                            let first = lo * stride;
+                            let data = self.mc_read_dwords(mem, addr.wrapping_add(4 * first as u32), end.saturating_sub(first));
+                            vsgen::ArraySrc::Copy { data, first: lo as u32 }
+                        }
+                    };
+                    job.arrays.push((src, stride as u32));
+                    sizes.push(n as u32);
+                }
+                (ids, vsgen::Fetch::Arrays(sizes))
+            }
+        };
+        job.indices = vsgen::triangles(prim, ids.len()).into_iter().map(|k| ids[k as usize]).collect();
+        let bypass = self.reg(VAP_CNTL_STATUS) & PVS_BYPASS != 0;
+        let code = self.reg(VAP_PVS_CODE_CNTL_0);
+        let const_base = bits(self.reg(VAP_PVS_CONST_CNTL), 0, 8) as usize;
+        let start = ((pvs::CONST_START + const_base) * 4).min(self.r3d.vecmem.len());
+        let program = if bypass { Vec::new() } else { vsgen::code(&self.r3d.vecmem, bits(code, 0, 10) as usize, bits(code, 20, 10) as usize) };
+        let used = vsgen::consts_used(&program).saturating_mul(4);
+        job.consts = self.r3d.vecmem[start..(start.saturating_add(used)).min(self.r3d.vecmem.len())].to_vec();
+        job.uniforms.nconsts = (job.consts.len() / 4) as u32;
+        let vp = self.viewport();
+        job.uniforms.scale = [vp.scale[0], vp.scale[1], vp.scale[2], 0.0];
+        job.uniforms.offset = [vp.offset[0], vp.offset[1], vp.offset[2], 0.0];
+        job.uniforms.ga_fog = [vp.ga.0, vp.ga.1, vp.fog.1, vp.fog.2];
+        let psc = self.psc();
+        let mut r = self.raster_state(mem);
+        job.uniforms.solid = r.solid;
+        let desc = vsgen::VsDesc {
+            code: program,
+            psc: std::array::from_fn(|i| if i < 8 { psc.cntl[i] } else { psc.ext[i - 8] }),
+            fetch,
+            fmt: [self.reg(VAP_OUT_VTX_FMT_0), self.reg(VAP_OUT_VTX_FMT_1)],
+            vte: vp.vte,
+            clip: self.reg(VAP_CLIP_CNTL) & CLIP_DISABLE == 0,
+            dx: self.reg(VAP_CNTL) & DX_CLIP_SPACE_DEF != 0,
+            fog_select: vp.fog.0,
+            colour_control,
+            clamp_colours: r.clamp_colours,
+            rs_inst: r.rs_inst.clone(),
+            rs_ip: r.rs_ip,
+        };
+        let slots = Captured::new(&r.rs_inst).slots;
+        r.capture = None;
+        let Some(m) = self.metal.as_mut() else { return false };
+        if !m.draw_vertices(&r, &slots, &desc, &job) {
+            return false;
+        }
+        self.vga.touch();
+        true
+    }
+
     fn draw_3d(&mut self, mem: &mut dyn BusMemory, vf: u32, verts: Verts<'_>) {
         self.r3d.draws += 1;
         self.resolve_zmask();
+        if self.gpu_vertices(mem, vf, &verts) {
+            return;
+        }
         let prim = vf & 15;
         let (verts, remap) = match verts {
             Verts::Indices(idx) => {

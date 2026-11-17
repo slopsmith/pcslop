@@ -10,6 +10,7 @@
 //! see `Radeon::gpu_sync`.
 
 use super::metal_tex::{self, MetalTexture, TexCache};
+use super::vsgen::{ArraySrc, VertexJob, VsDesc};
 use super::{msl, us};
 use super::raster::{Captured, Raster};
 use super::zmask::Fill;
@@ -108,6 +109,8 @@ struct Uniforms {
     fog: u32,
     fog_factor: f32,
     fog_colour: [f32; 3],
+    poly_enable: u32,
+    poly: [f32; 4],
 }
 
 type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
@@ -196,6 +199,9 @@ pub(crate) struct MetalR3d {
     textures: TexCache,
     /// False to sample every texture in software, for comparison.
     native_textures: bool,
+    /// False to run every vertex program on the CPU, for comparison.
+    gpu_vertices: bool,
+    vertex_draws: u64,
 }
 
 // The Metal objects are only touched while the card's owner holds it.
@@ -211,6 +217,10 @@ impl Drop for MetalR3d {
 
 fn bytes_of<T>(v: &T) -> &[u8] {
     unsafe { std::slice::from_raw_parts((v as *const T).cast::<u8>(), size_of::<T>()) }
+}
+
+fn words_of(v: &[u32]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), v.len() * 4) }
 }
 
 fn slice_bytes(v: &[u64]) -> &[u8] {
@@ -254,6 +264,8 @@ impl MetalR3d {
             gpu_seconds: 0.0,
             textures: TexCache::new(),
             native_textures: std::env::var("SLOPPER_TEX").as_deref() != Ok("software"),
+            gpu_vertices: std::env::var("SLOPPER_VS").as_deref() != Ok("cpu"),
+            vertex_draws: 0,
         })
     }
 
@@ -272,6 +284,26 @@ impl MetalR3d {
         let built = self.build(&msl::shader(&r.us, slots, r.perspective));
         if built.is_none() {
             eprintln!("radeon: Metal pipeline failed; drawing on the CPU instead");
+        }
+        self.pipelines.insert(key, built.clone());
+        built
+    }
+
+    /// The pipeline for a draw whose vertices `vs` describes, keyed like
+    /// `pipeline` plus the vertex state.
+    fn vs_pipeline(&mut self, r: &Raster, slots: &[usize], vs: &VsDesc) -> Option<Pipeline> {
+        let mut key = pipeline_key(&r.us, slots, r.perspective);
+        key.push(u32::MAX);
+        key.extend(vs.key());
+        if let Some(p) = self.pipelines.get(&key) {
+            return p.clone();
+        }
+        if self.pipelines.len() >= MAX_PIPELINES {
+            self.pipelines.clear();
+        }
+        let built = self.build(&msl::shader_gpu(&r.us, slots, r.perspective, vs));
+        if built.is_none() {
+            eprintln!("radeon: Metal vertex pipeline failed; running vertices on the CPU instead");
         }
         self.pipelines.insert(key, built.clone());
         built
@@ -359,7 +391,31 @@ impl MetalR3d {
         }
     }
 
-    fn draw_chunk(&mut self, r: &Raster, floats: &[f32], vertices: usize, pipeline: &Pipeline, [x0, y0, x1, y1]: [i32; 4]) {
+    fn draw_chunk(&mut self, r: &Raster, floats: &[f32], vertices: usize, pipeline: &Pipeline, bounds: [i32; 4]) {
+        let floats: &[u8] = unsafe { std::slice::from_raw_parts(floats.as_ptr().cast::<u8>(), floats.len() * 4) };
+        self.encode(r, pipeline, bounds, &[], floats.len(), |enc, arena| {
+            let vb = arena.put(floats)?;
+            enc.setCullMode(MTLCullMode::None);
+            unsafe {
+                enc.setVertexBuffer_offset_atIndex(Some(&arena.buf), vb, 0);
+                enc.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, vertices);
+            }
+            Some(())
+        });
+    }
+
+    /// Queues a draw of `r`'s fragment state with `pipeline`: `emit` puts
+    /// the vertex data, `vertex_bytes` at most, in the arena and draws.
+    /// `vertex_reads` are the VRAM ranges the vertex stage reads.
+    fn encode(
+        &mut self,
+        r: &Raster,
+        pipeline: &Pipeline,
+        [x0, y0, x1, y1]: [i32; 4],
+        vertex_reads: &[(usize, usize)],
+        vertex_bytes: usize,
+        emit: impl FnOnce(&ProtocolObject<dyn MTLRenderCommandEncoder>, &mut Arena) -> Option<()>,
+    ) {
         let mut u = self.uniforms(r);
         let reads: Vec<(usize, usize)> = r
             .textures
@@ -368,6 +424,7 @@ impl MetalR3d {
                 (Some(t), Some(TexMem::Vram(o))) => Some((*o, o + t.span())),
                 _ => None,
             })
+            .chain(vertex_reads.iter().copied())
             .collect();
         let writes: Vec<(usize, usize)> = r
             .colour
@@ -381,14 +438,13 @@ impl MetalR3d {
                 (d.offset + y0 as usize * d.pitch * bpp, d.offset + (y1 as usize + 1) * d.pitch * bpp)
             }))
             .collect();
-        let floats: &[u8] = unsafe { std::slice::from_raw_parts(floats.as_ptr().cast::<u8>(), floats.len() * 4) };
         let mut copies: Vec<(usize, &[u8])> = Vec::new();
         for (i, t) in r.textures.iter().enumerate() {
             if let Some(Texture { mem: TexMem::Copy(v), .. }) = t {
                 copies.push((i, v));
             }
         }
-        let need = floats.len() + copies.iter().map(|c| c.1.len() + ALIGN).sum::<usize>() + size_of::<Uniforms>() + TABLES + 6 * ALIGN;
+        let need = vertex_bytes + copies.iter().map(|c| c.1.len() + ALIGN).sum::<usize>() + size_of::<Uniforms>() + TABLES + 6 * ALIGN;
         if self.batch.as_ref().is_some_and(|b| b.arena.used + need > ARENA_SIZE) {
             self.kick();
         }
@@ -402,7 +458,6 @@ impl MetalR3d {
             u.tex[i].base = at as u32;
             u.tex[i].limit = ARENA_SIZE as u32;
         }
-        let Some(vb) = batch.arena.put(floats) else { return };
         let Some(ub) = batch.arena.put(bytes_of(&u)) else { return };
         let ids: Vec<u64> = images.iter().map(|t| resource_id(t.gpuResourceID())).collect();
         let Some(tb) = batch.arena.put(slice_bytes(&ids)) else { return };
@@ -422,7 +477,6 @@ impl MetalR3d {
         let arena = batch.arena.buf.clone();
         enc.setRenderPipelineState(pipeline);
         unsafe {
-            enc.setVertexBuffer_offset_atIndex(Some(&arena), vb, 0);
             enc.setFragmentBuffer_offset_atIndex(Some(&vram), 0, 0);
             enc.setFragmentBuffer_offset_atIndex(Some(&vram), 0, 1);
             enc.setFragmentBuffer_offset_atIndex(Some(&arena), 0, 2);
@@ -439,8 +493,80 @@ impl MetalR3d {
         batch.arena.keep.extend(images);
         enc.setViewport(MTLViewport { originX: 0.0, originY: 0.0, width: TARGET as f64, height: TARGET as f64, znear: 0.0, zfar: 1.0 });
         enc.setScissorRect(MTLScissorRect { x: x0 as usize, y: y0 as usize, width: (x1 - x0 + 1) as usize, height: (y1 - y0 + 1) as usize });
-        unsafe { enc.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, vertices) };
-        self.draws += 1;
+        enc.setDepthClipMode(MTLDepthClipMode::Clamp);
+        if emit(&enc, &mut batch.arena).is_some() {
+            self.draws += 1;
+        }
+    }
+
+    /// Queues a draw whose vertices the GPU fetches and shades. False if
+    /// the CPU must run its vertices instead.
+    fn draw_vertices_inner(&mut self, r: &Raster, slots: &[usize], vs: &VsDesc, job: &VertexJob) -> bool {
+        let words = job.indices.len() + job.immediate.len() + job.consts.len() + job.arrays.iter().map(|(a, _)| match a {
+            ArraySrc::Copy { data, .. } => data.len(),
+            ArraySrc::Vram(_) => 0,
+        }).sum::<usize>();
+        let bytes = 4 * words + size_of::<super::vsgen::VsUniforms>() + (job.arrays.len() + 4) * ALIGN;
+        if slots.len() > MAX_SLOTS || bytes > ARENA_SIZE / 2 {
+            return false;
+        }
+        let Some(pipeline) = self.vs_pipeline(r, slots, vs) else { return false };
+        self.vertex_draws += 1;
+        let [x0, y0, x1, y1] = r.bounds();
+        if job.cull & 3 == 3 || job.indices.is_empty() || x0 > x1 || y0 > y1 {
+            return true;
+        }
+        let vram = self.vram.clone();
+        let vram_dwords = (self.vram_len / 4) as i32;
+        self.encode(r, &pipeline, [x0, y0, x1, y1], &job.reads, bytes, |enc, arena| {
+            let ib = arena.put(words_of(&job.indices))?;
+            let mut vu = job.uniforms;
+            if !job.immediate.is_empty() {
+                vu.imm_base = (arena.put(words_of(&job.immediate))? / 4) as u32;
+            }
+            for (a, (src, stride)) in job.arrays.iter().enumerate() {
+                vu.arrays[a] = match src {
+                    ArraySrc::Vram(at) => [0, *at as i32, *stride as i32, vram_dwords],
+                    ArraySrc::Copy { data, first } => {
+                        let at = (arena.put(words_of(data))? / 4) as i32;
+                        [1, at - (*first * *stride) as i32, *stride as i32, at + data.len() as i32]
+                    }
+                };
+            }
+            let cb = arena.put(words_of(&job.consts))?;
+            let ub = arena.put(bytes_of(&vu))?;
+            let front = if job.cull & 4 == 0 { MTLWinding::CounterClockwise } else { MTLWinding::Clockwise };
+            enc.setFrontFacingWinding(front);
+            enc.setCullMode(match job.cull & 3 {
+                1 => MTLCullMode::Front,
+                2 => MTLCullMode::Back,
+                _ => MTLCullMode::None,
+            });
+            unsafe {
+                enc.setVertexBuffer_offset_atIndex(Some(&vram), 0, 0);
+                enc.setVertexBuffer_offset_atIndex(Some(&arena.buf), 0, 1);
+                enc.setVertexBuffer_offset_atIndex(Some(&arena.buf), ub, 2);
+                enc.setVertexBuffer_offset_atIndex(Some(&arena.buf), cb, 3);
+                enc.drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferOffset(MTLPrimitiveType::Triangle, job.indices.len(), MTLIndexType::UInt32, &arena.buf, ib);
+            }
+            Some(())
+        });
+        true
+    }
+
+    /// Runs every vertex program on the CPU when false.
+    #[cfg(test)]
+    pub fn set_gpu_vertices(&mut self, on: bool) {
+        self.gpu_vertices = on;
+    }
+
+    pub fn gpu_vertices(&self) -> bool {
+        self.gpu_vertices
+    }
+
+    /// Draws whose vertices the GPU shaded.
+    pub fn vertex_draws(&self) -> u64 {
+        self.vertex_draws
     }
 
     /// Points the descriptors of the textures Metal can sample at their
@@ -476,6 +602,7 @@ impl MetalR3d {
     }
 
     /// Samples every texture in software when false.
+    #[cfg(test)]
     pub fn set_native_textures(&mut self, on: bool) {
         self.native_textures = on;
     }
@@ -515,6 +642,8 @@ impl MetalR3d {
             fog: r.fog,
             fog_factor: r.fog_factor,
             fog_colour: r.fog_colour,
+            poly_enable: r.poly_offset.0,
+            poly: r.poly_offset.1,
         };
         for (i, c) in r.us.consts.iter().take(32).enumerate() {
             u.consts[i] = *c;
@@ -707,6 +836,10 @@ impl MetalR3d {
 
     pub fn draw(&mut self, r: &Raster, cap: &Captured, pipeline: &Pipeline) {
         autoreleasepool(|_| self.draw_inner(r, cap, pipeline))
+    }
+
+    pub fn draw_vertices(&mut self, r: &Raster, slots: &[usize], vs: &VsDesc, job: &VertexJob) -> bool {
+        autoreleasepool(|_| self.draw_vertices_inner(r, slots, vs, job))
     }
 
     pub fn fill(&mut self, f: Fill, bpp: usize, value: u32) -> bool {
