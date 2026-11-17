@@ -62,6 +62,7 @@ fn run_interp(cpu: &mut Cpu, bus: &mut FlatBus) {
 fn run_jit(cpu: &mut Cpu, bus: &mut FlatBus) -> Stats {
     let _vm = VM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut jit = unsafe { Jit::new(bus.ram.as_ptr(), RAM).unwrap() };
+    jit.vm_fill = true;
     let kicker = jit.kicker();
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop = done.clone();

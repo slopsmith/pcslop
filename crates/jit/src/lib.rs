@@ -291,6 +291,9 @@ pub struct Jit {
     pub stats: Stats,
     /// Runs each block against the interpreter and stops at the first difference.
     pub verify: bool,
+    /// Fills shadow entries inside the VM (SLOPPER_JIT_VM_FILL). Off by default:
+    /// XP's first boot can hang with it.
+    pub vm_fill: bool,
     /// Measures time spent in the VM and per exit kind (SLOPPER_JIT_PROFILE).
     timing: bool,
     audit: bool,
@@ -372,6 +375,7 @@ impl Jit {
             stats: Stats::default(),
             interp_profile: std::env::var_os("SLOPPER_JIT_PROFILE").map(|_| HashMap::default()),
             verify: std::env::var_os("SLOPPER_JIT_VERIFY").is_some(),
+            vm_fill: std::env::var_os("SLOPPER_JIT_VM_FILL").is_some(),
             timing: std::env::var_os("SLOPPER_JIT_PROFILE").is_some(),
             audit: std::env::var_os("SLOPPER_JIT_AUDIT").is_some(),
             audit_seen: HashSet::default(),
@@ -489,6 +493,7 @@ impl Jit {
     }
 
     fn load_state(&mut self, cpu: &Cpu) {
+        let vm_fill = self.vm_fill;
         let s = self.state();
         s.regs = cpu.regs;
         s.eip = cpu.eip;
@@ -505,7 +510,7 @@ impl Jit {
         {
             use x86::cpu::{cr0, cr4};
             let mut f = 0;
-            if cpu.cr0 & cr0::PG != 0 && cpu.cr4 & cr4::PAE == 0 {
+            if vm_fill && cpu.cr0 & cr0::PG != 0 && cpu.cr4 & cr4::PAE == 0 {
                 f |= state::walk::ON;
             }
             if cpu.cr4 & cr4::PSE != 0 {
