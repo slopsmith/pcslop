@@ -214,6 +214,99 @@ impl Default for ThreeD {
     }
 }
 
+/// VAP_PROG_STREAM_CNTL_0..7 and their EXT registers.
+#[derive(Clone, Copy)]
+struct Psc {
+    cntl: [u32; 8],
+    ext: [u32; 8],
+}
+
+impl Psc {
+    /// Splits a vertex's dwords into input vectors.
+    fn inputs(&self, dwords: &[u32]) -> [V4; pvs::INPUTS] {
+        let mut inputs = [[0.0, 0.0, 0.0, 1.0]; pvs::INPUTS];
+        let mut at = 0;
+        for e in 0..16u32 {
+            let cntl = self.cntl[e as usize / 2] >> (16 * (e % 2));
+            let ext = self.ext[e as usize / 2] >> (16 * (e % 2));
+            let kind = cntl & 15;
+            let signed = cntl & (1 << 14) != 0;
+            let normalize = cntl & (1 << 15) != 0;
+            let d = |i: usize| dwords.get(at + i).copied().unwrap_or(0);
+            let (raw, used): (V4, usize) = match kind {
+                0..=3 => {
+                    let n = kind as usize + 1;
+                    let mut v = [0.0, 0.0, 0.0, 1.0];
+                    for (c, x) in v.iter_mut().enumerate().take(n) {
+                        *x = f32::from_bits(d(c));
+                    }
+                    (v, n)
+                }
+                4 | 5 => {
+                    let w = d(0);
+                    let mut v = [0, 8, 16, 24].map(|s| fixed(w >> s, 8, signed, normalize));
+                    if kind == 5 {
+                        v.swap(0, 2);
+                    }
+                    (v, 1)
+                }
+                6 => {
+                    let w = d(0);
+                    ([fixed(w, 16, signed, normalize), fixed(w >> 16, 16, signed, normalize), 0.0, 1.0], 1)
+                }
+                7 => {
+                    let (w0, w1) = (d(0), d(1));
+                    ([w0, w0 >> 16, w1, w1 >> 16].map(|x| fixed(x, 16, signed, normalize)), 2)
+                }
+                8 => {
+                    let w = d(0);
+                    ([fixed(w, 10, signed, normalize), fixed(w >> 10, 10, signed, normalize), fixed(w >> 20, 10, signed, normalize), 1.0], 1)
+                }
+                _ => {
+                    let w = d(0);
+                    ([fixed(w, 11, signed, normalize), fixed(w >> 11, 11, signed, normalize), fixed(w >> 22, 10, signed, normalize), 1.0], 1)
+                }
+            };
+            let dst = bits(cntl, 8, 5) as usize;
+            let mask = bits(ext, 12, 4);
+            for c in 0..4 {
+                if mask & (1 << c) != 0 {
+                    inputs[dst][c] = match bits(ext, 3 * c as u32, 3) {
+                        s @ 0..=3 => raw[s as usize],
+                        5 => 1.0,
+                        _ => 0.0,
+                    };
+                }
+            }
+            at += used + bits(cntl, 4, 4) as usize;
+            if cntl & (1 << 13) != 0 {
+                break;
+            }
+        }
+        inputs
+    }
+}
+
+/// The distinct indices in `idx`, in first-use order, and where each entry
+/// of `idx` is among them.
+fn unique_indices(idx: &[u32]) -> (Vec<u32>, Vec<u32>) {
+    let mut slot = std::collections::HashMap::with_capacity(idx.len() / 2);
+    let mut unique = Vec::new();
+    let remap = idx
+        .iter()
+        .map(|&i| {
+            *slot.entry(i).or_insert_with(|| {
+                unique.push(i);
+                unique.len() as u32 - 1
+            })
+        })
+        .collect();
+    (unique, remap)
+}
+
+/// Draws with fewer vertices run the vertex program on the calling thread.
+const PARALLEL_VERTICES: usize = 2048;
+
 enum Verts<'a> {
     Immediate(&'a [u32]),
     List,
@@ -500,70 +593,12 @@ impl Radeon {
         }
     }
 
-    /// Splits a vertex's dwords into input vectors through the PSC.
-    fn psc(&self, dwords: &[u32]) -> [V4; pvs::INPUTS] {
-        let mut inputs = [[0.0, 0.0, 0.0, 1.0]; pvs::INPUTS];
-        let mut at = 0;
-        let norm_cntl = self.reg(VAP_PSC_SGN_NORM_CNTL);
-        for e in 0..16u32 {
-            let cntl = self.reg(VAP_PROG_STREAM_CNTL_0 + 4 * (e / 2)) >> (16 * (e % 2));
-            let ext = self.reg(VAP_PROG_STREAM_CNTL_EXT_0 + 4 * (e / 2)) >> (16 * (e % 2));
-            let kind = cntl & 15;
-            let signed = cntl & (1 << 14) != 0;
-            let normalize = cntl & (1 << 15) != 0;
-            let d = |i: usize| dwords.get(at + i).copied().unwrap_or(0);
-            let _ = norm_cntl;
-            let (raw, used): (V4, usize) = match kind {
-                0..=3 => {
-                    let n = kind as usize + 1;
-                    let mut v = [0.0, 0.0, 0.0, 1.0];
-                    for (c, x) in v.iter_mut().enumerate().take(n) {
-                        *x = f32::from_bits(d(c));
-                    }
-                    (v, n)
-                }
-                4 | 5 => {
-                    let w = d(0);
-                    let mut v = [0, 8, 16, 24].map(|s| fixed(w >> s, 8, signed, normalize));
-                    if kind == 5 {
-                        v.swap(0, 2);
-                    }
-                    (v, 1)
-                }
-                6 => {
-                    let w = d(0);
-                    ([fixed(w, 16, signed, normalize), fixed(w >> 16, 16, signed, normalize), 0.0, 1.0], 1)
-                }
-                7 => {
-                    let (w0, w1) = (d(0), d(1));
-                    ([w0, w0 >> 16, w1, w1 >> 16].map(|x| fixed(x, 16, signed, normalize)), 2)
-                }
-                8 => {
-                    let w = d(0);
-                    ([fixed(w, 10, signed, normalize), fixed(w >> 10, 10, signed, normalize), fixed(w >> 20, 10, signed, normalize), 1.0], 1)
-                }
-                _ => {
-                    let w = d(0);
-                    ([fixed(w, 11, signed, normalize), fixed(w >> 11, 11, signed, normalize), fixed(w >> 22, 10, signed, normalize), 1.0], 1)
-                }
-            };
-            let dst = bits(cntl, 8, 5) as usize;
-            let mask = bits(ext, 12, 4);
-            for c in 0..4 {
-                if mask & (1 << c) != 0 {
-                    inputs[dst][c] = match bits(ext, 3 * c as u32, 3) {
-                        s @ 0..=3 => raw[s as usize],
-                        5 => 1.0,
-                        _ => 0.0,
-                    };
-                }
-            }
-            at += used + bits(cntl, 4, 4) as usize;
-            if cntl & (1 << 13) != 0 {
-                break;
-            }
+    /// The PSC's registers, which split a vertex's dwords into input vectors.
+    fn psc(&self) -> Psc {
+        Psc {
+            cntl: std::array::from_fn(|i| self.reg(VAP_PROG_STREAM_CNTL_0 + 4 * i as u32)),
+            ext: std::array::from_fn(|i| self.reg(VAP_PROG_STREAM_CNTL_EXT_0 + 4 * i as u32)),
         }
-        inputs
     }
 
     /// The VAP's output vector for each vertex attribute the GA receives.
@@ -772,6 +807,13 @@ impl Radeon {
         self.r3d.draws += 1;
         self.resolve_zmask();
         let prim = vf & 15;
+        let (verts, remap) = match verts {
+            Verts::Indices(idx) => {
+                let (unique, remap) = unique_indices(&idx);
+                (Verts::Indices(unique), Some(remap))
+            }
+            v => (v, None),
+        };
         let dwords = self.vertex_dwords(mem, vf, &verts);
         if self.trace.is_some() {
             let first: Vec<String> = dwords.iter().take(4).map(|d| format!("{:?}", d.iter().map(|w| f32::from_bits(*w)).collect::<Vec<_>>())).collect();
@@ -785,18 +827,26 @@ impl Radeon {
             last: bits(code, 20, 10) as usize,
             const_base: bits(self.reg(VAP_PVS_CONST_CNTL), 0, 8) as usize,
         };
-        let vertices: Vec<Vertex> = dwords
-            .iter()
-            .map(|d| {
-                let inputs = self.psc(d);
-                let out = if bypass {
-                    std::array::from_fn(|i| inputs[i])
-                } else {
-                    program.run(&inputs)
-                };
-                self.setup_vertex(&out)
+        let psc = self.psc();
+        let shade = |d: &Vec<u32>| {
+            let inputs = psc.inputs(d);
+            if bypass { std::array::from_fn(|i| inputs[i]) } else { program.run(&inputs) }
+        };
+        let outputs: Vec<[V4; pvs::OUTPUTS]> = if dwords.len() < PARALLEL_VERTICES {
+            dwords.iter().map(shade).collect()
+        } else {
+            let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8);
+            let chunk = dwords.len().div_ceil(threads);
+            std::thread::scope(|s| {
+                let parts: Vec<_> = dwords.chunks(chunk).map(|c| s.spawn(move || c.iter().map(shade).collect::<Vec<_>>())).collect();
+                parts.into_iter().flat_map(|h| h.join().unwrap()).collect()
             })
-            .collect();
+        };
+        let shaded: Vec<Vertex> = outputs.iter().map(|o| self.setup_vertex(o)).collect();
+        let vertices: Vec<Vertex> = match &remap {
+            Some(r) => r.iter().map(|&k| shaded[k as usize]).collect(),
+            None => shaded,
+        };
         let mut r = self.raster_state(mem);
         let pipeline = self.metal.as_mut().and_then(|m| {
             let cap = Captured::new(&r.rs_inst);

@@ -27,7 +27,6 @@ pub const VAP_VTX_AOS_ATTR01: u32 = 0x20c4;
 pub const VAP_VF_MAX_VTX_INDX: u32 = 0x2134;
 pub const VAP_VF_MIN_VTX_INDX: u32 = 0x2138;
 pub const VAP_PROG_STREAM_CNTL_0: u32 = 0x2150;
-pub const VAP_PSC_SGN_NORM_CNTL: u32 = 0x21dc;
 pub const VAP_PROG_STREAM_CNTL_EXT_0: u32 = 0x21e0;
 pub const VAP_PVS_VECTOR_INDX_REG: u32 = 0x2200;
 pub const VAP_PVS_VECTOR_DATA_REG: u32 = 0x2204;

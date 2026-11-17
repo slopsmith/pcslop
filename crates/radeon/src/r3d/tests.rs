@@ -313,6 +313,36 @@ fn indexed_draws_fetch_vertices_from_arrays_of_structures() {
     assert_eq!(g.count(0xff00_00ff), 64);
 }
 
+/// A 64x64 grid of one-pixel quads from 65x65 shared vertices: enough
+/// vertices to shade them on several threads, each shared by up to six
+/// triangles.
+#[test]
+fn a_large_indexed_mesh_shades_each_shared_vertex_once_and_covers_every_pixel() {
+    let mut g = Gpu::new();
+    let base = 0x8000;
+    for y in 0..65 {
+        for x in 0..65 {
+            let c = if y < 32 { RED } else { BLUE };
+            for (k, d) in v(x as f32, y as f32, c).iter().enumerate() {
+                g.ram.0[base + 4 * ((y * 65 + x) * 8 + k)..][..4].copy_from_slice(&f(*d).to_le_bytes());
+            }
+        }
+    }
+    let mut idx = Vec::new();
+    for y in 0..64u32 {
+        for x in 0..64u32 {
+            let at = |dx: u32, dy: u32| (y + dy) * 65 + x + dx;
+            idx.extend([at(0, 0), at(1, 0), at(1, 1), at(0, 0), at(1, 1), at(0, 1)]);
+        }
+    }
+    let mut p = vec![pkt3(0x2f, 3), 1, 8 | 8 << 8, base as u32, pkt3(0x36, 1 + idx.len() / 2), 4 | 1 << 4 | (idx.len() as u32) << 16];
+    p.extend(idx.chunks(2).map(|c| c[0] | c[1] << 16));
+    g.r.execute(&mut g.ram, &p);
+    assert_eq!(g.count(0xffff_0000), 64 * 31, "rows above the cells that blend red into blue");
+    assert_eq!(g.count(0xff00_00ff), 64 * 32, "rows below them");
+    assert_eq!(g.count(0), 0);
+}
+
 #[test]
 fn an_index_buffer_may_start_two_bytes_into_a_dword() {
     let mut g = Gpu::new();
