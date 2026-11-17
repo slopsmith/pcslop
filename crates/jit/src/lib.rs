@@ -565,6 +565,18 @@ impl Jit {
         s.mm = std::array::from_fn(|i| cpu.fpu.mm(i));
         s.mmx_ok = (cpu.cr0 & ts_em == 0 && cpu.fpu.sw & x86::fpu::sw::ES == 0) as u32;
         s.mm_used = 0;
+        let f = &cpu.fpu;
+        s.fse = std::array::from_fn(|i| f.regs[i].se);
+        s.fcw = f.cw as u32;
+        s.fsw = f.sw as u32;
+        s.ftags = f.tags as u32;
+        let base = cpu.cr0 & ts_em == 0 && f.sw & x86::fpu::sw::ES == 0;
+        s.x87_base = base as u32;
+        s.x87_ok = state::x87_ok(base, f.cw) as u32;
+        s.fip = f.fip;
+        s.fdp = f.fdp;
+        s.fnote = 0;
+        s.fdseg = 0;
         s.sse_ok = (cpu.cr0 & ts_em == 0 && cpu.cr4 & x86::cpu::cr4::OSFXSR != 0) as u32;
         s.xmm = cpu.xmm;
     }
@@ -578,6 +590,22 @@ impl Jit {
         cpu.set_flag(x86::cpu::flags::IF, if_flag);
         cpu.set_flag(x86::cpu::flags::DF, df);
         cpu.xmm = s.xmm;
+        let f = &mut cpu.fpu;
+        for i in 0..8 {
+            f.regs[i] = x86::fpu::F80 { mant: s.mm[i], se: s.fse[i] };
+        }
+        f.cw = s.fcw as u16;
+        f.sw = s.fsw as u16;
+        f.tags = s.ftags as u8;
+        if s.fnote != 0 {
+            f.fop = s.fnote as u16 & 0x7ff;
+            f.fip = s.fip;
+            f.fcs = cpu.segs[CS].selector;
+        }
+        if s.fdseg != 0 {
+            f.fdp = s.fdp;
+            f.fds = cpu.segs[(s.fdseg & 7) as usize].selector;
+        }
         let used = s.mm_used;
         if used != 0 {
             for i in 0..8 {
@@ -1040,6 +1068,9 @@ impl Jit {
         let mut diffs = Vec::new();
         if got.regs != exp.cpu.regs {
             diffs.push(format!("regs jit {:08x?}\n     interp {:08x?}", got.regs, exp.cpu.regs));
+        }
+        if got.fpu != exp.cpu.fpu {
+            diffs.push(format!("fpu jit {:x?}\n     interp {:x?}", got.fpu, exp.cpu.fpu));
         }
         if got.eip != exp.cpu.eip {
             diffs.push(format!("eip jit {:#x} interp {:#x}", got.eip, exp.cpu.eip));

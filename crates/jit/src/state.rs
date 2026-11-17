@@ -105,6 +105,23 @@ pub struct State {
     pub mmx_ok: u32,
     /// Bit n: MM n was written; bit 8: an MMX instruction ran.
     pub mm_used: u32,
+    /// Sign and exponent of each physical x87 register; `mm` holds the significands.
+    pub fse: [u16; 8],
+    pub fcw: u32,
+    pub fsw: u32,
+    /// Bit n: physical x87 register n is not empty.
+    pub ftags: u32,
+    /// CR0.EM and CR0.TS clear and no x87 exception pending.
+    pub x87_base: u32,
+    /// `x87_base`, all x87 exceptions masked and precision 53 or 64 bits:
+    /// translated x87 code may run.
+    pub x87_ok: u32,
+    pub fip: u32,
+    pub fdp: u32,
+    /// FOP of the last x87 instruction translated code ran, with bit 31 set; 0 if none.
+    pub fnote: u32,
+    /// 0x100 plus the segment register index of FDS once translated code set FDP; 0 if not.
+    pub fdseg: u32,
     /// 1 when SSE instructions may run: CR0.TS and CR0.EM clear, CR4.OSFXSR set.
     pub sse_ok: u32,
     pub xmm: [u128; 8],
@@ -143,6 +160,21 @@ pub const WALK_FLAGS: usize = offset_of!(State, walk_flags);
 pub const RAM_SIZE: usize = offset_of!(State, ram_size);
 pub const FILL_COUNT: usize = offset_of!(State, fill_count);
 pub const XMM: usize = offset_of!(State, xmm);
+pub const FSE: usize = offset_of!(State, fse);
+pub const FCW: usize = offset_of!(State, fcw);
+pub const FSW: usize = offset_of!(State, fsw);
+pub const FTAGS: usize = offset_of!(State, ftags);
+pub const X87_BASE: usize = offset_of!(State, x87_base);
+pub const X87_OK: usize = offset_of!(State, x87_ok);
+pub const FIP: usize = offset_of!(State, fip);
+pub const FDP: usize = offset_of!(State, fdp);
+pub const FNOTE: usize = offset_of!(State, fnote);
+pub const FDSEG: usize = offset_of!(State, fdseg);
+
+/// Whether translated x87 code may run with this control word.
+pub fn x87_ok(base: bool, cw: u16) -> bool {
+    base && cw & 0x3f == 0x3f && cw & 0x200 != 0
+}
 
 const NZCV_N: u32 = 1 << 31;
 const NZCV_Z: u32 = 1 << 30;
