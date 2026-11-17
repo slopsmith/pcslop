@@ -1084,26 +1084,11 @@ impl Emit {
                 self.a.mov_imm(Size::W, T_B, insn.imm as u64 & 0xffff);
                 self.alu(4, Ow::H, a, T_B);
             }
-            0xf7 if op32 => match insn.reg() {
+            0xf7 if op32 && !matches!(insn.reg(), 4 | 5) => match insn.reg() {
                 6 | 7 => {
                     if !self.div32(insn, eip, insn.reg() == 7) {
                         return Step::Unsupported;
                     }
-                }
-                4 => {
-                    let Some(b) = self.rm_w(insn, Ow::D, false) else { return Step::Unsupported };
-                    self.a.umull(T_RES, guest_reg(0), b);
-                    self.a.lsr_imm(Size::X, T_B, T_RES, 32);
-                    self.a.cmp_imm(Size::W, T_B, 0);
-                    self.a.cset(Size::W, T_C, Cond::Ne);
-                    self.a.tst(Size::W, T_RES, T_RES);
-                    self.a.movz(Size::W, T_D, 2, 0);
-                    self.a.sub(Size::W, T_D, T_D, T_C);
-                    self.a.rmif(T_D, 0, 0b0011);
-                    self.a.mov(Size::W, PF_RESULT, T_RES);
-                    self.a.mov(Size::W, AF_AUX, ZR);
-                    self.a.mov(Size::W, guest_reg(0), T_RES);
-                    self.a.mov(Size::W, guest_reg(2), T_B);
                 }
                 0 => {
                     let Some(a) = self.rm32(insn) else { return Step::Unsupported };

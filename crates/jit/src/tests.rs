@@ -203,6 +203,25 @@ fn rep_ret_runs_translated() {
 }
 
 #[test]
+fn one_operand_mul_and_imul_run_translated() {
+    let mut code = vec![
+        0xb9, 0x40, 0, 0, 0, // mov ecx, 64
+        0xc7, 0x05, 0x00, 0x30, 0, 0, 0x07, 0xf0, 0xff, 0xff, // mov dword [0x3000], -4089
+        0xb8, 0x39, 0x30, 0, 0, // loop: mov eax, 12345
+        0xf7, 0x2d, 0x00, 0x30, 0, 0, // imul dword [0x3000]
+        0x01, 0xd6, // add esi, edx
+        0xf7, 0xe9, // imul ecx
+        0x01, 0xc7, // add edi, eax
+        0xf7, 0x25, 0x00, 0x30, 0, 0, // mul dword [0x3000]
+        0x01, 0xd3, // add ebx, edx
+    ];
+    code.extend([0x90; 12]); // past the interpreter's tail
+    code.extend([0x49, 0x75, 0xd8, 0xf4]); // dec ecx; jnz loop; hlt
+    let stats = compare(&code, |_| {});
+    assert!(stats.interp_exits < 8, "one-operand IMUL is common in XP and Linux and must not leave translated code: {stats:?}");
+}
+
+#[test]
 fn popf_changes_to_ac_and_id_reach_the_cpu() {
     let code = [
         0x9c, // pushfd
