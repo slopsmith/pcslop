@@ -1,6 +1,7 @@
 //! An i440FX + PIIX3 PC: memory map, chipset registers and legacy devices.
 
 pub mod acpi;
+pub mod apic;
 pub mod fdc;
 pub mod fw_cfg;
 pub mod i8042;
