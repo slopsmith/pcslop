@@ -465,6 +465,27 @@ fn a_texture_map_with_another_logical_id_reads_as_disabled() {
     assert_eq!(g.px(4, 4), 0xff00_0000);
 }
 
+/// Catalyst's fast colour clear, as Mesa's r300 driver also does it: the
+/// top half of the colour buffer is the colour buffer and the bottom half
+/// the Z buffer, which writes ZB_DEPTHCLEARVALUE with ZB_CB_CLEAR set.
+fn cbzb_clear(g: &mut Gpu) {
+    g.w(ZB_CNTL, 5);
+    g.w(ZB_ZSTENCILCNTL, 0x24bf);
+    g.w(ZB_FORMAT, 2);
+    g.w(ZB_BW_CNTL, 1 << 5);
+    g.w(ZB_DEPTHCLEARVALUE, 0xff00_ff00);
+    g.w(ZB_DEPTHOFFSET, VRAM + COLOUR + 32 * PITCH as u32 * 4);
+    g.w(ZB_DEPTHPITCH, PITCH as u32);
+    g.draw(13, &quad(0.0, 0.0, 64.0, 32.0, [0.0, 1.0, 0.0, 1.0]));
+}
+
+#[test]
+fn a_colour_clear_through_the_z_buffer_writes_the_clear_value() {
+    let mut g = Gpu::new();
+    cbzb_clear(&mut g);
+    assert_eq!(g.count(0xff00_ff00), 64 * 64);
+}
+
 /// A one-texel ARGB8888 map of `kind` (1 volume, 2 cube) whose texels
 /// hold `texels`, one per slice or face, sampled with the vertex colour
 /// as coordinates.
@@ -784,6 +805,11 @@ mod against_metal {
                 64,
             );
         }
+    }
+
+    #[test]
+    fn colour_clears_through_the_z_buffer_match() {
+        same(cbzb_clear, 0, 0);
     }
 
     #[test]

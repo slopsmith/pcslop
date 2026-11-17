@@ -24,7 +24,7 @@ struct Uniforms {
     TexDesc tex[16];
     ColourDesc cb[4];
     uint ncb, has_depth, depth_base, depth_pitch, z16;
-    uint zb_cntl, zs_cntl, stencil_ref;
+    uint zb_cntl, cb_clear, cb_clear_value, zs_cntl, stencil_ref;
     float depth_scale, depth_bias;
     int clips[16];
     uint clip_rule, blend, ablend, channel_mask, constant_colour, rop, alpha_func, out_fmt;
@@ -320,6 +320,10 @@ static bool depth_stencil(constant Uniforms &u, device uchar *vram, uint x, uint
     uint bpp = u.z16 ? 2 : 4;
     uint a = u.depth_base + (y * u.depth_pitch + x) * bpp;
     if (a + bpp > u.vram_size) return true;
+    if (u.cb_clear) {
+        write_px(vram, a, bpp, u.cb_clear_value);
+        return true;
+    }
     uint old = read_px(vram, a, bpp);
     float ds = u.depth_scale != 0.0 ? u.depth_scale : 16777215.0;
     uint z24 = uint(clamp(round(z * ds + u.depth_bias), 0.0, 16777215.0));

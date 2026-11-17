@@ -101,6 +101,9 @@ pub const ZB_STENCILREFMASK: u32 = 0x4f08;
 pub const ZB_FORMAT: u32 = 0x4f10;
 pub const ZB_BW_CNTL: u32 = 0x4f1c;
 pub const FAST_FILL: u32 = 1 << 2;
+/// The Z buffer helps clear a colour buffer: drawn pixels write
+/// ZB_DEPTHCLEARVALUE, unchanged, instead of a depth and stencil.
+pub const ZB_CB_CLEAR: u32 = 1 << 5;
 pub const ZB_DEPTHOFFSET: u32 = 0x4f20;
 pub const ZB_DEPTHPITCH: u32 = 0x4f24;
 pub const ZB_DEPTHCLEARVALUE: u32 = 0x4f28;

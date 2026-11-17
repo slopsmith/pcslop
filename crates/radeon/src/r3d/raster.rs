@@ -40,6 +40,8 @@ pub(crate) struct Raster {
     pub colour: Vec<ColourBuffer>,
     pub depth: Option<DepthBuffer>,
     pub zb_cntl: u32,
+    /// ZB_DEPTHCLEARVALUE while ZB_BW_CNTL.ZB_CB_CLEAR is set.
+    pub cb_clear: Option<u32>,
     pub zs_cntl: u32,
     pub stencil_ref: u32,
     pub depth_scale: f32,
@@ -498,6 +500,10 @@ impl Raster {
             return true;
         }
         let (bpp, a) = if db.z16 { (2, db.offset + (y as usize * db.pitch + x as usize) * 2) } else { (4, db.offset + (y as usize * db.pitch + x as usize) * 4) };
+        if let Some(v) = self.cb_clear {
+            write_px(vram, a, bpp, v);
+            return true;
+        }
         let old = read_px(vram, a, bpp);
         let ds = if self.depth_scale != 0.0 { self.depth_scale } else { 16_777_215.0 };
         let z24 = (z * ds + self.depth_offset).round().clamp(0.0, 16_777_215.0) as u32;

@@ -730,6 +730,7 @@ impl Radeon {
             colour,
             depth,
             zb_cntl,
+            cb_clear: (self.reg(ZB_BW_CNTL) & ZB_CB_CLEAR != 0).then(|| self.reg(ZB_DEPTHCLEARVALUE)),
             zs_cntl: self.reg(ZB_ZSTENCILCNTL),
             stencil_ref: self.reg(ZB_STENCILREFMASK),
             depth_scale: f(SU_DEPTH_SCALE),
