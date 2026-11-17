@@ -87,6 +87,26 @@ pub enum Extend {
     Sxtx = 7,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Fcm {
+    Eq,
+    Ge,
+    Gt,
+    /// |rn| > |rm|.
+    Agt,
+}
+
+impl Fcm {
+    fn scalar(self) -> u32 {
+        match self {
+            Fcm::Eq => 0x5e20_e400,
+            Fcm::Ge => 0x7e20_e400,
+            Fcm::Gt => 0x7ea0_e400,
+            Fcm::Agt => 0x7ea0_ec00,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Logic {
     And,
@@ -1089,6 +1109,92 @@ impl Asm {
         self.emit(0x9e66_0000 | (rn.0 as u32) << 5 | rd.0 as u32);
     }
 
+    /// Scalar two-source FP: `op` is 0 FMUL, 1 FDIV, 2 FADD, 3 FSUB, 4 FMAX, 5 FMIN.
+    pub fn fp2(&mut self, double: bool, op: u32, rd: V, rn: V, rm: V) {
+        self.emit(0x1e20_0800 | (double as u32) << 22 | (rm.0 as u32) << 16 | op << 12 | (rn.0 as u32) << 5 | rd.0 as u32);
+    }
+
+    /// Scalar one-source FP: `op` is 1 FABS, 2 FNEG, 3 FSQRT, 4/5 FCVT to
+    /// single/double, 8 FRINTN, 9 FRINTP, 10 FRINTM, 11 FRINTZ, 14 FRINTX.
+    pub fn fp1(&mut self, double: bool, op: u32, rd: V, rn: V) {
+        self.emit(0x1e20_4000 | (double as u32) << 22 | op << 15 | (rn.0 as u32) << 5 | rd.0 as u32);
+    }
+
+    /// Scalar FP compare into all ones or zeros in `rd`; NZCV is left alone.
+    pub fn fcm(&mut self, kind: Fcm, double: bool, rd: V, rn: V, rm: V) {
+        self.emit(kind.scalar() | (double as u32) << 22 | (rm.0 as u32) << 16 | (rn.0 as u32) << 5 | rd.0 as u32);
+    }
+
+    /// The vector form of `fcm`, on four singles or two doubles.
+    pub fn fcm_v(&mut self, kind: Fcm, double: bool, rd: V, rn: V, rm: V) {
+        self.emit(kind.scalar() & !0x1000_0000 | 1 << 30 | (double as u32) << 22 | (rm.0 as u32) << 16 | (rn.0 as u32) << 5 | rd.0 as u32);
+    }
+
+    pub fn ldr_s(&mut self, rt: V, rn: Reg, offset: i32) {
+        assert!(offset >= 0 && offset % 4 == 0 && offset < 4 << 12);
+        self.emit(0xbd40_0000 | ((offset / 4) as u32) << 10 | (rn.0 as u32) << 5 | rt.0 as u32);
+    }
+
+    pub fn str_s(&mut self, rt: V, rn: Reg, offset: i32) {
+        assert!(offset >= 0 && offset % 4 == 0 && offset < 4 << 12);
+        self.emit(0xbd00_0000 | ((offset / 4) as u32) << 10 | (rn.0 as u32) << 5 | rt.0 as u32);
+    }
+
+    pub fn ldr_q(&mut self, rt: V, rn: Reg, offset: i32) {
+        assert!(offset >= 0 && offset % 16 == 0 && offset < 16 << 12);
+        self.emit(0x3dc0_0000 | ((offset / 16) as u32) << 10 | (rn.0 as u32) << 5 | rt.0 as u32);
+    }
+
+    pub fn str_q(&mut self, rt: V, rn: Reg, offset: i32) {
+        assert!(offset >= 0 && offset % 16 == 0 && offset < 16 << 12);
+        self.emit(0x3d80_0000 | ((offset / 16) as u32) << 10 | (rn.0 as u32) << 5 | rt.0 as u32);
+    }
+
+    /// INS: element `i` of `rd` = element `j` of `rn`, elements of 1 << `size` bytes.
+    pub fn ins(&mut self, size: u32, rd: V, i: u32, rn: V, j: u32) {
+        let imm5 = (i << (size + 1)) | 1 << size;
+        self.emit(0x6e00_0400 | imm5 << 16 | (j << size) << 11 | (rn.0 as u32) << 5 | rd.0 as u32);
+    }
+
+    pub fn not_v(&mut self, rd: V, rn: V) {
+        self.emit(0x6e20_5800 | (rn.0 as u32) << 5 | rd.0 as u32);
+    }
+
+    /// FSQRT on four singles or two doubles.
+    pub fn fsqrt_v(&mut self, double: bool, rd: V, rn: V) {
+        self.emit(0x6ea1_f800 | (double as u32) << 22 | (rn.0 as u32) << 5 | rd.0 as u32);
+    }
+
+    /// FMADD (`sub` false: ra + rn * rm) or FMSUB (ra - rn * rm), fused, on doubles.
+    pub fn fmadd_d(&mut self, sub: bool, rd: V, rn: V, rm: V, ra: V) {
+        self.emit(0x1f40_0000 | (rm.0 as u32) << 16 | (sub as u32) << 15 | (ra.0 as u32) << 10 | (rn.0 as u32) << 5 | rd.0 as u32);
+    }
+
+    /// FCMP, or FCMPE (`signal`), of `rn` with `rm`.
+    pub fn fcmp(&mut self, double: bool, signal: bool, rn: V, rm: V) {
+        self.emit(0x1e20_2000 | (double as u32) << 22 | (rm.0 as u32) << 16 | (rn.0 as u32) << 5 | (signal as u32) << 4);
+    }
+
+    /// SCVTF from a W or X register.
+    pub fn scvtf(&mut self, double: bool, size: Size, rd: V, rn: Reg) {
+        self.emit(0x1e22_0000 | size.sf() | (double as u32) << 22 | (rn.0 as u32) << 5 | rd.0 as u32);
+    }
+
+    /// FCVTZS to a W or X register.
+    pub fn fcvtzs(&mut self, double: bool, size: Size, rd: Reg, rn: V) {
+        self.emit(0x1e38_0000 | size.sf() | (double as u32) << 22 | (rn.0 as u32) << 5 | rd.0 as u32);
+    }
+
+    /// FMOV Sd, Wn.
+    pub fn fmov_sw(&mut self, rd: V, rn: Reg) {
+        self.emit(0x1e27_0000 | (rn.0 as u32) << 5 | rd.0 as u32);
+    }
+
+    /// FMOV Wd, Sn.
+    pub fn fmov_ws(&mut self, rd: Reg, rn: V) {
+        self.emit(0x1e26_0000 | (rn.0 as u32) << 5 | rd.0 as u32);
+    }
+
     /// The "three same" group: `opcode` and `u` pick ADD, UQADD, CMEQ, ...
     pub fn vec3(&mut self, q: bool, u: bool, size: u32, opcode: u32, rd: V, rn: V, rm: V) {
         self.emit(
@@ -1117,6 +1223,17 @@ impl Asm {
         self.shift_imm_v(q, !signed, 0, 2 * esize - shift, rd, rn);
     }
 
+    /// USRA: adds `rn` shifted right by `shift` (1..=esize) into `rd`.
+    pub fn usra(&mut self, q: bool, esize: u32, rd: V, rn: V, shift: u32) {
+        assert!(shift >= 1 && shift <= esize);
+        self.shift_imm_v(q, true, 0b00010, 2 * esize - shift, rd, rn);
+    }
+
+    /// UMOV Wd, Vn.B[i].
+    pub fn umov_b(&mut self, rd: Reg, rn: V, i: u32) {
+        self.emit(0x0e00_3c00 | (i << 1 | 1) << 16 | (rn.0 as u32) << 5 | rd.0 as u32);
+    }
+
     /// SHRN: narrows elements of 2*`esize` bits to `esize` after shifting right.
     pub fn shrn(&mut self, esize: u32, rd: V, rn: V, shift: u32) {
         assert!(shift >= 1 && shift <= esize);
@@ -1139,6 +1256,43 @@ impl Asm {
     }
 
     /// SMULL or UMULL of the lower halves, widening from `size`.
+    /// The "2" form of `narrow`: writes the upper half of `rd`, keeping the lower.
+    pub fn narrow_hi(&mut self, kind: Narrow, size: u32, rd: V, rn: V) {
+        self.narrow(kind, size, rd, rn);
+        self.code.last_mut().map(|w| *w |= 1 << 30);
+    }
+
+    /// SMULL2 or UMULL2: the upper halves of `rn` and `rm`.
+    pub fn mull_hi(&mut self, signed: bool, size: u32, rd: V, rn: V, rm: V) {
+        self.mull(signed, size, rd, rn, rm);
+        self.code.last_mut().map(|w| *w |= 1 << 30);
+    }
+
+    /// UZP1 (`second` false) or UZP2.
+    pub fn uzp(&mut self, q: bool, size: u32, second: bool, rd: V, rn: V, rm: V) {
+        self.emit(0x0e00_1800 | (q as u32) << 30 | size << 22 | (rm.0 as u32) << 16 | (second as u32) << 14 | (rn.0 as u32) << 5 | rd.0 as u32);
+    }
+
+    /// EXT of 16 bytes: bytes `index`.. of `rn` followed by `rm`.
+    pub fn ext(&mut self, rd: V, rn: V, rm: V, index: u32) {
+        self.emit(0x6e00_0000 | (rm.0 as u32) << 16 | index << 11 | (rn.0 as u32) << 5 | rd.0 as u32);
+    }
+
+    /// UADDLP: adds adjacent unsigned elements into elements twice as wide.
+    pub fn uaddlp(&mut self, q: bool, size: u32, rd: V, rn: V) {
+        self.emit(0x2e20_2800 | (q as u32) << 30 | size << 22 | (rn.0 as u32) << 5 | rd.0 as u32);
+    }
+
+    /// UMOV Wd, Vn.H[i].
+    pub fn umov_h(&mut self, rd: Reg, rn: V, i: u32) {
+        self.emit(0x0e00_3c00 | (i << 2 | 2) << 16 | (rn.0 as u32) << 5 | rd.0 as u32);
+    }
+
+    /// INS Vd.H[i], Wn.
+    pub fn ins_h(&mut self, rd: V, i: u32, rn: Reg) {
+        self.emit(0x4e00_1c00 | (i << 2 | 2) << 16 | (rn.0 as u32) << 5 | rd.0 as u32);
+    }
+
     pub fn mull(&mut self, signed: bool, size: u32, rd: V, rn: V, rm: V) {
         let base = if signed { 0x0e20_c000 } else { 0x2e20_c000 };
         self.emit(base | size << 22 | (rm.0 as u32) << 16 | (rn.0 as u32) << 5 | rd.0 as u32);
