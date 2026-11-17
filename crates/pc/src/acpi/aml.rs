@@ -118,6 +118,11 @@ pub fn device(path: &str, body: impl IntoIterator<Item = Aml>) -> Aml {
     package_op(&[EXT_OP, 0x82], concat([name_string(path), concat(body)]))
 }
 
+/// An ACPI 1.0 Processor object; a `pblk` of 0 means no P_BLK registers.
+pub fn processor(path: &str, id: u8, pblk: u32, pblk_len: u8, body: impl IntoIterator<Item = Aml>) -> Aml {
+    package_op(&[EXT_OP, 0x83], concat([name_string(path), vec![id], pblk.to_le_bytes().to_vec(), vec![pblk_len], concat(body)]))
+}
+
 pub fn method(path: &str, args: u8, serialized: bool, body: impl IntoIterator<Item = Aml>) -> Aml {
     assert!(args <= 7);
     let flags = args | (serialized as u8) << 3;
@@ -330,6 +335,11 @@ mod tests {
         assert_eq!(d[2] as usize, d.len() - 2);
         assert_eq!(&d[3..7], b"KBD_");
         assert_eq!(&d[7..12], b"\x08_HID");
+    }
+
+    #[test]
+    fn processor_matches_iasl() {
+        assert_eq!(processor("CPU0", 0, 0, 0, []), [0x5b, 0x83, 0x0b, b'C', b'P', b'U', b'0', 0, 0, 0, 0, 0, 0]);
     }
 
     #[test]

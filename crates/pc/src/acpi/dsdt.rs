@@ -13,6 +13,7 @@ const PCI_HOLE_END: u32 = 0xfebf_ffff;
 
 pub fn body(ram_bytes: u32) -> Aml {
     [
+        aml::scope("\\_PR", [aml::processor("CPU0", super::CPU_ID, 0, 0, [])]),
         aml::scope(
             "\\_SB",
             [

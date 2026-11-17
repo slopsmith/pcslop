@@ -28,6 +28,8 @@ const FADT_LEN: usize = 116;
 const FADT_FIRMWARE_CTRL: usize = 36;
 const FADT_DSDT: usize = 40;
 const RTC_CENTURY: u8 = 0x32;
+/// The ACPI processor ID of the CPU, shared by the DSDT and the MADT.
+const CPU_ID: u8 = 0;
 
 pub struct Files {
     pub tables: Vec<u8>,
@@ -158,13 +160,49 @@ fn fadt() -> Vec<u8> {
     t
 }
 
-/// Builds the ACPI fw_cfg files for a board with `ram_bytes` of RAM below 4 GiB.
-pub fn build(ram_bytes: u32) -> Files {
+mod madt_flag {
+    pub const PCAT_COMPAT: u32 = 1;
+    pub const ENABLED: u32 = 1;
+    pub const LEVEL_ACTIVE_HIGH: u16 = 0x000d;
+}
+
+// Overrides as in QEMU's `build_madt` (hw/i386/acpi-common.c, the QEMU
+// authors): IRQ 0 on I/O APIC input 2, PCI and SCI IRQs level-triggered.
+fn madt() -> Vec<u8> {
+    let mut t = header(b"APIC", 1, HEADER_LEN);
+    t.extend(crate::apic::DEFAULT_BASE.to_le_bytes());
+    t.extend(madt_flag::PCAT_COMPAT.to_le_bytes());
+    t.extend([0, 8, CPU_ID, 0]);
+    t.extend(madt_flag::ENABLED.to_le_bytes());
+    t.extend([1, 12, 0, 0]);
+    t.extend(crate::ioapic::BASE.to_le_bytes());
+    t.extend(0u32.to_le_bytes());
+    let mut source_override = |irq: u8, gsi: u32, flags: u16| {
+        t.extend([2, 10, 0, irq]);
+        t.extend(gsi.to_le_bytes());
+        t.extend(flags.to_le_bytes());
+    };
+    source_override(0, 2, 0);
+    for irq in [5, 9, 10, 11] {
+        source_override(irq, irq as u32, madt_flag::LEVEL_ACTIVE_HIGH);
+    }
+    t.extend([4, 6, 0xff, 0, 0, 1]);
+    let len = t.len() as u32;
+    t[4..8].copy_from_slice(&len.to_le_bytes());
+    t
+}
+
+/// Builds the ACPI fw_cfg files for a board with `ram_bytes` of RAM below
+/// 4 GiB, with a MADT when it has a local APIC and an I/O APIC.
+pub fn build(ram_bytes: u32, apic: bool) -> Files {
     let mut b = Builder::new();
     let facs = b.push(facs(), 64);
     let dsdt = b.push(dsdt(ram_bytes), 4);
     b.checksum(dsdt);
     b.add_table(fadt(), &[(FADT_FIRMWARE_CTRL, facs), (FADT_DSDT, dsdt)]);
+    if apic {
+        b.add_table(madt(), &[]);
+    }
     b.finish()
 }
 
@@ -179,7 +217,11 @@ mod tests {
     type Memory = BTreeMap<String, (u32, Vec<u8>)>;
 
     fn load() -> Memory {
-        let f = build(512 << 20);
+        load_with(false)
+    }
+
+    fn load_with(apic: bool) -> Memory {
+        let f = build(512 << 20, apic);
         let files = [(TABLES_FILE, f.tables), (RSDP_FILE, f.rsdp)];
         loader::execute(&f.loader, &files, |name, align, zone| {
             let addr = if name == TABLES_FILE { TABLES_AT } else { RSDP_AT };
@@ -242,6 +284,37 @@ mod tests {
         assert_eq!(facs % 64, 0);
         assert_eq!(&table(&mem, facs)[..4], b"FACS");
         assert_eq!(&table(&mem, u32_at(tables[0], FADT_DSDT))[..4], b"DSDT");
+    }
+
+    #[test]
+    fn madt_describes_the_apics_for_an_apic_mode_os() {
+        let mem = load_with(true);
+        let tables = rsdt_tables(&mem);
+        let madt = *tables.iter().find(|t| &t[..4] == b"APIC").expect("an APIC-mode OS needs a MADT");
+        assert_eq!(sum(madt), 0);
+        assert_eq!(u32_at(madt, 36), 0xfee0_0000);
+        let mut entries = Vec::new();
+        let mut i = 44;
+        while i < madt.len() {
+            entries.push(&madt[i..i + madt[i + 1] as usize]);
+            i += madt[i + 1] as usize;
+        }
+        assert_eq!(i, madt.len());
+        assert_eq!(entries[0], [0, 8, 0, 0, 1, 0, 0, 0]);
+        assert_eq!(entries[1], [1, 12, 0, 0, 0, 0, 0xc0, 0xfe, 0, 0, 0, 0]);
+        assert!(entries.contains(&&[2, 10, 0, 0, 2, 0, 0, 0, 0, 0][..]), "IRQ 0 must be on I/O APIC input 2");
+        assert!(entries.contains(&&[2, 10, 0, 9, 9, 0, 0, 0, 0x0d, 0][..]), "the SCI must be level-triggered");
+        assert_eq!(*entries.last().unwrap(), [4, 6, 0xff, 0, 0, 1]);
+    }
+
+    #[test]
+    fn a_board_without_apics_gets_no_madt() {
+        assert!(rsdt_tables(&load()).iter().all(|t| &t[..4] != b"APIC"));
+    }
+
+    #[test]
+    fn dsdt_declares_the_processor_the_madt_names() {
+        assert!(dsdt_contains(&aml::scope("\\_PR", [aml::processor("CPU0", CPU_ID, 0, 0, [])])));
     }
 
     #[test]
