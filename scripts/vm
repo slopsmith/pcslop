@@ -75,6 +75,22 @@ start)
 		--bios "$refs/seabios/share/seabios/bios.bin" \
 		--vgabios "$refs/seavgabios/share/seabios/vgabios.bin" \
 		--headless --control "$s" "${extra[@]}" "$@" </dev/null >"$l" 2>&1 &
+	# Stops the run if its memory footprint passes VM_MAX_MEM_GB (default 6),
+	# so a leak can't run the Mac out of memory.
+	nohup bash -c '
+		limit=$(( $3 * 1024 ))
+		sleep 5
+		while pid=$(pgrep -f -- "^$1 .*--control $2( |$)" | head -n 1) && [ -n "$pid" ]; do
+			mem=$(top -l 1 -pid "$pid" -stats mem 2>/dev/null | tail -n 1)
+			mb=$(echo "$mem" | tr -cd "0-9.KMG" | awk "{v=\$1+0; u=substr(\$1,length(\$1)); if(u==\"G\")v*=1024; else if(u==\"K\")v/=1024; print int(v)}")
+			if [ "${mb:-0}" -gt "$limit" ]; then
+				echo "scripts/vm: memory footprint $mem passed VM_MAX_MEM_GB=$3, stopping the run" >>"$4"
+				kill "$pid"
+				break
+			fi
+			sleep 10
+		done
+	' _ "$bin" "$s" "${VM_MAX_MEM_GB:-6}" "$l" </dev/null >/dev/null 2>&1 &
 	for _ in $(seq 100); do
 		[ -S "$s" ] && { echo "started $name: socket $s, log $l"; exit 0; }
 		kill -0 $! 2>/dev/null || break
