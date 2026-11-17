@@ -19,9 +19,11 @@ pub mod key {
     pub const SMBIOS_ENTRIES: u16 = 0x8001;
 }
 
-#[derive(Default)]
+#[derive(Default, snapshot::Snap)]
 pub struct FwCfg {
+    #[snap(skip)]
     items: BTreeMap<u16, Vec<u8>>,
+    #[snap(skip)]
     files: Vec<(String, u16)>,
     selected: u16,
     offset: usize,

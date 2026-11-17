@@ -86,7 +86,7 @@ pub fn smbus_base(c: &ConfigSpace) -> Option<u16> {
     (c.data[SMBHSTCFG] & 1 != 0 && base != 0).then_some(base)
 }
 
-#[derive(Default)]
+#[derive(Default, snapshot::Snap)]
 pub struct Pm {
     sts: u16,
     en: u16,

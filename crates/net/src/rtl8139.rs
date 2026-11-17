@@ -153,7 +153,7 @@ pub struct Stats {
 }
 
 /// The C+ tally counters, in the layout the dump command writes.
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Default, Debug, snapshot::Snap)]
 struct Tally {
     tx_ok: u64,
     rx_ok: u64,
@@ -184,6 +184,7 @@ enum Rx {
     Retry,
 }
 
+#[derive(snapshot::Snap)]
 pub struct Rtl8139 {
     mac: [u8; 6],
     phys: [u8; 6],
@@ -230,8 +231,11 @@ pub struct Rtl8139 {
     timer_base_ns: u64,
     timer_int: u32,
     timer_deadline: Option<u64>,
+    #[snap(skip)]
     backend: Box<dyn Backend>,
+    #[snap(skip)]
     pending_rx: Option<Vec<u8>>,
+    #[snap(skip)]
     pub stats: Stats,
 }
 
@@ -281,6 +285,13 @@ fn multicast_hash(mac: &[u8]) -> usize {
 }
 
 impl Rtl8139 {
+    /// Plugs the card into another network. A frame the old one delivered
+    /// but the guest has not taken yet is dropped.
+    pub fn set_backend(&mut self, backend: Box<dyn Backend>) {
+        self.backend = backend;
+        self.pending_rx = None;
+    }
+
     pub fn new(mac: [u8; 6], backend: Box<dyn Backend>) -> Self {
         let mut contents = [0u16; crate::eeprom::WORDS];
         contents[0] = 0x8129;

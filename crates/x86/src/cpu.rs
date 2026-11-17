@@ -82,6 +82,7 @@ pub const GS: usize = 5;
 /// AVL, L, D/B and G bits in bits 12..=15.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
+#[derive(snapshot::Snap)]
 pub struct Segment {
     pub selector: u16,
     pub attr: u16,
@@ -129,13 +130,14 @@ impl Segment {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
+#[derive(snapshot::Snap)]
 pub struct DescriptorTable {
     pub base: u32,
     pub limit: u16,
 }
 
 /// Cached x86 page translation. `tag` is the linear page number plus one, so 0 is empty.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, snapshot::Snap)]
 pub struct TlbEntry {
     pub tag: u32,
     pub phys: u32,
@@ -151,7 +153,7 @@ pub mod tlb_perm {
 }
 
 /// What the most recent TLB flush covered.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, snapshot::Snap)]
 pub enum FlushKind {
     All,
     /// A CR3 load with CR4.PGE set: global mappings stay.
@@ -164,7 +166,7 @@ pub const TLB_SIZE: usize = 1024;
 /// Software TLB for the interpreter. Like a hardware TLB it may hold stale
 /// entries until CR3 is reloaded or INVLPG runs; write permission is only
 /// cached once the Dirty bit is set.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, snapshot::Snap)]
 pub struct Tlb {
     pub entries: Box<[TlbEntry; TLB_SIZE]>,
     /// Incremented by every flush, so other translation caches can follow.
@@ -207,6 +209,7 @@ impl Tlb {
 
 #[derive(Clone, Debug)]
 #[repr(C)]
+#[derive(snapshot::Snap)]
 pub struct Cpu {
     pub regs: [u32; 8],
     pub eip: u32,

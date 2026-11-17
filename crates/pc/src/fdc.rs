@@ -15,7 +15,7 @@ const RESET_SENSES: u8 = 4;
 /// ST0 for a command on a missing drive: abnormal termination, equipment check.
 const ST0_NO_DRIVE: u8 = 0x40 | 0x10;
 
-#[derive(Default)]
+#[derive(Default, snapshot::Snap)]
 pub struct Fdc {
     dor: u8,
     tdr: u8,

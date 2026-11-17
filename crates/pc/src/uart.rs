@@ -21,6 +21,7 @@ const MCR_LOOP: u8 = 0x10;
 const MCR_OUT2: u8 = 0x08;
 const RX_FIFO: usize = 16;
 
+#[derive(snapshot::Snap)]
 pub struct Uart {
     ier: u8,
     lcr: u8,
@@ -33,6 +34,7 @@ pub struct Uart {
     rx: VecDeque<u8>,
     /// Host bytes not yet in the receive FIFO.
     input: VecDeque<u8>,
+    #[snap(skip)]
     out: Box<dyn Write + Send>,
 }
 

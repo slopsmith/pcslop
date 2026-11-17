@@ -11,7 +11,7 @@ fn ns_at(ticks: u64) -> u64 {
     (ticks as u128 * 1_000_000_000).div_ceil(FREQ_HZ as u128) as u64
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, snapshot::Snap)]
 enum Access {
     #[default]
     Word,
@@ -19,7 +19,7 @@ enum Access {
     Hi,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, snapshot::Snap)]
 struct Channel {
     mode: u8,
     access: Access,
@@ -94,6 +94,7 @@ impl Channel {
     }
 }
 
+#[derive(snapshot::Snap)]
 pub struct Pit {
     ch: [Channel; 3],
     /// Tick up to which channel 0 edges have been reported.

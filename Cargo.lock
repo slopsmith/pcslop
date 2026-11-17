@@ -9,6 +9,9 @@ version = "0.1.0"
 [[package]]
 name = "ac97"
 version = "0.1.0"
+dependencies = [
+ "snapshot",
+]
 
 [[package]]
 name = "adler2"
@@ -345,6 +348,9 @@ dependencies = [
 [[package]]
 name = "ide"
 version = "0.1.0"
+dependencies = [
+ "snapshot",
+]
 
 [[package]]
 name = "is_terminal_polyfill"
@@ -486,6 +492,7 @@ dependencies = [
  "crc32fast",
  "libc",
  "pkg-config",
+ "snapshot",
 ]
 
 [[package]]
@@ -519,6 +526,7 @@ dependencies = [
  "ide",
  "net",
  "radeon",
+ "snapshot",
  "usb",
  "vga",
  "x86",
@@ -805,6 +813,9 @@ checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 [[package]]
 name = "usb"
 version = "0.1.0"
+dependencies = [
+ "snapshot",
+]
 
 [[package]]
 name = "utf8parse"
@@ -821,6 +832,9 @@ checksum = "579a42fc0b8e0c63b76519a339be31bed574929511fa53c1a3acae26eb258f29"
 [[package]]
 name = "vga"
 version = "0.1.0"
+dependencies = [
+ "snapshot",
+]
 
 [[package]]
 name = "wasm-bindgen"
@@ -1022,6 +1036,9 @@ dependencies = [
 [[package]]
 name = "x86"
 version = "0.1.0"
+dependencies = [
+ "snapshot",
+]
 
 [[package]]
 name = "xcursor"

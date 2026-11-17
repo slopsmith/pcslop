@@ -26,6 +26,16 @@ pub trait Backend: Send {
     fn recv(&mut self) -> Option<Vec<u8>>;
 }
 
+/// No cable: frames from the guest go nowhere and none arrive.
+pub struct Unplugged;
+
+impl Backend for Unplugged {
+    fn send(&mut self, _frame: &[u8]) {}
+    fn recv(&mut self) -> Option<Vec<u8>> {
+        None
+    }
+}
+
 /// QEMU's default MAC address, 52:54:00:12:34:56.
 pub const DEFAULT_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 

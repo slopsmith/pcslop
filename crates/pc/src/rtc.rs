@@ -23,6 +23,7 @@ const CENTURY: usize = 0x32;
 /// The IBM PS/2 century byte, which the non-ACPI Windows HAL reads.
 const CENTURY_PS2: usize = 0x37;
 
+#[derive(snapshot::Snap)]
 pub struct Rtc {
     pub ram: [u8; 128],
     index: u8,

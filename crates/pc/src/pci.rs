@@ -1,9 +1,11 @@
 //! PCI configuration mechanism #1 (ports 0xCF8/0xCFC) and simple
 //! configuration-space-only devices.
 
+#[derive(snapshot::Snap)]
 pub struct ConfigSpace {
     pub data: [u8; 256],
     /// Bits the guest may change.
+    #[snap(skip)]
     pub writable: [u8; 256],
 }
 

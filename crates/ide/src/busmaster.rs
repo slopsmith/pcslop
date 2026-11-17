@@ -13,7 +13,7 @@ const ST_DRIVE_CAPS: u8 = 0x60;
 
 const PRD_EOT: u32 = 1 << 31;
 
-#[derive(Default)]
+#[derive(Default, snapshot::Snap)]
 pub struct BusMaster {
     cmd: u8,
     status: u8,

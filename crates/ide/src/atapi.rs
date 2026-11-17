@@ -17,7 +17,7 @@ const REASON_COD: u8 = 0x01;
 const REASON_IO: u8 = 0x02;
 
 pub mod sense {
-    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, snapshot::Snap)]
     pub struct Sense {
         pub key: u8,
         pub asc: u8,
@@ -45,7 +45,9 @@ pub mod sense {
 
 use sense::Sense;
 
+#[derive(snapshot::Snap)]
 pub struct Cdrom {
+    #[snap(skip)]
     medium: Option<Box<dyn BlockBackend>>,
     tray_open: bool,
     locked: bool,

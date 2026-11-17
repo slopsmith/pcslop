@@ -52,6 +52,7 @@ const READ_ONLY: &[u8] = &[
     reg::VENDOR_ID2,
 ];
 
+#[derive(snapshot::Snap)]
 pub struct Codec {
     regs: [u16; 64],
 }

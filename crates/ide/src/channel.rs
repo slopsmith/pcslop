@@ -31,7 +31,7 @@ pub const DEV_LBA: u8 = 0x40;
 // src/disk/hdc_ide.c ide_status() (Miran Grca, Sarah Walker et al.).
 const EMPTY_BUS: u8 = 0x7f;
 
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, snapshot::Snap)]
 pub struct Taskfile {
     pub feature: u8,
     pub nsector: u8,
@@ -73,6 +73,7 @@ impl Taskfile {
 }
 
 /// A source of bytes for a device-to-host transfer.
+#[derive(snapshot::Snap)]
 pub enum Stream {
     Buf(Vec<u8>),
     /// Contiguous bytes of the device's backend starting at this offset.
@@ -82,6 +83,7 @@ pub enum Stream {
 }
 
 /// What happens as the host drains or fills the PIO buffer.
+#[derive(snapshot::Snap)]
 pub enum Pio {
     None,
     /// A single buffer (IDENTIFY); the command ends when it is drained.
@@ -93,12 +95,25 @@ pub enum Pio {
     AtapiOut { done: usize, total: usize },
 }
 
+impl Default for Stream {
+    fn default() -> Self {
+        Stream::Buf(Vec::new())
+    }
+}
+
+impl Default for DmaReq {
+    fn default() -> Self {
+        DmaReq::AtapiOut { total: 0 }
+    }
+}
+
 impl Pio {
     fn host_writes(&self) -> bool {
         matches!(self, Pio::AtaWrite { .. } | Pio::Packet | Pio::AtapiOut { .. })
     }
 }
 
+#[derive(snapshot::Snap)]
 pub enum DmaReq {
     AtaRead { lba: u64, count: u32 },
     AtaWrite { lba: u64, count: u32 },
@@ -119,7 +134,9 @@ impl DmaReq {
     }
 }
 
+#[derive(snapshot::Snap)]
 pub struct Disk {
+    #[snap(skip)]
     pub backend: Box<dyn BlockBackend>,
     pub sectors: u64,
     pub cyls: u16,
@@ -133,6 +150,36 @@ pub enum Kind {
     Cdrom(Cdrom),
 }
 
+/// Loads in place, keeping the disk or medium attached here; a snapshot of
+/// a different kind of device is refused.
+impl snapshot::Snap for Kind {
+    const SCHEMA: u64 = snapshot::mix(snapshot::fnv(b"Kind"), &[Disk::SCHEMA, Cdrom::SCHEMA]);
+
+    fn save(&self, w: &mut snapshot::Writer) {
+        match self {
+            Kind::None => w.u32(0),
+            Kind::Disk(d) => {
+                w.u32(1);
+                w.put(d);
+            }
+            Kind::Cdrom(c) => {
+                w.u32(2);
+                w.put(c);
+            }
+        }
+    }
+
+    fn load(&mut self, r: &mut snapshot::Reader<'_>) -> snapshot::Result<()> {
+        match (r.u32()?, self) {
+            (0, Kind::None) => Ok(()),
+            (1, Kind::Disk(d)) => r.get(d),
+            (2, Kind::Cdrom(c)) => r.get(c),
+            (t, _) => Err(snapshot::Error::new(format!("IDE device kind {t} in the snapshot differs from this machine's"))),
+        }
+    }
+}
+
+#[derive(snapshot::Snap)]
 pub struct Device {
     pub kind: Kind,
     pub tf: Taskfile,
@@ -256,6 +303,7 @@ impl Device {
     }
 }
 
+#[derive(snapshot::Snap)]
 pub struct Channel {
     pub dev: [Device; 2],
     pub sel: usize,
@@ -288,6 +336,10 @@ impl Channel {
         d.kind = Kind::Disk(Disk { backend, sectors, cyls, heads, spt });
         d.serial = format!("SLOPHD{:014}", slot + 1);
         d.hard_reset();
+    }
+
+    pub fn detach(&mut self, slot: usize) {
+        self.dev[slot] = Device::new();
     }
 
     pub fn attach_cdrom(&mut self, slot: usize, medium: Option<Box<dyn BlockBackend>>) {

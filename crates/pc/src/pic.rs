@@ -1,7 +1,7 @@
 //! Cascaded 8259A programmable interrupt controllers (Intel 8259A datasheet),
 //! plus the PIIX ELCR registers that select edge or level triggering.
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, snapshot::Snap)]
 struct Chip {
     irr: u8,
     isr: u8,
@@ -164,6 +164,7 @@ impl Chip {
     }
 }
 
+#[derive(snapshot::Snap)]
 pub struct Pic {
     chips: [Chip; 2],
 }

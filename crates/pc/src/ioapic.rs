@@ -21,6 +21,7 @@ pub mod redir {
     pub const WRITABLE_HI: u64 = 0xff << 56;
 }
 
+#[derive(snapshot::Snap)]
 pub struct IoApic {
     id: u8,
     select: u8,

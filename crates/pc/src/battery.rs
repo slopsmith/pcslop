@@ -47,7 +47,7 @@ pub mod state {
 
 const UNKNOWN: u32 = 0xffff_ffff;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, snapshot::Snap)]
 pub struct Battery {
     pub design_mah: u32,
     pub full_mah: u32,
@@ -59,7 +59,7 @@ pub struct Battery {
     pub charging: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, snapshot::Snap)]
 pub struct Power {
     pub ac_online: bool,
     pub battery: Option<Battery>,
@@ -110,7 +110,7 @@ impl Battery {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, snapshot::Snap)]
 pub struct PowerDevice {
     power: Power,
     events: u32,

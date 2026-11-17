@@ -29,6 +29,7 @@ pub trait DmaMemory {
 const CMD_BASE: [u16; 2] = [0x1f0, 0x170];
 const CTL_PORT: [u16; 2] = [0x3f6, 0x376];
 
+#[derive(snapshot::Snap)]
 pub struct Ide {
     ch: [Channel; 2],
     bm_base: Option<u16>,
@@ -49,10 +50,27 @@ impl Ide {
         self.ch[channel].attach_disk(slot, b);
     }
 
+    /// Leaves the slot without a drive.
+    pub fn detach(&mut self, channel: usize, slot: usize) {
+        self.ch[channel].detach(slot);
+    }
+
     /// Attaches a CD-ROM drive, or changes the medium if the slot already
     /// holds one (`None` ejects it). A medium change raises a unit attention.
     pub fn attach_cdrom(&mut self, channel: usize, slot: usize, b: Option<Box<dyn BlockBackend>>) {
         self.ch[channel].attach_cdrom(slot, b);
+    }
+
+    /// Writes buffered data of every disk to its backend's storage.
+    pub fn flush(&mut self) -> std::io::Result<()> {
+        for ch in &mut self.ch {
+            for d in &mut ch.dev {
+                if let channel::Kind::Disk(disk) = &mut d.kind {
+                    disk.backend.flush()?;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn set_bus_master_base(&mut self, base: Option<u16>) {

@@ -88,7 +88,7 @@ pub struct Stats {
 }
 
 /// A 256-bit vector bitmap, as in ISR, TMR and IRR.
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug, snapshot::Snap)]
 struct Bits([u64; 4]);
 
 impl Bits {
@@ -115,6 +115,7 @@ impl Bits {
     }
 }
 
+#[derive(snapshot::Snap)]
 pub struct LocalApic {
     base_msr: u64,
     id: u8,
@@ -134,6 +135,7 @@ pub struct LocalApic {
     timer_divide: u32,
     /// When the current timer period started, while the timer counts.
     timer_start: Option<u64>,
+    #[snap(skip)]
     pub stats: Stats,
 }
 

@@ -28,13 +28,15 @@ const GFX_MASK: [u8; 16] = [0x0f, 0x0f, 0x0f, 0x1f, 0x03, 0x7b, 0x0f, 0x0f, 0xff
 
 /// A packed-pixel window at 0xA0000..0xB0000 in two 32 KiB halves, each
 /// mapped at its own VRAM offset for reads and for writes.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, snapshot::Snap)]
 pub struct BankWindow {
     pub read: [u32; 2],
     pub write: [u32; 2],
 }
 
+#[derive(snapshot::Snap)]
 pub struct Vga {
+    #[snap(skip)]
     vram: vram::Vram,
     ext_window: Option<BankWindow>,
     misc: u8,
@@ -62,9 +64,13 @@ pub struct Vga {
     retrace_toggle: u8,
     /// Whether ports 0x1CE/0x1CF answer with the Bochs VBE registers.
     dispi: bool,
+    #[snap(skip)]
     frames: u64,
+    #[snap(skip)]
     scratch: Vec<u32>,
+    #[snap(skip)]
     pixels: Vec<u8>,
+    #[snap(skip)]
     changed: bool,
 }
 

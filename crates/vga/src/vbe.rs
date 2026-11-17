@@ -31,6 +31,7 @@ const MAX_YRES: u16 = 12000;
 const MAX_BPP: u16 = 32;
 const BANK_MASK: u16 = (VRAM_SIZE >> 16) as u16 - 1;
 
+#[derive(snapshot::Snap)]
 pub(crate) struct Vbe {
     index: u16,
     regs: [u16; 10],

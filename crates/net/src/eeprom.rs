@@ -10,7 +10,7 @@ const ADDR_MASK: u16 = WORDS as u16 - 1;
 const OP_MASK: u16 = 0xc0;
 const OP_READ: u16 = 0x80;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, snapshot::Snap)]
 enum Mode {
     Idle,
     AwaitStart,
@@ -18,7 +18,7 @@ enum Mode {
     Read,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, snapshot::Snap)]
 pub struct Eeprom93c46 {
     pub contents: [u16; WORDS],
     mode: Mode,

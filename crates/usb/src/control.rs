@@ -11,7 +11,7 @@ const MAX_DATA: usize = 4096;
 
 pub const DIR_IN: u8 = 0x80;
 
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Default, Debug, snapshot::Snap)]
 pub struct Setup {
     pub request_type: u8,
     pub request: u8,
@@ -43,7 +43,7 @@ pub trait ControlHandler {
     fn control(&mut self, setup: &Setup, data: &mut [u8]) -> Option<usize>;
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug, snapshot::Snap)]
 enum Stage {
     #[default]
     Idle,
@@ -51,7 +51,7 @@ enum Stage {
     Status,
 }
 
-#[derive(Default)]
+#[derive(Default, snapshot::Snap)]
 pub struct ControlPipe {
     setup: Setup,
     stage: Stage,

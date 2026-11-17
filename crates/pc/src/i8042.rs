@@ -19,13 +19,14 @@ const CB_KBD_OFF: u8 = 0x10;
 const CB_AUX_OFF: u8 = 0x20;
 const CB_TRANSLATE: u8 = 0x40;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Default, snapshot::Snap)]
 enum Src {
+    #[default]
     Kbd,
     Aux,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, snapshot::Snap)]
 enum Pending {
     None,
     CommandByte,
@@ -36,6 +37,7 @@ enum Pending {
     KbdArg(u8),
 }
 
+#[derive(snapshot::Snap)]
 pub struct I8042 {
     command_byte: u8,
     status_cmd: bool,
@@ -49,7 +51,7 @@ pub struct I8042 {
     pub reset_requested: bool,
 }
 
-#[derive(Default)]
+#[derive(Default, snapshot::Snap)]
 struct Mouse {
     reporting: bool,
     sample_rate: u8,

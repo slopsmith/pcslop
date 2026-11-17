@@ -13,7 +13,10 @@ pub mod pm;
 pub mod pit;
 pub mod ram;
 pub mod rtc;
+mod state;
 pub mod uart;
+
+pub use state::Machine;
 
 use std::io::Write;
 use std::time::Instant;
@@ -121,6 +124,8 @@ pub struct Board {
     vgabios: Vec<u8>,
     pub debugcon: Box<dyn Write + Send>,
     start: Instant,
+    /// Board time at `start`, which a restored snapshot carries on from.
+    clock_base: u64,
     pub reset_requested: bool,
     pub post_code: u8,
     /// The ISO in the CD-ROM drive.
@@ -203,6 +208,7 @@ impl Board {
             vgabios: Vec::new(),
             debugcon: Box::new(std::io::stdout()),
             start: Instant::now(),
+            clock_base: 0,
             reset_requested: false,
             post_code: 0,
             cdrom: None,
@@ -351,7 +357,7 @@ impl Board {
     }
 
     pub fn now_ns(&self) -> u64 {
-        self.start.elapsed().as_nanos() as u64
+        self.clock_base + self.start.elapsed().as_nanos() as u64
     }
 
     /// Advances timers and raises their interrupts.
@@ -1182,7 +1188,7 @@ impl Bus for Board {
             && let Some(base) = self.pci[DISPLAY].1.io_bar(1)
             && (base..base.wrapping_add(radeon::IO_SIZE as u16)).contains(&port)
         {
-            r.set_time(self.start.elapsed().as_nanos() as u64);
+            r.set_time(self.clock_base + self.start.elapsed().as_nanos() as u64);
             return r.io_read(port - base, size);
         }
         if let Some(base) = self.pci[UHCI].1.io_bar(4)
@@ -1247,7 +1253,7 @@ impl Bus for Board {
                 if let Some(base) = self.pci[DISPLAY].1.io_bar(1)
                     && (base..base.wrapping_add(radeon::IO_SIZE as u16)).contains(&port)
                 {
-                    r.set_time(self.start.elapsed().as_nanos() as u64);
+                    r.set_time(self.clock_base + self.start.elapsed().as_nanos() as u64);
                     r.io_write(port - base, size, value);
                     return;
                 }

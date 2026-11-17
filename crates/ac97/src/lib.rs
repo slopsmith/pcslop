@@ -99,7 +99,7 @@ const CR_KEPT_ON_RESET: u8 = cr::IOCE | cr::FEIE | cr::LVBIE;
 const BDL_ENTRIES: u8 = 32;
 const CHUNK: usize = 4096;
 
-#[derive(Default)]
+#[derive(Default, snapshot::Snap)]
 struct Channel {
     bdbar: u32,
     civ: u8,
@@ -202,6 +202,7 @@ impl Channel {
     }
 }
 
+#[derive(snapshot::Snap)]
 pub struct Ac97 {
     pub codec: Codec,
     /// PCM in, PCM out, mic in.
@@ -209,6 +210,7 @@ pub struct Ac97 {
     glob_cnt: u32,
     glob_sta: u32,
     cas: bool,
+    #[snap(skip)]
     out: Box<dyn AudioOut>,
     /// Byte of a PCM out sample split across two buffers.
     carry: Vec<u8>,

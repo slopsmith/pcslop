@@ -40,7 +40,7 @@ pub mod rc {
 
 /// An 80-bit extended-precision value: `se` holds the sign (bit 15) and the
 /// biased exponent; `mant` holds the significand with its explicit integer bit.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, snapshot::Snap)]
 pub struct F80 {
     pub mant: u64,
     pub se: u16,
@@ -372,7 +372,7 @@ pub(crate) fn round_pack(sign: bool, e: i32, m: u64, rc: u8, f: &Binary) -> (u64
 }
 
 /// x87 data registers and control state.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, snapshot::Snap)]
 pub struct Fpu {
     /// Physical registers R0..R7; ST(i) is `regs[(top + i) & 7]`.
     pub regs: [F80; 8],

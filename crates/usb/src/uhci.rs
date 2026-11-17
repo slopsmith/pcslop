@@ -93,11 +93,14 @@ enum TdResult {
     Complete,
 }
 
+#[derive(snapshot::Snap)]
 struct Port {
     sc: u16,
+    #[snap(skip)]
     dev: Option<Box<dyn UsbDevice>>,
 }
 
+#[derive(snapshot::Snap)]
 pub struct Uhci {
     cmd: u16,
     status: u16,

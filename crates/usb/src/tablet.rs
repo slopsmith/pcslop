@@ -124,7 +124,7 @@ fn string(index: u8) -> Option<&'static str> {
     })
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug, snapshot::Snap)]
 struct Report {
     x: u16,
     y: u16,
@@ -140,7 +140,7 @@ impl Report {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, snapshot::Snap)]
 struct State {
     address: u8,
     config: u8,
@@ -235,7 +235,7 @@ impl ControlHandler for State {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, snapshot::Snap)]
 pub struct Tablet {
     pipe: ControlPipe,
     st: State,
