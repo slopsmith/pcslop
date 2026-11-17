@@ -295,6 +295,9 @@ pub struct Jit {
     pub verify: bool,
     /// Fills shadow entries inside the VM; SLOPPER_JIT_NO_VM_FILL turns it off.
     pub vm_fill: bool,
+    /// FEAT_AFP works in the guest, so SSE arithmetic can run on the A64 FPU.
+    afp: bool,
+    fpcr: u64,
     /// Verify only blocks with recent translations (SLOPPER_JIT_VERIFY=new).
     verify_recent_only: bool,
     /// Measures time spent in the VM and per exit kind (SLOPPER_JIT_PROFILE).
@@ -396,6 +399,8 @@ impl Jit {
             interp_profile: std::env::var_os("SLOPPER_JIT_PROFILE").map(|_| HashMap::default()),
             verify: std::env::var_os("SLOPPER_JIT_VERIFY").is_some(),
             vm_fill: std::env::var_os("SLOPPER_JIT_NO_VM_FILL").is_none(),
+            afp: false,
+            fpcr: 0,
             verify_recent_only: std::env::var("SLOPPER_JIT_VERIFY").is_ok_and(|v| v == "new"),
             timing: std::env::var_os("SLOPPER_JIT_PROFILE").is_some(),
             audit: std::env::var_os("SLOPPER_JIT_AUDIT").is_some(),
@@ -422,6 +427,13 @@ impl Jit {
         v.set_reg(reg::CPSR, 0x3c5)?;
         v.set_reg(reg::PC, layout::va(entries.resume))?;
         v.set_reg(reg::X0 + 28, layout::va(layout::STATE))?;
+        let probe = state::fpcr_for(x86::cpu::mxcsr::RESET);
+        v.set_reg(reg::FPCR, probe)?;
+        jit.afp = v.reg(reg::FPCR)? == probe && std::env::var_os("SLOPPER_JIT_NO_SSE").is_none();
+        jit.fpcr = if jit.afp { probe } else { 0 };
+        if !jit.afp {
+            v.set_reg(reg::FPCR, 0)?;
+        }
         jit.state().lookup = layout::va(layout::LOOKUP);
         Ok(jit)
     }
@@ -530,6 +542,14 @@ impl Jit {
 
     fn load_state(&mut self, cpu: &Cpu) {
         let vm_fill = self.vm_fill;
+        let afp = self.afp;
+        if afp {
+            let fpcr = state::fpcr_for(cpu.mxcsr);
+            if fpcr != self.fpcr {
+                self.fpcr = fpcr;
+                self.vcpu.set_reg(reg::FPCR, fpcr).expect("FPCR write");
+            }
+        }
         let s = self.state();
         s.regs = cpu.regs;
         s.eip = cpu.eip;
@@ -577,8 +597,12 @@ impl Jit {
         s.fdp = f.fdp;
         s.fnote = 0;
         s.fdseg = 0;
-        s.sse_ok = (cpu.cr0 & ts_em == 0 && cpu.cr4 & x86::cpu::cr4::OSFXSR != 0) as u32;
+        let sse_ok = cpu.cr0 & ts_em == 0 && cpu.cr4 & x86::cpu::cr4::OSFXSR != 0;
+        s.sse_ok = sse_ok as u32;
         s.xmm = cpu.xmm;
+        s.mxcsr = cpu.mxcsr;
+        s.fpsr = 0;
+        s.sse_fp_ok = (sse_ok && afp && cpu.mxcsr & 0x1f80 == 0x1f80) as u32;
     }
 
     fn store_state(&mut self, cpu: &mut Cpu) {
@@ -590,6 +614,8 @@ impl Jit {
         cpu.set_flag(x86::cpu::flags::IF, if_flag);
         cpu.set_flag(x86::cpu::flags::DF, df);
         cpu.xmm = s.xmm;
+        cpu.mxcsr |= state::mxcsr_flags(s.fpsr);
+        s.fpsr = 0;
         let f = &mut cpu.fpu;
         for i in 0..8 {
             f.regs[i] = x86::fpu::F80 { mant: s.mm[i], se: s.fse[i] };
@@ -966,7 +992,8 @@ impl Jit {
                     at_dispatch = false;
                 }
                 Exit::Exception { syndrome, ipa, .. } if exit.ec() == Some(0x24) => {
-                    if let Some(done) = self.finish_string_in_interp(cpu, bus)? {
+                    let no_syndrome = syndrome & 1 << 24 == 0;
+                    if let Some(done) = self.finish_in_interp(cpu, bus, no_syndrome)? {
                         if let Some(e) = done {
                             return Ok(RunExit::Interp(e));
                         }
@@ -1068,6 +1095,10 @@ impl Jit {
         let mut diffs = Vec::new();
         if got.regs != exp.cpu.regs {
             diffs.push(format!("regs jit {:08x?}\n     interp {:08x?}", got.regs, exp.cpu.regs));
+        }
+        let de = x86::fpu::exc::DE as u32;
+        if got.xmm != exp.cpu.xmm || (got.mxcsr | de) != (exp.cpu.mxcsr | de) {
+            diffs.push(format!("sse jit {:x?} {:#x}\n     interp {:x?} {:#x}", got.xmm, got.mxcsr, exp.cpu.xmm, exp.cpu.mxcsr));
         }
         if got.fpu != exp.cpu.fpu {
             diffs.push(format!("fpu jit {:x?}\n     interp {:x?}", got.fpu, exp.cpu.fpu));
@@ -1291,15 +1322,16 @@ impl Jit {
         None
     }
 
-    /// Hands a REP string op that hit MMIO to the interpreter, avoiding one exit
-    /// per element. Some(Some(exit)) means the CPU must leave translated code.
-    fn finish_string_in_interp<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B) -> hvf::Result<Option<Option<interp::Exit>>> {
+    /// Interprets a REP string op that hit MMIO, or with `any` any instruction
+    /// (SIMD accesses carry no syndrome). Some(Some(exit)): leave translated code.
+    fn finish_in_interp<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B, any: bool) -> hvf::Result<Option<Option<interp::Exit>>> {
         let pc = self.vcpu.reg(reg::PC)?;
         let Some(eip) = self.eip_at(pc) else { return Ok(None) };
         let Ok(phys) = interp::translate(&mut cpu.clone(), bus, eip, false) else { return Ok(None) };
         let insn = x86::decode::decode::<()>(true, |i| Ok(bus.read8(phys.wrapping_add(i))));
         let Ok(insn) = insn else { return Ok(None) };
-        if insn.rep == x86::decode::Rep::None || !matches!(insn.op, 0xa4..=0xa7 | 0xaa..=0xaf) {
+        let string = insn.rep != x86::decode::Rep::None && matches!(insn.op, 0xa4..=0xa7 | 0xaa..=0xaf);
+        if !string && !any {
             return Ok(None);
         }
         let mut regs = [0u32; 8];

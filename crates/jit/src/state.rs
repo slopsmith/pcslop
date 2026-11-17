@@ -125,6 +125,12 @@ pub struct State {
     /// 1 when SSE instructions may run: CR0.TS and CR0.EM clear, CR4.OSFXSR set.
     pub sse_ok: u32,
     pub xmm: [u128; 8],
+    pub mxcsr: u32,
+    /// `sse_ok`, all SIMD exceptions masked and FPCR set up for MXCSR: SSE
+    /// arithmetic may run on the A64 FPU.
+    pub sse_fp_ok: u32,
+    /// FPSR exception flags gathered at each exit from the VM.
+    pub fpsr: u32,
 }
 
 pub const REGS: usize = offset_of!(State, regs);
@@ -160,6 +166,9 @@ pub const WALK_FLAGS: usize = offset_of!(State, walk_flags);
 pub const RAM_SIZE: usize = offset_of!(State, ram_size);
 pub const FILL_COUNT: usize = offset_of!(State, fill_count);
 pub const XMM: usize = offset_of!(State, xmm);
+pub const MXCSR: usize = offset_of!(State, mxcsr);
+pub const SSE_FP_OK: usize = offset_of!(State, sse_fp_ok);
+pub const FPSR: usize = offset_of!(State, fpsr);
 pub const FSE: usize = offset_of!(State, fse);
 pub const FCW: usize = offset_of!(State, fcw);
 pub const FSW: usize = offset_of!(State, fsw);
@@ -170,6 +179,23 @@ pub const FIP: usize = offset_of!(State, fip);
 pub const FDP: usize = offset_of!(State, fdp);
 pub const FNOTE: usize = offset_of!(State, fnote);
 pub const FDSEG: usize = offset_of!(State, fdseg);
+
+/// FPCR for SSE arithmetic under `mxcsr` (with FEAT_AFP): AH for x86 NaN and
+/// MIN/MAX rules, FIZ for DAZ, FZ for FTZ with underflow masked, RMode from RC.
+/// FIZ flushes without raising IDC, so translated code never sets MXCSR.DE.
+pub fn fpcr_for(mxcsr: u32) -> u64 {
+    let rc = (mxcsr >> 13) & 3;
+    let rmode = (rc & 1) << 1 | rc >> 1;
+    let daz = mxcsr & 0x40 != 0;
+    let fz = mxcsr & 0x8000 != 0 && mxcsr & 0x800 != 0;
+    daz as u64 | 2 | (rmode as u64) << 22 | (fz as u64) << 24
+}
+
+/// MXCSR exception flags for the FPSR bits in `fpsr`.
+pub fn mxcsr_flags(fpsr: u32) -> u32 {
+    let bit = |b: u32, to: u32| (fpsr >> b & 1) << to;
+    bit(0, 0) | bit(1, 2) | bit(2, 3) | bit(3, 4) | bit(4, 5)
+}
 
 /// Whether translated x87 code may run with this control word.
 pub fn x87_ok(base: bool, cw: u16) -> bool {

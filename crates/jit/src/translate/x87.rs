@@ -19,6 +19,7 @@ const P: Reg = Reg(5);
 const M: Reg = Reg(6);
 const S: Reg = Reg(7);
 const U: Reg = Reg(8);
+const SAVED_FPSR: Reg = Reg(1);
 const FA: V = V(18);
 const FB: V = V(19);
 const FR: V = V(20);
@@ -489,9 +490,13 @@ impl Emit {
         self.a.bind(zero);
     }
 
+    /// Leaves unless the x87 and the SSE rounding control (the FPCR one) are nearest.
     fn check_rc_nearest(&mut self, bail: Label) {
         self.a.ldr(Width::W, T_A, STATE, state::FCW as i32);
         self.a.ubfx(Size::W, T_A, T_A, 10, 2);
+        self.a.cbnz(Size::W, T_A, bail);
+        self.a.ldr(Width::W, T_A, STATE, state::MXCSR as i32);
+        self.a.ubfx(Size::W, T_A, T_A, 13, 2);
         self.a.cbnz(Size::W, T_A, bail);
     }
 
@@ -634,13 +639,16 @@ impl Emit {
         }
     }
 
+    /// Clears FPSR for one operation; the SSE flags gathered so far wait in SAVED_FPSR.
     fn fp_begin(&mut self) {
+        self.a.mrs(SAVED_FPSR, sysreg::FPSR);
         self.a.msr(sysreg::FPSR, ZR);
     }
 
     /// Leaves on any FP exception but inexact, which becomes PE.
     fn fp_end(&mut self, bail: Label) {
         self.a.mrs(T_A, sysreg::FPSR);
+        self.a.msr(sysreg::FPSR, SAVED_FPSR);
         self.and_imm(Size::W, T_B, T_A, 0xf);
         self.a.cbnz(Size::W, T_B, bail);
         self.a.ubfx(Size::W, T_B, T_A, 4, 1);

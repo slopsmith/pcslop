@@ -70,6 +70,11 @@ fn store_guest(a: &mut Asm, nzcv_from_spsr: Option<Reg>) {
     a.str(Width::W, PF_RESULT, STATE, state::PF_RESULT as i32);
     a.str(Width::W, AF_AUX, STATE, state::AF_AUX as i32);
     a.str(Width::X, ICOUNT, STATE, state::ICOUNT as i32);
+    a.mrs(r(9), sysreg::FPSR);
+    a.ldr(Width::W, r(10), STATE, state::FPSR as i32);
+    a.orr(Size::W, r(10), r(10), r(9));
+    a.str(Width::W, r(10), STATE, state::FPSR as i32);
+    a.msr(sysreg::FPSR, ZR);
 }
 
 fn load_guest(a: &mut Asm) {
