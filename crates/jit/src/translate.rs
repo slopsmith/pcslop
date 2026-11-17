@@ -164,7 +164,7 @@ impl Emit {
     /// Drops the code from an STI on and leaves the STI to the interpreter,
     /// which runs the instruction after it before taking interrupts.
     fn back_to_sti(&mut self, (start, eip, insns, nb): (usize, u32, usize, usize), pc: &mut u32, n: &mut usize, boundaries: &mut Vec<(u32, u32)>) {
-        self.a.code.truncate(start);
+        self.a.truncate(start);
         self.chains.retain(|&(w, _)| (w as usize) < start);
         boundaries.truncate(nb + 1);
         *pc = eip;
@@ -1665,7 +1665,7 @@ pub fn compile(
                 }
                 Step::End => insns += 1,
                 Step::Unsupported | Step::Sti => {
-                    e.a.code.truncate(start);
+                    e.a.truncate(start);
                     e.chains.retain(|&(w, _)| (w as usize) < start);
                     e.exit_interp(pc);
                     break;
@@ -1724,7 +1724,7 @@ pub fn compile(
                 if let Some(at) = sti {
                     e.back_to_sti(at, &mut pc, &mut insns, &mut boundaries);
                 } else {
-                    e.a.code.truncate(start);
+                    e.a.truncate(start);
                     e.chains.retain(|&(w, _)| (w as usize) < start);
                     e.exit_interp(pc);
                 }

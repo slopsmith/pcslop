@@ -557,3 +557,10 @@ fn atomics_match_the_interpreter_when_the_compare_succeeds() {
         });
     }
 }
+
+#[test]
+fn untranslatable_instruction_across_a_page_end() {
+    let mut code = vec![0x90; 0xfff];
+    code.extend([0x0f, 0xa2, 0x40, 0xf4]);
+    compare(&code, |_| {});
+}

@@ -208,6 +208,17 @@ impl Asm {
         self.labels[l.0] = Some(self.code.len());
     }
 
+    /// Drops the code from `pos` on, with its label references and bindings.
+    pub fn truncate(&mut self, pos: usize) {
+        self.code.truncate(pos);
+        self.fixups.retain(|&(at, _, _)| at < pos);
+        for l in &mut self.labels {
+            if l.is_some_and(|at| at > pos) {
+                *l = None;
+            }
+        }
+    }
+
     fn branch_to(&mut self, word: u32, l: Label, fix: Fix) {
         self.fixups.push((self.code.len(), l, fix));
         self.emit(word);
