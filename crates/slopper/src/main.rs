@@ -597,6 +597,7 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
     let mut last_stats = jit::Stats::default();
     let mut last_apic = pc::apic::Stats::default();
     let mut last_nic = net::rtl8139::Stats::default();
+    let mut last_aperture = 0;
     let mut script = match args.script.as_ref().map(Script::load).transpose() {
         Ok(s) => s,
         Err(e) => {
@@ -829,6 +830,13 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                                     r(a.page_faults, b.page_faults),
                                 );
                                 last_stats = a;
+                                out += &format!(
+                                    "\naperture/s: emulated accesses {:.0} direct fills {:.0} flushes {:.0}",
+                                    (board.aperture_accesses - last_aperture) as f64 / span,
+                                    r(a.aperture_fills, b.aperture_fills),
+                                    r(a.aperture_flushes, b.aperture_flushes),
+                                );
+                                last_aperture = board.aperture_accesses;
                                 out += &format!("\n{}\n{:?}", j.debug_state(), j.stats);
                             }
                             out

@@ -173,6 +173,8 @@ pub mod bx {
     pub const AGPSTAT: usize = 0xa4;
     pub const AGPCMD: usize = 0xa8;
     pub const AGPCTRL: usize = 0xb0;
+    /// AGPCTRL: GTLB Enable; clearing it flushes the GTLB.
+    pub const GTLB_ENABLE: u32 = 1 << 7;
     pub const APSIZE: usize = 0xb4;
     pub const ATTBASE: usize = 0xb8;
     /// APSIZE as a 440BX board's firmware sets it: a 64 MiB aperture.

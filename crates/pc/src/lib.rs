@@ -139,6 +139,11 @@ pub struct Board {
     cdrom: Option<String>,
     /// Set while the Radeon runs its command processor on a thread of its own.
     gpu_bus: Option<Arc<GpuBusState>>,
+    /// Counts host bridge configuration writes, which may flush the GTLB or
+    /// move the aperture: see `aperture_page`.
+    gtlb_epoch: u64,
+    /// Guest accesses to the aperture that the board translated itself.
+    pub aperture_accesses: u64,
 }
 
 const LEGACY_START: u32 = 0xa_0000;
@@ -224,6 +229,8 @@ impl Board {
             post_code: 0,
             cdrom: None,
             gpu_bus: None,
+            gtlb_epoch: 0,
+            aperture_accesses: 0,
         };
         match cfg.gpu {
             Gpu::StdVga => {
@@ -662,6 +669,10 @@ impl Board {
 
     /// Reads `size` bytes (1, 2 or 4) of a PCI memory range.
     fn mmio_read(&mut self, addr: u32, size: u8) -> u32 {
+        if let Some(phys) = self.gart(addr) {
+            self.aperture_accesses += 1;
+            return bytes_le(size, |i| self.ram.get(phys as usize + i).copied().unwrap_or(0xff));
+        }
         if let Some(v) = self.apic_read(addr & !3) {
             return (v >> (8 * (addr & 3))) & (u32::MAX >> (32 - 8 * size as u32));
         }
@@ -706,13 +717,21 @@ impl Board {
         {
             return bytes_le(size, |i| self.vgabios.get((addr - base) as usize + i).copied().unwrap_or(0xff));
         }
-        if let Some(phys) = self.gart(addr) {
-            return bytes_le(size, |i| self.ram.get(phys as usize + i).copied().unwrap_or(0xff));
-        }
         u32::MAX >> (32 - 8 * size as u32)
     }
 
     fn mmio_write(&mut self, addr: u32, size: u8, v: u32) {
+        if let Some(phys) = self.gart(addr) {
+            self.aperture_accesses += 1;
+            for i in 0..size as u32 {
+                let a = phys + i;
+                if (a as usize) < self.ram.len() {
+                    self.code_watch.note_write(a);
+                    self.ram[a as usize] = (v >> (8 * i)) as u8;
+                }
+            }
+            return;
+        }
         if self.apic_write(addr, v, size) {
             return;
         }
@@ -752,15 +771,6 @@ impl Board {
                 {
                     r.set_time(now);
                     return self.radeon_write(|r, bus| r.mmio_write(addr - base, size, v, bus));
-                }
-            }
-        }
-        if let Some(phys) = self.gart(addr) {
-            for i in 0..size as u32 {
-                let a = phys + i;
-                if (a as usize) < self.ram.len() {
-                    self.code_watch.note_write(a);
-                    self.ram[a as usize] = (v >> (8 * i)) as u8;
                 }
             }
         }
@@ -1566,6 +1576,7 @@ impl Bus for Board {
                     self.pci[f].1.write(off, size as usize, value);
                     if f == HOST && self.chipset == Chipset::I440bx {
                         pci::i440bx_update(&mut self.pci[HOST].1);
+                        self.gtlb_epoch += 1;
                     }
                     if f == DISPLAY {
                         self.sync_display_bars();
@@ -1634,6 +1645,23 @@ impl Bus for Board {
         if let Some(word) = self.code_watch.bits.get_mut(page >> 6) {
             *word |= 1 << (page & 63);
         }
+    }
+
+    // The 82443BX caches GATT entries in its GTLB and only rereads them once
+    // software clears AGPCTRL.GTLB_EN (datasheet 3.3.34). Linux's intel-agp
+    // does that after every GATT update (intel_tlbflush), so translations
+    // stay valid until the next host bridge configuration write, and while
+    // the GTLB is off nothing may be cached at all.
+    fn aperture_page(&mut self, addr: u32) -> Option<u32> {
+        if self.pci[HOST].1.read(pci::bx::AGPCTRL, 4) & pci::bx::GTLB_ENABLE == 0 {
+            return None;
+        }
+        let page = self.gart(addr & !0xfff)?;
+        self.plain_ram(page, 0x1000).then_some(page)
+    }
+
+    fn aperture_epoch(&self) -> u64 {
+        self.gtlb_epoch
     }
 
     fn take_written_code_pages(&mut self) -> Vec<u32> {
@@ -1990,6 +2018,30 @@ mod tests {
         b.write16(0xe000_1012, 0x5555);
         assert_eq!(b.read32(0x0020_0010), 0x5555_ef01);
         assert_eq!(b.read32(0xe000_2000), u32::MAX);
+    }
+
+    #[test]
+    fn aperture_pages_are_cacheable_only_while_the_gtlb_is_on() {
+        let mut b = bx_board();
+        config_write(&mut b, 0, 0, 0x10, 0xe000_0000);
+        config_write(&mut b, 0, 0, pci::bx::ATTBASE as u32, 0x0010_0000);
+        config_write(&mut b, 0, 0, pci::bx::NBXCFG as u32, pci::bx::APERTURE_ENABLE);
+        b.write32(0x0010_0004, 0x0020_0001);
+        assert_eq!(b.aperture_page(0xe000_1234), None, "the GTLB is off, so every access reads the GATT");
+        let before = b.aperture_epoch();
+        config_write(&mut b, 0, 0, pci::bx::AGPCTRL as u32, pci::bx::GTLB_ENABLE);
+        assert_ne!(b.aperture_epoch(), before);
+        assert_eq!(b.aperture_page(0xe000_1234), Some(0x0020_0000));
+        assert_eq!(b.aperture_page(0xe000_2000), None, "invalid GATT entry");
+        assert_eq!(b.aperture_page(0xd000_0000), None, "outside the aperture");
+        b.write32(0x0010_0008, 0x000a_0001);
+        assert_eq!(b.aperture_page(0xe000_2000), None, "legacy VGA hole");
+        b.write32(0x0010_0004, 0x0021_0001);
+        let before = b.aperture_epoch();
+        config_write(&mut b, 0, 0, pci::bx::AGPCTRL as u32, 0);
+        config_write(&mut b, 0, 0, pci::bx::AGPCTRL as u32, pci::bx::GTLB_ENABLE);
+        assert_ne!(b.aperture_epoch(), before, "a GTLB flush must invalidate cached translations");
+        assert_eq!(b.aperture_page(0xe000_1000), Some(0x0021_0000));
     }
 
     #[test]

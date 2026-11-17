@@ -247,6 +247,10 @@ pub struct Stats {
     pub flush_single_all: u64,
     pub flush_multi: u64,
     pub flush_pool: u64,
+    /// Shadow entries that map the graphics aperture straight to RAM.
+    pub aperture_fills: u64,
+    /// Times those entries were dropped because the aperture changed.
+    pub aperture_flushes: u64,
     /// APIC TPR accesses served inside the VM.
     pub tpr_fast: u64,
     /// Nanoseconds inside `hv_vcpu_run`, and handling each kind of exit.
@@ -302,6 +306,10 @@ pub struct Jit {
     nonglobal: [Vec<usize>; 2],
     /// Linear pages mapped writable in the shadow tables, by physical page.
     writable: [HashMap<u32, Vec<u32>>; 2],
+    /// Shadow leaf entries for physical addresses above RAM (the aperture
+    /// among them), cleared when `Bus::aperture_epoch` changes.
+    aperture_leaves: [HashSet<usize>; 2],
+    aperture_epoch: u64,
     pub stats: Stats,
     /// Runs each block against the interpreter and stops at the first difference.
     pub verify: bool,
@@ -427,6 +435,8 @@ impl Jit {
             self_check: Default::default(),
             writable: [HashMap::default(), HashMap::default()],
             nonglobal: [Vec::new(), Vec::new()],
+            aperture_leaves: [HashSet::default(), HashSet::default()],
+            aperture_epoch: 0,
             pt_watch: PtWatch::default(),
             chain_wanted: HashMap::default(),
             chain_in: HashMap::default(),
@@ -508,6 +518,7 @@ impl Jit {
                     let listed = self.writable[r].get(&phys).is_some_and(|l| l.contains(&lin));
                     eprintln!("AUDIT writable code page: root {r} lin {lin:#010x} phys {phys:#x} listed {listed} x86 {want:x?}");
                 }
+                let want = want.map(|(p, perms, leaf)| (if p != phys { bus.aperture_page(p).unwrap_or(p) } else { p }, perms, leaf));
                 let why = match want {
                     None => "not present",
                     Some((p, _, _)) if p != phys => "other page",
@@ -898,6 +909,7 @@ impl Jit {
         for r in 0..2 {
             self.writable[r].clear();
             self.nonglobal[r].clear();
+            self.aperture_leaves[r].clear();
         }
         self.state().ctl |= ctl::TLBI_ALL;
         self.stats.flushes += 1;
@@ -905,6 +917,7 @@ impl Jit {
 
     /// Follows the interpreter's TLB: CR3/CR0/CR4 writes and INVLPG flush it.
     fn check_shadow<B: Bus>(&mut self, cpu: &Cpu, bus: &mut B) {
+        self.check_aperture(bus);
         let key = cpu.tlb.generation;
         let paged = cpu.cr0 & x86::cpu::cr0::PG != 0;
         let was_paged = std::mem::replace(&mut self.shadow_paged, paged);
@@ -961,6 +974,27 @@ impl Jit {
         }
     }
 
+    /// Drops the shadow entries of addresses above RAM once the chipset's
+    /// aperture translations may have changed, so they fill again.
+    fn check_aperture<B: Bus>(&mut self, bus: &mut B) {
+        let epoch = bus.aperture_epoch();
+        if epoch == self.aperture_epoch {
+            return;
+        }
+        self.aperture_epoch = epoch;
+        if self.aperture_leaves.iter().all(HashSet::is_empty) {
+            return;
+        }
+        for r in 0..2 {
+            for off in std::mem::take(&mut self.aperture_leaves[r]) {
+                self.shadow[r].clear_leaf(self.mem.as_mut_slice(), off);
+            }
+        }
+        self.bump_vcache();
+        self.state().ctl |= ctl::TLBI_ALL;
+        self.stats.aperture_flushes += 1;
+    }
+
     fn tlbi_page(&mut self, lin: u32) {
         let s = self.state();
         if s.ctl & ctl::TLBI_PAGE != 0 && s.tlbi_page != (lin >> 12) as u64 {
@@ -970,7 +1004,7 @@ impl Jit {
         s.ctl |= ctl::TLBI_PAGE;
     }
 
-    fn map_shadow<B: Bus>(&mut self, bus: &mut B, cpu: &Cpu, lin: u32, phys: u32, writable: bool, global: bool) {
+    fn map_shadow<B: Bus>(&mut self, bus: &mut B, cpu: &Cpu, lin: u32, phys: u32, writable: bool, global: bool) -> usize {
         if cpu.cr0 & x86::cpu::cr0::PG != 0 {
             self.pt_watch.watch(cpu, bus, lin);
         }
@@ -998,6 +1032,7 @@ impl Jit {
             self.nonglobal[r].push(leaf);
         }
         self.stats.shadow_fills += 1;
+        leaf
     }
 
     /// Points the `b` at `site` to `target_va`, or back to the slow path right after it.
@@ -1577,7 +1612,10 @@ impl Jit {
             lin = (lin | 0xfff).wrapping_add(1);
         }
         match interp::translate_global(cpu, bus, lin, write) {
-            Ok((phys, global)) => {
+            Ok((x86_phys, global)) => {
+                let above_ram = x86_phys >= self.state().ram_size;
+                let gart = if above_ram { bus.aperture_page(x86_phys) } else { None };
+                let phys = gart.map_or(x86_phys, |p| p | (x86_phys & 0xfff));
                 let page = phys & !0xfff;
                 if bus.apic_page() == Some(page) && cpu.cpl() == 0 && lin == far as u32 {
                     let at = elr.wrapping_sub(layout::va(0)) as usize;
@@ -1594,7 +1632,8 @@ impl Jit {
                     let eip = self.eip_at(elr).expect("fault outside any translated block");
                     self.deopt_at_fault(elr);
                     self.invalidate_code_page(page);
-                    self.map_shadow(bus, cpu, lin, phys, write, global);
+                    let leaf = self.map_shadow(bus, cpu, lin, phys, write, global);
+                    self.note_aperture_leaf(leaf, above_ram, gart.is_some());
                     self.tlbi_page(lin);
                     self.state().eip = eip;
                     self.store_state(cpu);
@@ -1609,7 +1648,8 @@ impl Jit {
                     self.state().resume = resume::DISPATCH;
                     return None;
                 }
-                self.map_shadow(bus, cpu, lin, phys, write, global);
+                let leaf = self.map_shadow(bus, cpu, lin, phys, write, global);
+                self.note_aperture_leaf(leaf, above_ram, gart.is_some());
                 self.tlbi_page(lin);
                 self.state().resume = resume::RETRY;
             }
@@ -1626,6 +1666,15 @@ impl Jit {
             }
         }
         None
+    }
+
+    fn note_aperture_leaf(&mut self, leaf: usize, above_ram: bool, direct: bool) {
+        if above_ram {
+            self.aperture_leaves[self.root].insert(leaf);
+        }
+        if direct {
+            self.stats.aperture_fills += 1;
+        }
     }
 
     /// Performs a faulting access to the APIC page from the syndrome and arms

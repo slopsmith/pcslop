@@ -86,4 +86,17 @@ pub trait Bus {
     fn take_written_code_pages(&mut self) -> Vec<u32> {
         Vec::new()
     }
+
+    /// The RAM page that a chipset's graphics aperture maps the physical
+    /// address `addr` to, when that translation may be cached until
+    /// `aperture_epoch` changes. None leaves `addr` to the read and write
+    /// methods.
+    fn aperture_page(&mut self, _addr: u32) -> Option<u32> {
+        None
+    }
+
+    /// Changes whenever translations from `aperture_page` may have gone stale.
+    fn aperture_epoch(&self) -> u64 {
+        0
+    }
 }

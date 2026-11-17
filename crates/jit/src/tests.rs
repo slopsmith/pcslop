@@ -8,15 +8,39 @@ static VM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct FlatBus {
     ram: GuestMemory,
+    gart: Option<Gart>,
+}
+
+/// A graphics aperture at `APERTURE` translated through a GATT in RAM, as on
+/// the 440BX with its GTLB on. An OUT to `GTLB_FLUSH` flushes the GTLB.
+struct Gart {
+    gatt: u32,
+    epoch: u64,
+}
+
+const APERTURE: u32 = 0xe000_0000;
+const GTLB_FLUSH: u16 = 0xcfc;
+
+impl FlatBus {
+    fn resolve(&self, addr: u32) -> Option<u32> {
+        let Some(g) = &self.gart else { return Some(addr) };
+        let off = addr.wrapping_sub(APERTURE);
+        if off >= 16 << 20 {
+            return Some(addr);
+        }
+        let at = (g.gatt + (off >> 12) * 4) as usize;
+        let entry = u32::from_le_bytes(self.ram.as_slice()[at..at + 4].try_into().unwrap());
+        (entry & 1 != 0).then_some((entry & !0xfff) | (off & 0xfff))
+    }
 }
 
 impl Bus for FlatBus {
     fn read8(&mut self, addr: u32) -> u8 {
-        self.ram.as_slice().get(addr as usize).copied().unwrap_or(0xff)
+        self.resolve(addr).and_then(|a| self.ram.as_slice().get(a as usize).copied()).unwrap_or(0xff)
     }
 
     fn write8(&mut self, addr: u32, value: u8) {
-        if let Some(b) = self.ram.as_mut_slice().get_mut(addr as usize) {
+        if let Some(b) = self.resolve(addr).and_then(|a| self.ram.as_mut_slice().get_mut(a as usize)) {
             *b = value;
         }
     }
@@ -25,7 +49,22 @@ impl Bus for FlatBus {
         0xffff_ffff
     }
 
-    fn io_write(&mut self, _port: u16, _size: u8, _value: u32) {}
+    fn io_write(&mut self, port: u16, _size: u8, _value: u32) {
+        if port == GTLB_FLUSH
+            && let Some(g) = &mut self.gart
+        {
+            g.epoch += 1;
+        }
+    }
+
+    fn aperture_page(&mut self, addr: u32) -> Option<u32> {
+        let page = self.resolve(addr & !0xfff).filter(|_| addr.wrapping_sub(APERTURE) < 16 << 20)?;
+        ((page as usize) < RAM).then_some(page)
+    }
+
+    fn aperture_epoch(&self) -> u64 {
+        self.gart.as_ref().map_or(0, |g| g.epoch)
+    }
 }
 
 fn flat_cpu(eip: u32, esp: u32) -> Cpu {
@@ -45,7 +84,7 @@ fn flat_cpu(eip: u32, esp: u32) -> Cpu {
 }
 
 fn bus_with(code_at: u32, code: &[u8]) -> FlatBus {
-    let mut bus = FlatBus { ram: GuestMemory::new(RAM).unwrap() };
+    let mut bus = FlatBus { ram: GuestMemory::new(RAM).unwrap(), gart: None };
     bus.ram.as_mut_slice()[code_at as usize..code_at as usize + code.len()].copy_from_slice(code);
     bus
 }
@@ -1255,7 +1294,7 @@ fn sysenter_sysexit_and_fs_loads_match_the_interpreter() {
     }
     assert!(interp::load_segment(&mut a, &mut bus_a, 4, 0x3b));
     let mut b = a.clone();
-    let mut bus_b = FlatBus { ram: GuestMemory::new(RAM).unwrap() };
+    let mut bus_b = FlatBus { ram: GuestMemory::new(RAM).unwrap(), gart: None };
     bus_b.ram.as_mut_slice().copy_from_slice(bus_a.ram.as_slice());
     run_interp(&mut a, &mut bus_a);
     let stats = run_jit(&mut b, &mut bus_b);
@@ -1329,7 +1368,7 @@ fn iret_within_the_kernel_and_to_user_mode_matches_the_interpreter() {
     ]);
     let (mut a, mut bus_a) = ring_test_machine(&user, &kernel);
     let mut b = a.clone();
-    let mut bus_b = FlatBus { ram: GuestMemory::new(RAM).unwrap() };
+    let mut bus_b = FlatBus { ram: GuestMemory::new(RAM).unwrap(), gart: None };
     bus_b.ram.as_mut_slice().copy_from_slice(bus_a.ram.as_slice());
     run_interp(&mut a, &mut bus_a);
     let stats = run_jit(&mut b, &mut bus_b);
@@ -1355,7 +1394,7 @@ fn x87_results_survive_a_store_into_the_running_code() {
     bus_a.ram.as_mut_slice()[0x3000..0x3008].copy_from_slice(&1.5f64.to_le_bytes());
     bus_a.ram.as_mut_slice()[0x3008..0x3010].copy_from_slice(&2.25f64.to_le_bytes());
     let mut b = a.clone();
-    let mut bus_b = FlatBus { ram: GuestMemory::new(RAM).unwrap() };
+    let mut bus_b = FlatBus { ram: GuestMemory::new(RAM).unwrap(), gart: None };
     bus_b.ram.as_mut_slice().copy_from_slice(bus_a.ram.as_slice());
     run_interp(&mut a, &mut bus_a);
     let stats = run_jit(&mut b, &mut bus_b);
@@ -1378,7 +1417,7 @@ fn code_mapped_at_two_linear_addresses_pushes_each_return_address() {
     paged(&mut a, &mut bus_a, false);
     bus_a.ram.as_mut_slice()[0x11014..0x11018].copy_from_slice(&0x2007u32.to_le_bytes());
     let mut b = a.clone();
-    let mut bus_b = FlatBus { ram: GuestMemory::new(RAM).unwrap() };
+    let mut bus_b = FlatBus { ram: GuestMemory::new(RAM).unwrap(), gart: None };
     bus_b.ram.as_mut_slice().copy_from_slice(bus_a.ram.as_slice());
     run_interp(&mut a, &mut bus_a);
     run_jit(&mut b, &mut bus_b);
@@ -1707,4 +1746,127 @@ fn a_snapshot_taken_mid_run_resumes_to_the_same_result() {
     assert_eq!(cpu.xmm, want.xmm);
     assert_eq!(cpu.eflags & ARITH_MASK, want.eflags & ARITH_MASK);
     assert!(bus.ram.as_slice() == &want_ram[..], "memory differs");
+}
+
+const GATT: u32 = 0x20000;
+
+/// `paged`, plus linear 0x800000.. mapped onto the aperture, whose GATT maps
+/// page 0 to 0x30000, page 1 to 0x31000 and leaves page 2 invalid.
+fn paged_with_aperture(cpu: &mut Cpu, bus: &mut FlatBus) {
+    paged(cpu, bus, false);
+    bus.gart = Some(Gart { gatt: GATT, epoch: 0 });
+    let mem = bus.ram.as_mut_slice();
+    mem[0x10008..0x1000c].copy_from_slice(&0x12007u32.to_le_bytes());
+    for i in 0..1024u32 {
+        let pte = (APERTURE + (i << 12)) | 7;
+        let at = 0x12000 + i as usize * 4;
+        mem[at..at + 4].copy_from_slice(&pte.to_le_bytes());
+    }
+    for (i, entry) in [0x30001u32, 0x31001].into_iter().enumerate() {
+        let at = GATT as usize + i * 4;
+        mem[at..at + 4].copy_from_slice(&entry.to_le_bytes());
+    }
+}
+
+fn compare_with_aperture(code: &[u8], setup: impl Fn(&mut FlatBus)) -> (Stats, FlatBus, Cpu) {
+    let mut a = flat_cpu(0x1000, 0x8000);
+    let mut b = a.clone();
+    let mut bus_a = bus_with(0x1000, code);
+    let mut bus_b = bus_with(0x1000, code);
+    paged_with_aperture(&mut a, &mut bus_a);
+    paged_with_aperture(&mut b, &mut bus_b);
+    setup(&mut bus_a);
+    setup(&mut bus_b);
+    run_interp(&mut a, &mut bus_a);
+    let stats = run_jit(&mut b, &mut bus_b);
+    assert_eq!(a.regs, b.regs, "registers");
+    let (ma, mb) = (bus_a.ram.as_slice(), bus_b.ram.as_slice());
+    if let Some(i) = (0..RAM).find(|&i| ma[i] != mb[i]) {
+        panic!("memory differs at {i:#x}: interp {:#04x} jit {:#04x}", ma[i], mb[i]);
+    }
+    (stats, bus_b, b)
+}
+
+#[test]
+fn aperture_accesses_reach_the_gatt_pages_without_exits() {
+    let code = [
+        0xbf, 0x00, 0x00, 0x80, 0x00, // mov edi, 0x800000
+        0xb8, 0x44, 0x33, 0x22, 0x11, // mov eax, 0x11223344
+        0x89, 0x07, // mov [edi], eax
+        0x89, 0x87, 0x04, 0x10, 0x00, 0x00, // mov [edi+0x1004], eax
+        0x8b, 0x1f, // mov ebx, [edi]
+        0xb9, 0xe8, 0x03, 0x00, 0x00, // mov ecx, 1000
+        0x01, 0x4f, 0x08, // loop: add [edi+8], ecx
+        0x49, // dec ecx
+        0x75, 0xfa, // jnz loop
+        0xbe, 0x00, 0x20, 0x00, 0x00, // mov esi, 0x2000
+        0x81, 0xc7, 0x00, 0x01, 0x00, 0x00, // add edi, 0x100
+        0xb9, 0x40, 0x00, 0x00, 0x00, // mov ecx, 64
+        0xfc, 0xf3, 0xa5, // cld; rep movsd
+        0x8b, 0x15, 0x00, 0x20, 0x80, 0x00, // mov edx, [0x802000]
+        0xa3, 0x04, 0x20, 0x80, 0x00, // mov [0x802004], eax
+        0xf4,
+    ];
+    let (stats, bus, cpu) = compare_with_aperture(&code, |bus| {
+        for (i, b) in bus.ram.as_mut_slice()[0x2000..0x2100].iter_mut().enumerate() {
+            *b = i as u8 ^ 0x5a;
+        }
+    });
+    let ram = bus.ram.as_slice();
+    assert_eq!(&ram[0x30000..0x30004], &[0x44, 0x33, 0x22, 0x11]);
+    assert_eq!(&ram[0x31004..0x31008], &[0x44, 0x33, 0x22, 0x11]);
+    assert_eq!(u32::from_le_bytes(ram[0x30008..0x3000c].try_into().unwrap()), 500_500);
+    assert_eq!(&ram[0x30100..0x30200], &ram[0x2000..0x2100]);
+    assert_eq!(cpu.regs[2], u32::MAX, "an invalid GATT entry reads all ones");
+    assert!(stats.aperture_fills >= 2, "{stats:?}");
+    assert!(stats.mmio_exits <= 2, "only the invalid page may exit: {stats:?}");
+}
+
+#[test]
+fn a_gtlb_flush_remaps_the_aperture() {
+    let mut code = vec![
+        0xbf, 0x00, 0x00, 0x80, 0x00, // mov edi, 0x800000
+        0xc7, 0x07, 0xaa, 0xaa, 0xaa, 0xaa, // mov dword [edi], 0xaaaaaaaa
+        0xc7, 0x87, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov dword [edi+0x2000], 0 (invalid: dropped)
+        0x8b, 0x8f, 0x00, 0x20, 0x00, 0x00, // mov ecx, [edi+0x2000]
+        0xc7, 0x05, 0x00, 0x00, 0x02, 0x00, 0x01, 0x20, 0x03, 0x00, // mov dword [GATT], 0x32001
+        0xc7, 0x05, 0x08, 0x00, 0x02, 0x00, 0x01, 0x30, 0x03, 0x00, // mov dword [GATT+8], 0x33001
+        0x66, 0xba, 0xfc, 0x0c, // mov dx, 0xcfc
+        0xee, // out dx, al
+    ];
+    code.extend([0x46; 32]); // inc esi, past the interpreter's tail
+    code.extend([
+        0xc7, 0x07, 0xbb, 0xbb, 0xbb, 0xbb, // mov dword [edi], 0xbbbbbbbb
+        0x8b, 0x07, // mov eax, [edi]
+        0xc7, 0x87, 0x00, 0x20, 0x00, 0x00, 0xcc, 0xcc, 0xcc, 0xcc, // mov dword [edi+0x2000], 0xcccccccc
+        0xf4,
+    ]);
+    let (stats, bus, cpu) = compare_with_aperture(&code, |_| {});
+    let ram = bus.ram.as_slice();
+    assert_eq!(&ram[0x30000..0x30004], &[0xaa; 4]);
+    assert_eq!(&ram[0x32000..0x32004], &[0xbb; 4]);
+    assert_eq!(&ram[0x33000..0x33004], &[0xcc; 4], "a page that was invalid before the flush must map now");
+    assert_eq!((cpu.regs[0], cpu.regs[1]), (0xbbbb_bbbb, u32::MAX));
+    assert!(stats.aperture_flushes >= 1 && stats.aperture_fills >= 3, "{stats:?}");
+}
+
+#[test]
+fn code_rewritten_through_the_aperture_is_translated_again() {
+    let mut code = vec![
+        0xbf, 0x00, 0x00, 0x80, 0x00, // mov edi, 0x800000
+        0xc6, 0x47, 0x01, 0x01, // mov byte [edi+1], 1
+    ];
+    code.extend([0x46; 32]); // inc esi, past the interpreter's tail
+    code.extend([
+        0xbb, 0x00, 0x00, 0x03, 0x00, // mov ebx, 0x30000
+        0xff, 0xd3, // call ebx
+        0x89, 0xc2, // mov edx, eax
+        0xc6, 0x47, 0x01, 0x02, // mov byte [edi+1], 2
+    ]);
+    code.extend([0x46; 32]);
+    code.extend([0xff, 0xd3, 0xf4]); // call ebx; hlt
+    let (_, _, cpu) = compare_with_aperture(&code, |bus| {
+        bus.ram.as_mut_slice()[0x30000..0x30006].copy_from_slice(&[0xb8, 0, 0, 0, 0, 0xc3]); // mov eax, imm; ret
+    });
+    assert_eq!((cpu.regs[2], cpu.regs[0]), (1, 2));
 }
