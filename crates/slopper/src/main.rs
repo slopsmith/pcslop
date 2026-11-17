@@ -338,7 +338,8 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
             && !irq_due
         {
             let t = Instant::now();
-            let r = j.run(&mut cpu, &mut board);
+            let fb = board.framebuffer();
+            let r = unsafe { j.set_framebuffer(fb) }.and_then(|_| j.run(&mut cpu, &mut board));
             time.jit += t.elapsed();
             match r {
                 Ok(jit::RunExit::Kicked) => {}
@@ -563,6 +564,9 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
         }
         if Instant::now() >= next_frame {
             next_frame = Instant::now() + Duration::from_millis(16);
+            if jit.as_mut().is_some_and(|j| j.take_framebuffer_written().unwrap_or(true)) {
+                board.framebuffer_written();
+            }
             if board.display_changed()
                 && let Some((w, h)) = board.render(&mut scratch)
             {

@@ -436,6 +436,18 @@ impl Board {
         self.vga.take_changed()
     }
 
+    /// The display's linear framebuffer: its guest physical base, host memory
+    /// and size, while the guest has it decoded.
+    pub fn framebuffer(&mut self) -> Option<(u32, *mut u8, usize)> {
+        let base = self.display().mem_bar(0)?;
+        Some((base, self.vga.vram_ptr(), vga::VRAM_SIZE))
+    }
+
+    /// Notes that the guest wrote the framebuffer through a direct mapping.
+    pub fn framebuffer_written(&mut self) {
+        self.vga.mark_changed();
+    }
+
     /// Inserts an ISO image into the CD-ROM drive on the secondary master.
     pub fn attach_cdrom(&mut self, path: &str) -> std::io::Result<()> {
         let b = ide::FileBackend::open(path, true)?;

@@ -60,9 +60,14 @@ fn run_interp(cpu: &mut Cpu, bus: &mut FlatBus) {
 }
 
 fn run_jit(cpu: &mut Cpu, bus: &mut FlatBus) -> Stats {
+    run_jit_with(cpu, bus, |_| {}, |_| {})
+}
+
+fn run_jit_with(cpu: &mut Cpu, bus: &mut FlatBus, before: impl FnOnce(&mut Jit), after: impl FnOnce(&mut Jit)) -> Stats {
     let _vm = VM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut jit = unsafe { Jit::new(bus.ram.as_ptr(), RAM).unwrap() };
     jit.vm_fill = true;
+    before(&mut jit);
     let kicker = jit.kicker();
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop = done.clone();
@@ -87,6 +92,7 @@ fn run_jit(cpu: &mut Cpu, bus: &mut FlatBus) -> Stats {
         }
     }
     assert!(cpu.halted, "JIT run did not reach HLT; eip {:#x} {:?}", cpu.eip, jit.stats);
+    after(&mut jit);
     jit.stats
 }
 
@@ -1286,4 +1292,38 @@ fn rdtsc_reads_the_host_clock_without_leaving_translated_code() {
     let second = (cpu.regs[2] as u64) << 32 | cpu.regs[0] as u64;
     assert!(before <= first && first <= second && second <= after, "the guest TSC must agree with the host clock and never run backwards: {before} {first} {second} {after}");
     assert_eq!(stats.interp_exits, 1, "Linux reads the TSC constantly for scheduling, so RDTSC must not exit: {stats:?}");
+}
+
+#[test]
+fn framebuffer_writes_skip_the_host_and_are_reported_once() {
+    let code = [
+        0xbf, 0x00, 0x00, 0x00, 0xe0, // mov edi, 0xe0000000
+        0xb8, 0x44, 0x33, 0x22, 0x11, // mov eax, 0x11223344
+        0x89, 0x07, // mov [edi], eax
+        0x89, 0x87, 0x00, 0x30, 0x00, 0x00, // mov [edi+0x3000], eax
+        0x8b, 0x1f, // mov ebx, [edi]
+        0xf4,
+    ];
+    let len = 1 << 20;
+    let layout = std::alloc::Layout::from_size_align(len, 16 << 10).unwrap();
+    let fb = unsafe { std::alloc::alloc_zeroed(layout) };
+    let _free = scopeguard(move || unsafe { std::alloc::dealloc(fb, layout) });
+    let mut cpu = flat_cpu(0x1000, 0x8000);
+    let mut bus = bus_with(0x1000, &code);
+    let mut reports = Vec::new();
+    let stats = run_jit_with(
+        &mut cpu,
+        &mut bus,
+        |j| unsafe { j.set_framebuffer(Some((0xe000_0000, fb, len))).unwrap() },
+        |j| {
+            reports.push(j.take_framebuffer_written().unwrap());
+            reports.push(j.take_framebuffer_written().unwrap());
+        },
+    );
+    let pixels = unsafe { std::slice::from_raw_parts(fb, len) };
+    assert_eq!(&pixels[..4], &[0x44, 0x33, 0x22, 0x11]);
+    assert_eq!(&pixels[0x3000..0x3004], &[0x44, 0x33, 0x22, 0x11]);
+    assert_eq!(cpu.regs[3], 0x1122_3344);
+    assert_eq!(stats.mmio_exits, 0, "framebuffer stores must not leave the VM, or drawing crawls: {stats:?}");
+    assert_eq!(reports, [true, false], "the display must redraw after writes, and only then");
 }

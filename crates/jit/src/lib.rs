@@ -317,7 +317,8 @@ pub struct Jit {
     /// translated block, or a runtime offset (negative keys, 64-byte buckets).
     pc_samples: HashMap<i64, u64>,
     /// Declared last so it is dropped after the vCPU.
-    _vm: Vm,
+    vm: Vm,
+    fb: Option<Framebuffer>,
 }
 
 /// Offset of the two-entry lookup bucket for `key`; the runtime's dispatcher
@@ -325,6 +326,20 @@ pub struct Jit {
 fn bucket(key: u64) -> usize {
     let shift = 64 - (layout::LOOKUP_ENTRIES.trailing_zeros() - 1);
     layout::LOOKUP + ((key.wrapping_mul(runtime::HASH_MUL) >> shift) as usize) * 32
+}
+
+struct Framebuffer {
+    ipa: u64,
+    host: usize,
+    len: usize,
+    /// Mapped writable after a write fault, until the renderer takes it.
+    written: bool,
+}
+
+impl Framebuffer {
+    fn contains(&self, ipa: u64) -> bool {
+        (self.ipa..self.ipa + self.len as u64).contains(&ipa)
+    }
 }
 
 /// Blocks are looked up by physical address, linear page (their code embeds
@@ -417,7 +432,8 @@ impl Jit {
             audit_every: std::env::var("SLOPPER_JIT_AUDIT").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1),
             audit_tick: 0,
             audit_seen: HashSet::default(),
-            _vm: vm,
+            vm,
+            fb: None,
         };
         for t in &mut jit.shadow {
             t.flush(jit.mem.as_mut_slice());
@@ -596,6 +612,36 @@ impl Jit {
         };
         *self.pc_samples.entry(key).or_default() += 1;
         Ok(())
+    }
+
+    /// Maps a display's framebuffer (guest physical base, host memory, size)
+    /// so translated code accesses it without exits, or unmaps it with `None`.
+    /// The first write after each `take_framebuffer_written` faults once to
+    /// record it.
+    ///
+    /// # Safety
+    /// The host memory must stay valid and 16 KiB aligned while mapped.
+    pub unsafe fn set_framebuffer(&mut self, fb: Option<(u32, *mut u8, usize)>) -> hvf::Result<()> {
+        let want = fb.map(|(ipa, host, len)| (ipa as u64, host as usize, len));
+        if self.fb.as_ref().map(|f| (f.ipa, f.host, f.len)) == want {
+            return Ok(());
+        }
+        if let Some(f) = self.fb.take() {
+            self.vm.unmap(f.ipa, f.len)?;
+        }
+        if let Some((ipa, host, len)) = want {
+            unsafe { self.vm.map(host as *mut u8, ipa, len, mem::READ)? };
+            self.fb = Some(Framebuffer { ipa, host, len, written: false });
+        }
+        Ok(())
+    }
+
+    /// True if translated code wrote the framebuffer since the last call.
+    pub fn take_framebuffer_written(&mut self) -> hvf::Result<bool> {
+        let Some(f) = self.fb.as_mut().filter(|f| f.written) else { return Ok(false) };
+        self.vm.protect(f.ipa, f.len, mem::READ)?;
+        f.written = false;
+        Ok(true)
     }
 
     /// x86 instructions retired by translated code so far.
@@ -1143,6 +1189,12 @@ impl Jit {
                     // The vCPU may have stopped mid-block with guest state still in
                     // registers; let it run to the next dispatch, which saves it.
                     self.state().pending = 1;
+                    at_dispatch = false;
+                }
+                Exit::Exception { ipa, .. } if exit.ec() == Some(0x24) && self.fb.as_ref().is_some_and(|f| f.contains(ipa)) => {
+                    let f = self.fb.as_mut().unwrap();
+                    self.vm.protect(f.ipa, f.len, mem::READ | mem::WRITE)?;
+                    f.written = true;
                     at_dispatch = false;
                 }
                 Exit::Exception { syndrome, ipa, .. } if exit.ec() == Some(0x24) => {
