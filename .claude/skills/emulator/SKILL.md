@@ -25,7 +25,7 @@ scripts/vm build        # nix develop + cargo into target/work, signed copy at t
 ## Run and drive
 
 ```sh
-scripts/vm start xp --hda "$img"                    # headless, no sound, socket $TMPDIR/vm-xp.sock
+scripts/vm start xp --hda "$img"                    # headless, no sound, socket in the per-user temp dir
 scripts/vm shot xp                                  # prints the PNG path; look at it with Read
 scripts/vm ctl xp "key enter" "type hello" status   # any control-socket commands
 scripts/vm wait-text xp "boot:" 90                  # text-mode screens only

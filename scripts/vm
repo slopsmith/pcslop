@@ -23,19 +23,22 @@ build      builds inside nix develop into target/work and installs a signed copy
 start      starts NAME headless in the background, without sound unless VM_AUDIO=1, killed
            after VM_TIMEOUT seconds (default 1800); waits up to 20 s for its control socket
 ctl        sends control-socket commands (scripts/ctl) to NAME
-shot       saves a screenshot (default \$TMPDIR/vm-NAME.png) and prints its path
+shot       saves a screenshot (default $tmp/vm-NAME.png) and prints its path
 wait-text  polls NAME's text screen until TEXT shows up, for at most SECONDS (default 60)
 status     prints the status report
 log        prints the last LINES (default 30) of NAME's log
 stop       quits NAME, killing it after 5 s if it does not exit
 
-Each run uses \$TMPDIR/vm-NAME.sock and \$TMPDIR/vm-NAME.log.
+Each run uses $tmp/vm-NAME.sock and $tmp/vm-NAME.log (the per-user temp directory, even inside nix develop).
 EOF
 	exit 2
 }
 
-sock() { echo "${TMPDIR%/}/vm-$1.sock"; }
-log() { echo "${TMPDIR%/}/vm-$1.log"; }
+# nix develop moves TMPDIR, so sockets live in the per-user temp directory.
+tmp=$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || echo "${TMPDIR:-/tmp}")
+tmp=${tmp%/}
+sock() { echo "$tmp/vm-$1.sock"; }
+log() { echo "$tmp/vm-$1.log"; }
 
 alive() { pgrep -f -- "--control $(sock "$1")" >/dev/null; }
 
@@ -87,7 +90,7 @@ ctl)
 	;;
 shot)
 	[ $# -ge 1 ] || usage
-	out=${2:-${TMPDIR%/}/vm-$1.png}
+	out=${2:-$tmp/vm-$1.png}
 	case $out in /*) ;; *) out=$PWD/$out ;; esac
 	"$root/scripts/ctl" "$(sock "$1")" "shot $out" >/dev/null
 	for _ in $(seq 25); do

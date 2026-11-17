@@ -15,6 +15,8 @@ import tempfile
 args = sys.argv[1:]
 if args and os.path.exists(args[0]) and stat.S_ISSOCK(os.stat(args[0]).st_mode):
     path = args.pop(0)
+elif args and ("/" in args[0] or args[0].endswith(".sock")):
+    sys.exit(f"no control socket at {args[0]}")
 else:
     socks = glob.glob(os.path.join(tempfile.gettempdir(), "86slopper-*.sock"))
     path = None
