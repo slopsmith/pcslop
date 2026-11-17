@@ -12,6 +12,7 @@
 mod memory;
 mod render;
 mod timing;
+mod vram;
 pub mod vbe;
 
 #[cfg(test)]
@@ -26,7 +27,7 @@ const SEQ_MASK: [u8; 8] = [0x03, 0x3d, 0x0f, 0x3f, 0x0e, 0x00, 0x00, 0xff];
 const GFX_MASK: [u8; 16] = [0x0f, 0x0f, 0x0f, 0x1f, 0x03, 0x7b, 0x0f, 0x0f, 0xff, 0, 0, 0, 0, 0, 0, 0];
 
 pub struct Vga {
-    vram: Vec<u8>,
+    vram: vram::Vram,
     misc: u8,
     feature: u8,
     subsys: u8,
@@ -65,7 +66,7 @@ impl Default for Vga {
 impl Vga {
     pub fn new() -> Self {
         Vga {
-            vram: vec![0; VRAM_SIZE],
+            vram: vram::Vram::new(VRAM_SIZE),
             misc: 0,
             feature: 0,
             subsys: 0,
@@ -110,6 +111,17 @@ impl Vga {
     pub fn vram_mut(&mut self) -> &mut [u8] {
         self.changed = true;
         &mut self.vram
+    }
+
+    /// Notes that VRAM was written behind the emulator's back, e.g. by a
+    /// guest that has it mapped directly.
+    pub fn mark_changed(&mut self) {
+        self.changed = true;
+    }
+
+    /// Where VRAM lives in host memory, 16 KiB aligned, for mapping it into a VM.
+    pub fn vram_ptr(&mut self) -> *mut u8 {
+        self.vram.as_mut_ptr()
     }
 
     /// I/O base of the CRTC and input status 1: 0x3D0 in color mode, 0x3B0 in mono.
