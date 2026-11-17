@@ -1,4 +1,5 @@
 mod keys;
+mod vnc;
 
 use std::collections::VecDeque;
 use std::io::BufRead;
@@ -26,10 +27,11 @@ struct Args {
     exit_on_text: Option<String>,
     script: Option<PathBuf>,
     control: Option<PathBuf>,
+    vnc: Option<String>,
 }
 
 const USAGE: &str = "usage: slopper --bios <bios.bin> [--vgabios <vgabios.bin>] [--cdrom <iso>] [--hda <img>] \
-[--ram MiB] [--headless] [--jit] [--screenshot SECONDS:PATH]... [--exit-on-text TEXT] [--script FILE] [--control SOCKET] [--max-instructions N]";
+[--ram MiB] [--headless] [--jit] [--screenshot SECONDS:PATH]... [--exit-on-text TEXT] [--script FILE] [--control SOCKET] [--vnc [ADDR:]PORT] [--max-instructions N]";
 
 fn parse_args() -> Result<Args, String> {
     let mut args = Args {
@@ -45,6 +47,7 @@ fn parse_args() -> Result<Args, String> {
         exit_on_text: None,
         script: None,
         control: None,
+        vnc: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -63,6 +66,7 @@ fn parse_args() -> Result<Args, String> {
             "--exit-on-text" => args.exit_on_text = Some(value()?),
             "--script" => args.script = Some(PathBuf::from(value()?)),
             "--control" => args.control = Some(PathBuf::from(value()?)),
+            "--vnc" => args.vnc = Some(vnc::parse_addr(&value()?)?),
             "--screenshot" => {
                 let v = value()?;
                 let (secs, path) = v.split_once(':').ok_or("--screenshot needs SECONDS:PATH")?;
@@ -845,6 +849,18 @@ fn main() -> ExitCode {
     let (tx, rx) = channel();
     let headless = args.headless || !cfg!(feature = "window");
     let control_path = args.control.clone().unwrap_or_else(|| std::env::temp_dir().join(format!("86slopper-{}.sock", std::process::id())));
+    if let Some(addr) = &args.vnc {
+        let listener = match std::net::TcpListener::bind(addr) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("cannot listen for VNC on {addr}: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        eprintln!("VNC server on {addr}");
+        let (tx, shared) = (tx.clone(), shared.clone());
+        std::thread::spawn(move || vnc::serve(listener, tx, shared));
+    }
     let emu_shared = shared.clone();
     let emu = std::thread::spawn(move || emulate(args, cfg, rx, emu_shared));
 
