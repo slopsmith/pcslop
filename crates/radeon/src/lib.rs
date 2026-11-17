@@ -10,6 +10,7 @@ mod cp;
 mod crtc;
 mod ddc;
 mod engine;
+mod i2c;
 mod mem;
 mod names;
 pub mod regs;
@@ -78,6 +79,7 @@ pub struct Radeon {
     int_status: u32,
     cp: cp::Cp,
     engine: engine::Engine,
+    i2c: i2c::I2cEngine,
     /// The monitor on the VGA connector's DDC lines.
     monitor: ddc::Ddc,
     trace: Option<Trace>,
@@ -97,6 +99,7 @@ impl Radeon {
             int_status: 0,
             cp: cp::Cp::default(),
             engine: engine::Engine::default(),
+            i2c: i2c::I2cEngine::default(),
             monitor: ddc::Ddc::default(),
             trace: None,
         };
@@ -111,6 +114,7 @@ impl Radeon {
         self.int_status = 0;
         self.cp = cp::Cp::default();
         self.engine = engine::Engine::default();
+        self.i2c = i2c::I2cEngine::default();
         for r in [DEFAULT_SC_BOTTOM_RIGHT, SC_BOTTOM_RIGHT] {
             self.regs[r as usize / 4] = 0x1fff_1fff;
             self.engine_register_written(r, 0x1fff_1fff);
@@ -355,6 +359,7 @@ impl Radeon {
             }
             GEN_INT_STATUS => self.gen_int_status(),
             CP_RB_RPTR => self.cp_rptr(),
+            I2C_DATA => self.i2c.pop() as u32,
             CP_STAT | CP_CSQ_STAT => 0,
             RB2D_DSTCACHE_CTLSTAT
             | DSTCACHE_CTLSTAT
@@ -439,6 +444,15 @@ impl Radeon {
             _ => {}
         }
         self.regs[reg as usize / 4] = new;
+        match reg {
+            I2C_CNTL_0 => {
+                let cntl0 = self.i2c.control(new, self.reg(I2C_CNTL_1), self.monitor.edid());
+                self.regs[reg as usize / 4] = cntl0;
+                return;
+            }
+            I2C_DATA => return self.i2c.push(new as u8),
+            _ => {}
+        }
         if self.cp_register_written(reg, mem) || self.engine_register_written(reg, new) {
             return;
         }

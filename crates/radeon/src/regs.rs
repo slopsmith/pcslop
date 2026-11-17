@@ -179,3 +179,15 @@ pub const R300_RB3D_DSTCACHE_CTLSTAT: u32 = 0x4e4c;
 pub const R300_RB3D_ZCACHE_CTLSTAT: u32 = 0x4f18;
 /// RB2D_DC_BUSY and its 3D equivalents.
 pub const CACHE_BUSY: u32 = 1 << 31;
+pub const I2C_CNTL_0: u32 = 0x0090;
+pub const I2C_DONE: u32 = 1 << 0;
+pub const I2C_NACK: u32 = 1 << 1;
+pub const I2C_HALT: u32 = 1 << 2;
+pub const I2C_SOFT_RST: u32 = 1 << 5;
+pub const I2C_START: u32 = 1 << 8;
+pub const I2C_STOP: u32 = 1 << 9;
+pub const I2C_RECEIVE: u32 = 1 << 10;
+pub const I2C_ABORT: u32 = 1 << 11;
+pub const I2C_GO: u32 = 1 << 12;
+pub const I2C_CNTL_1: u32 = 0x0094;
+pub const I2C_DATA: u32 = 0x0098;

@@ -298,3 +298,44 @@ fn edid_lists_the_common_lower_modes() {
         .collect();
     assert_eq!(standard, [(1280, 1024), (1280, 800), (1440, 900)]);
 }
+
+fn i2c_read(r: &mut Radeon, from: u8, count: u32) -> (u32, Vec<u8>) {
+    let start = I2C_GO | I2C_START | 1 << 6;
+    r.mmio_write(I2C_CNTL_0, 4, I2C_DONE | I2C_NACK | I2C_HALT | I2C_SOFT_RST, &mut NoBus);
+    r.mmio_write(I2C_DATA, 1, 0xa0, &mut NoBus);
+    r.mmio_write(I2C_DATA, 1, from as u32, &mut NoBus);
+    r.mmio_write(I2C_CNTL_1, 4, 1 << 17 | 1 << 16 | 0x100 | 1, &mut NoBus);
+    r.mmio_write(I2C_CNTL_0, 4, start, &mut NoBus);
+    r.mmio_write(I2C_CNTL_0, 4, I2C_DONE | I2C_NACK | I2C_HALT | I2C_SOFT_RST, &mut NoBus);
+    r.mmio_write(I2C_DATA, 1, 0xa1, &mut NoBus);
+    r.mmio_write(I2C_CNTL_1, 4, 1 << 17 | 1 << 16 | 0x100 | count, &mut NoBus);
+    r.mmio_write(I2C_CNTL_0, 4, start | I2C_STOP | I2C_RECEIVE, &mut NoBus);
+    let status = r.mmio_read(I2C_CNTL_0, 4);
+    (status, (0..count).map(|_| r.mmio_read(I2C_DATA, 1) as u8).collect())
+}
+
+#[test]
+fn the_i2c_engine_reads_the_edid_in_chunks() {
+    let mut r = card();
+    let (status, head) = i2c_read(&mut r, 0, 8);
+    assert_eq!(status & (I2C_GO | I2C_DONE | I2C_NACK), I2C_DONE);
+    assert_eq!(head, ddc::edid()[..8]);
+    let (_, more) = i2c_read(&mut r, 0x36, 4);
+    assert_eq!(more, ddc::edid()[0x36..0x3a]);
+}
+
+#[test]
+fn the_i2c_engine_nacks_absent_devices() {
+    let mut r = card();
+    r.mmio_write(I2C_DATA, 1, 0xa4, &mut NoBus);
+    r.mmio_write(I2C_CNTL_1, 4, 1, &mut NoBus);
+    r.mmio_write(I2C_CNTL_0, 4, I2C_GO | I2C_START | I2C_STOP, &mut NoBus);
+    assert_eq!(r.mmio_read(I2C_CNTL_0, 4) & (I2C_GO | I2C_DONE | I2C_NACK), I2C_NACK);
+}
+
+#[test]
+fn an_i2c_abort_drops_go_at_once() {
+    let mut r = card();
+    r.mmio_write(I2C_CNTL_0 + 1, 1, (I2C_GO | I2C_ABORT) >> 8, &mut NoBus);
+    assert_eq!(r.mmio_read(I2C_CNTL_0 + 1, 1) & (I2C_GO | I2C_ABORT) >> 8, 0);
+}

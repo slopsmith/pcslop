@@ -81,6 +81,9 @@ pub fn detailed_timing(t: &Timing, size_mm: (u32, u32)) -> [u8; 18] {
     ]
 }
 
+/// The monitor's EDID EEPROM on the DDC bus.
+pub const EDID_ADDRESS: u8 = 0x50;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum State {
     Idle,
@@ -122,6 +125,10 @@ impl Default for Ddc {
 }
 
 impl Ddc {
+    pub fn edid(&self) -> &[u8; 128] {
+        &self.edid
+    }
+
     /// Level of SDA, which the master and the responder both pull down.
     pub fn sda_line(&self) -> bool {
         self.sda && !self.hold
@@ -162,7 +169,7 @@ impl Ddc {
         match self.state {
             State::Address | State::Write if self.clocks == 8 => {
                 if self.state == State::Address {
-                    if self.shift >> 1 == 0x50 {
+                    if self.shift >> 1 == EDID_ADDRESS {
                         self.reading_next = self.shift & 1 != 0;
                         self.hold = true;
                     } else {
