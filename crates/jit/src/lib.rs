@@ -630,7 +630,10 @@ impl Jit {
         cpu.regs = s.regs;
         cpu.eip = s.eip;
         let (if_flag, df) = (s.if_flag != 0, s.df != 0);
-        cpu.eflags = s.merge_eflags(cpu.eflags);
+        {
+            use x86::cpu::flags::{ARITH, DF, IF};
+            cpu.eflags = s.merge_eflags(cpu.eflags) & (ARITH | IF | DF) | s.eflags_rest;
+        }
         cpu.set_flag(x86::cpu::flags::IF, if_flag);
         cpu.set_flag(x86::cpu::flags::DF, df);
         cpu.xmm = s.xmm;

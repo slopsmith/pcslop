@@ -181,6 +181,24 @@ fn call_and_return() {
     compare(&code, |_| {});
 }
 
+#[test]
+fn popf_changes_to_ac_and_id_reach_the_cpu() {
+    let code = [
+        0x9c, // pushfd
+        0x81, 0x34, 0x24, 0x00, 0x00, 0x24, 0x00, // xor dword [esp], AC | ID
+        0x9d, // popfd
+        0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // run on in translated code
+        0xf4,
+    ];
+    let mut a = flat_cpu(0x1000, 0x8000);
+    let mut b = a.clone();
+    let mut bus_a = bus_with(0x1000, &code);
+    let mut bus_b = bus_with(0x1000, &code);
+    run_interp(&mut a, &mut bus_a);
+    run_jit(&mut b, &mut bus_b);
+    assert_eq!(a.eflags, b.eflags);
+}
+
 struct Rng(u64);
 
 impl Rng {
@@ -209,7 +227,30 @@ fn random_insn(rng: &mut Rng, out: &mut Vec<u8>) {
         out.push(reg << 3 | 5);
         out.extend((0x3000 + slot * 4).to_le_bytes());
     };
-    match rng.below(38) {
+    match rng.below(40) {
+        38 | 39 => match rng.below(7) {
+            0 => out.extend([[0x06, 0x0e, 0x1e][rng.below(3) as usize], 0x58 + rng.reg()]),
+            1 => out.extend([0x0f, [0xa0, 0xa8][rng.below(2) as usize], 0x58 + rng.reg()]),
+            2 => {
+                out.extend([0x50 + rng.reg(), 0x8f]);
+                if rng.below(2) == 0 {
+                    out.push(modrm_rr(0, rng.reg()));
+                } else {
+                    mem(out, 0, rng.below(4));
+                }
+            }
+            3 => out.extend([0x60, 0x83, 0xc0 + rng.reg(), rng.next() as u8, 0x61]),
+            4 => out.push(0x90 + rng.reg()),
+            5 => out.extend([0xf7, modrm_rr(4 + rng.below(2) as u8, rng.below(8) as u8)]),
+            _ => {
+                out.extend([0x0f, 0xbc + rng.below(2) as u8]);
+                if rng.below(2) == 0 {
+                    out.push(modrm_rr(rng.reg(), rng.reg()));
+                } else {
+                    mem(out, rng.reg(), rng.below(4));
+                }
+            }
+        },
         36 | 37 => match rng.below(9) {
             0 => out.extend([0x0f, 0xc8 + rng.reg()]),
             1 => {

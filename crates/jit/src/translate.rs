@@ -1395,6 +1395,112 @@ impl Emit {
                 self.a.movz(Size::W, T_B, if op == 0xf8 { 2 } else { 0 }, 0);
                 self.a.rmif(T_B, 0, 0b0010);
             }
+            0x06 | 0x0e | 0x1e | 0x1a0 | 0x1a8 if op32 => {
+                let at = match op {
+                    0x06 => state::ES_SEL,
+                    0x0e => state::CS_SEL,
+                    0x1e => state::DS_SEL,
+                    0x1a0 => state::FS_SEL,
+                    _ => state::GS_SEL,
+                };
+                self.a.ldr(Width::W, T_A, STATE, at as i32);
+                self.push(T_A);
+            }
+            0x8f if op32 && insn.reg() == 0 => {
+                let esp = guest_reg(4);
+                match insn.mem {
+                    Some(m) if m.base != 4 && m.index != 4 => {
+                        if !self.ea(insn, &m) {
+                            return Step::Unsupported;
+                        }
+                        self.a.mov(Size::X, T_E, T_ADDR);
+                        self.load(Width::W, T_B);
+                        self.store(Width::W, T_B);
+                        self.a.mov(Size::W, T_ADDR, esp);
+                        self.load(Width::W, T_A);
+                        self.a.mov(Size::X, T_ADDR, T_E);
+                        self.store(Width::W, T_A);
+                        self.a.add_imm(Size::W, esp, esp, 4);
+                    }
+                    Some(_) => return Step::Unsupported,
+                    None => {
+                        self.a.mov(Size::W, T_ADDR, esp);
+                        self.load(Width::W, T_A);
+                        self.a.add_imm(Size::W, esp, esp, 4);
+                        self.a.mov(Size::W, guest_reg(insn.rm()), T_A);
+                    }
+                }
+            }
+            0x60 if op32 => {
+                let esp = guest_reg(4);
+                self.a.mov(Size::W, T_B, esp);
+                for r in 0..8 {
+                    self.a.sub_imm(Size::W, T_ADDR, T_B, 4 * (r as u32 + 1));
+                    self.store(Width::W, if r == 4 { T_B } else { guest_reg(r) });
+                }
+                self.a.mov(Size::W, esp, T_ADDR);
+            }
+            0x61 if op32 => {
+                let esp = guest_reg(4);
+                for r in (0..8).filter(|&r| r != 4) {
+                    self.a.add_imm(Size::W, T_ADDR, esp, 28 - 4 * r as u32);
+                    self.load(Width::W, guest_reg(r));
+                }
+                self.a.add_imm(Size::W, esp, esp, 32);
+            }
+            0x91..=0x97 if op32 => {
+                let r = guest_reg((op & 7) as usize);
+                self.a.mov(Size::W, T_A, guest_reg(0));
+                self.a.mov(Size::W, guest_reg(0), r);
+                self.a.mov(Size::W, r, T_A);
+            }
+            0xf7 if op32 && matches!(insn.reg(), 4 | 5) => {
+                let Some(b) = self.rm32(insn) else { return Step::Unsupported };
+                let (eax, edx) = (guest_reg(0), guest_reg(2));
+                let signed = insn.reg() == 5;
+                if signed {
+                    self.a.smull(T_RES, eax, b);
+                } else {
+                    self.a.umull(T_RES, eax, b);
+                }
+                if self.need != 0 {
+                    if signed {
+                        self.a.addsub_ext(Size::X, true, true, ZR, T_RES, T_RES, Extend::Sxtw, 0);
+                    } else {
+                        self.a.lsr_imm(Size::X, T_C, T_RES, 32);
+                        self.a.cmp_imm(Size::X, T_C, 0);
+                    }
+                    self.a.cset(Size::W, T_B, Cond::Ne);
+                    self.a.tst(Size::W, T_RES, T_RES);
+                    self.a.movz(Size::W, T_C, 2, 0);
+                    self.a.sub(Size::W, T_C, T_C, T_B);
+                    self.a.rmif(T_C, 0, 0b0011);
+                    self.a.mov(Size::W, PF_RESULT, T_RES);
+                    self.a.mov(Size::W, AF_AUX, ZR);
+                }
+                self.a.lsr_imm(Size::X, edx, T_RES, 32);
+                self.a.mov(Size::W, eax, T_RES);
+            }
+            0x1bc | 0x1bd if op32 => {
+                let Some(v) = self.rm_w(insn, Ow::D, false) else { return Step::Unsupported };
+                let (zero, done) = (self.a.label(), self.a.label());
+                self.a.cbz(Size::W, v, zero);
+                if op == 0x1bc {
+                    self.a.rbit(Size::W, T_B, v);
+                    self.a.clz(Size::W, guest_reg(insn.reg()), T_B);
+                } else {
+                    self.a.clz(Size::W, T_B, v);
+                    self.a.movz(Size::W, T_C, 31, 0);
+                    self.a.sub(Size::W, guest_reg(insn.reg()), T_C, T_B);
+                }
+                self.a.movz(Size::W, T_C, 0, 0);
+                self.a.rmif(T_C, 0, 0b0100);
+                self.a.b(done);
+                self.a.bind(zero);
+                self.a.movz(Size::W, T_C, 4, 0);
+                self.a.rmif(T_C, 0, 0b0100);
+                self.a.bind(done);
+            }
             0x07 | 0x1f | 0x1a1 | 0x1a9 => {
                 let seg = match op {
                     0x07 => 0,
@@ -1585,15 +1691,18 @@ impl Emit {
         let slow = self.a.label();
         self.a.mov(Size::W, T_ADDR, esp);
         self.load(Width::W, T_A);
-        let mut fixed = flags::TF | flags::NT | flags::RF | flags::AC | flags::ID;
+        let mut rest = flags::NT | flags::RF | flags::AC | flags::ID;
         if !self.user {
-            fixed |= flags::IOPL;
+            rest |= flags::IOPL;
         }
         self.a.ldr(Width::W, T_B, STATE, state::EFLAGS_REST as i32);
-        self.a.eor(Size::W, T_B, T_B, T_A);
-        self.a.mov_imm(Size::W, T_C, fixed as u64);
-        self.a.and(Size::W, T_B, T_B, T_C);
-        self.a.cbnz(Size::W, T_B, slow);
+        self.a.eor(Size::W, T_C, T_B, T_A);
+        self.a.tbnz(T_C, flags::TF.trailing_zeros(), slow);
+        self.a.mov_imm(Size::W, T_C, rest as u64);
+        self.a.bic(Size::W, T_B, T_B, T_C);
+        self.a.and(Size::W, T_C, T_A, T_C);
+        self.a.orr(Size::W, T_B, T_B, T_C);
+        self.a.str(Width::W, T_B, STATE, state::EFLAGS_REST as i32);
         self.a.add_imm(Size::W, esp, esp, 4);
         self.a.ubfx(Size::W, T_C, T_A, 7, 1);
         self.a.ubfx(Size::W, T_B, T_A, 6, 1);
