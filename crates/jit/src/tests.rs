@@ -1266,3 +1266,24 @@ fn code_mapped_at_two_linear_addresses_pushes_each_return_address() {
     assert_eq!((a.regs[3], a.regs[0]), (0x2005, 0x5005));
     assert_eq!(b.regs, a.regs);
 }
+
+#[test]
+fn rdtsc_reads_the_host_clock_without_leaving_translated_code() {
+    let mut code = vec![
+        0x0f, 0x31, // rdtsc
+        0x89, 0xc6, // mov esi, eax
+        0x89, 0xd7, // mov edi, edx
+    ];
+    code.extend([0x40; 16]); // inc eax, past the interpreter's tail
+    code.extend([0x0f, 0x31, 0xf4]); // rdtsc; hlt
+    let mut cpu = flat_cpu(0x1000, 0x8000);
+    cpu.start_host_tsc();
+    let mut bus = bus_with(0x1000, &code);
+    let before = cpu.read_tsc();
+    let stats = run_jit(&mut cpu, &mut bus);
+    let after = cpu.read_tsc();
+    let first = (cpu.regs[7] as u64) << 32 | cpu.regs[6] as u64;
+    let second = (cpu.regs[2] as u64) << 32 | cpu.regs[0] as u64;
+    assert!(before <= first && first <= second && second <= after, "the guest TSC must agree with the host clock and never run backwards: {before} {first} {second} {after}");
+    assert_eq!(stats.interp_exits, 1, "Linux reads the TSC constantly for scheduling, so RDTSC must not exit: {stats:?}");
+}

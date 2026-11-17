@@ -929,6 +929,15 @@ impl Emit {
             }
             0x98 if op32 => self.a.sxth(Size::W, guest_reg(0), guest_reg(0)),
             0x99 if op32 => self.a.asr_imm(Size::W, guest_reg(2), guest_reg(0), 31),
+            0x131 if !self.user => {
+                self.a.mrs(T_A, a64::sysreg::CNTVCT_EL0);
+                self.a.ldr(Width::X, T_B, STATE, state::TSC_ORIGIN as i32);
+                self.a.sub(Size::X, T_A, T_A, T_B);
+                self.a.ldr(Width::X, T_B, STATE, state::TSC_MUL as i32);
+                self.a.mul(Size::X, T_A, T_A, T_B);
+                self.a.mov(Size::W, guest_reg(0), T_A);
+                self.a.lsr_imm(Size::X, guest_reg(2), T_A, 32);
+            }
             0xa0..=0xa3 => {
                 if !insn.addr32 {
                     return Step::Unsupported;

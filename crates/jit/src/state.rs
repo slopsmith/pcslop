@@ -154,6 +154,9 @@ pub struct State {
     /// SYSENTER and SYSEXIT switch trees without an exit.
     pub ttbr0: [u64; 2],
     pub roots: [u64; 2],
+    /// The TSC is (CNTVCT_EL0 - tsc_origin) * tsc_mul, as in `Cpu::read_tsc`.
+    pub tsc_origin: u64,
+    pub tsc_mul: u64,
     pub dr: [u32; 8],
     /// Set by translated code after LLDT loaded the null selector in `ldtr_sel`.
     pub ldtr_nulled: u32,
@@ -210,6 +213,8 @@ pub const SYSENTER_EIP: usize = offset_of!(State, sysenter_eip);
 pub const CR0: usize = offset_of!(State, cr0);
 pub const TTBR0: usize = offset_of!(State, ttbr0);
 pub const ROOTS: usize = offset_of!(State, roots);
+pub const TSC_ORIGIN: usize = offset_of!(State, tsc_origin);
+pub const TSC_MUL: usize = offset_of!(State, tsc_mul);
 pub const DR: usize = offset_of!(State, dr);
 pub const LDTR_NULLED: usize = offset_of!(State, ldtr_nulled);
 pub const LDTR_SEL: usize = offset_of!(State, ldtr_sel);

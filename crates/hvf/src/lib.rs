@@ -49,6 +49,7 @@ mod ffi {
         pub fn hv_vcpu_run(vcpu: HvVcpu) -> HvReturn;
         pub fn hv_vcpus_exit(vcpus: *const HvVcpu, count: u32) -> HvReturn;
         pub fn hv_vcpu_set_pending_interrupt(vcpu: HvVcpu, kind: u32, pending: bool) -> HvReturn;
+        pub fn hv_vcpu_set_vtimer_offset(vcpu: HvVcpu, offset: u64) -> HvReturn;
     }
 
     unsafe extern "C" {
@@ -323,6 +324,11 @@ impl Vcpu {
     /// Sets or clears a pending IRQ (`fiq` false) or FIQ for the next `run`.
     pub fn set_pending_interrupt(&self, fiq: bool, pending: bool) -> Result<()> {
         check(unsafe { ffi::hv_vcpu_set_pending_interrupt(self.id, fiq as u32, pending) })
+    }
+
+    /// Makes the guest's CNTVCT_EL0 read `mach_absolute_time() - offset`.
+    pub fn set_vtimer_offset(&self, offset: u64) -> Result<()> {
+        check(unsafe { ffi::hv_vcpu_set_vtimer_offset(self.id, offset) })
     }
 
     /// Selects x86-TSO memory ordering (ACTLR_EL1.EnTSO, macOS 15+).

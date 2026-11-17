@@ -433,6 +433,7 @@ impl Jit {
         v.set_sys_reg(sysreg::VBAR_EL1, layout::va(layout::VECTORS))?;
         v.set_sys_reg(sysreg::SP_EL1, layout::va(layout::STACK_TOP))?;
         v.set_sys_reg(sysreg::CPACR_EL1, 3 << 20)?;
+        v.set_vtimer_offset(0)?;
         v.set_sys_reg(sysreg::SCTLR_EL1, 0x30d0_0800 | 1 | 1 << 2 | 1 << 12)?;
         v.set_reg(reg::CPSR, 0x3c5)?;
         v.set_reg(reg::PC, layout::va(entries.resume))?;
@@ -689,6 +690,8 @@ impl Jit {
         s.cr4 = cpu.cr4;
         s.ttbr0 = ttbr0;
         s.roots = roots;
+        s.tsc_origin = cpu.tsc_origin;
+        s.tsc_mul = cpu.tsc_mul;
         s.dr = cpu.dr;
         s.ldtr_nulled = 0;
         s.sse_fp_ok = (sse_ok && afp && cpu.mxcsr & 0x1f80 == 0x1f80) as u32;
