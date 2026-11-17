@@ -1,11 +1,12 @@
 //! A VNC (RFB 3.8) server that shows the guest screen and feeds keyboard and
 //! pointer input back into the guest.
 
+mod des;
 mod keysym;
 mod proto;
 
 use std::collections::HashMap;
-use std::io::{self, BufReader, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -15,6 +16,10 @@ use std::time::Duration;
 use proto::{ClientMsg, ENC_DESKTOP_SIZE, PixelFormat, Rect};
 
 use crate::{Event, Shared, pixel_to_tablet};
+
+/// Environment variable holding the VNC password. Without it the server
+/// asks for no authentication.
+pub const PASSWORD_VAR: &str = "SLOPPER_VNC_PASSWORD";
 
 const DEFAULT_SIZE: (u32, u32) = (720, 400);
 
@@ -32,13 +37,13 @@ pub fn parse_addr(v: &str) -> Result<String, String> {
 }
 
 /// Accepts VNC clients on `listener` until the process exits.
-pub fn serve(listener: TcpListener, tx: Sender<Event>, shared: Arc<Shared>) {
+pub fn serve(listener: TcpListener, tx: Sender<Event>, shared: Arc<Shared>, password: Option<String>) {
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
-        let (tx, shared) = (tx.clone(), shared.clone());
+        let (tx, shared, password) = (tx.clone(), shared.clone(), password.clone());
         std::thread::spawn(move || {
             let peer = conn.peer_addr().map_or_else(|_| "?".into(), |a| a.to_string());
-            match client(conn, tx, shared) {
+            match client(conn, tx, shared, password) {
                 Ok(()) => eprintln!("vnc: {peer} disconnected"),
                 Err(e) => eprintln!("vnc: {peer}: {e}"),
             }
@@ -46,17 +51,24 @@ pub fn serve(listener: TcpListener, tx: Sender<Event>, shared: Arc<Shared>) {
     }
 }
 
+fn random_challenge() -> io::Result<[u8; 16]> {
+    let mut c = [0; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut c)?;
+    Ok(c)
+}
+
 fn pack_size(w: u32, h: u32) -> u32 {
     (w << 16) | h
 }
 
-fn client(mut conn: TcpStream, tx: Sender<Event>, shared: Arc<Shared>) -> io::Result<()> {
+fn client(mut conn: TcpStream, tx: Sender<Event>, shared: Arc<Shared>, password: Option<String>) -> io::Result<()> {
     conn.set_nodelay(true)?;
     let (w, h) = {
         let f = shared.frame.lock().unwrap();
         if f.width == 0 { DEFAULT_SIZE } else { (f.width, f.height) }
     };
-    proto::handshake(&mut conn, (w as u16, h as u16), "86slopper")?;
+    let pw = password.as_deref().map(str::as_bytes);
+    proto::handshake(&mut conn, pw, random_challenge()?, (w as u16, h as u16), "86slopper")?;
 
     let size = Arc::new(AtomicU32::new(pack_size(w, h)));
     let (msg_tx, msg_rx) = channel();
@@ -283,7 +295,6 @@ impl Session {
 mod tests {
     use super::*;
     use crate::Frame;
-    use std::io::Read;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU64};
 
@@ -431,7 +442,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = channel();
         let shared = shared.clone();
-        std::thread::spawn(move || serve(listener, tx, shared));
+        std::thread::spawn(move || serve(listener, tx, shared, None));
         let mut s = TcpStream::connect(addr).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         read_n::<12>(&mut s);

@@ -857,9 +857,16 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        eprintln!("VNC server on {addr}");
+        let password = std::env::var(vnc::PASSWORD_VAR).ok().filter(|p| !p.is_empty());
+        let local = listener.local_addr().is_ok_and(|a| a.ip().is_loopback());
+        match &password {
+            Some(p) if p.len() > 8 => eprintln!("vnc: only the first 8 bytes of {} count", vnc::PASSWORD_VAR),
+            None if !local => eprintln!("vnc: warning: anyone who can reach {addr} gets the VM; set {}", vnc::PASSWORD_VAR),
+            _ => {}
+        }
+        eprintln!("VNC server on {addr}{}", if password.is_some() { " (password set)" } else { "" });
         let (tx, shared) = (tx.clone(), shared.clone());
-        std::thread::spawn(move || vnc::serve(listener, tx, shared));
+        std::thread::spawn(move || vnc::serve(listener, tx, shared, password));
     }
     let emu_shared = shared.clone();
     let emu = std::thread::spawn(move || emulate(args, cfg, rx, emu_shared));

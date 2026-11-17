@@ -7,6 +7,7 @@ pub const ENC_RAW: i32 = 0;
 pub const ENC_DESKTOP_SIZE: i32 = -223;
 
 const SEC_NONE: u8 = 1;
+const SEC_VNC_AUTH: u8 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rect {
@@ -132,26 +133,49 @@ fn client_version(reply: &[u8; 12]) -> io::Result<u32> {
     }
 }
 
-/// Runs the handshake up to and including ServerInit, offering no
-/// authentication. Returns an error if the client breaks the protocol.
-pub fn handshake<S: Read + Write>(s: &mut S, size: (u16, u16), name: &str) -> io::Result<()> {
+/// Runs the handshake up to and including ServerInit. With a password, the
+/// client must answer `challenge` with `vnc_auth_response`. Returns an error
+/// if the client fails authentication or breaks the protocol.
+pub fn handshake<S: Read + Write>(
+    s: &mut S,
+    password: Option<&[u8]>,
+    challenge: [u8; 16],
+    size: (u16, u16),
+    name: &str,
+) -> io::Result<()> {
     s.write_all(b"RFB 003.008\n")?;
     let mut reply = [0; 12];
     s.read_exact(&mut reply)?;
     let minor = client_version(&reply)?;
+    let sec = if password.is_some() { SEC_VNC_AUTH } else { SEC_NONE };
     if minor == 3 {
-        s.write_all(&(SEC_NONE as u32).to_be_bytes())?;
+        s.write_all(&(sec as u32).to_be_bytes())?;
     } else {
-        s.write_all(&[1, SEC_NONE])?;
-        if read_u8(s)? != SEC_NONE {
+        s.write_all(&[1, sec])?;
+        let chosen = read_u8(s)?;
+        if chosen != sec {
             if minor == 8 {
                 write_failure(s, "unsupported security type")?;
             }
             return Err(invalid("client chose an unsupported security type"));
         }
-        if minor == 8 {
-            s.write_all(&0u32.to_be_bytes())?;
+    }
+    if let Some(pw) = password {
+        s.write_all(&challenge)?;
+        let mut response = [0; 16];
+        s.read_exact(&mut response)?;
+        if response != super::des::vnc_auth_response(pw, &challenge) {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            if minor == 8 {
+                write_failure(s, "authentication failed")?;
+            } else {
+                s.write_all(&1u32.to_be_bytes())?;
+            }
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "authentication failed"));
         }
+        s.write_all(&0u32.to_be_bytes())?;
+    } else if minor == 8 {
+        s.write_all(&0u32.to_be_bytes())?;
     }
     let _shared = read_u8(s)?;
     let mut init = Vec::with_capacity(24 + name.len());
@@ -354,7 +378,7 @@ mod tests {
     #[test]
     fn handshake_without_password_on_3_8() {
         let mut p = Pipe::new(b"RFB 003.008\n\x01\x01");
-        handshake(&mut p, (720, 400), "vm").unwrap();
+        handshake(&mut p, None, [0; 16], (720, 400), "vm").unwrap();
         let mut want = b"RFB 003.008\n\x01\x01\0\0\0\0".to_vec();
         want.extend(server_init(720, 400, "vm"));
         assert_eq!(p.output, want);
@@ -363,7 +387,7 @@ mod tests {
     #[test]
     fn handshake_without_password_on_3_3() {
         let mut p = Pipe::new(b"RFB 003.003\n\x01");
-        handshake(&mut p, (640, 480), "vm").unwrap();
+        handshake(&mut p, None, [0; 16], (640, 480), "vm").unwrap();
         let mut want = b"RFB 003.008\n\0\0\0\x01".to_vec();
         want.extend(server_init(640, 480, "vm"));
         assert_eq!(p.output, want);
@@ -372,21 +396,57 @@ mod tests {
     #[test]
     fn handshake_treats_apple_version_as_3_8() {
         let mut p = Pipe::new(b"RFB 003.889\n\x01\x01");
-        handshake(&mut p, (720, 400), "vm").unwrap();
+        handshake(&mut p, None, [0; 16], (720, 400), "vm").unwrap();
         assert_eq!(&p.output[12..18], b"\x01\x01\0\0\0\0");
+    }
+
+    #[test]
+    fn handshake_with_the_right_password() {
+        let challenge = *b"0123456789abcdef";
+        let mut input = b"RFB 003.008\n\x02".to_vec();
+        input.extend(crate::vnc::des::vnc_auth_response(b"secret", &challenge));
+        input.push(1);
+        let mut p = Pipe::new(&input);
+        handshake(&mut p, Some(b"secret"), challenge, (720, 400), "vm").unwrap();
+        let mut want = b"RFB 003.008\n\x01\x02".to_vec();
+        want.extend(challenge);
+        want.extend([0, 0, 0, 0]);
+        want.extend(server_init(720, 400, "vm"));
+        assert_eq!(p.output, want);
+    }
+
+    #[test]
+    fn handshake_with_a_wrong_password_fails_with_a_reason() {
+        let challenge = *b"0123456789abcdef";
+        let mut input = b"RFB 003.008\n\x02".to_vec();
+        input.extend(crate::vnc::des::vnc_auth_response(b"guess", &challenge));
+        let mut p = Pipe::new(&input);
+        let e = handshake(&mut p, Some(b"secret"), challenge, (720, 400), "vm").unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        let tail = &p.output[12 + 2 + 16..];
+        assert_eq!(&tail[..4], &[0, 0, 0, 1]);
+        let len = u32::from_be_bytes(tail[4..8].try_into().unwrap()) as usize;
+        assert_eq!(tail.len(), 8 + len);
+    }
+
+    #[test]
+    fn handshake_rejects_no_auth_when_a_password_is_set() {
+        let mut p = Pipe::new(b"RFB 003.008\n\x01");
+        assert!(handshake(&mut p, Some(b"secret"), [0; 16], (720, 400), "vm").is_err());
+        assert_eq!(&p.output[14..18], &[0, 0, 0, 1]);
     }
 
     #[test]
     fn handshake_rejects_other_security_types() {
         let mut p = Pipe::new(b"RFB 003.008\n\x02");
-        assert!(handshake(&mut p, (720, 400), "vm").is_err());
+        assert!(handshake(&mut p, None, [0; 16], (720, 400), "vm").is_err());
         assert_eq!(&p.output[14..18], &[0, 0, 0, 1]);
     }
 
     #[test]
     fn handshake_rejects_other_protocols() {
         let mut p = Pipe::new(b"GET / HTTP/1");
-        assert!(handshake(&mut p, (720, 400), "vm").is_err());
+        assert!(handshake(&mut p, None, [0; 16], (720, 400), "vm").is_err());
     }
 
     #[test]
