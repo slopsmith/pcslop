@@ -74,6 +74,24 @@ A plain host-side interpreter comes first, for three reasons:
 - **Configuration:** goes through QEMU's `fw_cfg` interface (I/O ports `0x510`/`0x511`), so SeaBIOS can run its QEMU code path unchanged.
 - **ACPI:** current SeaBIOS no longer builds ACPI tables itself. We build ACPI 1.0b tables (RSDP, RSDT, FADT, FACS and a DSDT encoded by a small AML builder in `crates/pc/src/acpi`) and pass them through `fw_cfg` as QEMU does: `etc/acpi/tables`, `etc/acpi/rsdp`, and the linker/loader script `etc/table-loader`. The DSDT has the PCI root with `_PRT` and PIRQ link devices, the ISA devices, a control-method power button on GPE0 bit 0, and `\_S5`.
   - A PIIX4 power management function at 00:01.3 holds PM1 event and control, the PM timer and GPE0 at I/O 0x600 (where SeaBIOS puts them when a table loader exists), with the SCI on IRQ 9. Writing SLP_EN with the S5 sleep type ends the run, and the control socket's `power` presses the power button.
+  - A control-method battery `\_SB.BAT0` (`PNP0C0A`) and AC adapter `\_SB.AC` (`ACPI0003`) mirror the Mac's power state. A helper thread reads IOKit's power-source API and the `AppleSmartBattery` registry entry every 2 s; capacities are in mAh, and the remaining capacity follows the percentage macOS shows. The AML reads twelve 32-bit registers at I/O 0x640..0x66F:
+
+    | Offset | Field | Contents |
+    |---|---|---|
+    | 0x00 | PSTS | bit 0 battery present, bit 1 AC online |
+    | 0x04 | PEVT | pending events, write 1 to clear: bit 0 AC, bit 1 battery status, bit 2 battery info |
+    | 0x08 | BSTA | `_BST` state: bit 0 discharging, bit 1 charging, bit 2 critical |
+    | 0x0C | BRAT | present rate (mA), 0xFFFFFFFF if unknown |
+    | 0x10 | BRCP | remaining capacity (mAh) |
+    | 0x14 | BPVL | present voltage (mV) |
+    | 0x18 | BDCP | design capacity (mAh) |
+    | 0x1C | BFCP | last full charge capacity (mAh) |
+    | 0x20 | BDVL | design voltage (mV) |
+    | 0x24 | BWRN | warning capacity (10% of full) |
+    | 0x28 | BLOW | low capacity (2% of full) |
+    | 0x2C | BGRN | granularity (1% of full) |
+
+    A change in AC state, charge state, presence, capacity or whole percent sets PEVT bits and raises GPE0 bit 1, and `\_GPE._E01` sends `Notify(AC, 0x80)`, `Notify(BAT0, 0x80)` or `Notify(BAT0, 0x81)` for each bit. `--battery host|off|PERCENT[:ac]` picks the source at start (`off` means no battery, on AC), and the control socket's `battery` shows it or changes it with the same argument.
   - XP was installed with **no ACPI and no MP table** ("Standard PC" HAL, PIC + PIT). An installed XP keeps its HAL, so neither the ACPI tables nor the MP table SeaBIOS now builds changes it.
   - With the APICs present, a MADT lists the local APIC, the I/O APIC, IRQ 0 on input 2 and level-triggered IRQs 5, 9, 10 and 11, and the DSDT declares the CPU as `\_PR.CPU0`. A fresh XP install then picks the ACPI Uniprocessor HAL.
 - **Interrupt controllers:** two 8259s, a local APIC at `0xFEE00000` and an 82093AA I/O APIC at `0xFEC00000`. ISA IRQs drive both the 8259s and the I/O APIC (IRQ 0 on input 2, as in QEMU); PIRQA..D also drive I/O APIC inputs 16..19. The 8259 reaches the CPU through LINT0 set up as ExtINT, which SeaBIOS does. The APIC timer runs from a 100 MHz bus clock and is polled with the other timers. SeaBIOS builds the MP table from what it reads back.

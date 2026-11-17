@@ -373,6 +373,12 @@ mod tests {
     }
 
     #[test]
+    fn dsdt_declares_a_control_method_battery_and_an_ac_adapter() {
+        assert!(dsdt_contains(&aml::name("_HID", aml::eisaid("PNP0C0A"))));
+        assert!(dsdt_contains(&aml::name("_HID", aml::string("ACPI0003"))));
+    }
+
+    #[test]
     fn prt_routes_pins_like_the_board() {
         let slot1_intd = aml::package([aml::int(0x1_ffff), aml::int(3), aml::path("LNKD"), aml::int(0)]);
         assert!(dsdt_contains(&slot1_intd));

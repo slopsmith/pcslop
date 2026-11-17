@@ -2,6 +2,7 @@
 
 pub mod acpi;
 pub mod apic;
+pub mod battery;
 pub mod fdc;
 pub mod fw_cfg;
 pub mod i8042;
@@ -28,6 +29,7 @@ pub struct Config {
     pub apic: bool,
     pub chipset: Chipset,
     pub gpu: Gpu,
+    pub power: battery::Power,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -115,6 +117,7 @@ pub struct Board {
     ac97: Option<(usize, ac97::Ac97)>,
     /// The network card and its index in `pci`, if one is plugged in.
     nic: Option<(usize, net::Rtl8139)>,
+    power: battery::PowerDevice,
     vgabios: Vec<u8>,
     pub debugcon: Box<dyn Write + Send>,
     start: Instant,
@@ -194,6 +197,7 @@ impl Board {
             pm: pm::Pm::default(),
             ac97: None,
             nic: None,
+            power: battery::PowerDevice::new(cfg.power),
             vgabios: Vec::new(),
             debugcon: Box::new(std::io::stdout()),
             start: Instant::now(),
@@ -393,6 +397,18 @@ impl Board {
     pub fn power_button(&mut self) {
         self.pm.raise_gpe(pm::GPE_POWER_BUTTON);
         self.sync_sci();
+    }
+
+    /// Updates the battery and AC adapter, raising a GPE if the guest should look again.
+    pub fn set_power(&mut self, power: battery::Power) {
+        if self.power.set(power) {
+            self.pm.raise_gpe(pm::GPE_BATTERY);
+            self.sync_sci();
+        }
+    }
+
+    pub fn power(&self) -> battery::Power {
+        self.power.power()
     }
 
     /// Timer interrupts not yet delivered; it grows when the guest falls behind.
@@ -956,6 +972,7 @@ impl Board {
             nic.reset();
         }
         self.pm.reset();
+        self.power.reset();
         self.sci = false;
         self.pci[PM].1 = pm::config_space();
         self.pit = pit::Pit::default();
@@ -1175,6 +1192,9 @@ impl Bus for Board {
         if let Some(off) = self.nic_port(port) {
             return self.nic_read(off, size);
         }
+        if (battery::BASE..battery::BASE + battery::LEN).contains(&port) {
+            return self.power.read(port - battery::BASE, size);
+        }
         self.ide.set_bus_master_base(self.pci[IDE].1.io_bar(4));
         if let Some(v) = self.ide.io_read(port, size) {
             self.sync_ide();
@@ -1255,6 +1275,10 @@ impl Bus for Board {
         }
         if let Some(off) = self.nic_port(port) {
             return self.nic_write(off, size, value);
+        }
+        if (battery::BASE..battery::BASE + battery::LEN).contains(&port) {
+            self.power.write(port - battery::BASE, size, value);
+            return;
         }
         self.ide.set_bus_master_base(self.pci[IDE].1.io_bar(4));
         if self.ide.io_write(port, size, value, &mut RamDma(&mut self.ram[..], &mut self.code_watch)) {
@@ -1346,7 +1370,21 @@ mod tests {
     use super::*;
 
     fn board() -> Board {
-        Board::new(Config { ram_bytes: 1 << 20, bios: vec![0; 0x2_0000], vgabios: None, apic: true, chipset: Chipset::I440fx, gpu: Gpu::StdVga })
+        Board::new(Config { ram_bytes: 1 << 20, bios: vec![0; 0x2_0000], vgabios: None, apic: true, chipset: Chipset::I440fx, gpu: Gpu::StdVga, power: battery::Power::default() })
+    }
+
+    #[test]
+    fn a_battery_change_raises_the_sci_through_gpe0_and_shows_in_the_window() {
+        let mut b = board();
+        b.pci[PM].1.write(pm::PMBA, 4, acpi::PM_BASE as u32 | 1);
+        b.pci[PM].1.write(pm::PMREGMISC, 1, 1);
+        let gpe0_en = acpi::PM_BASE + pm::reg::GPE0_EN;
+        b.io_write(gpe0_en, 1, 1 << pm::GPE_BATTERY);
+        b.set_power(battery::Power { ac_online: false, battery: Some(battery::Battery::fake(42, false)) });
+        assert!(b.sci);
+        let window = |r| battery::BASE + r;
+        assert_eq!(b.io_read(window(battery::reg::STATUS), 4), battery::status::BATTERY_PRESENT);
+        assert_eq!(b.io_read(window(battery::reg::EVENTS), 4), battery::event::AC | battery::event::BATTERY_STATUS | battery::event::BATTERY_INFO);
     }
 
     #[test]
@@ -1549,6 +1587,7 @@ mod tests {
             bios: vec![0; 0x2_0000],
             vgabios: None,
             apic: true,
+            power: battery::Power::default(),
             chipset: Chipset::I440bx,
             gpu: Gpu::Radeon { rom: vec![0x55, 0xaa], trace: None },
         })

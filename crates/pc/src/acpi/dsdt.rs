@@ -1,9 +1,12 @@
 //! The DSDT body: the PCI root with its interrupt routing, the legacy ISA
-//! devices, the power button and the S5 sleep state. The PCI link devices and
-//! `_PRT` follow QEMU's i440FX DSDT in `hw/i386/acpi-build.c` and
-//! `hw/isa/piix.c` (Igor Mammedov, Michael S. Tsirkin and the QEMU authors).
+//! devices, the power button, the battery and AC adapter, and the S5 sleep
+//! state. The PCI link devices and `_PRT` follow QEMU's i440FX DSDT in
+//! `hw/i386/acpi-build.c` and `hw/isa/piix.c` (Igor Mammedov, Michael S.
+//! Tsirkin and the QEMU authors). The battery follows the control-method
+//! battery of ACPI 1.0b section 11.2.
 
-use super::aml::{self, Aml, RegionSpace, res};
+use super::aml::{self, Access, Aml, RegionSpace, res};
+use crate::battery::{self, event, reg, status};
 use crate::pci;
 use crate::pm;
 
@@ -18,22 +21,26 @@ pub fn body(ram_bytes: u32, layout: super::Layout) -> Aml {
             "\\_SB",
             [
                 pci_root(ram_bytes, layout),
-                aml::field("PCI0.ISA.P40C", &[("PRQ0", 8), ("PRQ1", 8), ("PRQ2", 8), ("PRQ3", 8)]),
+                aml::field("PCI0.ISA.P40C", aml::Access::Byte, &[("PRQ0", 8), ("PRQ1", 8), ("PRQ2", 8), ("PRQ3", 8)]),
                 link_status_method(),
                 link_current_settings_method(),
             ]
             .into_iter()
             .chain((0..4).map(link_device))
-            .chain([sci_link(), aml::device("PWRB", [aml::name("_HID", aml::eisaid("PNP0C0C"))])]),
+            .chain([sci_link(), aml::device("PWRB", [aml::name("_HID", aml::eisaid("PNP0C0C"))])])
+            .chain(power_devices()),
         ),
         aml::scope(
             "\\_GPE",
-            [aml::method(
-                &format!("_E{:02X}", pm::GPE_POWER_BUTTON),
-                0,
-                false,
-                [aml::notify(aml::path("\\_SB.PWRB"), aml::int(0x80))],
-            )],
+            [
+                aml::method(
+                    &format!("_E{:02X}", pm::GPE_POWER_BUTTON),
+                    0,
+                    false,
+                    [aml::notify(aml::path("\\_SB.PWRB"), aml::int(0x80))],
+                ),
+                power_event_method(),
+            ],
         ),
         aml::name("\\_S5", aml::package([aml::int(pm::SLP_TYP_SOFF as u64), aml::int(0), aml::int(0), aml::int(0)])),
     ]
@@ -176,4 +183,155 @@ fn sci_link() -> Aml {
             aml::method("_SRS", 1, false, []),
         ],
     )
+}
+
+/// (field name, register) in window order, as `Field` needs them.
+const POWER_FIELDS: [(&str, u16); 12] = [
+    ("PSTS", reg::STATUS),
+    ("PEVT", reg::EVENTS),
+    ("BSTA", reg::STATE),
+    ("BRAT", reg::RATE),
+    ("BRCP", reg::REMAINING),
+    ("BPVL", reg::VOLTAGE),
+    ("BDCP", reg::DESIGN_CAPACITY),
+    ("BFCP", reg::FULL_CAPACITY),
+    ("BDVL", reg::DESIGN_VOLTAGE),
+    ("BWRN", reg::WARNING),
+    ("BLOW", reg::LOW),
+    ("BGRN", reg::GRANULARITY),
+];
+
+const POWER_UNIT_MAH: u64 = 1;
+const TECHNOLOGY_RECHARGEABLE: u64 = 1;
+const STA_ABSENT_BATTERY: u64 = 0x0f;
+const STA_PRESENT_BATTERY: u64 = 0x1f;
+
+/// `Store(field, Index(package, i))` for each (field, i), then `Return(package)`.
+fn fill_package(package: &str, fields: &[(&str, u64)]) -> Vec<Aml> {
+    let stores = fields.iter().map(|&(f, i)| aml::store(aml::path(f), aml::index(aml::path(package), aml::int(i))));
+    stores.chain([aml::ret(aml::path(package))]).collect()
+}
+
+fn power_devices() -> Vec<Aml> {
+    let fields: Vec<(&str, usize)> = POWER_FIELDS.iter().map(|&(n, _)| (n, 32)).collect();
+    let unknown = || aml::int(0xffff_ffff);
+    let bif = aml::package([
+        aml::int(POWER_UNIT_MAH),
+        unknown(),
+        unknown(),
+        aml::int(TECHNOLOGY_RECHARGEABLE),
+        unknown(),
+        aml::int(0),
+        aml::int(0),
+        aml::int(0),
+        aml::int(0),
+        aml::string("SLOP-1"),
+        aml::string("86"),
+        aml::string("LION"),
+        aml::string("86slopper"),
+    ]);
+    let bif_fields = [("BDCP", 1), ("BFCP", 2), ("BDVL", 4), ("BWRN", 5), ("BLOW", 6), ("BGRN", 7), ("BGRN", 8)];
+    let bst_fields = [("BSTA", 0), ("BRAT", 1), ("BRCP", 2), ("BPVL", 3)];
+    let powered = || aml::name("_PCL", aml::package([aml::path("\\_SB")]));
+    vec![
+        aml::op_region("PWRR", RegionSpace::SystemIo, battery::BASE as u64, battery::LEN as u64),
+        aml::field("PWRR", Access::DWord, &fields),
+        aml::device(
+            "BAT0",
+            [
+                aml::name("_HID", aml::eisaid("PNP0C0A")),
+                aml::name("_UID", aml::int(1)),
+                powered(),
+                aml::method(
+                    "_STA",
+                    0,
+                    false,
+                    [
+                        aml::if_(aml::and(aml::path("PSTS"), aml::int(status::BATTERY_PRESENT as u64)), [aml::ret(aml::int(STA_PRESENT_BATTERY))]),
+                        aml::ret(aml::int(STA_ABSENT_BATTERY)),
+                    ],
+                ),
+                aml::name("PBIF", bif),
+                aml::method("_BIF", 0, true, fill_package("PBIF", &bif_fields)),
+                aml::name("PBST", aml::package([aml::int(0), aml::int(0), aml::int(0), aml::int(0)])),
+                aml::method("_BST", 0, true, fill_package("PBST", &bst_fields)),
+            ],
+        ),
+        aml::device(
+            "AC",
+            [
+                aml::name("_HID", aml::string("ACPI0003")),
+                powered(),
+                aml::method(
+                    "_PSR",
+                    0,
+                    false,
+                    [
+                        aml::if_(aml::and(aml::path("PSTS"), aml::int(status::AC_ONLINE as u64)), [aml::ret(aml::int(1))]),
+                        aml::ret(aml::int(0)),
+                    ],
+                ),
+            ],
+        ),
+    ]
+}
+
+/// Acknowledges the pending events in the window and sends each its notification.
+fn power_event_method() -> Aml {
+    let notify_if = |bit: u32, device: &str, code: u64| {
+        aml::if_(aml::and(aml::local(0), aml::int(bit as u64)), [aml::notify(aml::path(device), aml::int(code))])
+    };
+    aml::method(
+        &format!("_E{:02X}", pm::GPE_BATTERY),
+        0,
+        false,
+        [
+            aml::store(aml::path("\\_SB.PEVT"), aml::local(0)),
+            aml::store(aml::local(0), aml::path("\\_SB.PEVT")),
+            notify_if(event::AC, "\\_SB.AC", 0x80),
+            notify_if(event::BATTERY_STATUS, "\\_SB.BAT0", 0x80),
+            notify_if(event::BATTERY_INFO, "\\_SB.BAT0", 0x81),
+        ],
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    #[test]
+    fn power_fields_cover_the_register_window_in_order() {
+        let offsets: Vec<u16> = POWER_FIELDS.iter().map(|&(_, r)| r).collect();
+        let expected: Vec<u16> = (0..battery::LEN).step_by(4).collect();
+        assert_eq!(offsets, expected);
+    }
+
+    #[test]
+    fn battery_status_method_matches_iasl() {
+        let iasl = hex(
+            "143d5f42535408704253544188504253540000704252415488504253540100704252435088504253540a0200704250564c88504253540a0300a450425354",
+        );
+        assert!(power_devices().concat().windows(iasl.len()).any(|w| w == iasl));
+    }
+
+    #[test]
+    fn ac_power_source_method_matches_iasl() {
+        let iasl = hex("14145f50535200a00b7b505354530a0200a401a400");
+        assert!(power_devices().concat().windows(iasl.len()).any(|w| w == iasl));
+    }
+
+    #[test]
+    fn power_event_handler_matches_iasl() {
+        let iasl = hex(concat!(
+            "144a055f45303100705c2e5f53425f504556546070605c2e5f53425f50455654",
+            "a0127b600100865c2e5f53425f41435f5f0a80",
+            "a0137b600a0200865c2e5f53425f424154300a80",
+            "a0137b600a0400865c2e5f53425f424154300a81",
+        ));
+        assert_eq!(power_event_method(), iasl);
+    }
 }

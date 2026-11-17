@@ -1,4 +1,5 @@
 mod audio;
+mod host_power;
 mod keys;
 mod vnc;
 
@@ -11,6 +12,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use pc::battery::{Battery, Power};
 use pc::{Board, Config};
 use x86::cpu::Cpu;
 use x86::interp::{Exit, step};
@@ -38,12 +40,57 @@ struct Args {
     audio_wav: Option<PathBuf>,
     audio_silent: bool,
     net: Option<net::user::UserNet>,
+    battery: BatterySource,
+}
+
+#[derive(Clone, Copy)]
+enum BatterySource {
+    Host,
+    Fixed(Power),
+}
+
+const BATTERY_USAGE: &str = "host | off | PERCENT[:ac]";
+
+/// `host` mirrors the Mac, `off` has no battery on AC power, and `PERCENT`
+/// is a fixed level, discharging unless followed by `:ac`.
+fn parse_battery(spec: &str) -> Result<BatterySource, String> {
+    let bad = || format!("battery must be {BATTERY_USAGE}, not {spec:?}");
+    match spec {
+        "host" => Ok(BatterySource::Host),
+        "off" => Ok(BatterySource::Fixed(Power::default())),
+        _ => {
+            let (level, ac) = match spec.strip_suffix(":ac") {
+                Some(level) => (level, true),
+                None => (spec, false),
+            };
+            let percent: u8 = level.parse().ok().filter(|&p| p <= 100).ok_or_else(bad)?;
+            Ok(BatterySource::Fixed(Power { ac_online: ac, battery: Some(Battery::fake(percent, ac)) }))
+        }
+    }
+}
+
+fn describe_power(p: &Power) -> String {
+    let ac = if p.ac_online { "AC online" } else { "AC offline" };
+    let Some(b) = p.battery else {
+        return format!("{ac}, no battery");
+    };
+    let direction = if b.charging { "charging" } else if p.ac_online { "idle" } else { "discharging" };
+    let rate = b.rate_ma.map_or("unknown rate".into(), |r| format!("{r} mA"));
+    format!(
+        "{ac}, battery {}% {direction} at {rate}: {}/{} mAh (design {} mAh), {} mV (design {} mV)",
+        b.percent(),
+        b.remaining_mah,
+        b.full_mah,
+        b.design_mah,
+        b.present_mv,
+        b.design_mv
+    )
 }
 
 const USAGE: &str = "usage: slopper --bios <bios.bin> [--vgabios <vgabios.bin>] [--board fx|bx] \
 [--gpu stdvga|radeon --vga-rom <rom> [--gpu-trace PATH]] [--cdrom <iso>] [--hda <img>] \
 [--serial PATH|-] [--ram MiB] [--headless] [--jit] [--screenshot SECONDS:PATH]... [--exit-on-text TEXT] [--script FILE] [--control SOCKET] [--vnc [ADDR:]PORT] \
-[--audio ac97 [--audio-wav PATH] [--audio-silent]] [--net user[,hostfwd=tcp::HOSTPORT-:GUESTPORT]...] [--max-instructions N]";
+[--audio ac97 [--audio-wav PATH] [--audio-silent]] [--net user[,hostfwd=tcp::HOSTPORT-:GUESTPORT]...] [--battery host|off|PERCENT[:ac]] [--max-instructions N]";
 
 fn parse_args() -> Result<Args, String> {
     let mut args = Args {
@@ -64,6 +111,7 @@ fn parse_args() -> Result<Args, String> {
         exit_on_text: None,
         script: None,
         control: None,
+        battery: BatterySource::Host,
         vnc: None,
         audio: false,
         audio_wav: None,
@@ -104,6 +152,7 @@ fn parse_args() -> Result<Args, String> {
             "--exit-on-text" => args.exit_on_text = Some(value()?),
             "--script" => args.script = Some(PathBuf::from(value()?)),
             "--control" => args.control = Some(PathBuf::from(value()?)),
+            "--battery" => args.battery = parse_battery(&value()?)?,
             "--vnc" => args.vnc = Some(vnc::parse_addr(&value()?)?),
             "--audio" => match value()?.as_str() {
                 "ac97" => args.audio = true,
@@ -155,6 +204,8 @@ enum Event {
     /// A control-socket query answered by the emulator thread.
     Query(String, Sender<String>),
     PowerButton,
+    HostPower(Power),
+    Battery(BatterySource),
     Quit,
 }
 
@@ -396,6 +447,7 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
     let started = Instant::now();
     let mut executed: u64 = 0;
     let mut keyq = KeyQueue::default();
+    let mut mirror_host = matches!(args.battery, BatterySource::Host);
     let mut paused = false;
     let mut last_status = (Instant::now(), 0u64);
     let mut time = HostTime::default();
@@ -535,6 +587,10 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                     let answer = match cmd {
                         "screen" => text_screen(&mut board),
                         "regs" => format_regs(&cpu),
+                        "battery" => {
+                            let source = if mirror_host { "mirroring the host" } else { "fixed" };
+                            format!("{} ({source})", describe_power(&board.power()))
+                        }
                         "status" => {
                             let jit_insns = jit.as_mut().map_or(0, |j| j.instructions());
                             let total = executed + jit_insns;
@@ -658,6 +714,16 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                     let _ = reply.send(answer);
                 }
                 Event::PowerButton => board.power_button(),
+                Event::HostPower(p) => {
+                    if mirror_host {
+                        board.set_power(p);
+                    }
+                }
+                Event::Battery(BatterySource::Host) => mirror_host = true,
+                Event::Battery(BatterySource::Fixed(p)) => {
+                    mirror_host = false;
+                    board.set_power(p);
+                }
                 Event::Quit => break 'run ExitCode::SUCCESS,
             }
         }
@@ -803,7 +869,8 @@ fn control_server(path: PathBuf, tx: Sender<Event>) {
 /// once the emulator has stopped.
 fn run_command(line: &str, tx: &Sender<Event>) -> Option<String> {
     let cmd = line.split_whitespace().next().unwrap_or("");
-    if matches!(cmd, "screen" | "regs" | "status" | "pause" | "resume" | "mem" | "profile") {
+    let battery_query = cmd == "battery" && line.split_whitespace().nth(1).is_none();
+    if battery_query || matches!(cmd, "screen" | "regs" | "status" | "pause" | "resume" | "mem" | "profile") {
         let (rtx, rrx) = channel();
         tx.send(Event::Query(line.to_string(), rtx)).ok()?;
         return Some(rrx.recv_timeout(Duration::from_secs(10)).unwrap_or_else(|_| "no answer".into()));
@@ -853,9 +920,10 @@ fn command_event(line: &str) -> Result<Vec<Event>, String> {
             }
         }
         "power" => vec![Event::PowerButton],
+        "battery" => vec![Event::Battery(parse_battery(rest.trim())?)],
         "quit" => vec![Event::Quit],
         _ => {
-            return Err("commands: screen | status | regs | mem HEXADDR [LEN] | profile [on|off] | pause | resume | shot PATH | type TEXT | serial LINE | key NAME[+NAME] | mouse DX DY [BUTTONS] | tablet X Y [BUTTONS [WHEEL]] | power | quit\n\
+            return Err("commands: screen | status | regs | mem HEXADDR [LEN] | profile [on|off] | pause | resume | shot PATH | type TEXT | serial LINE | key NAME[+NAME] | mouse DX DY [BUTTONS] | tablet X Y [BUTTONS [WHEEL]] | power | battery [host|off|PERCENT[:ac]] | quit\n\
                  mouse sends relative PS/2 motion; tablet moves the USB tablet to guest screen pixel (X, Y)".into());
         }
     })
@@ -963,6 +1031,8 @@ fn picture_position(x: f32, y: f32, window: (usize, usize), picture: (usize, usi
     (to_tablet(x, ox, pw), to_tablet(y, oy, ph))
 }
 
+const HOST_POWER_INTERVAL: Duration = Duration::from_secs(2);
+
 fn main() -> ExitCode {
     let args = match parse_args() {
         Ok(a) => a,
@@ -1007,7 +1077,11 @@ fn main() -> ExitCode {
         _ => pc::Gpu::StdVga,
     };
     let chipset = args.board.unwrap_or(if args.radeon { pc::Chipset::I440bx } else { pc::Chipset::I440fx });
-    let cfg = Config { ram_bytes: args.ram_mb << 20, bios, vgabios, apic: true, chipset, gpu };
+    let power = match args.battery {
+        BatterySource::Host => host_power::read(),
+        BatterySource::Fixed(p) => p,
+    };
+    let cfg = Config { ram_bytes: args.ram_mb << 20, bios, vgabios, apic: true, chipset, gpu, power };
     let shared = Arc::new(Shared {
         frame: Mutex::new(Frame::default()),
         done: AtomicBool::new(false),
@@ -1035,6 +1109,7 @@ fn main() -> ExitCode {
         let (tx, shared) = (tx.clone(), shared.clone());
         std::thread::spawn(move || vnc::serve(listener, tx, shared, password));
     }
+    host_power::poll(HOST_POWER_INTERVAL, tx.clone(), Event::HostPower);
     let emu_shared = shared.clone();
     let emu = std::thread::spawn(move || emulate(args, cfg, rx, emu_shared));
 
@@ -1058,6 +1133,39 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixed(spec: &str) -> Power {
+        match parse_battery(spec) {
+            Ok(BatterySource::Fixed(p)) => p,
+            _ => panic!("{spec} should be a fixed battery"),
+        }
+    }
+
+    #[test]
+    fn a_bare_percentage_is_a_discharging_battery() {
+        let p = fixed("42");
+        assert!(!p.ac_online);
+        assert_eq!(p.battery.unwrap().percent(), 42);
+    }
+
+    #[test]
+    fn an_ac_suffix_charges_the_battery() {
+        let p = fixed("42:ac");
+        assert!(p.ac_online && p.battery.unwrap().charging);
+    }
+
+    #[test]
+    fn off_means_no_battery_on_ac() {
+        assert_eq!(fixed("off"), Power::default());
+    }
+
+    #[test]
+    fn battery_levels_above_100_or_garbage_are_rejected() {
+        for spec in ["101", "-1", "", "42:dc", "full"] {
+            assert!(parse_battery(spec).is_err(), "{spec:?} was accepted");
+        }
+        assert!(matches!(parse_battery("host"), Ok(BatterySource::Host)));
+    }
 
     #[test]
     fn pixels_map_to_tablet_coordinates() {

@@ -183,6 +183,12 @@ pub fn lless(a: Aml, b: Aml) -> Aml {
     concat([vec![0x95], a, b])
 }
 
+/// `Index(source, index)` with no target: a reference to one element, which
+/// `store` can write through.
+pub fn index(source: Aml, index: Aml) -> Aml {
+    concat([vec![0x88], source, index, vec![0]])
+}
+
 pub fn notify(object: Aml, value: Aml) -> Aml {
     concat([vec![0x86], object, value])
 }
@@ -202,11 +208,18 @@ pub fn op_region(path: &str, space: RegionSpace, offset: u64, len: u64) -> Aml {
     concat([vec![EXT_OP, 0x80], name_string(path), vec![space as u8], int(offset), int(len)])
 }
 
-/// A `Field` with byte access, no lock and the Preserve update rule, listing
-/// (name, width in bits) in order from offset 0.
-pub fn field(region: &str, fields: &[(&str, usize)]) -> Aml {
+#[derive(Clone, Copy)]
+#[repr(u8)]
+pub enum Access {
+    Byte = 1,
+    DWord = 3,
+}
+
+/// A `Field` with no lock and the Preserve update rule, listing (name, width
+/// in bits) in order from offset 0.
+pub fn field(region: &str, access: Access, fields: &[(&str, usize)]) -> Aml {
     let mut body = name_string(region);
-    body.push(0x01);
+    body.push(access as u8);
     for &(n, bits) in fields {
         body.extend(name_seg(n));
         let n = [1 << 6, 1 << 12, 1 << 20].iter().take_while(|&&limit| bits >= limit).count() + 1;
@@ -356,10 +369,30 @@ mod tests {
 
     #[test]
     fn fields_encode_bit_widths_without_counting_themselves() {
-        let f = field("P40C", &[("PRQ0", 8), ("PRQ1", 8)]);
+        let f = field("P40C", Access::Byte, &[("PRQ0", 8), ("PRQ1", 8)]);
         assert_eq!(f, [0x5b, 0x81, 0x10, b'P', b'4', b'0', b'C', 0x01, b'P', b'R', b'Q', b'0', 8, b'P', b'R', b'Q', b'1', 8]);
-        let wide = field("R", &[("BIG", 64)]);
+        let wide = field("R", Access::Byte, &[("BIG", 64)]);
         assert_eq!(&wide[wide.len() - 2..], [0x40, 0x04]);
+    }
+
+    #[test]
+    fn dword_field_over_an_io_region_matches_iasl() {
+        let region = op_region("BATR", RegionSpace::SystemIo, 0x640, 0x30);
+        assert_eq!(region, [0x5b, 0x80, b'B', b'A', b'T', b'R', 0x01, 0x0b, 0x40, 0x06, 0x0a, 0x30]);
+        let f = field("BATR", Access::DWord, &[("BSTS", 32), ("BEVT", 32)]);
+        assert_eq!(f, [0x5b, 0x81, 0x10, b'B', b'A', b'T', b'R', 0x03, b'B', b'S', b'T', b'S', 0x20, b'B', b'E', b'V', b'T', 0x20]);
+    }
+
+    #[test]
+    fn store_through_an_index_matches_iasl() {
+        let s = store(path("BSTS"), index(path("BSTP"), int(1)));
+        assert_eq!(s, [0x70, b'B', b'S', b'T', b'S', 0x88, b'B', b'S', b'T', b'P', 0x01, 0x00]);
+    }
+
+    #[test]
+    fn store_between_a_local_and_a_field_matches_iasl() {
+        assert_eq!(store(path("\\_SB.BEVT"), local(0)), [0x70, b'\\', 0x2e, b'_', b'S', b'B', b'_', b'B', b'E', b'V', b'T', 0x60]);
+        assert_eq!(store(local(0), path("\\_SB.BEVT")), [0x70, 0x60, b'\\', 0x2e, b'_', b'S', b'B', b'_', b'B', b'E', b'V', b'T']);
     }
 
     #[test]
