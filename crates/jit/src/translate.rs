@@ -1686,13 +1686,32 @@ impl Emit {
     /// POPF that leaves the system flags alone; anything else goes to the
     /// interpreter. In kernel mode IF may change, so the block ends at the dispatcher.
     fn popf(&mut self, eip: u32, next: u32) -> Step {
-        use x86::cpu::flags;
         let esp = guest_reg(4);
         let slow = self.a.label();
         self.a.mov(Size::W, T_ADDR, esp);
         self.load(Width::W, T_A);
+        self.load_eflags(slow, !self.user);
+        self.a.add_imm(Size::W, esp, esp, 4);
+        if self.user {
+            let done = self.a.label();
+            self.a.b(done);
+            self.a.bind(slow);
+            self.exit_interp(eip);
+            self.a.bind(done);
+            return Step::Next;
+        }
+        self.goto_dispatch(next);
+        self.a.bind(slow);
+        self.exit_interp(eip);
+        Step::End
+    }
+
+    /// Loads EFLAGS from T_A as POPF does (IF and IOPL only with `cpl0`), or
+    /// branches to `slow` before changing anything if TF would change.
+    fn load_eflags(&mut self, slow: Label, cpl0: bool) {
+        use x86::cpu::flags;
         let mut rest = flags::NT | flags::RF | flags::AC | flags::ID;
-        if !self.user {
+        if cpl0 {
             rest |= flags::IOPL;
         }
         self.a.ldr(Width::W, T_B, STATE, state::EFLAGS_REST as i32);
@@ -1703,7 +1722,6 @@ impl Emit {
         self.a.and(Size::W, T_C, T_A, T_C);
         self.a.orr(Size::W, T_B, T_B, T_C);
         self.a.str(Width::W, T_B, STATE, state::EFLAGS_REST as i32);
-        self.a.add_imm(Size::W, esp, esp, 4);
         self.a.ubfx(Size::W, T_C, T_A, 7, 1);
         self.a.ubfx(Size::W, T_B, T_A, 6, 1);
         self.a.logic_shift(a64::Logic::Orr, false, Size::W, T_C, T_B, T_C, Shift::Lsl, 1);
@@ -1721,20 +1739,10 @@ impl Emit {
         assert!(ok);
         self.a.ubfx(Size::W, T_B, T_A, 10, 1);
         self.a.str(Width::W, T_B, STATE, state::DF as i32);
-        if self.user {
-            let done = self.a.label();
-            self.a.b(done);
-            self.a.bind(slow);
-            self.exit_interp(eip);
-            self.a.bind(done);
-            return Step::Next;
+        if cpl0 {
+            self.a.ubfx(Size::W, T_B, T_A, 9, 1);
+            self.a.str(Width::W, T_B, STATE, state::IF_FLAG as i32);
         }
-        self.a.ubfx(Size::W, T_B, T_A, 9, 1);
-        self.a.str(Width::W, T_B, STATE, state::IF_FLAG as i32);
-        self.goto_dispatch(next);
-        self.a.bind(slow);
-        self.exit_interp(eip);
-        Step::End
     }
 
     fn mm_off(n: usize) -> i32 {
