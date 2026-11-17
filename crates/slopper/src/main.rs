@@ -19,6 +19,7 @@ struct Args {
     vgabios: Option<String>,
     cdrom: Option<String>,
     hda: Option<String>,
+    serial: Option<String>,
     ram_mb: u32,
     max_instructions: Option<u64>,
     headless: bool,
@@ -31,7 +32,7 @@ struct Args {
 }
 
 const USAGE: &str = "usage: slopper --bios <bios.bin> [--vgabios <vgabios.bin>] [--cdrom <iso>] [--hda <img>] \
-[--ram MiB] [--headless] [--jit] [--screenshot SECONDS:PATH]... [--exit-on-text TEXT] [--script FILE] [--control SOCKET] [--vnc [ADDR:]PORT] [--max-instructions N]";
+[--serial PATH|-] [--ram MiB] [--headless] [--jit] [--screenshot SECONDS:PATH]... [--exit-on-text TEXT] [--script FILE] [--control SOCKET] [--vnc [ADDR:]PORT] [--max-instructions N]";
 
 fn parse_args() -> Result<Args, String> {
     let mut args = Args {
@@ -39,6 +40,7 @@ fn parse_args() -> Result<Args, String> {
         vgabios: None,
         cdrom: None,
         hda: None,
+        serial: None,
         ram_mb: 256,
         max_instructions: None,
         headless: false,
@@ -57,6 +59,7 @@ fn parse_args() -> Result<Args, String> {
             "--vgabios" => args.vgabios = Some(value()?),
             "--cdrom" => args.cdrom = Some(value()?),
             "--hda" => args.hda = Some(value()?),
+            "--serial" => args.serial = Some(value()?),
             "--ram" => args.ram_mb = value()?.parse().map_err(|_| "--ram needs a size in MiB")?,
             "--max-instructions" => {
                 args.max_instructions = Some(value()?.parse().map_err(|_| "--max-instructions needs a number")?)
@@ -85,6 +88,8 @@ fn parse_args() -> Result<Args, String> {
 enum Event {
     Key(u16, bool),
     Type(String),
+    /// Bytes for the guest to receive on COM1.
+    Serial(Vec<u8>),
     Mouse(i32, i32, u8),
     /// Host pointer: absolute position (0..=`usb::MAX_COORD` on each axis),
     /// relative motion for PS/2, buttons and wheel detents.
@@ -268,6 +273,20 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
         eprintln!("cannot open {path}: {e}");
         return ExitCode::FAILURE;
     }
+    if let Some(path) = &args.serial {
+        let out: Box<dyn std::io::Write + Send> = if path == "-" {
+            Box::new(std::io::stderr())
+        } else {
+            match std::fs::File::create(path) {
+                Ok(f) => Box::new(f),
+                Err(e) => {
+                    eprintln!("cannot open {path}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        };
+        board.com1.set_output(out);
+    }
     let mut jit = if args.jit {
         let (ptr, len) = board.ram_region();
         match unsafe { jit::Jit::new(ptr, len) } {
@@ -394,6 +413,7 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
             match ev {
                 Event::Key(code, down) => board.key(code, down),
                 Event::Type(text) => text.chars().for_each(|c| keyq.push_char(c)),
+                Event::Serial(bytes) => board.serial_input(&bytes),
                 Event::Mouse(dx, dy, b) => board.mouse_motion(dx, dy, b),
                 // A guest with a USB tablet driver gets absolute positions only:
                 // feeding the same motion through PS/2 as well would move the
@@ -675,12 +695,13 @@ fn run_command(line: &str, tx: &Sender<Event>) -> Option<String> {
     })
 }
 
-/// Parses an input command (`shot`, `type`, `key`, `mouse`, `tablet`, `quit`) into events.
+/// Parses an input command (`shot`, `type`, `serial`, `key`, `mouse`, `tablet`, `quit`) into events.
 fn command_event(line: &str) -> Result<Vec<Event>, String> {
     let (cmd, rest) = line.split_once(' ').unwrap_or((line, ""));
     Ok(match cmd {
         "shot" => vec![Event::Screenshot(PathBuf::from(if rest.is_empty() { "screen.png" } else { rest }))],
         "type" => vec![Event::Type(rest.to_string())],
+        "serial" => vec![Event::Serial(format!("{rest}\r").into_bytes())],
         "key" => {
             let codes: Option<Vec<u16>> = rest.split('+').map(keys::by_name).collect();
             let codes = codes.ok_or_else(|| format!("unknown key in {rest}"))?;
@@ -709,7 +730,7 @@ fn command_event(line: &str) -> Result<Vec<Event>, String> {
         }
         "quit" => vec![Event::Quit],
         _ => {
-            return Err("commands: screen | status | regs | mem HEXADDR [LEN] | profile [on|off] | pause | resume | shot PATH | type TEXT | key NAME[+NAME] | mouse DX DY [BUTTONS] | tablet X Y [BUTTONS [WHEEL]] | quit\n\
+            return Err("commands: screen | status | regs | mem HEXADDR [LEN] | profile [on|off] | pause | resume | shot PATH | type TEXT | serial LINE | key NAME[+NAME] | mouse DX DY [BUTTONS] | tablet X Y [BUTTONS [WHEEL]] | quit\n\
                  mouse sends relative PS/2 motion; tablet moves the USB tablet to guest screen pixel (X, Y)".into());
         }
     })

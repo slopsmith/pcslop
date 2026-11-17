@@ -75,6 +75,7 @@ A plain host-side interpreter comes first, for three reasons:
 - **ACPI:** current SeaBIOS no longer builds ACPI tables itself. It expects the VMM to pass them through `fw_cfg` (`etc/table-loader`). The plan:
   - First boot XP with **no ACPI and no MP table** ("Standard PC" HAL, PIC + PIT). Our SeaBIOS build sets `CONFIG_MPTABLE=n`: with an MP table present, Setup would pick the MPS uniprocessor HAL, which needs a local APIC and an I/O APIC.
   - Generate our own ACPI tables later, for the ACPI uniprocessor HAL and power-off.
+- **Serial:** COM1 is a 16550A UART at `0x3F8`, IRQ 4. `--serial PATH` (or `-` for stderr) logs what the guest sends, and the control socket's `serial LINE` types into it. Linux takes `console=ttyS0`.
 - **Hot MMIO and ports, handled inside the VM:** APIC TPR (if we move to an APIC HAL), PIC EOI, and PIT counter reads. Everything else exits to the host.
 
 ## Remote display (VNC)
