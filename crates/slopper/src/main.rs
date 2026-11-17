@@ -1095,7 +1095,7 @@ fn run_command(line: &str, tx: &Sender<Event>) -> Option<String> {
     })
 }
 
-/// Parses an input command (`shot`, `type`, `serial`, `key`, `mouse`, `tablet`, `power`, `quit`) into events.
+/// Parses an input command (`shot`, `type`, `serial`, `key`, `down`, `up`, `mouse`, `tablet`, `power`, `quit`) into events.
 fn command_event(line: &str) -> Result<Vec<Event>, String> {
     let (cmd, rest) = line.split_once(' ').unwrap_or((line, ""));
     Ok(match cmd {
@@ -1108,6 +1108,10 @@ fn command_event(line: &str) -> Result<Vec<Event>, String> {
             let mut evs: Vec<Event> = codes.iter().map(|&c| Event::Key(c, true)).collect();
             evs.extend(codes.iter().rev().map(|&c| Event::Key(c, false)));
             evs
+        }
+        "down" | "up" => {
+            let code = keys::by_name(rest.trim()).ok_or_else(|| format!("unknown key {rest}"))?;
+            vec![Event::Key(code, cmd == "down")]
         }
         "mouse" => {
             let v: Vec<i32> = rest.split_whitespace().filter_map(|x| x.parse().ok()).collect();
@@ -1133,7 +1137,8 @@ fn command_event(line: &str) -> Result<Vec<Event>, String> {
         "battery" => vec![Event::Battery(parse_battery(rest.trim())?)],
         "quit" => vec![Event::Quit],
         _ => {
-            return Err("commands: screen | status | regs | mem HEXADDR [LEN] | profile [on|off] | pause | resume | save DIR | load DIR | shot PATH | type TEXT | serial LINE | key NAME[+NAME] | mouse DX DY [BUTTONS [WHEEL]] | tablet X Y [BUTTONS [WHEEL]] | capture [on|off|toggle] | power | battery [host|off|PERCENT[:ac]] | cdrom [ISO] | eject | stall MS EVERY_MS | quit\n\
+            return Err("commands: screen | status | regs | mem HEXADDR [LEN] | profile [on|off] | pause | resume | save DIR | load DIR | shot PATH | type TEXT | serial LINE | key NAME[+NAME] | down NAME | up NAME | mouse DX DY [BUTTONS [WHEEL]] | tablet X Y [BUTTONS [WHEEL]] | capture [on|off|toggle] | power | battery [host|off|PERCENT[:ac]] | cdrom [ISO] | eject | stall MS EVERY_MS | quit\n\
+                 down and up press or release one key and hold it in between;\n\
                  mouse sends relative PS/2 motion; tablet moves the USB tablet to guest screen pixel (X, Y);\n\
                  capture sends the window's mouse as PS/2 motion only and drops tablet input;\n\
                  stall sleeps the emulation thread for MS every EVERY_MS, to test devices under load".into());

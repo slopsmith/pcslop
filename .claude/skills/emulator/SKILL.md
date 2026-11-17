@@ -37,7 +37,7 @@ scripts/vm stop xp
 **Control socket commands:**
 - `screen`, `status`, `regs`, `mem HEXADDR [LEN]`
 - `profile on|off`, `pause`, `resume`
-- `shot PATH`, `type TEXT`, `serial LINE`, `key NAME[+NAME]`
+- `shot PATH`, `type TEXT`, `serial LINE`, `key NAME[+NAME]`, `down NAME`, `up NAME` (hold a key between them)
 - `mouse DX DY [BUTTONS]`, `tablet X Y [BUTTONS [WHEEL]]`
 - `power`, `battery [host|off|PERCENT[:ac]]`
 - `cdrom [ISO]`, `eject`, `save DIR`, `load DIR`, `quit`
