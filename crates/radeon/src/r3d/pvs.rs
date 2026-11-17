@@ -6,10 +6,11 @@
 //! older classic r300_vertprog.c for LIT.
 //!
 //! Dual-math instructions, which XP's ATI driver emits and Mesa does not,
-//! are decoded from that driver's programs: a vector instruction with
-//! PVS_DST_DUAL_MATH_OP set also runs a math opcode on the third operand's
-//! x. The opcode is DUAL_MATH_OP above the third operand's bits 25-26, and
-//! bits 27-28 pick the component of alternate temporary 0 it writes.
+//! follow AMD's R5xx Acceleration guide (7.5.6 and the "Dual Math
+//! Instruction" table): a vector instruction with PVS_DST_DUAL_MATH_OP set
+//! also runs a math opcode, which the third operand describes. Its two
+//! scalar sources are the X and Y swizzles of that operand's register, and
+//! it writes one component of alternate temporary 0 to 3.
 
 use super::V4;
 
@@ -126,13 +127,8 @@ impl Machine<'_> {
         let d0 = d[0];
         let (a, b, c) = (self.read(Src(d[1])), self.read(Src(d[2])), self.read(Src(d[3])));
         let op = d0 & 0x3f;
-        let dual = (d0 >> 27) & 3;
         let vector_op = d0 & (3 << 6) == 0;
-        let side = (vector_op && dual != 0).then(|| {
-            let x = self.read(Src(d[3] & !(0xf << 25)))[0];
-            let me_op = dual << 2 | (d[3] >> 25) & 3;
-            (math(me_op, [x; 4], [0.0; 4], [0.0; 4]), (d[3] >> 27) & 3)
-        });
+        let side = (vector_op && d0 & (1 << 28) != 0).then(|| self.dual_math(d0, d[3]));
         let v = if d0 & (1 << 6) != 0 {
             math(op, a, b, c)
         } else if d0 & (1 << 7) != 0 {
@@ -143,9 +139,44 @@ impl Machine<'_> {
         if let Some(v) = v {
             self.write(d0, v);
         }
-        if let Some((Some(m), comp)) = side {
-            self.alt[0][comp as usize] = m[0];
+        if let Some(Some((index, comp, m))) = side {
+            self.alt[index][comp] = m;
         }
+    }
+
+    /// The math half of a dual-math instruction: its alternate temporary,
+    /// the component it writes and the value.
+    fn dual_math(&self, d0: u32, s: u32) -> Option<(usize, usize, f32)> {
+        let src = Src(s);
+        let i = src.index(&self.a0);
+        let reg = match src.class() {
+            0 => self.temps.get(i).copied(),
+            1 => self.inputs.get(i).copied(),
+            2 => Some(self.constant(i)),
+            _ => self.alt.get(i).copied(),
+        }
+        .unwrap_or([0.0; 4]);
+        let scalar = |k: u32| {
+            let mut v = match (s >> (13 + 3 * k)) & 7 {
+                sw @ 0..=3 => reg[sw as usize],
+                5 => 1.0,
+                _ => 0.0,
+            };
+            if s & (1 << 3) != 0 {
+                v = v.abs();
+            }
+            if s & (1 << (25 + k)) != 0 {
+                v = -v;
+            }
+            v
+        };
+        let (x, y) = (scalar(0), scalar(1));
+        let op = (s >> 21) & 0xf | ((s >> 2) & 1) << 4;
+        let mut m = math(op, [x; 4], [y; 4], [y; 4])?[0];
+        if d0 & (1 << 25) != 0 {
+            m = m.clamp(0.0, 1.0);
+        }
+        Some((((s >> 19) & 3) as usize, ((s >> 27) & 3) as usize, m))
     }
 }
 

@@ -649,14 +649,30 @@ fn draw_128_takes_indices_when_its_walk_says_so() {
 fn a_dual_math_instruction_leaves_a_reciprocal_square_root_in_the_alternate_temporary() {
     let mut g = Gpu::new();
     g.constant(0, [4.0, 0.0, 0.0, 0.0]);
-    let mut add = pvs(3, 0, 1, [src(1, 1), ZERO, src(2, 0) | 3 << 27]);
-    add[0] |= 2 << 27;
+    let rsq_into_alt0_w = 2 | 8 << 21 | 3 << 27;
+    let mut add = pvs(3, 0, 1, [src(1, 1), ZERO, rsq_into_alt0_w]);
+    add[0] |= 1 << 28;
     let alt_w = 3 | 3 << 13 | 3 << 16 | 3 << 19 | 3 << 22;
     let scale = pvs(2, 2, 1, [src(0, 1), alt_w, ZERO]);
     g.vertex_program(&[pvs(3, 2, 0, [src(1, 0), ZERO, ZERO]), add, scale]);
     g.draw(13, &quad(0.0, 0.0, 4.0, 4.0, RED));
     let red = g.px(1, 1) >> 16 & 0xff;
     assert!((0x7f..=0x80).contains(&red), "red {red:#x}");
+}
+
+#[test]
+fn a_dual_math_multiply_takes_the_x_and_y_swizzles_of_its_operand_into_any_alternate_temporary() {
+    let mut g = Gpu::new();
+    g.constant(0, [0.0, 0.0, 0.0, 0.25]);
+    let w_times_one_into_alt2_y = 2 | 3 << 13 | 5 << 16 | 2 << 19 | 10 << 21 | 1 << 27;
+    let mut mul = pvs(2, 0, 1, [src(1, 1), src(1, 1), w_times_one_into_alt2_y]);
+    mul[0] |= 1 << 28;
+    let alt2_y = 3 | 2 << 5 | 1 << 13 | 1 << 16 | 1 << 19 | 1 << 22;
+    let scale = pvs(2, 2, 1, [src(0, 1), alt2_y, ZERO]);
+    g.vertex_program(&[pvs(3, 2, 0, [src(1, 0), ZERO, ZERO]), mul, scale]);
+    g.draw(13, &quad(0.0, 0.0, 4.0, 4.0, [1.0, 1.0, 1.0, 1.0]));
+    let red = g.px(1, 1) >> 16 & 0xff;
+    assert!((0x3f..=0x40).contains(&red), "red {red:#x}");
 }
 
 #[test]
