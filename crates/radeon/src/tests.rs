@@ -227,6 +227,14 @@ fn scanout_counts_from_display_base_addr() {
 }
 
 #[test]
+fn memory_reports_power_up_complete_after_an_sdram_reset() {
+    let mut r = card();
+    r.mmio_write(0x0158, 4, 1 << 31);
+    r.mmio_write(0x0158, 4, 0);
+    assert_eq!(r.mmio_read(MC_STATUS, 4) & 0x0f, 0x0f, "XP's ATI driver waits for every channel to power up");
+}
+
+#[test]
 fn pll_atomic_updates_finish_at_once() {
     let mut r = card();
     r.io_write(8, 1, PPLL_REF_DIV as u32 | PLL_WR_EN);
