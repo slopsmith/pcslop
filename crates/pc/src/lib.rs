@@ -2,6 +2,7 @@
 
 pub mod acpi;
 pub mod apic;
+mod audio;
 pub mod battery;
 pub mod fdc;
 pub mod fw_cfg;
@@ -19,6 +20,7 @@ pub mod uart;
 pub use state::Machine;
 
 use std::io::Write;
+use std::sync::Arc;
 use std::time::Instant;
 
 use pci::{Bdf, ConfigSpace, PAM0};
@@ -119,7 +121,7 @@ pub struct Board {
     pub uhci: usb::Uhci,
     pub pm: pm::Pm,
     /// The AC'97 controller and its index in `pci`, when the board has one.
-    ac97: Option<(usize, ac97::Ac97)>,
+    ac97: Option<(usize, audio::Audio)>,
     /// The network card and its index in `pci`, if one is plugged in.
     nic: Option<(usize, net::Rtl8139)>,
     power: battery::PowerDevice,
@@ -128,6 +130,8 @@ pub struct Board {
     start: Instant,
     /// Board time at `start`, which a restored snapshot carries on from.
     clock_base: u64,
+    /// The same clock for device threads.
+    shared_clock: Arc<audio::SharedClock>,
     pub reset_requested: bool,
     pub post_code: u8,
     /// The ISO in the CD-ROM drive.
@@ -176,6 +180,7 @@ impl Board {
             Chipset::I440fx => pci::host_bridge(),
             Chipset::I440bx => pci::i440bx_host(ram_bytes),
         };
+        let start = Instant::now();
         let mut b = Board {
             ram: ram::Ram::new(ram_bytes as usize),
             code_watch: CodeWatch { bits: vec![0; (ram_bytes as usize >> 12).div_ceil(64)], written: Vec::new() },
@@ -209,8 +214,9 @@ impl Board {
             power: battery::PowerDevice::new(cfg.power),
             vgabios: Vec::new(),
             debugcon: Box::new(std::io::stdout()),
-            start: Instant::now(),
+            start,
             clock_base: 0,
+            shared_clock: audio::SharedClock::new(start),
             reset_requested: false,
             post_code: 0,
             cdrom: None,
@@ -276,12 +282,22 @@ impl Board {
         c.writable[0x04] |= 0x04;
         c.data[pci::INTERRUPT_PIN] = 1;
         self.pci.push((Bdf::new(0, 4, 0), c));
-        self.ac97 = Some((self.pci.len() - 1, ac97::Ac97::new(out)));
+        self.ac97 = Some((self.pci.len() - 1, audio::Audio::new(ac97::Ac97::new(out))));
+    }
+
+    /// Moves the sound card's bus masters onto a thread of their own, so they
+    /// keep time while this one is busy. `wake` is called when the card
+    /// raises its interrupt and should get the CPU to call [`Board::tick`].
+    pub fn start_audio_thread(&mut self, wake: Box<dyn Fn() + Send>) {
+        let ram = (self.ram.as_mut_ptr(), self.ram.len());
+        if let Some((_, a)) = self.ac97.as_mut() {
+            a.start_thread(ram, self.shared_clock.clone(), wake);
+        }
     }
 
     /// The sound card's state, for debugging.
     pub fn describe_audio(&self) -> Option<String> {
-        self.ac97.as_ref().map(|(_, a)| a.describe())
+        self.ac97.as_ref().map(|(_, a)| a.shared.lock().describe())
     }
 
     pub fn describe_gpu(&self) -> Option<String> {
@@ -389,10 +405,16 @@ impl Board {
         if self.pci[UHCI].1.bus_master() {
             self.uhci.run(now, &mut RamDma(&mut self.ram[..], &mut self.code_watch));
         }
-        if let Some((i, a)) = self.ac97.as_mut()
-            && self.pci[*i].1.bus_master()
-        {
-            a.run(now, &mut RamDma(&mut self.ram[..], &mut self.code_watch));
+        if let Some((i, a)) = self.ac97.as_ref() {
+            let master = self.pci[*i].1.bus_master();
+            a.shared.set_bus_master(master);
+            if a.threaded() {
+                for addr in a.take_written() {
+                    self.code_watch.note_write(addr);
+                }
+            } else if master {
+                a.shared.with(|a| a.run(now, &mut RamDma(&mut self.ram[..], &mut self.code_watch)));
+            }
         }
         if let Some((i, nic)) = self.nic.as_mut() {
             if self.pci[*i].1.bus_master() {
@@ -962,7 +984,7 @@ impl Board {
         if let Some((i, a)) = &self.ac97
             && *i == function
         {
-            return a.irq();
+            return a.shared.irq();
         }
         match function {
             UHCI => self.uhci.irq(),
@@ -1029,8 +1051,8 @@ impl Board {
             r.reset();
         }
         self.uhci.reset();
-        if let Some((_, a)) = self.ac97.as_mut() {
-            a.reset();
+        if let Some((_, a)) = self.ac97.as_ref() {
+            a.shared.with(|a| a.reset());
         }
         if let Some((_, nic)) = self.nic.as_mut() {
             nic.reset();
@@ -1044,6 +1066,14 @@ impl Board {
         self.com1.reset();
         self.irq0_backlog = 0;
         self.reset_requested = false;
+    }
+}
+
+impl Drop for Board {
+    fn drop(&mut self) {
+        if let Some((_, a)) = self.ac97.as_mut() {
+            a.stop_thread();
+        }
     }
 }
 
@@ -1299,12 +1329,12 @@ impl Bus for Board {
         if let Some(base) = self.ac97_bar(0)
             && (base..base + ac97::NAM_LEN).contains(&port)
         {
-            return self.ac97.as_mut().unwrap().1.nam_read(port - base, size);
+            return self.ac97.as_ref().unwrap().1.shared.with(|a| a.nam_read(port - base, size));
         }
         if let Some(base) = self.ac97_bar(1)
             && (base..base + ac97::NABM_LEN).contains(&port)
         {
-            return self.ac97.as_mut().unwrap().1.nabm_read(port - base, size);
+            return self.ac97.as_ref().unwrap().1.shared.with(|a| a.nabm_read(port - base, size));
         }
         if let Some(base) = pm::io_base(&self.pci[PM].1)
             && (base..base + pm::IO_LEN).contains(&port)
@@ -1373,14 +1403,14 @@ impl Bus for Board {
         if let Some(base) = self.ac97_bar(0)
             && (base..base + ac97::NAM_LEN).contains(&port)
         {
-            self.ac97.as_mut().unwrap().1.nam_write(port - base, size, value);
+            self.ac97.as_ref().unwrap().1.shared.with(|a| a.nam_write(port - base, size, value));
             return;
         }
         if let Some(base) = self.ac97_bar(1)
             && (base..base + ac97::NABM_LEN).contains(&port)
         {
             let dma = &mut RamDma(&mut self.ram[..], &mut self.code_watch);
-            self.ac97.as_mut().unwrap().1.nabm_write(port - base, size, value, dma);
+            self.ac97.as_ref().unwrap().1.shared.with(|a| a.nabm_write(port - base, size, value, dma));
             self.sync_pci_irqs();
             return;
         }
@@ -1606,6 +1636,36 @@ mod tests {
         b.write32(ioapic::BASE + 0x10, 0x8000 | 0x45);
         b.tick();
         assert_eq!(b.inta(), 0x45);
+    }
+
+    #[test]
+    fn the_sound_card_thread_raises_the_interrupt_and_wakes_the_cpu_without_ticks() {
+        let mut b = ac97_playing_short_buffer();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx = std::sync::Mutex::new(tx);
+        b.start_audio_thread(Box::new(move || {
+            let _ = tx.lock().unwrap().send(());
+        }));
+        rx.recv_timeout(std::time::Duration::from_secs(5)).expect("no wakeup");
+        let slave_irr = |b: &Board| b.pic.registers()[1].0;
+        assert_eq!(slave_irr(&b), 0, "the PIC hears of it on the next tick");
+        b.tick();
+        assert_eq!(slave_irr(&b), 1 << (11 - 8));
+    }
+
+    #[test]
+    fn a_snapshot_taken_while_the_sound_card_thread_runs_restores() {
+        let mut b = ac97_playing_short_buffer();
+        b.start_audio_thread(Box::new(|| {}));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let mut w = snapshot::Writer::new();
+        b.save_devices(&mut w).unwrap();
+        let saved = w.buf;
+        let mut c = ac97_playing_short_buffer();
+        c.start_audio_thread(Box::new(|| {}));
+        c.load_devices(&mut snapshot::Reader::new(&saved)).unwrap();
+        c.tick();
+        assert_eq!(c.pic.registers()[1].0, 1 << (11 - 8), "the finished buffer's interrupt comes back");
     }
 
     #[test]

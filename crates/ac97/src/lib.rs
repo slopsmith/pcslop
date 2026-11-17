@@ -6,11 +6,13 @@
 //! section 5.17. The bus masters move data when [`Ac97::run`] is called,
 //! all three at their sample rate in host time: PCM out into the host
 //! output, which it keeps a fixed latency ahead of the speaker, and the two
-//! inputs filled with silence.
+//! inputs filled with silence. A [`Worker`] calls it on its own thread.
 
 pub mod codec;
+mod worker;
 
 pub use codec::Codec;
+pub use worker::{Shared, Worker};
 
 pub const PCI_VENDOR: u16 = 0x8086;
 pub const PCI_DEVICE: u16 = 0x2415;

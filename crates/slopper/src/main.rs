@@ -517,6 +517,16 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
             net::start_user_network(cfg, Box::new(wake))
         }
     };
+    if std::env::var_os("SLOPPER_AUDIO_SYNC").is_none() {
+        let emu = std::thread::current();
+        let kicker = jit.as_ref().map(|j| j.kicker());
+        board.start_audio_thread(Box::new(move || {
+            emu.unpark();
+            if let Some(k) = &kicker {
+                k.kick();
+            }
+        }));
+    }
     if let Some(cfg) = &args.net {
         match start_net(cfg) {
             Ok(backend) => board.attach_nic(net::DEFAULT_MAC, backend),

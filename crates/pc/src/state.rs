@@ -145,7 +145,9 @@ impl Board {
         w.put(&self.uhci);
         put_opt(w, self.uhci.device::<usb::Tablet>(0));
         w.put(&self.pm);
-        put_opt(w, self.ac97.as_ref().map(|(_, a)| a));
+        let audio = self.ac97.as_ref().map(|(_, a)| a.shared.lock());
+        put_opt(w, audio.as_deref());
+        drop(audio);
         put_opt(w, self.nic.as_ref().map(|(_, n)| n));
         w.put(&self.power);
         w.put(&self.post_code);
@@ -156,6 +158,9 @@ impl Board {
     /// `Machine`, with the same drives attached. The board's clock carries
     /// on from the snapshot's time, so timers neither fire early nor late.
     pub fn load_devices(&mut self, r: &mut Reader<'_>) -> Result<()> {
+        // The sound card thread waits until the clock has been rebased too.
+        let audio = self.ac97.as_ref().map(|(_, a)| a.shared.clone());
+        let mut audio_dev = audio.as_ref().map(|a| a.lock());
         let now = r.u64()?;
         r.get(&mut self.a20)?;
         r.get(&mut self.pci_addr)?;
@@ -191,7 +196,7 @@ impl Board {
         r.get(&mut self.uhci)?;
         get_opt(r, self.uhci.device_mut::<usb::Tablet>(0), "USB tablet")?;
         r.get(&mut self.pm)?;
-        get_opt(r, self.ac97.as_mut().map(|(_, a)| a), "sound card")?;
+        get_opt(r, audio_dev.as_deref_mut(), "sound card")?;
         get_opt(r, self.nic.as_mut().map(|(_, n)| n), "network card")?;
         r.get(&mut self.power)?;
         r.get(&mut self.post_code)?;
@@ -203,6 +208,13 @@ impl Board {
         self.reset_requested = false;
         self.sync_display_bars();
         self.rebase_clock(now);
+        if let Some(dev) = audio_dev.as_mut() {
+            dev.resync();
+        }
+        drop(audio_dev);
+        if let Some(a) = &audio {
+            a.with(|_| ());
+        }
         Ok(())
     }
 
@@ -245,6 +257,7 @@ impl Board {
     pub(crate) fn rebase_clock(&mut self, now_ns: u64) {
         self.clock_base = now_ns;
         self.start = Instant::now();
+        self.shared_clock.rebase(now_ns, self.start);
     }
 }
 
