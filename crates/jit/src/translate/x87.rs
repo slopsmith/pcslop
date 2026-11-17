@@ -438,6 +438,7 @@ impl Emit {
                 self.a.fp1(true, 3, FR, a);
                 self.check_result(FR, None, bail);
                 self.track_inexact(SQRT, a, a);
+                self.apply_precision(bail);
                 self.clear_c1();
                 self.fset(0, FR);
             }
@@ -501,10 +502,6 @@ impl Emit {
         self.and_imm(Size::W, T_B, T_A, 0x3f);
         let ok = self.a.logic_imm(Logic::Eor, Size::W, T_B, T_B, 0x3f);
         assert!(ok);
-        self.a.ubfx(Size::W, T_C, T_A, 9, 1);
-        let ok = self.a.logic_imm(Logic::Eor, Size::W, T_C, T_C, 1);
-        assert!(ok);
-        self.a.orr(Size::W, T_B, T_B, T_C);
         self.a.sub_imm(Size::W, T_B, T_B, 1);
         self.a.lsr_imm(Size::W, T_B, T_B, 31);
         self.a.ldr(Width::W, T_C, STATE, state::X87_BASE as i32);
@@ -939,7 +936,38 @@ impl Emit {
         };
         self.check_result(FR, zero_needs, bail);
         self.track_inexact(op, x, y);
+        self.apply_precision(bail);
         self.clear_c1();
+    }
+
+    /// Single precision rounds to an f32 and takes its range, as the interpreter does.
+    fn apply_precision(&mut self, bail: Label) {
+        let (normal, inexact_known, done) = (self.a.label(), self.a.label(), self.a.label());
+        self.a.ldr(Width::W, T_B, STATE, state::FCW as i32);
+        self.a.ubfx(Size::W, T_B, T_B, 8, 2);
+        self.a.cbnz(Size::W, T_B, done);
+        self.a.fp1(true, 4, FS, FR);
+        self.a.fmov_ws(T_A, FS);
+        self.a.ubfx(Size::W, T_B, T_A, 23, 8);
+        self.a.add_imm(Size::W, T_C, T_B, 1);
+        self.a.tbnz(T_C, 8, bail);
+        self.a.cbnz(Size::W, T_B, normal);
+        self.a.lsl_imm(Size::W, T_B, T_A, 1);
+        self.a.cbnz(Size::W, T_B, bail);
+        self.a.fmov_xd(T_B, FR);
+        self.a.lsl_imm(Size::X, T_B, T_B, 1);
+        self.a.cbz(Size::X, T_B, done);
+        self.a.b(bail);
+        self.a.bind(normal);
+        self.a.fp1(false, 5, E1, FS);
+        self.a.tbnz(SW, PE_SHIFT, inexact_known);
+        self.a.fcm(Fcm::Eq, true, E2, E1, FR);
+        self.a.fmov_xd(T_B, E2);
+        self.a.mvn(Size::X, T_B, T_B);
+        self.flag_nonzero_to_pe(T_B);
+        self.a.bind(inexact_known);
+        self.a.fp1(true, 0, FR, E1);
+        self.a.bind(done);
     }
 
     /// FCOM's condition codes for `a` against `b`.

@@ -947,7 +947,7 @@ fn random_x87(rng: &mut Rng, out: &mut Vec<u8>) {
             let (op, reg) = [(0xdb, 2), (0xdb, 3), (0xdf, 2), (0xdf, 3), (0xdf, 7)][rng.below(5) as usize];
             mem_abs(out, op, reg, 0x34c0 + 8 * k);
         }
-        20 => mem_abs(out, 0xd9, 5, 0x3500 + 2 * (k % 5)),
+        20 => mem_abs(out, 0xd9, 5, 0x3500 + 2 * (k % 6)),
         21 => mem_abs(out, [0xd9, 0xdd][rng.below(2) as usize], 7, 0x3520 + 2 * k),
         22 => match rng.below(4) {
             0 => out.extend([0x0f, 0x6f, modrm_rr(rng.below(8) as u8, rng.below(8) as u8)]),
@@ -980,7 +980,7 @@ fn x87_memory(rng: &mut Rng) -> Vec<u8> {
         let q = ((rng.next() as u64) << 32 | rng.next() as u64) as i64 >> rng.below(63);
         mem[0x300 + 8 * k..0x308 + 8 * k].copy_from_slice(&q.to_le_bytes());
     }
-    for (j, cw) in [0x37fu16, 0x27f, 0xf7f, 0x77f, 0xb7f].iter().enumerate() {
+    for (j, cw) in [0x37fu16, 0x27f, 0xf7f, 0x77f, 0xb7f, 0x07f].iter().enumerate() {
         mem[0x500 + 2 * j..0x502 + 2 * j].copy_from_slice(&cw.to_le_bytes());
     }
     mem
@@ -1002,9 +1002,7 @@ fn random_x87_programs_match_the_interpreter() {
         code.push(0xf4);
         let mem = x87_memory(&mut rng);
         let mut a = flat_cpu(0x1000, 0x8000);
-        if round % 2 == 1 {
-            a.fpu.cw = 0x27f;
-        }
+        a.fpu.cw = [0x37f, 0x27f, 0x07f][round % 3];
         let mut b = a.clone();
         let mut bus_a = bus_with(0x1000, &code);
         let mut bus_b = bus_with(0x1000, &code);

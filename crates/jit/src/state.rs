@@ -260,7 +260,7 @@ pub fn mxcsr_flags(fpsr: u32) -> u32 {
 
 /// Whether translated x87 code may run with this control word.
 pub fn x87_ok(base: bool, cw: u16) -> bool {
-    base && cw & 0x3f == 0x3f && cw & 0x200 != 0
+    base && cw & 0x3f == 0x3f
 }
 
 const NZCV_N: u32 = 1 << 31;
