@@ -71,6 +71,8 @@ scripts/vm stop xp
     Options typed after `live` land after `--`, so the kernel never sees them.
   - **Serial in and out:** start with `--serial "$SCRATCH/serial.log"`. Type into COM1 with `ctl NAME "serial dmesg | grep -i acpi"` and read the log. Commands that aren't busybox applets may be missing in the initramfs shell.
 - **Radeon 9700:** `--gpu radeon --vga-rom /Volumes/Projects/86slopper/references/docs/ati-r300/ATI.9700NP.128.Infineon.021216.rom` (implies the 440BX board). The ROM is the user's copyrighted firmware: never copy it into the repo, a test or the Nix store. `--gpu-trace FILE` logs every register access and collapses repeats into `... N more times`. The tail of the trace shows what a driver is spinning on.
+  - The 3D engine draws with Metal; `--gpu-3d cpu` (or `SLOPPER_R3D=cpu`) uses the CPU reference path. `status` prints a `radeon:` line with 3D draws, `flips` (CRTC_OFFSET writes, so two samples give a page-flipping app's frame rate), Metal draws, CPU fallbacks and waits.
+  - XP's first boot with the card installs the ATI driver and asks to restart: answer with a `tablet` click and let it reboot. Killing the run mid-install left agp440 broken (Code 39) and XP on VgaSave at 1280x1024; the ATI desktop is 1440x900. Save a state at that desktop and load it instead of booting.
 - **Firmware:** `references/seabios` and `references/seavgabios` are Nix out-links. After changing the SeaBIOS part of `flake.nix`, run `nix build .#seabios --out-link references/seabios`. That needs the flake changes committed in jj (`jj new` first).
 
 ## Measure and debug

@@ -1,6 +1,6 @@
 # GPU
 
-Plan for 2D and 3D acceleration. Built so far: the 440BX board with AGP, the card's PCI function, the real video BIOS's POST, VGA and VBE modes, DDC with our EDID, the primary CRTC with its cursor, the command processor, the 2D engine, and the 3D engine drawing on the CPU (see [3D engine](#3d-engine)). Run it with `--gpu radeon --vga-rom ROM`, and add `--gpu-trace PATH` to log every register access.
+Plan for 2D and 3D acceleration. Built so far: the 440BX board with AGP, the card's PCI function, the real video BIOS's POST, VGA and VBE modes, DDC with our EDID, the primary CRTC with its cursor, the command processor, the 2D engine, and the 3D engine drawing with Metal or on the CPU (see [3D engine](#3d-engine)). Run it with `--gpu radeon --vga-rom ROM`, and add `--gpu-trace PATH` to log every register access.
 
 ## Target: ATI Radeon 9700 (R300)
 
@@ -76,7 +76,7 @@ In the order we need them:
    - Drivers can also program the engines through MMIO without the CP. Both paths feed the same register writes.
 6. **GART.** The PCI GART table, or the AGP aperture if we add AGP. We follow it to read guest memory for rings, indirect buffers, vertex data and textures.
 7. **2D engine.** Solid fills, screen-to-screen blits with ROP3, host data uploads, monochrome colour expansion for text, and scaled blits. These come before 3D because they give us a usable desktop. They run on the CPU at first and move to Metal later.
-8. **3D engine on Metal.** It runs on the CPU for now; see [3D engine](#3d-engine).
+8. **3D engine on Metal.** Fragment work runs on Metal, vertex work on the CPU; see [3D engine](#3d-engine).
    - The vertex shader unit (PVS) and fragment shader unit (US): decode their programs and translate them to MSL.
    - The rasterizer setup (RS), texture units, blending (RB3D) and depth/stencil (ZB), mapped to Metal pipeline, depth-stencil and sampler objects, each cached by its state.
    - Fast Z clears and Z compression: track the clear state per surface and resolve it ourselves.
@@ -102,7 +102,7 @@ Our EDID prefers 1440x900 at 60 Hz (CVT reduced blanking, 88.75 MHz) and also li
 - **radeonfb:** drives a 1440x900 console. Its fills and scrolls run on our 2D engine.
 - **The radeon DRM:** loads the R300 microcode, which we ignore, and its writeback test succeeds. The ring and the indirect buffers sit in the AGP aperture.
 - **X (xf86-video-ati 6.8.0) with an unmodified xorg.conf:** 1440x900x24, DRI on, XAA over the CP, colour tiling on (the driver turns Render acceleration off on R300). GNOME draws correctly: menus, terminal scrolling and window moves. `glxinfo` reports direct rendering with Mesa 7.0.3's R300 driver.
-- **glxgears:** draws its lit gears through Mesa 7.0.3's r300 driver with hardware TCL, at about 48 frames per second on the CPU path.
+- **glxgears:** draws its lit gears through Mesa 7.0.3's r300 driver with hardware TCL, at about 114 frames per second with Metal and 48 on the CPU path.
 - **Compiz:** composites the desktop through the 3D engine: windows, decorations and the desktop wall's slide between workspaces draw. Hardy's compiz-manager skips Compiz with "Found laptop using ati driver" whenever the guest has ACPI power devices, even with `--battery off`; `SKIP_CHECKS=yes compiz --replace` starts it anyway.
 
 What we built for this:
@@ -139,7 +139,7 @@ Its hottest MMIO polls: `CP_RB_RPTR` (about 900,000 reads while it waited on a f
 
 ## 3D engine
 
-`crates/radeon/src/r3d` runs the R300's 3D pipeline on the CPU while the packet executes, as a reference to check a Metal backend against:
+`crates/radeon/src/r3d` runs the R300's 3D pipeline. Its CPU path draws while the packet executes and is the reference for the Metal backend, which draws the pixels by default (see [Metal backend](#metal-backend)):
 
 - **Packets:** `3D_DRAW_IMMD(_2)`, `3D_DRAW_VBUF(_2)`, `3D_DRAW_INDX(_2)`, `INDX_BUFFER` (indices or any register), `3D_LOAD_VBPNTR` and `3D_DRAW_128`.
 - **Vertex fetch:** a vertex's dwords come from the packet or from each array of structures in turn, and the PSC (`VAP_PROG_STREAM_CNTL*`) splits them into input vectors: floats, bytes, D3DCOLOR, shorts and packed 10/11-bit formats, with SIGNED and NORMALIZE.
@@ -150,15 +150,29 @@ Its hottest MMIO polls: `CP_RB_RPTR` (about 900,000 reads while it waited on a f
 - **Textures:** 8 to 128-bit integer, half and float formats and DXT1/3/5, from VRAM or through the GART, with every wrap mode, point and bilinear filtering and mipmap levels.
 - **Back end:** alpha test, 16-bit and 24/8 depth and stencil (two-sided too), blending with every factor and combine function, separate alpha, ROP2, colour masks, and ARGB8888, RGB565, ARGB1555, ARGB4444, I8 and UV88 colour buffers. `ZB_ZPASS_*` counts passing pixels for occlusion queries.
 - **Tiling:** like the 2D engine, it treats every surface as linear, so what it draws stays consistent with the CRTC and the 2D engine.
-- **Sync:** drawing finishes before the next packet, so fences, scratch writebacks, `WAIT_UNTIL` and CPU reads of a surface always see finished pixels.
+- **Sync:** on the CPU path, drawing finishes before the next packet, so fences, scratch writebacks, `WAIT_UNTIL` and CPU reads of a surface always see finished pixels.
 
-Still missing: Metal, the 3D engine's HiZ, Z compression and fast clears (`3D_CLEAR_ZMASK`, `3D_CLEAR_HIZ` do nothing), cube and volume textures, fog, MSAA and the R5xx-only opcodes.
+Still missing: the vertex shader on the GPU, the 3D engine's HiZ, Z compression and fast clears (`3D_CLEAR_ZMASK`, `3D_CLEAR_HIZ` do nothing), cube and volume textures, fog, MSAA and the R5xx-only opcodes.
+
+### Metal backend
+
+`--gpu-3d metal` (the default) or `--gpu-3d cpu`, also set by `SLOPPER_R3D`, picks the backend; `status` reports draws, CPU fallbacks and waits.
+
+- **Split:** the CPU still fetches vertices, runs the vertex program, clips, culls, applies polygon offset, flat shading and the RS, and turns points and lines into triangles. `Raster::triangle` captures the window-space triangles, with the pixel stack registers the RS fills, instead of scan-converting them. Metal rasterizes them in an attachmentless 4096x4096 pass with the scissor as its scissor rectangle.
+- **VRAM** is one `MTLBuffer` over the card's memory (`newBufferWithBytesNoCopy`, page aligned, shared storage), so Metal reads textures and writes pixels where the CRTC, the 2D engine and the guest see them, with no copies.
+- **Fragment programs** are translated to MSL (`r3d/msl.rs`) straight-line, with the same instruction semantics as the interpreter. Pipelines are cached by the program's instruction words, the RS slots and the interpolation mode. Constants, texture state and the back end's registers go in a uniform buffer.
+- **Textures** are fetched from the VRAM buffer by the shader, decoding every format and wrap mode as `tex.rs` does; textures in system memory are copied into a per-batch arena.
+- **Back end in the shader.** Metal's depth attachments cannot alias VRAM, and it has no 24-bit Z, no ROP and no ARGB4444 or ARGB1555 layout matching the card's. So the fragment shader does the alpha test, Z16 and Z24/8 depth and two-sided stencil, blending, the ROP, the channel mask and colour packing itself, reading and writing VRAM, with raster order groups keeping overlapping fragments in submission order. The occlusion counter is an atomic. A draw that samples memory the open encoder writes starts a new encoder.
+- **Fallback:** the CPU draws when a pipeline fails to build, a draw fills more than 24 pixel stack registers, or its system-memory textures do not fit the arena; it waits for Metal first.
+- **Sync:** draws collect in a command buffer, which is submitted at the end of each ring run. Everything that touches VRAM outside the pipeline waits for it first: 2D operations, scanout, CPU fallbacks and saves. So do idle polls (`RBBM_STATUS`, cache `CTLSTAT`, `CP_STAT` and the other status registers drivers spin on), software interrupts and the occlusion counter. Fences behave as on the card: a scratch register or `CP_RESYNC` write behind queued draws lands, with its writeback, only when those draws finish; the board's device poll applies finished fences. `WAIT_UNTIL` needs no wait, since Metal runs draws in order and the CPU-side users wait anyway. Guest CPU reads of VRAM do not trap, so they rely on the driver waiting on a fence or idle first, as it must on the card.
+- **Measurements** (on this Apple Silicon Mac, CPU path / Metal): dxdiag's spinning cube at 640x480 (D3D7) 28 / 460, at 640x480 (D3D8) 29 / 541 and at 800x600 (D3D9) 16.5 / 545 frames per second; glxgears 48 / 114, with or without Compiz. Waiting for the GPU at every fence instead held glxgears at 85.
 
 ## Open questions
 
 - **Catalyst on the 440BX.** See [Bus](#bus-agp-on-a-440bx). Check early, with Catalyst 2D, that it accepts our AGP setup before building much of the CP.
 - **Fixed-function Direct3D.** We expect Catalyst to turn fixed-function state into vertex and fragment programs, since R300 runs all transform, lighting and texture combining through its shader units. Logging what the driver sends confirms it.
-- **Sync with the guest on Metal.** The CPU path draws synchronously. If we write fences only when the Metal command buffer completes, every fence costs a round trip to the GPU. If we write them early, the guest can lock a render target and read stale pixels. A middle path: write early, and when the guest reads a surface, wait for pending Metal work and read the surface back.
+- **Guest reads of VRAM without a fence.** See the Metal backend's sync. Write-protecting rendered pages through HVF would catch them, at a fault per page.
+- **The vertex shader on Metal.** PVS programs still run on the CPU; in glxgears they take about 2% of the vCPU thread, so it waits until a workload needs it.
 
 ## Apple Silicon and Metal
 
