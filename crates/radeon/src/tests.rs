@@ -339,3 +339,11 @@ fn an_i2c_abort_drops_go_at_once() {
     r.mmio_write(I2C_CNTL_0 + 1, 1, (I2C_GO | I2C_ABORT) >> 8, &mut NoBus);
     assert_eq!(r.mmio_read(I2C_CNTL_0 + 1, 1) & (I2C_GO | I2C_ABORT) >> 8, 0);
 }
+
+#[test]
+fn queue_status_reads_idle_for_xps_wait_loop() {
+    let mut r = card();
+    assert_eq!(r.mmio_read(0x0790, 4) & 0x1f, 2);
+    assert_eq!(r.mmio_read(0x07b0, 4) & 0x1f, 8);
+    assert_eq!(r.mmio_read(0x0a10, 4) & 0xffff, 0x3333);
+}

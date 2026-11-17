@@ -191,3 +191,7 @@ pub const I2C_ABORT: u32 = 1 << 11;
 pub const I2C_GO: u32 = 1 << 12;
 pub const I2C_CNTL_1: u32 = 0x0094;
 pub const I2C_DATA: u32 = 0x0098;
+/// Undocumented queue status registers that XP's ATI driver polls until the
+/// engine is idle: the low five bits of 0x790 read 2 and those of 0x7B0 read 8,
+/// then 0xA10's low half reads 0x3333.
+pub const IDLE_QUEUE_STATUS: [(u32, u32); 3] = [(0x0790, 0x02), (0x07b0, 0x08), (0x0a10, 0x3333)];

@@ -361,6 +361,7 @@ impl Radeon {
             CP_RB_RPTR => self.cp_rptr(),
             I2C_DATA => self.i2c.pop() as u32,
             CP_STAT | CP_CSQ_STAT => 0,
+            0x0790 | 0x07b0 | 0x0a10 => IDLE_QUEUE_STATUS.iter().find(|e| e.0 == reg).map_or(0, |e| e.1),
             RB2D_DSTCACHE_CTLSTAT
             | DSTCACHE_CTLSTAT
             | RB3D_DSTCACHE_CTLSTAT
