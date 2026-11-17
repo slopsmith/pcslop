@@ -389,6 +389,9 @@ impl Board {
                 nic.poll(now, &mut NoDma);
             }
         }
+        if let Display::Radeon(r) = &mut self.display {
+            r.set_time(now);
+        }
         self.sync_sci();
     }
 
@@ -435,7 +438,11 @@ impl Board {
         let usb = self.uhci.next_frame_ns().map(|t| t.saturating_sub(now));
         let lapic = self.lapic.as_ref().and_then(|l| l.next_event_ns(now));
         let nic = self.nic.as_ref().and_then(|(_, n)| n.next_event_ns()).map(|t| t.saturating_sub(now));
-        let others = usb.unwrap_or(u64::MAX).min(lapic.unwrap_or(u64::MAX)).min(nic.unwrap_or(u64::MAX));
+        let gpu = match &self.display {
+            Display::Radeon(r) => r.next_irq_ns().map(|t| t.saturating_sub(now)),
+            Display::Std(_) => None,
+        };
+        let others = usb.unwrap_or(u64::MAX).min(lapic.unwrap_or(u64::MAX)).min(nic.unwrap_or(u64::MAX)).min(gpu.unwrap_or(u64::MAX));
         self.pit.next_irq0_ns(now).unwrap_or(1_000_000).min(others).min(1_000_000)
     }
 
@@ -700,8 +707,7 @@ impl Board {
                     && (base..base + radeon::MMIO_SIZE).contains(&addr)
                 {
                     r.set_time(now);
-                    r.mmio_write(addr - base, size, v);
-                    return;
+                    return self.radeon_write(|r, bus| r.mmio_write(addr - base, size, v, bus));
                 }
             }
         }
@@ -716,20 +722,17 @@ impl Board {
         }
     }
 
-    // GATT entries are a page address with bit 0 as the valid bit, as Linux's intel-agp writes them.
     fn gart(&self, addr: u32) -> Option<u32> {
+        self.aperture().and_then(|a| a.translate(&self.ram, addr))
+    }
+
+    fn aperture(&self) -> Option<Aperture> {
         if self.chipset != Chipset::I440bx {
             return None;
         }
         let host = &self.pci[HOST].1;
         let (base, size) = pci::i440bx_aperture(host)?;
-        let off = addr.wrapping_sub(base);
-        if off >= size {
-            return None;
-        }
-        let entry_addr = (host.read(pci::bx::ATTBASE, 4) & !0xfff) as usize + (off >> 12) as usize * 4;
-        let entry = u32::from_le_bytes(self.ram.get(entry_addr..entry_addr + 4)?.try_into().unwrap());
-        (entry & 1 != 0).then_some((entry & !0xfff) | (off & 0xfff))
+        Some(Aperture { base, size, attbase: host.read(pci::bx::ATTBASE, 4) & !0xfff })
     }
 
     fn write_slow(&mut self, addr: u32, v: u8) {
@@ -872,7 +875,7 @@ impl Board {
         let base = self.pci[DISPLAY].1.mem_bar(0)?;
         match &mut self.display {
             Display::Std(v) => Some((base, v.vram_ptr(), vga::VRAM_SIZE)),
-            Display::Radeon(_) => None,
+            Display::Radeon(r) => Some((base, r.vga().vram_ptr(), radeon::APER_SIZE as usize)),
         }
     }
 
@@ -921,8 +924,24 @@ impl Board {
         Ok(())
     }
 
+    /// Writes a Radeon register, letting the card reach memory and raise INTA.
+    fn radeon_write(&mut self, f: impl FnOnce(&mut radeon::Radeon, &mut CardBus)) {
+        let aperture = self.aperture();
+        let master = self.pci[DISPLAY].1.bus_master();
+        if let Display::Radeon(r) = &mut self.display {
+            let mut bus = CardBus { ram: &mut self.ram[..], watch: &mut self.code_watch, aperture, master };
+            f(r, &mut bus);
+        }
+        self.sync_pci_irqs();
+    }
+
     /// Level of the INTx line of `self.pci[function]`.
     fn intx(&self, function: usize) -> bool {
+        if function == DISPLAY
+            && let Display::Radeon(r) = &self.display
+        {
+            return r.irq();
+        }
         if let Some((i, a)) = &self.ac97
             && *i == function
         {
@@ -1008,6 +1027,70 @@ impl Board {
         self.com1.reset();
         self.irq0_backlog = 0;
         self.reset_requested = false;
+    }
+}
+
+/// The 440BX's AGP aperture and the GATT that maps it onto RAM.
+#[derive(Clone, Copy)]
+struct Aperture {
+    base: u32,
+    size: u32,
+    attbase: u32,
+}
+
+impl Aperture {
+    // GATT entries are a page address with bit 0 as the valid bit, as Linux's intel-agp writes them.
+    fn translate(&self, ram: &[u8], addr: u32) -> Option<u32> {
+        let off = addr.wrapping_sub(self.base);
+        if off >= self.size {
+            return None;
+        }
+        let entry_addr = self.attbase as usize + (off >> 12) as usize * 4;
+        let entry = u32::from_le_bytes(ram.get(entry_addr..entry_addr + 4)?.try_into().unwrap());
+        (entry & 1 != 0).then_some((entry & !0xfff) | (off & 0xfff))
+    }
+}
+
+/// Guest memory as the Radeon's bus master sees it, through the aperture.
+struct CardBus<'a> {
+    ram: &'a mut [u8],
+    watch: &'a mut CodeWatch,
+    aperture: Option<Aperture>,
+    master: bool,
+}
+
+impl CardBus<'_> {
+    fn ram_addr(&self, addr: u32) -> Option<usize> {
+        let phys = self.aperture.and_then(|a| a.translate(self.ram, addr)).unwrap_or(addr) as usize;
+        (phys < self.ram.len() && self.master).then_some(phys)
+    }
+}
+
+impl radeon::BusMemory for CardBus<'_> {
+    fn read(&mut self, addr: u32, buf: &mut [u8]) {
+        let mut done = 0;
+        while done < buf.len() {
+            let a = addr.wrapping_add(done as u32);
+            let n = (0x1000 - (a & 0xfff) as usize).min(buf.len() - done);
+            match self.ram_addr(a) {
+                Some(p) if p + n <= self.ram.len() => buf[done..done + n].copy_from_slice(&self.ram[p..p + n]),
+                _ => buf[done..done + n].fill(0xff),
+            }
+            done += n;
+        }
+    }
+
+    fn write(&mut self, addr: u32, buf: &[u8]) {
+        let mut done = 0;
+        while done < buf.len() {
+            let a = addr.wrapping_add(done as u32);
+            let n = (0x1000 - (a & 0xfff) as usize).min(buf.len() - done);
+            if let Some(p) = self.ram_addr(a).filter(|p| p + n <= self.ram.len()) {
+                self.watch.note_write(p as u32);
+                self.ram[p..p + n].copy_from_slice(&buf[done..done + n]);
+            }
+            done += n;
+        }
     }
 }
 
@@ -1254,8 +1337,7 @@ impl Bus for Board {
                     && (base..base.wrapping_add(radeon::IO_SIZE as u16)).contains(&port)
                 {
                     r.set_time(self.clock_base + self.start.elapsed().as_nanos() as u64);
-                    r.io_write(port - base, size, value);
-                    return;
+                    return self.radeon_write(|r, bus| r.io_write(port - base, size, value, bus));
                 }
                 r.vga_io_write(port, size, value)
             }
@@ -1715,5 +1797,26 @@ mod tests {
         b.write16(0xe000_1012, 0x5555);
         assert_eq!(b.read32(0x0020_0010), 0x5555_ef01);
         assert_eq!(b.read32(0xe000_2000), u32::MAX);
+    }
+
+    #[test]
+    fn radeon_scratch_writeback_reaches_ram_through_the_aperture() {
+        let mut b = bx_board();
+        config_write(&mut b, 0, 0, 0x10, 0xd000_0000);
+        config_write(&mut b, 0, 0, pci::bx::ATTBASE as u32, 0x0010_0000);
+        config_write(&mut b, 0, 0, pci::bx::NBXCFG as u32, pci::bx::APERTURE_ENABLE);
+        b.write32(0x0010_0000, 0x0030_0001);
+        config_write(&mut b, 0, 1, 0x18, 0x0001_0100);
+        config_write(&mut b, 1, 0, 0x18, 0xfe00_0000);
+        config_write(&mut b, 1, 0, 0x04, 0x0002);
+        b.write32(0xfe00_0000 + radeon::regs::MC_AGP_LOCATION, 0xf87f_f800);
+        b.write32(0xfe00_0000 + radeon::regs::AGP_BASE, 0xd000_0000);
+        b.write32(0xfe00_0000 + radeon::regs::SCRATCH_ADDR, 0xf800_0100);
+        b.write32(0xfe00_0000 + radeon::regs::SCRATCH_UMSK, 1);
+        b.write32(0xfe00_0000 + radeon::regs::SCRATCH_REG0, 0xdead_beef);
+        assert_eq!(b.read32(0x0030_0100), 0, "bus mastering is off");
+        config_write(&mut b, 1, 0, 0x04, 0x0006);
+        b.write32(0xfe00_0000 + radeon::regs::SCRATCH_REG0, 0xdead_beef);
+        assert_eq!(b.read32(0x0030_0100), 0xdead_beef);
     }
 }

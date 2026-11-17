@@ -201,7 +201,7 @@ const MMIO: &[(u32, &str)] = &[
     (0x0540, "RADEON_SUBPIC_CNTL"),
     (0x0600, "RADEON_OV1_Y_X_START"),
     (0x0604, "RADEON_OV1_Y_X_END"),
-    (0x0700, "RADEON_SCLK_MORE_FORCEON"),
+    (0x0700, "RADEON_CP_RB_BASE"),
     (0x0704, "RADEON_CP_RB_CNTL"),
     (0x070c, "RADEON_CP_RB_RPTR_ADDR"),
     (0x0710, "RADEON_CP_RB_RPTR"),
@@ -209,8 +209,10 @@ const MMIO: &[(u32, &str)] = &[
     (0x0718, "RADEON_CP_RB_WPTR_DELAY"),
     (0x0738, "RADEON_CP_IB_BASE"),
     (0x073c, "RADEON_CP_IB_BUFSZ"),
-    (0x0740, "RADEON_CRC_CMDFIFO_ADDR"),
+    (0x0740, "RADEON_CP_CSQ_CNTL"),
     (0x0744, "RADEON_CRC_CMDFIFO_DOUT"),
+    (0x0770, "RADEON_SCRATCH_UMSK"),
+    (0x0774, "RADEON_SCRATCH_ADDR"),
     (0x07d4, "RADEON_CP_ME_RAM_ADDR"),
     (0x07d8, "RADEON_CP_ME_RAM_RADDR"),
     (0x07dc, "RADEON_CP_ME_RAM_DATAH"),
@@ -911,7 +913,9 @@ const PLL: &[(u32, &str)] = &[
 ];
 
 fn lookup(table: &[(u32, &'static str)], key: u32) -> &'static str {
-    table.binary_search_by_key(&key, |e| e.0).map_or("?", |i| table[i].1)
+    table
+        .binary_search_by_key(&key, |e| e.0)
+        .map_or("?", |i| table[i].1)
 }
 
 pub(crate) fn mmio_name(reg: u32) -> &'static str {

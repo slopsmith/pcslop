@@ -6,19 +6,27 @@
 //! those first bytes. The legacy VGA keeps its planes interleaved at the start
 //! of VRAM, as QEMU's stdvga and ati-vga do.
 
+mod cp;
 mod crtc;
 mod ddc;
+mod engine;
+mod mem;
 mod names;
 pub mod regs;
 mod trace;
 
 #[cfg(test)]
+mod cp_tests;
+#[cfg(test)]
+mod engine_tests;
+#[cfg(test)]
 mod tests;
 
 use std::io::Write;
 
-use regs::*;
 pub use crtc::Mode;
+pub use mem::{BusMemory, NoBus};
+use regs::*;
 pub use trace::Trace;
 use vga::Vga;
 
@@ -43,6 +51,8 @@ pub enum Source {
     Io,
     /// MM_INDEX/MM_DATA.
     Indexed,
+    /// A packet the command processor executed.
+    Cp,
 }
 
 /// Bus addresses of the BARs, as the PCI configuration space last placed them.
@@ -64,6 +74,10 @@ pub struct Radeon {
     now_ns: u64,
     /// Frames whose vertical blank CRTC_STATUS and GEN_INT_STATUS have been acknowledged up to.
     vblank_acked: [u64; 2],
+    /// GEN_INT_STATUS bits other than the vertical blank, which follows the clock.
+    int_status: u32,
+    cp: cp::Cp,
+    engine: engine::Engine,
     /// The monitor on the VGA connector's DDC lines.
     monitor: ddc::Ddc,
     trace: Option<Trace>,
@@ -80,6 +94,9 @@ impl Radeon {
             config: [0; 256],
             now_ns: 0,
             vblank_acked: [0; 2],
+            int_status: 0,
+            cp: cp::Cp::default(),
+            engine: engine::Engine::default(),
             monitor: ddc::Ddc::default(),
             trace: None,
         };
@@ -91,6 +108,14 @@ impl Radeon {
     pub fn reset(&mut self) {
         self.regs.fill(0);
         self.pll = [0; 64];
+        self.int_status = 0;
+        self.cp = cp::Cp::default();
+        self.engine = engine::Engine::default();
+        for r in [DEFAULT_SC_BOTTOM_RIGHT, SC_BOTTOM_RIGHT] {
+            self.regs[r as usize / 4] = 0x1fff_1fff;
+            self.engine_register_written(r, 0x1fff_1fff);
+        }
+        self.regs[DP_WRITE_MASK as usize / 4] = u32::MAX;
         self.vga.set_bank_window(None);
         self.monitor = ddc::Ddc::default();
     }
@@ -132,19 +157,20 @@ impl Radeon {
     }
 
     pub fn mmio_read(&mut self, off: u32, size: u8) -> u32 {
-        self.access(Source::Mmio, off, size, None)
+        self.access(Source::Mmio, off, size, None, &mut NoBus)
     }
 
-    pub fn mmio_write(&mut self, off: u32, size: u8, v: u32) {
-        self.access(Source::Mmio, off, size, Some(v));
+    /// Writes a register. `mem` is what the card reaches by bus mastering.
+    pub fn mmio_write(&mut self, off: u32, size: u8, v: u32, mem: &mut dyn BusMemory) {
+        self.access(Source::Mmio, off, size, Some(v), mem);
     }
 
     pub fn io_read(&mut self, off: u16, size: u8) -> u32 {
-        self.access(Source::Io, off as u32 & 0xff, size, None)
+        self.access(Source::Io, off as u32 & 0xff, size, None, &mut NoBus)
     }
 
-    pub fn io_write(&mut self, off: u16, size: u8, v: u32) {
-        self.access(Source::Io, off as u32 & 0xff, size, Some(v));
+    pub fn io_write(&mut self, off: u16, size: u8, v: u32, mem: &mut dyn BusMemory) {
+        self.access(Source::Io, off as u32 & 0xff, size, Some(v), mem);
     }
 
     /// A legacy VGA port. None if the VGA does not decode it.
@@ -171,7 +197,9 @@ impl Radeon {
     }
 
     fn vga_mono(&mut self) -> bool {
-        self.vga.io_read(0x3cc, 1, self.now_ns).is_some_and(|m| m & 1 == 0)
+        self.vga
+            .io_read(0x3cc, 1, self.now_ns)
+            .is_some_and(|m| m & 1 == 0)
     }
 
     // The ROM's mode set writes CR12 and checks that CRTC_V_TOTAL_DISP follows,
@@ -203,10 +231,21 @@ impl Radeon {
     }
 
     /// Reads or writes `size` bytes of the register file at byte offset `off`.
-    pub fn access(&mut self, src: Source, off: u32, size: u8, write: Option<u32>) -> u32 {
+    pub fn access(
+        &mut self,
+        src: Source,
+        off: u32,
+        size: u8,
+        write: Option<u32>,
+        mem: &mut dyn BusMemory,
+    ) -> u32 {
         let reg = off & 0xfffc;
         let shift = (off & 3) * 8;
-        let lanes = if size >= 4 { u32::MAX } else { (1u32 << (8 * size as u32)) - 1 };
+        let lanes = if size >= 4 {
+            u32::MAX
+        } else {
+            (1u32 << (8 * size as u32)) - 1
+        };
         let mask = lanes << shift;
         match reg {
             MM_DATA => {
@@ -214,7 +253,13 @@ impl Radeon {
                 if index & 0x8000_0000 != 0 {
                     return self.vram_dword(index & 0x7fff_fffc, shift, mask, write);
                 }
-                return self.access(Source::Indexed, (index & 0xfffc) + (off & 3), size, write);
+                return self.access(
+                    Source::Indexed,
+                    (index & 0xfffc) + (off & 3),
+                    size,
+                    write,
+                    mem,
+                );
             }
             CLOCK_CNTL_DATA => return self.pll_access(shift, mask, write),
             _ => {}
@@ -232,7 +277,7 @@ impl Radeon {
                 if reg != MM_INDEX && reg != CLOCK_CNTL_INDEX {
                     self.trace_reg(src, 'W', size, off, v >> shift);
                 }
-                self.write_reg(reg, v, mask);
+                self.write_reg(reg, v, mask, mem);
                 0
             }
         }
@@ -268,8 +313,15 @@ impl Radeon {
                 let enabled = index_reg & PLL_WR_EN != 0;
                 let name = names::pll_name(index as u32);
                 if let Some(t) = &mut self.trace {
-                    let note = if enabled { "" } else { " (PLL_WR_EN clear: dropped)" };
-                    t.line(format!("pll W {index:#04x} {name} = {:#010x} mask {mask:#010x}{note}", v));
+                    let note = if enabled {
+                        ""
+                    } else {
+                        " (PLL_WR_EN clear: dropped)"
+                    };
+                    t.line(format!(
+                        "pll W {index:#04x} {name} = {:#010x} mask {mask:#010x}{note}",
+                        v
+                    ));
                 }
                 if enabled {
                     self.write_pll(index, v, mask);
@@ -294,16 +346,28 @@ impl Radeon {
     fn read_reg(&mut self, reg: u32) -> u32 {
         match reg {
             CRTC_STATUS => {
-                let saved = if self.frame() > self.vblank_acked[0] { CRTC_VBLANK_SAVE } else { 0 };
+                let saved = if self.frame() > self.vblank_acked[0] {
+                    CRTC_VBLANK_SAVE
+                } else {
+                    0
+                };
                 saved | (self.in_vblank() as u32 * CRTC_VBLANK_CUR)
             }
-            GEN_INT_STATUS => {
-                let v = self.reg(GEN_INT_STATUS) & !VSYNC_INT;
-                v | if self.frame() > self.vblank_acked[1] { VSYNC_INT } else { 0 }
-            }
+            GEN_INT_STATUS => self.gen_int_status(),
+            CP_RB_RPTR => self.cp_rptr(),
+            CP_STAT | CP_CSQ_STAT => 0,
+            RB2D_DSTCACHE_CTLSTAT
+            | DSTCACHE_CTLSTAT
+            | RB3D_DSTCACHE_CTLSTAT
+            | R300_RB3D_DSTCACHE_CTLSTAT
+            | R300_RB3D_ZCACHE_CTLSTAT => self.reg(reg) & !CACHE_BUSY,
             DAC_CNTL => {
                 let v = self.reg(DAC_CNTL);
-                if v & DAC_CMP_EN != 0 { v | DAC_CMP_OUTPUT } else { v & !DAC_CMP_OUTPUT }
+                if v & DAC_CMP_EN != 0 {
+                    v | DAC_CMP_OUTPUT
+                } else {
+                    v & !DAC_CMP_OUTPUT
+                }
             }
             GPIO_VGA_DDC | GPIO_DVI_DDC | GPIO_MONID | GPIO_CRT2_DDC => {
                 let v = self.reg(reg);
@@ -318,7 +382,8 @@ impl Radeon {
             PALETTE_DATA | PALETTE_30_DATA => {
                 let index = self.reg(PALETTE_INDEX);
                 let [r, g, b] = self.vga.dac_entry((index >> 16) as u8);
-                self.regs[PALETTE_INDEX as usize / 4] = (index & !0x00ff_0000) | ((index + 0x1_0000) & 0x00ff_0000);
+                self.regs[PALETTE_INDEX as usize / 4] =
+                    (index & !0x00ff_0000) | ((index + 0x1_0000) & 0x00ff_0000);
                 if reg == PALETTE_DATA {
                     (r as u32) << 16 | (g as u32) << 8 | b as u32
                 } else {
@@ -340,7 +405,7 @@ impl Radeon {
         }
     }
 
-    fn write_reg(&mut self, reg: u32, v: u32, mask: u32) {
+    fn write_reg(&mut self, reg: u32, v: u32, mask: u32, mem: &mut dyn BusMemory) {
         let old = self.reg(reg);
         let new = (old & !mask) | (v & mask);
         match reg {
@@ -351,8 +416,12 @@ impl Radeon {
                 return;
             }
             GEN_INT_STATUS => {
-                if new & VSYNC_INT != 0 {
+                if v & mask & (VSYNC_INT | CRTC_VBLANK_STAT) != 0 {
                     self.vblank_acked[1] = self.frame();
+                }
+                self.int_status &= !(v & mask & SW_INT_TEST);
+                if v & mask & SW_INT_FIRE != 0 {
+                    self.int_status |= SW_INT_TEST;
                 }
                 return;
             }
@@ -370,6 +439,9 @@ impl Radeon {
             _ => {}
         }
         self.regs[reg as usize / 4] = new;
+        if self.cp_register_written(reg, mem) || self.engine_register_written(reg, new) {
+            return;
+        }
         match reg {
             DAC_CNTL => self.vga.set_dac_8bit(new & DAC_8BIT_EN != 0),
             GPIO_VGA_DDC => {
@@ -405,10 +477,18 @@ impl Radeon {
                 Source::Mmio => "mmio",
                 Source::Io => "io",
                 Source::Indexed => "idx",
+                Source::Cp => "cp",
             };
             let name = names::mmio_name(off & 0xfffc);
-            let byte = if off & 3 != 0 { format!("+{}", off & 3) } else { String::new() };
-            t.line(format!("{src} {dir}{size} {:#06x}{byte} {name} = {v:#x}", off & 0xfffc));
+            let byte = if off & 3 != 0 {
+                format!("+{}", off & 3)
+            } else {
+                String::new()
+            };
+            t.line(format!(
+                "{src} {dir}{size} {:#06x}{byte} {name} = {v:#x}",
+                off & 0xfffc
+            ));
         }
     }
 
@@ -418,6 +498,35 @@ impl Radeon {
             return self.render_extended(out);
         }
         self.vga.render(out)
+    }
+
+    /// GEN_INT_STATUS: the latched vertical blank and the software interrupt.
+    fn gen_int_status(&self) -> u32 {
+        let vblank = if self.frame() > self.vblank_acked[1] {
+            VSYNC_INT | CRTC_VBLANK_STAT
+        } else {
+            0
+        };
+        self.int_status | vblank
+    }
+
+    /// Level of the card's INTA line.
+    pub fn irq(&self) -> bool {
+        self.gen_int_status()
+            & self.reg(GEN_INT_CNTL)
+            & (CRTC_VBLANK_STAT | VSYNC_INT | SW_INT_TEST)
+            != 0
+    }
+
+    /// When the next vertical blank interrupt is due, if one is enabled and not pending.
+    pub fn next_irq_ns(&self) -> Option<u64> {
+        let enabled = self.reg(GEN_INT_CNTL) & (CRTC_VBLANK_STAT | VSYNC_INT) != 0;
+        (enabled && !self.irq()).then(|| self.next_frame_ns())
+    }
+
+    /// Commands and 2D operations run so far.
+    pub fn stats(&self) -> (u64, u64) {
+        (self.cp.packets, self.engine.ops)
     }
 
     pub fn take_changed(&mut self) -> bool {

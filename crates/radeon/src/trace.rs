@@ -11,7 +11,11 @@ pub struct Trace {
 
 impl Trace {
     pub fn new(out: Box<dyn Write + Send>) -> Self {
-        Trace { out, last: String::new(), repeats: 0 }
+        Trace {
+            out,
+            last: String::new(),
+            repeats: 0,
+        }
     }
 
     pub fn line(&mut self, text: String) {

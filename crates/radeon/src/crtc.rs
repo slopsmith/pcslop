@@ -47,9 +47,20 @@ impl Radeon {
         }
         let bytes = bits.div_ceil(8);
         let pitch = (self.reg(CRTC_PITCH) & 0x7ff) * 8 * bytes;
-        let offset = self.vram_offset(self.reg(CRTC_OFFSET));
-        (width <= MAX_DIM && height <= MAX_DIM && height > 0)
-            .then_some(Mode { width, height, bits, pitch, offset, double_scan })
+        let mut offset = self.vram_offset(self.reg(CRTC_OFFSET));
+        if self.reg(CRTC_OFFSET_CNTL) & R300_CRTC_X_Y_MODE_EN != 0 {
+            let xy = self.reg(R300_CRTC_TILE_X0_Y0);
+            let (x, y) = (xy & 0xfff, (xy >> 16) & 0xfff);
+            offset = offset.wrapping_add(y * pitch + x * bytes) % crate::VRAM_SIZE as u32;
+        }
+        (width <= MAX_DIM && height <= MAX_DIM && height > 0).then_some(Mode {
+            width,
+            height,
+            bits,
+            pitch,
+            offset,
+            double_scan,
+        })
     }
 
     /// VRAM offset of a CRTC or cursor offset, which count from
@@ -75,13 +86,21 @@ impl Radeon {
         self.now_ns / FRAME_NS
     }
 
+    pub(crate) fn next_frame_ns(&self) -> u64 {
+        (self.frame() + 1) * FRAME_NS
+    }
+
     pub(crate) fn render_extended(&mut self, out: &mut Vec<u32>) -> Option<(u32, u32)> {
         let ctl = self.reg(CRTC_GEN_CNTL);
         if ctl & CRTC_EN == 0 || self.reg(CRTC_EXT_CNTL) & CRTC_DISPLAY_DIS != 0 {
             return None;
         }
         let m = self.mode()?;
-        let pal = if m.bits == 8 { self.vga.palette256() } else { [0; 256] };
+        let pal = if m.bits == 8 {
+            self.vga.palette256()
+        } else {
+            [0; 256]
+        };
         let vram = self.vga.vram();
         let (w, h) = (m.width as usize, m.height as usize);
         out.clear();
