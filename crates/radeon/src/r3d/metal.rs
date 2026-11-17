@@ -82,6 +82,9 @@ struct Uniforms {
     alpha_func: u32,
     out_fmt: u32,
     vram_size: u32,
+    fog: u32,
+    fog_factor: f32,
+    fog_colour: [f32; 3],
 }
 
 type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
@@ -397,6 +400,9 @@ impl MetalR3d {
             alpha_func: r.alpha_func,
             out_fmt: r.out_fmt,
             vram_size: self.vram_len as u32,
+            fog: r.fog,
+            fog_factor: r.fog_factor,
+            fog_colour: r.fog_colour,
         };
         for (i, c) in r.us.consts.iter().take(32).enumerate() {
             u.consts[i] = *c;

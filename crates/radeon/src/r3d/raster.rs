@@ -9,13 +9,14 @@ use super::us::{self, Quad, TEMPS};
 use crate::engine::rop3;
 
 /// A vertex after the vertex shader and viewport transform: window x, y and
-/// z, and 1/w for perspective-correct interpolation.
+/// z, 1/w for perspective-correct interpolation, and the GA's fog value.
 #[derive(Clone, Copy, Default, Debug)]
 pub(crate) struct Vertex {
     pub pos: V4,
     pub colours: [V4; 4],
     pub tex: [V4; 8],
     pub psize: Option<f32>,
+    pub fog: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -32,7 +33,8 @@ pub(crate) struct DepthBuffer {
     pub z16: bool,
 }
 
-const ATTRS: usize = 16 + 32;
+const FOG: usize = 16 + 32;
+const ATTRS: usize = FOG + 1;
 
 pub(crate) struct Raster {
     pub colour: Vec<ColourBuffer>,
@@ -52,6 +54,10 @@ pub(crate) struct Raster {
     pub constant: u32,
     pub rop: u32,
     pub alpha_func: u32,
+    /// FG_FOG_BLEND, the fog colour and FG_FOG_FACTOR.
+    pub fog: u32,
+    pub fog_colour: [f32; 3],
+    pub fog_factor: f32,
     pub cull: u32,
     pub colour_control: u32,
     pub clamp_colours: bool,
@@ -71,7 +77,8 @@ pub(crate) struct Raster {
 
 /// Triangles set up for another rasterizer: per vertex, window x, y, z
 /// (after polygon offset) and the 1/w the CPU path interpolates with, the
-/// face, and the pixel stack registers in `slots` as the RS fills them.
+/// face and the fog value, and the pixel stack registers in `slots` as the
+/// RS fills them.
 #[derive(Default)]
 pub(crate) struct Captured {
     pub slots: Vec<usize>,
@@ -215,6 +222,24 @@ fn write_px(vram: &mut [u8], a: usize, bpp: usize, v: u32) {
     }
 }
 
+/// The FG's fog blend. The GA's value is the share of fog colour for the
+/// linear function and the exponent for the others, as the scale and offset
+/// Mesa's classic r300 driver (Nicolai Hähnle, Jerome Glisse and others, MIT
+/// license) programs for OpenGL's fog modes imply.
+fn blend_fog(cntl: u32, colour: [f32; 3], factor: f32, c: V4, value: f32) -> V4 {
+    if cntl & 1 == 0 {
+        return c;
+    }
+    let amount = match (cntl >> 1) & 3 {
+        0 => value,
+        1 => 1.0 - (-16.0 * value).exp2(),
+        2 => 1.0 - (-16.0 * value * value).exp2(),
+        _ => factor,
+    }
+    .clamp(0.0, 1.0);
+    [c[0] + (colour[0] - c[0]) * amount, c[1] + (colour[1] - c[1]) * amount, c[2] + (colour[2] - c[2]) * amount, c[3]]
+}
+
 impl Raster {
     fn inside_clip(&self, x: i32, y: i32) -> bool {
         let [x0, y0, x1, y1] = self.scissor;
@@ -259,7 +284,8 @@ impl Raster {
             let c = if self.clamp_colours { c.map(|x| x.clamp(0.0, 1.0)) } else { *c };
             a[4 * i..4 * i + 4].copy_from_slice(&c);
         }
-        a[16..].copy_from_slice(&self.pack(v, counts));
+        a[16..FOG].copy_from_slice(&self.pack(v, counts));
+        a[FOG] = v.fog;
         a
     }
 
@@ -330,7 +356,7 @@ impl Raster {
             let cap = self.capture.as_mut().unwrap();
             for k in 0..3 {
                 cap.floats.extend_from_slice(&[p[k].0 as f32 / 16.0, p[k].1 as f32 / 16.0, z[k], q[k]]);
-                cap.floats.extend_from_slice(&[front as u32 as f32, 0.0, 0.0, 0.0]);
+                cap.floats.extend_from_slice(&[front as u32 as f32, attrs[k][FOG], 0.0, 0.0]);
                 for &s in &cap.slots {
                     cap.floats.extend_from_slice(&temps[k][s]);
                 }
@@ -438,6 +464,7 @@ impl Raster {
     ) {
         let mut temps = [[[0.0; 4]; TEMPS]; 4];
         let mut depth = [0.0f32; 4];
+        let mut fog = [0.0f32; 4];
         for l in 0..4 {
             let b = bary[l];
             let wsum = b[0] * q[0] + b[1] * q[1] + b[2] * q[2];
@@ -447,6 +474,7 @@ impl Raster {
                 *v = if wsum != 0.0 { n / wsum } else { 0.0 };
             }
             temps[l] = self.rs(&a);
+            fog[l] = a[FOG];
             depth[l] = b[0] * z[0] + b[1] * z[1] + b[2] * z[2];
         }
         let out = {
@@ -459,7 +487,8 @@ impl Raster {
             }
             let (px, py) = (x + (l & 1) as i32, y + (l >> 1) as i32);
             let z = out.depth[l].unwrap_or(depth[l]);
-            self.backend(vram, px, py, out.colour[l], z, front);
+            let colour = blend_fog(self.fog, self.fog_colour, self.fog_factor, out.colour[l], fog[l]);
+            self.backend(vram, px, py, colour, z, front);
         }
     }
 

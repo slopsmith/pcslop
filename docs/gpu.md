@@ -154,6 +154,11 @@ How it drives the card, compared with XP's own driver:
 - Flips are `CRTC_OFFSET` writes in the ring, behind the frame's draws. OpenGL renders to a tiled back buffer and presents it with a full-screen point sprite into one of two front buffers before the flip.
 - Colour and depth buffers are macro- and micro-tiled. We keep them linear, as everywhere else.
 
+Sniper: Path of Vengeance (LithTech, Direct3D) on Catalyst needed:
+
+- **Frustum clipping.** Catalyst sets `DX_CLIP_SPACE_DEF` and leaves clipping on, with a guard band of about 3.4 by 4.2 viewports. We only clipped at w = 0, so vertices just in front of the eye but behind the near plane, or lerped onto w = 0, became huge spikes across the screen and their near depth hid the level. Clipping interpolates from the inside vertex, since t computed from a far outside one rounds to 1.
+- **Fog.** Its levels use linear fog by eye distance (`GB_SELECT` 1/(1/W)), with the clear colour as fog colour.
+
 To install it:
 
 1. Boot a fresh `~/xp-acpi.img` clone with `--gpu radeon --vga-rom ROM`, let XP install its ATI and AGP drivers, and click Yes on the restart prompt.
@@ -167,15 +172,16 @@ To install it:
 - **Packets:** `3D_DRAW_IMMD(_2)`, `3D_DRAW_VBUF(_2)`, `3D_DRAW_INDX(_2)`, `INDX_BUFFER` (indices or any register), `3D_LOAD_VBPNTR` and `3D_DRAW_128`.
 - **Vertex fetch:** a vertex's dwords come from the packet or from each array of structures in turn, and the PSC (`VAP_PROG_STREAM_CNTL*`) splits them into input vectors: floats, bytes, D3DCOLOR, shorts and packed 10/11-bit formats, with SIGNED and NORMALIZE.
 - **Vertex shader:** the PVS program in vector memory (code at 0, constants at 512), interpreted per vertex: every R3xx vector and math opcode, the macro MAD, dual-math instructions, relative addressing through A0, and saturation. `PVS_BYPASS` passes inputs through. Flow control (loops, JSR) is not implemented.
-- **Setup:** `VAP_OUT_VTX_FMT_*` lays out position, point size, colours and texture coordinates. Triangles behind the w = 0 plane are clipped, then the VTE divides by w and applies the viewport (whose registers have a second address at 0x1D98). Points become sprites, lines become quads; quads, strips, fans and polygons become triangles. Culling follows `SU_CULL_MODE`; polygon offset `SU_POLY_OFFSET_*`.
+- **Setup:** `VAP_OUT_VTX_FMT_*` lays out position, point size, colours and texture coordinates. Triangles are clipped in clip space as `VAP_CLIP_CNTL` and `VAP_CNTL` say: to the near plane (z = 0 with `DX_CLIP_SPACE_DEF`, z = -w without), the far plane z = w and the guard band in `VAP_GB_*_CLIP_ADJ`; with `CLIP_DISABLE` only to w > 0. Then the VTE divides by w and applies the viewport (whose registers have a second address at 0x1D98). Points become sprites, lines become quads; quads, strips, fans and polygons become triangles. Culling follows `SU_CULL_MODE`; polygon offset `SU_POLY_OFFSET_*`.
 - **Rasterizer:** triangles are scan-converted in 1/16 pixel fixed point with a top-left fill rule, inside the scissor and the clip rectangles (offset by 1440 with 1/12 subpixels, 1088 with 1/16, as AMD's R5xx guide says for `GB_TILE_CONFIG`). Attributes are interpolated perspective-correctly; the RS instructions place colours and texture coordinates in the fragment shader's registers.
 - **Fragment shader:** the US program, interpreted on 2x2 quads so texture lookups can take their level of detail from neighbouring pixels: nodes, TEX/TXP/TXB/KIL, and every RGB and alpha ALU opcode with pre-subtract, swizzles, modifiers, output modifiers and clamping.
 - **Textures:** 8 to 128-bit integer, half and float formats and DXT1/3/5, from VRAM or through the GART, with every wrap mode, point and bilinear filtering and mipmap levels.
+- **Fog:** the GA's fog value is a vertex colour's alpha, the eye distance w or z (`GB_SELECT`), scaled and offset by `GA_FOG_SCALE`/`GA_FOG_OFFSET` and interpolated; the FG blends towards `FG_FOG_COLOR_*` (10-bit units) by it, linearly, as 2^(-16f) or 2^(-16f²), or by `FG_FOG_FACTOR`, as Mesa's classic r300 driver's fog constants imply.
 - **Back end:** alpha test, 16-bit and 24/8 depth and stencil (two-sided too), blending with every factor and combine function, separate alpha, ROP2, colour masks, and ARGB8888, RGB565, ARGB1555, ARGB4444, I8 and UV88 colour buffers. `ZB_ZPASS_*` counts passing pixels for occlusion queries.
 - **Tiling:** like the 2D engine, it treats every surface as linear, so what it draws stays consistent with the CRTC and the 2D engine.
 - **Sync:** on the CPU path, drawing finishes before the next packet, so fences, scratch writebacks, `WAIT_UNTIL` and CPU reads of a surface always see finished pixels.
 
-Still missing: the vertex shader on the GPU, HiZ (`3D_CLEAR_HIZ` does nothing, which only costs speed), Z compression beyond fast clears (see [Catalyst](#catalyst-102-on-windows-xp)), cube and volume textures, fog, MSAA and the R5xx-only opcodes.
+Still missing: the vertex shader on the GPU, HiZ (`3D_CLEAR_HIZ` does nothing, which only costs speed), Z compression beyond fast clears (see [Catalyst](#catalyst-102-on-windows-xp)), cube and volume textures, user clip planes, MSAA and the R5xx-only opcodes.
 
 ### Metal backend
 

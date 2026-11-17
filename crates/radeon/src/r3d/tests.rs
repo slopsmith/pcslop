@@ -354,6 +354,57 @@ fn triangles_crossing_the_eye_plane_draw_only_their_visible_part() {
     assert_eq!(g.px(32, 10), 0);
 }
 
+fn clip_space(g: &mut Gpu) {
+    g.w(VAP_VTE_CNTL, 0xf | 1 << 10);
+    for (reg, val) in [(VAP_VPORT_XSCALE, 32.0), (VAP_VPORT_XOFFSET, 32.0), (VAP_VPORT_YSCALE, 32.0), (VAP_VPORT_YOFFSET, 32.0)] {
+        g.w(reg, f(val));
+    }
+}
+
+/// Direct3D's near plane is z = 0: a vertex just in front of the eye but
+/// behind it must not stretch its triangle across the screen.
+#[test]
+fn triangles_are_clipped_to_the_direct3d_near_plane() {
+    let mut g = Gpu::new();
+    clip_space(&mut g);
+    g.w(VAP_CNTL, DX_CLIP_SPACE_DEF);
+    let at = |x: f32, y: f32, z: f32| [x, y, z, 1.0, 1.0, 0.0, 0.0, 1.0];
+    g.draw(4, &[at(-1.0, -1.0, 0.5), at(1.0, -1.0, 0.5), at(0.0, 1.0, -0.5)]);
+    assert_eq!(g.px(32, 20), 0xffff_0000);
+    assert_eq!(g.px(32, 40), 0);
+    g.w(VAP_CLIP_CNTL, CLIP_DISABLE);
+    g.draw(4, &[at(-1.0, -1.0, 0.5), at(1.0, -1.0, 0.5), at(0.0, 1.0, -0.5)]);
+    assert_eq!(g.px(32, 40), 0xffff_0000);
+}
+
+#[test]
+fn opengl_clip_space_keeps_z_down_to_minus_w_and_clips_beyond_the_far_plane() {
+    let mut g = Gpu::new();
+    clip_space(&mut g);
+    let at = |x: f32, y: f32, z: f32| [x, y, z, 1.0, 1.0, 0.0, 0.0, 1.0];
+    g.draw(4, &[at(-1.0, -1.0, -0.5), at(1.0, -1.0, -0.5), at(0.0, 1.0, -0.9)]);
+    assert_eq!(g.px(32, 40), 0xffff_0000);
+    g.draw(4, &[at(-1.0, -1.0, 0.5), at(1.0, -1.0, 0.5), at(0.0, 1.0, 1.5)].map(|mut v| {
+        v[6] = 1.0;
+        v
+    }));
+    assert_eq!(g.px(32, 20), 0xffff_00ff);
+    assert_eq!(g.px(32, 40), 0xffff_0000);
+}
+
+/// A vertex far outside the guard band is clipped before the divide, so
+/// what is left of the triangle still covers the screen it should.
+#[test]
+fn the_guard_band_clips_vertices_far_off_screen() {
+    let mut g = Gpu::new();
+    clip_space(&mut g);
+    g.w(VAP_GB_HORZ_CLIP_ADJ, f(2.0));
+    g.w(VAP_GB_VERT_CLIP_ADJ, f(2.0));
+    let at = |x: f32, y: f32| [x, y, 0.5, 1.0, 1.0, 0.0, 0.0, 1.0];
+    g.draw(4, &[at(-1.0, -1.0), at(1.0e12, -1.0), at(-1.0, 1.0e12)]);
+    assert_eq!(g.count(0xffff_0000), 64 * 64);
+}
+
 fn textured_sprite(g: &mut Gpu, unit: u32, logical_id: u32) {
     for i in 0..16 {
         g.put(TEXTURE as usize + i * 4, 0xff00_ff00);
@@ -386,6 +437,36 @@ fn a_texture_map_with_another_logical_id_reads_as_disabled() {
     let mut g = Gpu::new();
     textured_sprite(&mut g, 0, 3);
     assert_eq!(g.px(4, 4), 0xff00_0000);
+}
+
+/// Linear fog by eye distance, as Sniper: Path of Vengeance sets it up on
+/// Catalyst: half the fog colour at w = 2.
+fn fogged(g: &mut Gpu, function: u32) {
+    g.w(GB_SELECT, 4);
+    g.w(GA_FOG_SCALE, f(0.25));
+    g.w(GA_FOG_OFFSET, f(0.0));
+    g.w(FG_FOG_BLEND, 1 | function << 1);
+    for (c, v) in [0, 0, 1023].into_iter().enumerate() {
+        g.w(FG_FOG_COLOR_R + 4 * c as u32, v);
+    }
+    let near = quad(0.0, 0.0, 16.0, 16.0, RED);
+    let far = quad(16.0, 0.0, 32.0, 16.0, RED).map(|mut v| {
+        v[3] = 0.5;
+        v
+    });
+    g.draw(13, &near);
+    g.draw(13, &far);
+}
+
+#[test]
+fn linear_fog_blends_towards_the_fog_colour_with_eye_distance() {
+    let mut g = Gpu::new();
+    fogged(&mut g, 0);
+    assert_eq!(g.px(4, 4), 0xffbf_0040);
+    assert_eq!(g.px(20, 4), 0xff80_0080);
+    g.w(FG_FOG_BLEND, 0);
+    g.draw(13, &quad(0.0, 0.0, 16.0, 16.0, RED));
+    assert_eq!(g.px(4, 4), 0xffff_0000);
 }
 
 #[test]
@@ -543,6 +624,20 @@ mod against_metal {
             0,
             40,
         );
+    }
+
+    #[test]
+    fn fog_matches() {
+        for function in 0..4 {
+            same(|g| {
+                fogged(g, function);
+                g.w(FG_FOG_FACTOR, 300);
+                g.draw(4, &[v(0.0, 20.0, RED), v(64.0, 20.0, RED), v(0.0, 64.0, BLUE)].map(|mut v| {
+                    v[3] = 0.3 + v[0] / 64.0;
+                    v
+                }));
+            }, 2, 64);
+        }
     }
 
     fn depth(g: &mut Gpu, z16: bool) {

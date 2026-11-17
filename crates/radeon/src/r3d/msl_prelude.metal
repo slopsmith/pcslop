@@ -26,6 +26,9 @@ struct Uniforms {
     int clips[16];
     uint clip_rule, blend, ablend, channel_mask, constant_colour, rop, alpha_func, out_fmt;
     uint vram_size;
+    uint fog;
+    float fog_factor;
+    float fog_colour[3];
 };
 
 static uint rd8(const device uchar *d, uint a, uint limit) {
@@ -359,6 +362,19 @@ static uint rop2(uint r, uint s, uint d) {
     return out;
 }
 
+static float4 blend_fog(constant Uniforms &u, float4 c, float value) {
+    if (!(u.fog & 1)) return c;
+    float amount;
+    switch ((u.fog >> 1) & 3) {
+    case 0: amount = value; break;
+    case 1: amount = 1.0 - exp2(-16.0 * value); break;
+    case 2: amount = 1.0 - exp2(-16.0 * value * value); break;
+    default: amount = u.fog_factor; break;
+    }
+    amount = clamp(amount, 0.0, 1.0);
+    return float4(mix(c.xyz, float3(u.fog_colour[0], u.fog_colour[1], u.fog_colour[2]), amount), c.w);
+}
+
 static void backend(constant Uniforms &u, device uchar *vram, device atomic_uint *counter, uint x, uint y, float4 colour, float z, bool front) {
     if (u.alpha_func & (1 << 11)) {
         uint a = uint(round(clamp(colour.w, 0.0, 1.0) * 255.0));
@@ -423,6 +439,7 @@ vertex VOut vs(uint vid [[vertex_id]], const device float4 *vb [[buffer(0)]]) {
     o.position = float4((p.x / 2048.0 - 1.0) * w, (1.0 - p.y / 2048.0) * w, 0.0, w);
     o.z = p.z;
     o.front = v[1].x;
+    o.fog = v[1].y;
     @COPY@
     return o;
 }

@@ -45,6 +45,8 @@ struct Viewport {
     scale: [f32; 3],
     offset: [f32; 3],
     ga: (f32, f32),
+    /// GB_SELECT's fog source, then GA_FOG_SCALE and GA_FOG_OFFSET.
+    fog: (u32, f32, f32),
 }
 
 impl Viewport {
@@ -53,7 +55,7 @@ impl Viewport {
         self.vte & (1 << 8) == 0 && self.vte & (1 << 10) != 0
     }
 
-    /// Window coordinates and 1/w of a vertex.
+    /// Window coordinates and 1/w of a vertex, and its fog value.
     fn apply(&self, mut v: Vertex) -> Vertex {
         let vte = self.vte;
         let w = v.pos[3];
@@ -75,6 +77,14 @@ impl Viewport {
                 *c += self.offset[i];
             }
         }
+        let (select, scale, offset) = self.fog;
+        let source = match select {
+            k @ 0..=3 => v.colours[k as usize][3],
+            4 if vte & (1 << 10) != 0 => w,
+            4 => 1.0 / w,
+            _ => c[2],
+        };
+        v.fog = source * scale + offset;
         v.pos = [c[0] + self.ga.0, c[1] + self.ga.1, c[2], rcp];
         v
     }
@@ -87,24 +97,69 @@ fn lerp(a: &Vertex, b: &Vertex, t: f32) -> Vertex {
         colours: [0, 1, 2, 3].map(|i| mix(a.colours[i], b.colours[i])),
         tex: std::array::from_fn(|i| mix(a.tex[i], b.tex[i])),
         psize: a.psize,
+        fog: a.fog + (b.fog - a.fog) * t,
     }
 }
 
-/// The part of a clip-space triangle in front of the w = NEAR_W plane, as a
-/// polygon.
-fn clip_near(t: &[Vertex; 3]) -> Vec<Vertex> {
-    let mut out = Vec::with_capacity(4);
-    for i in 0..3 {
-        let (a, b) = (&t[i], &t[(i + 1) % 3]);
-        let (da, db) = (a.pos[3] - NEAR_W, b.pos[3] - NEAR_W);
-        if da >= 0.0 {
-            out.push(*a);
-        }
-        if (da >= 0.0) != (db >= 0.0) {
-            out.push(lerp(a, b, da / (da - db)));
+/// A clip plane: a vertex is inside where `dot(n, pos) >= bias`.
+type Plane = ([f32; 4], f32);
+
+/// The planes the VAP clips triangles against, in clip space. With
+/// VAP_CLIP_CNTL's CLIP_DISABLE only w > 0 is kept. Otherwise the near
+/// plane is z = 0 under VAP_CNTL's DX_CLIP_SPACE_DEF and z = -w without,
+/// the far plane z = w, and x and y are clipped to the guard band the
+/// VAP_GB_*_CLIP_ADJ registers give in multiples of w. Register meanings
+/// follow Mesa's r300 driver (r300_reg.h, r300_emit.c's guard band and
+/// VAP_CNTL state; MIT license, Jerome Glisse, Corbin Simpson, Marek Olšák
+/// and others).
+fn clip_planes(enabled: bool, dx: bool, horz: f32, vert: f32) -> Vec<Plane> {
+    let mut planes = vec![([0.0, 0.0, 0.0, 1.0], NEAR_W)];
+    if enabled {
+        planes.push(([0.0, 0.0, 1.0, if dx { 0.0 } else { 1.0 }], 0.0));
+        planes.push(([0.0, 0.0, -1.0, 1.0], 0.0));
+        for (axis, adj) in [(0, horz), (1, vert)] {
+            if adj > 0.0 && adj.is_finite() {
+                for sign in [1.0, -1.0] {
+                    let mut n = [0.0, 0.0, 0.0, adj];
+                    n[axis] = sign;
+                    planes.push((n, 0.0));
+                }
+            }
         }
     }
-    out
+    planes
+}
+
+fn distance((n, bias): &Plane, v: &Vertex) -> f32 {
+    n[0] * v.pos[0] + n[1] * v.pos[1] + n[2] * v.pos[2] + n[3] * v.pos[3] - bias
+}
+
+/// The part of a clip-space triangle inside every plane, as a polygon.
+fn clip(t: &[Vertex; 3], planes: &[Plane]) -> Vec<Vertex> {
+    let mut poly = t.to_vec();
+    for plane in planes {
+        if poly.iter().all(|v| distance(plane, v) >= 0.0) {
+            continue;
+        }
+        let mut out = Vec::with_capacity(poly.len() + 1);
+        for i in 0..poly.len() {
+            let (a, b) = (&poly[i], &poly[(i + 1) % poly.len()]);
+            let (da, db) = (distance(plane, a), distance(plane, b));
+            if da >= 0.0 {
+                out.push(*a);
+            }
+            if da >= 0.0 && db < 0.0 {
+                out.push(lerp(a, b, da / (da - db)));
+            } else if da < 0.0 && db >= 0.0 {
+                out.push(lerp(b, a, db / (db - da)));
+            }
+        }
+        if out.len() < 3 {
+            return Vec::new();
+        }
+        poly = out;
+    }
+    poly
 }
 
 pub(crate) mod op {
@@ -538,6 +593,7 @@ impl Radeon {
             scale: [f(VAP_VPORT_XSCALE), f(VAP_VPORT_YSCALE), f(VAP_VPORT_ZSCALE)],
             offset: [f(VAP_VPORT_XOFFSET), f(VAP_VPORT_YOFFSET), f(VAP_VPORT_ZOFFSET)],
             ga: (((ga & 0xffff) as i16) as f32 / sub, ((ga >> 16) as i16) as f32 / sub),
+            fog: (self.reg(GB_SELECT) & 7, f(GA_FOG_SCALE), f(GA_FOG_OFFSET)),
         }
     }
 
@@ -679,6 +735,9 @@ impl Radeon {
             constant: self.reg(RB3D_CONSTANT_COLOR),
             rop: self.reg(RB3D_ROPCNTL),
             alpha_func: self.reg(FG_ALPHA_FUNC),
+            fog: self.reg(FG_FOG_BLEND),
+            fog_colour: [0, 1, 2].map(|c| bits(self.reg(FG_FOG_COLOR_R + 4 * c), 0, 10) as f32 / 1023.0),
+            fog_factor: bits(self.reg(FG_FOG_FACTOR), 0, 10) as f32 / 1023.0,
             cull: self.reg(SU_CULL_MODE),
             colour_control: self.reg(GA_COLOR_CONTROL),
             clamp_colours: self.reg(GA_ROUND_MODE) & (1 << 4) == 0,
@@ -739,12 +798,19 @@ impl Radeon {
         let gb = self.reg(GB_ENABLE);
         let vp = self.viewport();
         let behind = |v: &Vertex| vp.clips() && v.pos[3] < NEAR_W;
+        let planes = clip_planes(
+            self.reg(VAP_CLIP_CNTL) & CLIP_DISABLE == 0,
+            self.reg(VAP_CNTL) & DX_CLIP_SPACE_DEF != 0,
+            f32::from_bits(self.reg(VAP_GB_HORZ_CLIP_ADJ)),
+            f32::from_bits(self.reg(VAP_GB_VERT_CLIP_ADJ)),
+        );
+        let outside = |v: &Vertex| planes.iter().any(|p| distance(p, v) < 0.0);
         let vram = self.vga.vram_mut();
         let n = vertices.len();
         let tri = |r: &mut Raster, vram: &mut [u8], a: usize, b: usize, c: usize| {
             let t = [vertices[a], vertices[b], vertices[c]];
-            if t.iter().any(behind) {
-                let poly = clip_near(&t);
+            if vp.clips() && t.iter().any(outside) {
+                let poly = clip(&t, &planes);
                 for i in 2..poly.len() {
                     r.triangle(vram, [poly[0], poly[i - 1], poly[i]].map(|v| vp.apply(v)), &counts, true);
                 }

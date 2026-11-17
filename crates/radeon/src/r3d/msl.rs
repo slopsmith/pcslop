@@ -11,7 +11,7 @@ const PRELUDE: &str = include_str!("msl_prelude.metal");
 /// whose rasterizer fills pixel stack registers `slots`.
 pub(crate) fn shader(prog: &Program, slots: &[usize], perspective: bool) -> String {
     let interp = if perspective { "center_perspective" } else { "center_no_perspective" };
-    let mut varyings = String::new();
+    let mut varyings = format!("    float fog [[{interp}]];\n");
     let mut copy = String::new();
     for (i, _) in slots.iter().enumerate() {
         let _ = writeln!(varyings, "    float4 v{i} [[{interp}]];");
@@ -48,7 +48,7 @@ fn fragment(prog: &Program, slots: &[usize]) -> String {
         }
     }
     f.push_str(
-        "    int x = int(in.position.x), y = int(in.position.y);\n    if (killed || x < 0 || y < 0 || !inside_clip(u, x, y)) return;\n    backend(u, vram, counter, uint(x), uint(y), out, depth, in.front != 0.0);\n}\n",
+        "    int x = int(in.position.x), y = int(in.position.y);\n    if (killed || x < 0 || y < 0 || !inside_clip(u, x, y)) return;\n    backend(u, vram, counter, uint(x), uint(y), blend_fog(u, out, in.fog), depth, in.front != 0.0);\n}\n",
     );
     f
 }

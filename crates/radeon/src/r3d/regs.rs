@@ -2,6 +2,12 @@
 //! (2008) and Mesa's r300_reg.h.
 
 pub const VAP_CNTL_STATUS: u32 = 0x2140;
+pub const VAP_CNTL: u32 = 0x2080;
+pub const DX_CLIP_SPACE_DEF: u32 = 1 << 22;
+pub const VAP_CLIP_CNTL: u32 = 0x221c;
+pub const CLIP_DISABLE: u32 = 1 << 16;
+pub const VAP_GB_VERT_CLIP_ADJ: u32 = 0x2220;
+pub const VAP_GB_HORZ_CLIP_ADJ: u32 = 0x2228;
 pub const PVS_BYPASS: u32 = 1 << 8;
 pub const VAP_OUT_VTX_FMT_0: u32 = 0x2090;
 pub const VAP_OUT_VTX_FMT_1: u32 = 0x2094;
@@ -32,6 +38,8 @@ pub const VAP_PVS_CONST_CNTL: u32 = 0x22d4;
 pub const GB_ENABLE: u32 = 0x4008;
 pub const GB_TILE_CONFIG: u32 = 0x4018;
 pub const GB_SELECT: u32 = 0x401c;
+pub const GA_FOG_SCALE: u32 = 0x4294;
+pub const GA_FOG_OFFSET: u32 = 0x4298;
 pub const TX_ENABLE: u32 = 0x4104;
 pub const GA_POINT_S0: u32 = 0x4200;
 pub const GA_POINT_T0: u32 = 0x4204;
@@ -74,6 +82,9 @@ pub const US_ALU_RGB_ADDR_0: u32 = 0x46c0;
 pub const US_ALU_ALPHA_ADDR_0: u32 = 0x47c0;
 pub const US_ALU_RGB_INST_0: u32 = 0x48c0;
 pub const US_ALU_ALPHA_INST_0: u32 = 0x49c0;
+pub const FG_FOG_BLEND: u32 = 0x4bc0;
+pub const FG_FOG_FACTOR: u32 = 0x4bc4;
+pub const FG_FOG_COLOR_R: u32 = 0x4bc8;
 pub const FG_ALPHA_FUNC: u32 = 0x4bd4;
 pub const US_ALU_CONST_R_0: u32 = 0x4c00;
 pub const RB3D_CCTL: u32 = 0x4e00;
