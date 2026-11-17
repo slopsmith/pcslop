@@ -1,6 +1,6 @@
 # References
 
-Nothing listed here is committed. Run `scripts/fetch-references.sh` (add `--tests` for the hardware-generated CPU test suites, `--gpu` for the Nvidia GPU references) to clone the source trees into `references/src/`. Spec PDFs go in `references/docs/`. Both directories are gitignored.
+Nothing listed here is committed. Run `scripts/fetch-references.sh` (add `--tests` for the hardware-generated CPU test suites, `--gpu` for the ATI GPU references) to clone the source trees into `references/src/`. Spec PDFs go in `references/docs/`. Both directories are gitignored.
 
 **Ground rule:** code copied from, or closely modelled on, any of these projects carries a comment naming the project, the file, the upstream revision, and the original authors where known. Each such use is also listed under [Code we use](#code-we-use).
 
@@ -9,7 +9,7 @@ Nothing listed here is committed. Run `scripts/fetch-references.sh` (add `--test
 | Project | License | Can we copy code? | What we want from it |
 | --- | --- | --- | --- |
 | [SeaBIOS](https://github.com/coreboot/seabios) | LGPL-3.0 | Not copied; we run it as a separate ROM | Firmware we boot. `src/fw/paravirt.c` (fw_cfg), `src/fw/pciinit.c`, `src/hw/` show which devices it expects |
-| [QEMU](https://gitlab.com/qemu-project/qemu) | GPL-2.0 (some files GPL-2.0+, LGPL, BSD) | Yes, with attribution; check each file's header | `hw/i386`, `hw/isa`, `hw/ide`, `hw/display/vga*`, `hw/nvram/fw_cfg.c`; `target/i386/tcg` as the baseline we compete with; `target/arm/hvf` for HVF usage |
+| [QEMU](https://gitlab.com/qemu-project/qemu) | GPL-2.0 (some files GPL-2.0+, LGPL, BSD) | Yes, with attribution; check each file's header | `hw/i386`, `hw/isa`, `hw/ide`, `hw/display/vga*`, `hw/display/ati*` (Rage 128 and RV100, GPL-2.0+), `hw/nvram/fw_cfg.c`; `target/i386/tcg` as the baseline we compete with; `target/arm/hvf` for HVF usage |
 | [Bochs](https://github.com/bochs-emu/Bochs) | LGPL-2.1+ | Yes, with attribution | The most readable x86 semantics reference: `bochs/cpu/` (flags, exceptions, task switches, x87) |
 | [86Box](https://github.com/86Box/86Box) | GPL-2.0+ | Yes, with attribution | Period-accurate chipset and device models (i440FX, PIIX, period VGA cards) |
 | [box64](https://github.com/ptitSeb/box64) | MIT | Yes, with attribution | x86 → ARM64 dynarec: flag handling, x87/SSE on NEON (`src/dynarec/arm64`) |
@@ -20,10 +20,10 @@ Nothing listed here is committed. Run `scripts/fetch-references.sh` (add `--test
 | [dbalsom/moo](https://github.com/dbalsom/moo) | MIT | Yes, with attribution | Specification of the MOO test file format (`doc/moo_format_v1.md`) |
 | [dougallj/applecpu](https://github.com/dougallj/applecpu) | No license | **No**, read only | Firestorm/Icestorm instruction latencies and ports, for codegen decisions |
 | [AsahiLinux/docs](https://github.com/AsahiLinux/docs) | CC-BY-3.0 | Text with attribution | Apple CPU implementation-defined registers and features |
-| [envytools](https://github.com/envytools/envytools) | MIT | Yes, with attribution | Nvidia register and method database (`rnndb/`), hardware docs (`docs/hw/`), video BIOS parser (`nvbios/`). See [gpu.md](gpu.md) |
-| [Mesa](https://gitlab.freedesktop.org/mesa/mesa) | MIT (nouveau driver) | Yes, with attribution | `src/gallium/drivers/nouveau/nv30/`: Rankine 3D methods, shader encodings, texture formats |
-| [Nouveau kernel driver](https://gitlab.freedesktop.org/drm/nouveau) (`drivers/gpu/drm/nouveau/` in Linux) | MIT | Yes, with attribution | Video BIOS tables, NV04 to NV40 FIFO and PGRAPH setup, pre-NV50 mode setting |
-| [xemu](https://github.com/xemu-project/xemu) | GPL-2.0 overall; `hw/xbox/nv2a/` files are LGPL-2.0+ | Yes, with attribution; check each file's header | NV2A (Kelvin) emulation drawn with OpenGL/Vulkan: PFIFO, DMA objects, swizzling, surface caching, combiners to shaders |
+| [Mesa](https://gitlab.freedesktop.org/mesa/mesa) | MIT (r300 driver) | Yes, with attribution | `src/gallium/drivers/r300/`: shader encodings (`compiler/`), state to register mapping, texture formats and tiling. See [gpu.md](gpu.md) |
+| [Linux](https://github.com/torvalds/linux) `drivers/gpu/drm/radeon/` | MIT for the radeon files (the kernel overall is GPL-2.0-only) | Yes, with attribution; check each file's header | Command-stream checker, COMBIOS tables, legacy mode setting, CP and PCI GART setup, register headers. Fetched as a sparse clone |
+| [Linux 2.6.24](https://github.com/torvalds/linux/tree/v2.6.24) `drivers/char/drm/` | MIT for the radeon files | Yes, with attribution; check each file's header | The UMS radeon DRM that Ubuntu 8.04 runs. Fetched as a sparse clone |
+| [xf86-video-ati](https://gitlab.freedesktop.org/xorg/driver/xf86-video-ati) | MIT | Yes, with attribution | Checked out at 6.14.6, the last release with UMS: mode setting, BIOS parsing, XAA and EXA 2D acceleration |
 
 ## Apple Silicon and Hypervisor.framework
 
@@ -58,7 +58,10 @@ Nothing listed here is committed. Run `scripts/fetch-references.sh` (add `--test
 | Storage | SFF-8020i rev 2.6 (ATAPI CD-ROM), SFF-8038i (bus-master IDE DMA) | The SFF-8020i copy comes from a forum upload, but the content checks out |
 | Video | VESA BIOS Extension 3.0 | |
 | Video | [FreeVGA](http://www.osdever.net/FreeVGA/home.htm) | VGA registers; no free IBM VGA technical reference exists |
-| GPU | OpenGL `NV_vertex_program2`, `NV_fragment_program` specs ([Khronos registry](https://registry.khronos.org/OpenGL/index_gl.php)) | Semantics of NV3x shader instructions |
+| GPU | AMD R3xx 3D Registers, R5xx Acceleration v1.5 ([X.org](https://www.x.org/docs/AMD/old/)) | Released by AMD in 2008. 3D registers and shader formats; CP, PM4 packets and 2D engine |
+| GPU | ATI R3xx databook (`ati-r300/r3xx_databook.pdf`) | Shared privately; no public source found yet, so it stays local |
+| GPU | Radeon 9700 video BIOS (`ati-r300/ATI.9700NP.128.Infineon.021216.rom`) | ATI's copyrighted firmware, COMBIOS, PCI ID `1002:4E44`. Never committed or shipped |
+| GPU | OpenGL `ARB_vertex_program`, `ARB_fragment_program` specs ([Khronos registry](https://registry.khronos.org/OpenGL/index_gl.php)) | The semantics R300's shader units were designed around |
 | Host | Arm Architecture Reference Manual, A-profile (DDI 0487 M.d) | 129 MB |
 | General | [OSDev wiki](https://wiki.osdev.org/) | Pages on PIC, PIT, CMOS, PS/2, APIC, PCI, ATA, ATAPI, VGA |
 

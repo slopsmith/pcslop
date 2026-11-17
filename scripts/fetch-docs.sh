@@ -48,3 +48,5 @@ get t13-1532d-ata-atapi-7-vol2-r4b.pdf $t13/D1532v2r4b-AT_Attachment_with_Packet
 get sff-8020i-atapi-cdrom-rev2.6.pdf $wb/2020id_/https://www.mikrocontroller.net/attachment/7769/8020rev26.pdf
 get vesa-vbe-3.0.pdf $mit/hardware/vbe3.pdf
 get arm-ddi0487-M.d-a-profile-arm-arm.pdf https://documentation-service.arm.com/static/6abbec2a6db85c5e6614a4a1
+get amd-R3xx_3D_Registers.pdf https://www.x.org/docs/AMD/old/R3xx_3D_Registers.pdf
+get amd-R5xx_Acceleration_v1.5.pdf https://www.x.org/docs/AMD/old/R5xx_Acceleration_v1.5.pdf

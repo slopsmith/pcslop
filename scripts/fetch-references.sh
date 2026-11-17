@@ -1,7 +1,7 @@
 #!/bin/sh
 # Shallow-clones reference source trees into references/src (gitignored).
 # Pass --tests to also fetch the large hardware-generated CPU test suites,
-# and --gpu to fetch the Nvidia GPU references.
+# and --gpu to fetch the ATI GPU references.
 set -eu
 dest="$(cd "$(dirname "$0")/.." && pwd)/references/src"
 mkdir -p "$dest"
@@ -14,6 +14,15 @@ clone() {
 	else
 		git clone --depth 1 --progress "$2" "$1"
 	fi
+}
+
+sparse() {
+	echo "=== $1"
+	[ -d "$1" ] && return
+	name=$1 url=$2 rev=$3
+	shift 3
+	git clone --depth 1 --branch "$rev" --filter=blob:none --sparse --progress "$url" "$name"
+	git -C "$name" sparse-checkout set "$@"
 }
 
 clone seabios https://github.com/coreboot/seabios.git
@@ -34,9 +43,13 @@ for arg in "$@"; do
 		clone SingleStepTests-80386 https://github.com/SingleStepTests/80386.git
 		;;
 	--gpu)
-		clone envytools https://github.com/envytools/envytools.git
 		clone mesa https://gitlab.freedesktop.org/mesa/mesa.git
-		clone xemu https://github.com/xemu-project/xemu.git
+		sparse linux https://github.com/torvalds/linux.git master drivers/gpu/drm/radeon include/uapi/drm include/drm
+		sparse linux-2.6.24 https://github.com/torvalds/linux.git v2.6.24 drivers/char/drm include/linux
+		if [ ! -d xf86-video-ati ]; then
+			git clone --progress https://gitlab.freedesktop.org/xorg/driver/xf86-video-ati.git xf86-video-ati
+			git -C xf86-video-ati -c advice.detachedHead=false checkout xf86-video-ati-6.14.6
+		fi
 		;;
 	esac
 done
