@@ -5,6 +5,7 @@ pub mod apic;
 pub mod fdc;
 pub mod fw_cfg;
 pub mod i8042;
+pub mod ioapic;
 pub mod pci;
 pub mod pic;
 pub mod pm;
