@@ -35,14 +35,16 @@ struct Uniforms {
 };
 
 static uint rd8(const device uchar *d, uint a, uint limit) {
-    return d[a % limit];
+    return d[a < limit ? a : a % limit];
 }
 
 static uint rd16(const device uchar *d, uint a, uint limit) {
+    if ((a & 1) == 0 && a + 2 <= limit) return *(const device ushort *)(d + a);
     return rd8(d, a, limit) | rd8(d, a + 1, limit) << 8;
 }
 
 static uint rd32(const device uchar *d, uint a, uint limit) {
+    if ((a & 3) == 0 && a + 4 <= limit) return *(const device uint *)(d + a);
     return rd16(d, a, limit) | rd16(d, a + 2, limit) << 16;
 }
 
