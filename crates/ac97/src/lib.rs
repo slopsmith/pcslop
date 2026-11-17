@@ -32,6 +32,11 @@ pub trait AudioOut: Send {
     /// Stereo frames at `rate` Hz the output can take now.
     fn room(&mut self, rate: u32) -> usize;
     fn push(&mut self, rate: u32, frames: &[[i16; 2]]);
+
+    /// The output's state, for debugging.
+    fn describe(&self) -> String {
+        String::new()
+    }
 }
 
 /// Throws PCM out away as soon as it arrives.
@@ -249,9 +254,9 @@ impl Ac97 {
     pub fn describe(&self) -> String {
         let c = &self.ch[1];
         format!(
-            "ac97: po civ {} lvi {} piv {} sr {:#x} cr {:#x} picb {} bdbar {:#x} bd {:#x}/{:#x} | rate {} gain {:?} glob_cnt {:#x} irq {}",
+            "ac97: po civ {} lvi {} piv {} sr {:#x} cr {:#x} picb {} bdbar {:#x} bd {:#x}/{:#x} | rate {} gain {:?} glob_cnt {:#x} irq {} | {}",
             c.civ, c.lvi, c.piv, c.sr, c.cr, c.picb, c.bdbar, c.bd_addr, c.bd_ctl,
-            self.codec.dac_rate(), self.codec.out_gain(), self.glob_cnt, self.irq()
+            self.codec.dac_rate(), self.codec.out_gain(), self.glob_cnt, self.irq(), self.out.describe()
         )
     }
 

@@ -20,7 +20,8 @@ usage: scripts/vm build
        scripts/vm stop NAME
 
 build      builds inside nix develop into target/work and installs a signed copy at $bin
-start      starts NAME headless in the background, without sound unless VM_AUDIO=1, killed
+start      starts NAME headless in the background, without sound unless VM_AUDIO=1 or
+           --audio-silent (a sound card that plays nothing, e.g. with --audio-wav), killed
            after VM_TIMEOUT seconds (default 1800); waits up to 20 s for its control socket
 ctl        sends control-socket commands (scripts/ctl) to NAME
 shot       saves a screenshot (default $tmp/vm-NAME.png) and prints its path
@@ -68,7 +69,8 @@ start)
 	l=$(log "$name")
 	rm -f "$s"
 	extra=()
-	[ "${VM_AUDIO:-0}" = 1 ] || extra+=(--no-audio)
+	# --audio-silent keeps the sound card but plays nothing on the Mac.
+	[ "${VM_AUDIO:-0}" = 1 ] || [[ " $* " == *" --audio-silent "* ]] || extra+=(--no-audio)
 	nohup timeout "${VM_TIMEOUT:-1800}" "$bin" \
 		--bios "$refs/seabios/share/seabios/bios.bin" \
 		--vgabios "$refs/seavgabios/share/seabios/vgabios.bin" \

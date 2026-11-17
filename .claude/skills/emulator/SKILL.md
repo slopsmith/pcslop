@@ -47,7 +47,7 @@ scripts/vm stop xp
 - **Keep socket paths under about 100 bytes**, or binding fails and nothing says so.
 - **`shot` with a relative path** writes into the emulator's working directory, which may be the repo root. Use absolute paths; `scripts/vm shot` does.
 - **Kill only your own runs.** `scripts/vm stop` kills by socket path. Never `pkill -f slopper` or anything broad.
-- **Defaults.** The JIT, AC'97 sound, the RTL8139 network card and the battery mirror are on by default. `scripts/vm start` adds `--no-audio`, so tests don't play sound on the user's Mac; set `VM_AUDIO=1` to keep sound. Opt-outs: `--no-jit`, `--no-net`, `--no-battery`. `slopper --help` lists everything.
+- **Defaults.** The JIT, AC'97 sound, the RTL8139 network card and the battery mirror are on by default. `scripts/vm start` adds `--no-audio`, so tests don't play sound on the user's Mac; set `VM_AUDIO=1` to keep sound. To check what the guest plays without sound, pass `--audio-silent --audio-wav PATH`: the WAV is what the speaker would play, gaps included, and `status` shows how often the host ring ran dry. Opt-outs: `--no-jit`, `--no-net`, `--no-battery`. `slopper --help` lists everything.
 
 ## Save states: skip repeated boots
 

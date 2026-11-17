@@ -5,6 +5,7 @@
 
 use std::ffi::c_void;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use super::Ring;
 
@@ -81,6 +82,7 @@ const FORMAT_FLAG_PACKED: u32 = 8;
 
 struct Render {
     ring: Arc<Ring>,
+    tap: Option<Arc<Ring>>,
     device_rate: f64,
     pos: f64,
     prev: [f32; 2],
@@ -95,7 +97,12 @@ extern "C" fn render(refcon: *mut c_void, _flags: *mut u32, _time: *const c_void
     for o in out {
         while r.pos >= 1.0 {
             r.prev = r.cur;
-            r.cur = r.ring.pop().unwrap_or([0.0; 2]);
+            let f = r.ring.pop();
+            if let Some(t) = &r.tap {
+                t.rate.store(r.ring.rate(), Ordering::Relaxed);
+                t.push(&[f]);
+            }
+            r.cur = f.map(|s| s as f32 / 32768.0);
             r.pos -= 1.0;
         }
         let t = r.pos as f32;
@@ -120,7 +127,8 @@ fn check(status: OsStatus, what: &str) -> Result<(), String> {
 }
 
 impl Output {
-    pub fn start(ring: Arc<Ring>) -> Result<Output, String> {
+    /// Plays `ring`, copying each frame it takes into `tap`.
+    pub fn start(ring: Arc<Ring>, tap: Option<Arc<Ring>>) -> Result<Output, String> {
         let desc = AudioComponentDescription {
             component_type: fourcc(b"auou"),
             sub_type: fourcc(b"def "),
@@ -134,7 +142,7 @@ impl Output {
         }
         let mut unit = std::ptr::null_mut();
         check(unsafe { AudioComponentInstanceNew(component, &mut unit) }, "AudioComponentInstanceNew")?;
-        let render = Box::into_raw(Box::new(Render { ring, device_rate: 48000.0, pos: 1.0, prev: [0.0; 2], cur: [0.0; 2] }));
+        let render = Box::into_raw(Box::new(Render { ring, tap, device_rate: 48000.0, pos: 1.0, prev: [0.0; 2], cur: [0.0; 2] }));
         let mut out = Output { unit, render, device_rate: 0.0 };
         out.configure()?;
         check(unsafe { AudioOutputUnitStart(out.unit) }, "AudioOutputUnitStart")?;
