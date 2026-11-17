@@ -1100,3 +1100,77 @@ fn sysenter_sysexit_and_fs_loads_match_the_interpreter() {
     assert_eq!(a.segs, b.segs);
     assert!(stats.interp_exits <= 17, "system calls left translated code: {stats:?}");
 }
+
+fn ring_test_machine(user: &[u8], kernel: &[u8]) -> (Cpu, FlatBus) {
+    let mut cpu = flat_cpu(0x2000, 0x9000);
+    let mut bus = bus_with(0x1000, user);
+    let mem = bus.ram.as_mut_slice();
+    mem[0x2000..0x2000 + kernel.len()].copy_from_slice(kernel);
+    let gdt: [u64; 8] = [
+        0,
+        0x00cf_9b00_0000_ffff,
+        0x00cf_9300_0000_ffff,
+        0x00cf_fb00_0000_ffff,
+        0x00cf_f300_0000_ffff,
+        0,
+        0x0040_9300_5000_0fff,
+        0x0040_f300_5100_0fff,
+    ];
+    for (i, d) in gdt.iter().enumerate() {
+        mem[0x4000 + 8 * i..0x4008 + 8 * i].copy_from_slice(&d.to_le_bytes());
+    }
+    paged(&mut cpu, &mut bus, false);
+    cpu.gdtr = x86::cpu::DescriptorTable { base: 0x4000, limit: 0x3f };
+    cpu.sysenter_cs = 8;
+    cpu.sysenter_esp = 0x9000;
+    cpu.sysenter_eip = 0x2100;
+    for (seg, sel) in [(0, 0x23), (2, 0x10), (3, 0x23)] {
+        cpu.segs[seg].selector = sel;
+    }
+    cpu.segs[0].attr |= 3 << 5;
+    cpu.segs[3].attr |= 3 << 5;
+    assert!(interp::load_segment(&mut cpu, &mut bus, 4, 0x3b));
+    assert!(interp::load_segment(&mut cpu, &mut bus, 5, 0));
+    (cpu, bus)
+}
+
+#[test]
+fn iret_within_the_kernel_and_to_user_mode_matches_the_interpreter() {
+    let user = [
+        0x40, // inc eax
+        0x89, 0xe2, // mov edx, esp
+        0x0f, 0x34, // sysenter
+    ];
+    let mut kernel = vec![
+        0x9c, // pushfd
+        0x6a, 0x08, // push 0x08
+        0x68, 0x0b, 0x20, 0, 0, // push 0x200b
+        0xcf, // iretd, to the next instruction at CPL 0
+        0x90, 0x90, // padding to 0x200b
+        0x6a, 0x23, // push 0x23
+        0x68, 0x00, 0x80, 0, 0, // push 0x8000
+        0x68, 0x02, 0x02, 0, 0, // push 0x202 (IF)
+        0x6a, 0x1b, // push 0x1b
+        0x68, 0x00, 0x10, 0, 0, // push 0x1000
+        0xcf, // iretd, to user mode
+    ];
+    kernel.resize(0x100, 0x90);
+    kernel.extend([
+        0x83, 0xf8, 0x03, // cmp eax, 3
+        0x75, 0x01, // jne over the hlt
+        0xf4, // hlt
+        0xbc, 0x00, 0x90, 0, 0, // mov esp, 0x9000
+        0xe9, 0xfb, 0xfe, 0xff, 0xff, // jmp 0x200b
+    ]);
+    let (mut a, mut bus_a) = ring_test_machine(&user, &kernel);
+    let mut b = a.clone();
+    let mut bus_b = FlatBus { ram: GuestMemory::new(RAM).unwrap() };
+    bus_b.ram.as_mut_slice().copy_from_slice(bus_a.ram.as_slice());
+    run_interp(&mut a, &mut bus_a);
+    let stats = run_jit(&mut b, &mut bus_b);
+    assert_eq!(a.regs, b.regs);
+    assert_eq!(a.eip, b.eip);
+    assert_eq!(a.eflags & ARITH_MASK, b.eflags & ARITH_MASK);
+    assert_eq!(a.segs, b.segs);
+    assert!(stats.interp_exits <= 1, "IRET left translated code: {stats:?}");
+}

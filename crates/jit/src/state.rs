@@ -154,6 +154,10 @@ pub struct State {
     /// SYSENTER and SYSEXIT switch trees without an exit.
     pub ttbr0: [u64; 2],
     pub roots: [u64; 2],
+    pub dr: [u32; 8],
+    /// Set by translated code after LLDT loaded the null selector in `ldtr_sel`.
+    pub ldtr_nulled: u32,
+    pub ldtr_sel: u32,
 }
 
 pub const REGS: usize = offset_of!(State, regs);
@@ -206,6 +210,9 @@ pub const SYSENTER_EIP: usize = offset_of!(State, sysenter_eip);
 pub const CR0: usize = offset_of!(State, cr0);
 pub const TTBR0: usize = offset_of!(State, ttbr0);
 pub const ROOTS: usize = offset_of!(State, roots);
+pub const DR: usize = offset_of!(State, dr);
+pub const LDTR_NULLED: usize = offset_of!(State, ldtr_nulled);
+pub const LDTR_SEL: usize = offset_of!(State, ldtr_sel);
 pub const FSE: usize = offset_of!(State, fse);
 pub const FCW: usize = offset_of!(State, fcw);
 pub const FSW: usize = offset_of!(State, fsw);

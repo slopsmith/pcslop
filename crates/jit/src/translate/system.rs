@@ -166,6 +166,121 @@ impl Emit {
         true
     }
 
+    /// 32-bit IRET at CPL 0, to the same CS or to XP's flat CPL 3 segments.
+    pub(super) fn iret(&mut self, insn: &Insn, eip: u32) -> Step {
+        use x86::cpu::flags;
+        if self.user || !insn.op32 {
+            return Step::Unsupported;
+        }
+        let (slow, outer) = (self.a.label(), self.a.label());
+        let esp = guest_reg(4);
+        let (new_esp, ss, base) = (Reg(2), Reg(3), Reg(4));
+        self.a.ldr(Width::W, T_B, STATE, state::EFLAGS_REST as i32);
+        self.a.tbnz(T_B, flags::NT.trailing_zeros(), slow);
+        self.a.mov(Size::W, T_ADDR, esp);
+        self.load(Width::W, T_E);
+        self.a.add_imm(Size::W, T_ADDR, esp, 4);
+        self.load(Width::H, T_D);
+        self.a.add_imm(Size::W, T_ADDR, esp, 8);
+        self.load(Width::W, T_A);
+        self.a.tbnz(T_A, flags::VM.trailing_zeros(), slow);
+        self.and_imm32(T_C, T_D, 3);
+        self.a.cbnz(Size::W, T_C, outer);
+        self.a.ldr(Width::W, T_C, STATE, state::CS_SEL as i32);
+        self.a.eor(Size::W, T_C, T_C, T_D);
+        self.a.cbnz(Size::W, T_C, slow);
+        self.load_eflags(slow, true);
+        self.a.add_imm(Size::W, esp, esp, 12);
+        self.goto_reg(T_E);
+
+        self.a.bind(outer);
+        let ok = self.a.logic_imm(Logic::Eor, Size::W, T_C, T_C, 3);
+        assert!(ok);
+        self.a.cbnz(Size::W, T_C, slow);
+        self.a.ldr(Width::W, base, STATE, state::SYSENTER_CS as i32);
+        self.and_imm32(base, base, 0xfffc);
+        self.a.cbz(Size::W, base, slow);
+        self.a.add_imm(Size::W, T_C, base, 16 | 3);
+        self.a.eor(Size::W, T_C, T_C, T_D);
+        self.a.cbnz(Size::W, T_C, slow);
+        self.a.add_imm(Size::W, T_ADDR, esp, 12);
+        self.load(Width::W, new_esp);
+        self.a.add_imm(Size::W, T_ADDR, esp, 16);
+        self.load(Width::H, ss);
+        self.a.add_imm(Size::W, base, base, 24 | 3);
+        for at in [None, Some(state::DS_SEL), Some(state::ES_SEL)] {
+            match at {
+                None => self.a.eor(Size::W, T_C, base, ss),
+                Some(at) => {
+                    self.a.ldr(Width::W, T_C, STATE, at as i32);
+                    self.a.eor(Size::W, T_C, T_C, base);
+                }
+            }
+            self.a.cbnz(Size::W, T_C, slow);
+        }
+        for at in [state::FS_SEL, state::GS_SEL] {
+            let fine = self.a.label();
+            self.a.ldr(Width::W, T_B, STATE, at as i32);
+            self.and_imm32(T_C, T_B, 3);
+            let ok = self.a.logic_imm(Logic::Eor, Size::W, T_C, T_C, 3);
+            assert!(ok);
+            self.a.cbz(Size::W, T_C, fine);
+            self.and_imm32(T_C, T_B, 0xfffc);
+            self.a.cbnz(Size::W, T_C, slow);
+            self.a.bind(fine);
+        }
+        self.load_eflags(slow, true);
+        self.a.mov(Size::W, esp, new_esp);
+        self.a.str(Width::W, T_D, STATE, state::CS_SEL as i32);
+        self.switch_tree(true);
+        self.goto_reg(T_E);
+        self.a.bind(slow);
+        self.exit_interp(eip);
+        Step::End
+    }
+
+    /// MOV to or from DR0..DR3, DR6, DR7 at CPL 0; they are plain storage here.
+    pub(super) fn mov_dr(&mut self, insn: &Insn, to_dr: bool) -> bool {
+        let n = insn.reg();
+        if self.user || matches!(n, 4 | 5) {
+            return false;
+        }
+        let at = (state::DR + 4 * n) as i32;
+        if to_dr {
+            self.a.str(Width::W, guest_reg(insn.rm()), STATE, at);
+        } else {
+            self.a.ldr(Width::W, guest_reg(insn.rm()), STATE, at);
+        }
+        true
+    }
+
+    /// LLDT with a null selector at CPL 0, which is all XP does on a thread switch.
+    pub(super) fn lldt(&mut self, insn: &Insn, eip: u32) -> bool {
+        if self.user {
+            return false;
+        }
+        match insn.mem {
+            Some(m) => {
+                if !self.ea(insn, &m) {
+                    return false;
+                }
+                self.load(Width::H, T_A);
+            }
+            None => self.a.uxth(T_A, guest_reg(insn.rm())),
+        }
+        let (slow, done) = (self.a.label(), self.a.label());
+        self.and_imm32(T_B, T_A, 0xfffc);
+        self.a.cbnz(Size::W, T_B, slow);
+        self.a.str(Width::W, T_A, STATE, state::LDTR_SEL as i32);
+        self.a.movz(Size::W, T_B, 1, 0);
+        self.a.str(Width::W, T_B, STATE, state::LDTR_NULLED as i32);
+        self.a.b(done);
+        self.a.bind(slow);
+        self.exit_interp(eip);
+        self.a.bind(done);
+        true
+    }
+
     fn and_imm32(&mut self, rd: Reg, rn: Reg, imm: u64) {
         let ok = self.a.logic_imm(Logic::And, Size::W, rd, rn, imm);
         assert!(ok);

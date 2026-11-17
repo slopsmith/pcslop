@@ -650,6 +650,8 @@ impl Jit {
         s.cr4 = cpu.cr4;
         s.ttbr0 = ttbr0;
         s.roots = roots;
+        s.dr = cpu.dr;
+        s.ldtr_nulled = 0;
         s.sse_fp_ok = (sse_ok && afp && cpu.mxcsr & 0x1f80 == 0x1f80) as u32;
     }
 
@@ -665,6 +667,7 @@ impl Jit {
         cpu.set_flag(x86::cpu::flags::IF, if_flag);
         cpu.set_flag(x86::cpu::flags::DF, df);
         cpu.xmm = s.xmm;
+        cpu.dr = s.dr;
         cpu.mxcsr |= state::mxcsr_flags(s.fpsr);
         s.fpsr = 0;
         let f = &mut cpu.fpu;
@@ -702,6 +705,10 @@ impl Jit {
             let s = self.state();
             (s.user, s.cs_sel, s.fs_sel, s.gs_sel, s.fs_base, s.gs_base)
         };
+        if std::mem::take(&mut self.state().ldtr_nulled) != 0 {
+            let sel = self.state().ldtr_sel as u16;
+            cpu.ldtr = x86::cpu::Segment { selector: sel, ..Default::default() };
+        }
         self.root = user as usize;
         if cs != cpu.segs[CS].selector as u32 {
             let flat = attr::P | attr::S | attr::RW | attr::ACCESSED | attr::DB | attr::G;

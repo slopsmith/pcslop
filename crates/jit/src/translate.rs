@@ -1517,6 +1517,17 @@ impl Emit {
                     return Step::Unsupported;
                 }
             }
+            0xcf => return self.iret(insn, eip),
+            0x121 | 0x123 => {
+                if !self.mov_dr(insn, op == 0x123) {
+                    return Step::Unsupported;
+                }
+            }
+            0x100 if insn.reg() == 2 => {
+                if !self.lldt(insn, eip) {
+                    return Step::Unsupported;
+                }
+            }
             0x134 => return self.sysenter(eip),
             0x135 => return self.sysexit(eip),
             0x120 => {
