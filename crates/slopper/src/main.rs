@@ -44,6 +44,7 @@ struct Args {
     audio_asked: bool,
     audio_wav: Option<PathBuf>,
     audio_silent: bool,
+    audio_latency: u32,
     net: Option<net::user::UserNet>,
     net_asked: bool,
     battery: BatterySource,
@@ -170,6 +171,9 @@ struct Cli {
     /// Keep the sound card in real time but play nothing on the Mac.
     #[arg(long)]
     audio_silent: bool,
+    /// How far ahead of the speaker the sound card queues audio.
+    #[arg(long, value_name = "MS", default_value_t = audio::LATENCY_MS, value_parser = clap::value_parser!(u32).range(10..=300))]
+    audio_latency: u32,
     /// Leave out the network card.
     #[arg(long, conflicts_with = "net")]
     no_net: bool,
@@ -244,6 +248,7 @@ fn parse_args() -> Result<Args, String> {
         audio_asked: cli.audio.is_some() || cli.audio_wav.is_some() || cli.audio_silent,
         audio_wav: cli.audio_wav,
         audio_silent: cli.audio_silent,
+        audio_latency: cli.audio_latency,
         net: (!cli.no_net).then(|| cli.net.unwrap_or_default()),
         net_asked,
         battery: if cli.no_battery {
@@ -447,7 +452,7 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
         return ExitCode::FAILURE;
     }
     if args.audio {
-        match audio::HostAudio::new(!args.audio_silent, args.audio_wav.as_deref()) {
+        match audio::HostAudio::new(!args.audio_silent, args.audio_wav.as_deref(), args.audio_latency) {
             Ok(out) => board.add_ac97(Box::new(out)),
             Err(e) if args.audio_asked => {
                 eprintln!("cannot start audio: {e}");

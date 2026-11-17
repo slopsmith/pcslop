@@ -1568,9 +1568,10 @@ mod tests {
         b.io_write(0xcfc, 4, v);
     }
 
-    /// A board whose AC'97 controller has just finished a buffer marked for
-    /// an interrupt, with PIRQD routed to IRQ 11.
-    fn ac97_after_buffer() -> Board {
+    /// A board whose AC'97 controller is playing a two-frame buffer marked
+    /// for an interrupt, with PIRQD routed to IRQ 11. It finishes on the
+    /// first tick after a millisecond.
+    fn ac97_playing_short_buffer() -> Board {
         let mut b = board();
         b.add_ac97(Box::new(ac97::NullOut));
         pci_write(&mut b, 4, 0x10, 0xc000);
@@ -1583,12 +1584,14 @@ mod tests {
         b.io_write(0xc000 + ac97::codec::reg::MASTER_VOLUME as u16, 2, 0);
         b.io_write(0xc100 + ac97::PCM_OUT + ac97::bm::BDBAR, 4, 0x1000);
         b.io_write(0xc100 + ac97::PCM_OUT + ac97::bm::CR, 1, (ac97::cr::RPBM | ac97::cr::IOCE) as u32);
+        b.tick();
+        std::thread::sleep(std::time::Duration::from_millis(1));
         b
     }
 
     #[test]
     fn ac97_interrupt_reaches_the_8259_through_its_pirq() {
-        let mut b = ac97_after_buffer();
+        let mut b = ac97_playing_short_buffer();
         let slave_irr = |b: &Board| b.pic.registers()[1].0;
         assert_eq!(slave_irr(&b), 0);
         b.tick();
@@ -1597,7 +1600,7 @@ mod tests {
 
     #[test]
     fn ac97_interrupt_reaches_the_io_apic_on_pirqd() {
-        let mut b = ac97_after_buffer();
+        let mut b = ac97_playing_short_buffer();
         b.write32(apic::DEFAULT_BASE + apic::reg::SVR, 0x1ff);
         b.write32(ioapic::BASE, 0x10 + 2 * (PIRQ_PIN as u32 + 3));
         b.write32(ioapic::BASE + 0x10, 0x8000 | 0x45);

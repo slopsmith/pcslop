@@ -3,9 +3,10 @@
 //!
 //! Register behaviour follows QEMU's hw/audio/ac97.c (InnoTek Systemberatung
 //! GmbH, from VirtualBox OSE; GPL-2.0-or-later) and the 82801AA datasheet,
-//! section 5.17. The bus masters move data when [`Ac97::run`] is called:
-//! PCM out as fast as the host output takes it, the two inputs at their
-//! sample rate in host time, filled with silence.
+//! section 5.17. The bus masters move data when [`Ac97::run`] is called,
+//! all three at their sample rate in host time: PCM out into the host
+//! output, which it keeps a fixed latency ahead of the speaker, and the two
+//! inputs filled with silence.
 
 pub mod codec;
 
@@ -26,11 +27,14 @@ pub trait DmaMemory {
     fn write_phys(&mut self, addr: u32, buf: &[u8]);
 }
 
-/// Where PCM out goes. It sets the pace of playback: the controller only
-/// fetches as many frames as `room` allows.
+/// Where PCM out goes: a queue that a player drains in real time.
 pub trait AudioOut: Send {
-    /// Stereo frames at `rate` Hz the output can take now.
-    fn room(&mut self, rate: u32) -> usize;
+    /// Stereo frames queued ahead of the speaker.
+    fn queued(&self) -> usize;
+    /// How many frames at `rate` Hz to keep queued. The controller fills
+    /// the queue this far from guest memory whenever it runs low, and slows
+    /// down or speeds up slightly to hold it there.
+    fn latency(&self, rate: u32) -> usize;
     fn push(&mut self, rate: u32, frames: &[[i16; 2]]);
 
     /// The output's state, for debugging.
@@ -39,12 +43,16 @@ pub trait AudioOut: Send {
     }
 }
 
-/// Throws PCM out away as soon as it arrives.
+/// Plays PCM out to nowhere, as if it always had its latency queued.
 pub struct NullOut;
 
 impl AudioOut for NullOut {
-    fn room(&mut self, rate: u32) -> usize {
-        rate as usize / 100
+    fn queued(&self) -> usize {
+        480
+    }
+
+    fn latency(&self, _rate: u32) -> usize {
+        480
     }
 
     fn push(&mut self, _rate: u32, _frames: &[[i16; 2]]) {}
@@ -103,6 +111,11 @@ const SR_WCLEAR: u16 = sr::FIFOE | sr::BCIS | sr::LVBCI;
 const CR_KEPT_ON_RESET: u8 = cr::IOCE | cr::FEIE | cr::LVBIE;
 const BDL_ENTRIES: u8 = 32;
 const CHUNK: usize = 4096;
+/// How hard PCM out leans against the host queue drifting from its latency,
+/// and the most it may run fast or slow. This only moves the guest's play
+/// position; the samples still play at their own rate.
+const DRIFT_GAIN: f64 = 0.01;
+const MAX_DRIFT: f64 = 0.005;
 
 #[derive(Default, snapshot::Snap)]
 struct Channel {
@@ -221,6 +234,12 @@ pub struct Ac97 {
     carry: Vec<u8>,
     /// Host time each input channel has been filled up to.
     input_ns: [Option<u64>; 2],
+    /// Host time PCM out has been paced up to, and the fraction of a frame
+    /// that was due but not yet fetched.
+    #[snap(skip)]
+    out_ns: Option<u64>,
+    #[snap(skip)]
+    out_frac: f64,
 }
 
 impl Ac97 {
@@ -234,6 +253,8 @@ impl Ac97 {
             out,
             carry: Vec::new(),
             input_ns: [None; 2],
+            out_ns: None,
+            out_frac: 0.0,
         }
     }
 
@@ -248,6 +269,14 @@ impl Ac97 {
         self.glob_sta = 0;
         self.cas = false;
         self.carry.clear();
+        self.resync();
+    }
+
+    /// Restarts PCM out pacing at the next [`Ac97::run`], as after a
+    /// restore whose host clock has nothing to do with the last run's.
+    pub fn resync(&mut self) {
+        self.out_ns = None;
+        self.input_ns = [None; 2];
     }
 
     /// The PCM out channel and codec state, for debugging.
@@ -339,11 +368,14 @@ impl Ac97 {
             }
             _ => {}
         }
+        if !self.ch[1].running() {
+            self.out_ns = None;
+        }
     }
 
     /// Runs the bus masters up to host time `now_ns`.
     pub fn run(&mut self, now_ns: u64, mem: &mut dyn DmaMemory) {
-        self.run_output(mem);
+        self.run_output(now_ns, mem);
         for (slot, i) in [(0, 0), (1, 2)] {
             let rate = if i == 0 { self.codec.adc_rate() } else { self.codec.mic_rate() } as u64;
             if !self.ch[i].running() || rate == 0 {
@@ -351,7 +383,7 @@ impl Ac97 {
                 continue;
             }
             let since = *self.input_ns[slot].get_or_insert(now_ns);
-            let frames = (now_ns - since) * rate / 1_000_000_000;
+            let frames = now_ns.saturating_sub(since) * rate / 1_000_000_000;
             if frames == 0 {
                 continue;
             }
@@ -367,17 +399,48 @@ impl Ac97 {
         }
     }
 
-    fn run_output(&mut self, mem: &mut dyn DmaMemory) {
+    /// How many PCM out frames are due at `now_ns`: host time at the sample
+    /// rate, nudged to hold the output queue at its latency. A queue that ran
+    /// low, as at the start or after the guest fell behind, is topped up at
+    /// once; a full one (twice the latency) holds playback.
+    fn output_due(&mut self, now_ns: u64, rate: u32) -> usize {
+        let target = self.out.latency(rate).max(1);
+        let queued = self.out.queued();
+        let n = match self.out_ns.replace(now_ns) {
+            None => {
+                self.out_frac = 0.0;
+                0
+            }
+            Some(last) => {
+                let error = (target as f64 - queued as f64) / target as f64;
+                let speed = 1.0 + (error * DRIFT_GAIN).clamp(-MAX_DRIFT, MAX_DRIFT);
+                let due = self.out_frac + now_ns.saturating_sub(last) as f64 * rate as f64 / 1e9 * speed;
+                self.out_frac = due.fract();
+                due as usize
+            }
+        };
+        if queued + n < target * 3 / 4 {
+            target - queued
+        } else {
+            n.min((2 * target).saturating_sub(queued))
+        }
+    }
+
+    fn run_output(&mut self, now_ns: u64, mem: &mut dyn DmaMemory) {
         let rate = self.codec.dac_rate();
         if !self.ch[1].running() || rate == 0 {
+            self.out_ns = None;
             return;
         }
-        let room = self.out.room(rate) as u32;
+        let due = self.output_due(now_ns, rate) as u32;
+        if due == 0 {
+            return;
+        }
         let gain = self.codec.out_gain();
         let (out, carry) = (&mut self.out, &mut self.carry);
         let mut buf = [0u8; CHUNK];
         let mut frames = Vec::with_capacity(CHUNK / 4 + 1);
-        let budget = (room * 4).saturating_sub(carry.len() as u32);
+        let budget = (due * 4).saturating_sub(carry.len() as u32);
         self.ch[1].transfer(budget, mem, &mut |mem, addr, len| {
             for at in (0..len).step_by(CHUNK) {
                 let n = (len - at).min(CHUNK as u32) as usize;
@@ -396,6 +459,9 @@ impl Ac97 {
                 out.push(rate, &frames);
             }
         });
+        if !self.ch[1].running() {
+            self.out_ns = None;
+        }
     }
 }
 

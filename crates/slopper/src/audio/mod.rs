@@ -11,8 +11,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-/// How much audio the guest may queue ahead of the speaker.
-const LATENCY_MS: u32 = 60;
+/// How much audio to keep queued ahead of the speaker by default. It has
+/// to cover the player's buffer and the sound card thread's wakeups.
+pub const LATENCY_MS: u32 = 60;
 const RING_FRAMES: usize = 1 << 14;
 
 /// Single-producer, single-consumer queue of stereo frames at `rate` Hz.
@@ -119,16 +120,17 @@ pub struct HostAudio {
     player: Player,
     play: bool,
     wav: Option<wav::Writer>,
+    latency_ms: u32,
 }
 
 
 impl HostAudio {
-    /// Output for the guest's sound card. With `play` false nothing is heard,
-    /// but playback still runs at real-time speed. `wav` records what the
-    /// guest plays.
-    pub fn new(play: bool, wav: Option<&Path>) -> std::io::Result<Self> {
+    /// Output for the guest's sound card, `latency_ms` ahead of the speaker.
+    /// With `play` false nothing is heard, but playback still runs at
+    /// real-time speed. `wav` records what the speaker gets.
+    pub fn new(play: bool, wav: Option<&Path>, latency_ms: u32) -> std::io::Result<Self> {
         let wav = wav.map(wav::Writer::create).transpose()?;
-        Ok(HostAudio { ring: Arc::new(Ring::new()), player: Player::Idle, play, wav })
+        Ok(HostAudio { ring: Arc::new(Ring::new()), player: Player::Idle, play, wav, latency_ms })
     }
 
     fn start(&mut self) {
@@ -212,8 +214,12 @@ fn record(tap: &Ring, mut wav: wav::Writer, stop: &AtomicBool) {
 }
 
 impl ac97::AudioOut for HostAudio {
-    fn room(&mut self, rate: u32) -> usize {
-        (rate * LATENCY_MS / 1000) as usize - self.ring.len().min((rate * LATENCY_MS / 1000) as usize)
+    fn queued(&self) -> usize {
+        self.ring.len()
+    }
+
+    fn latency(&self, rate: u32) -> usize {
+        ((rate as u64 * self.latency_ms as u64 / 1000) as usize).clamp(1, RING_FRAMES / 2)
     }
 
     fn push(&mut self, rate: u32, frames: &[[i16; 2]]) {
