@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # CPU benchmarks in Ubuntu 8.04 from a save state with a serial root shell:
-# Python, Perl, bzip2, gzip and md5sum, timed by the guest. Prints one line
-# per benchmark in seconds. Usage: scripts/bench-cpu [STATE_DIR]
+# Python, Perl, bzip2, gzip and md5sum (bench/ubuntu, copied in over the
+# serial line), timed by the guest.
+# Prints one line per benchmark in seconds and fails when a result differs
+# from bench/ubuntu/expected. scripts/make-bench-cpu-state makes the state.
+# Usage: scripts/bench-cpu [STATE_DIR]
 # VM_BIN picks the emulator binary; extra flags go in BENCH_FLAGS.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -15,7 +18,9 @@ trap '"$root/scripts/vm" stop "$name" >/dev/null 2>&1 || true; rm -f "$serial"' 
 VM_TIMEOUT=900 "$root/scripts/vm" start "$name" --load "$state" --cdrom ~/Documents/ISOs/ubuntu-8.04.4-desktop-i386.iso \
 	--ram 512 --no-net --serial "$serial" ${BENCH_FLAGS:-} >/dev/null
 sleep 2
-"$root/scripts/vm" ctl "$name" "serial bash /tmp/bench.sh" >/dev/null
+args=("serial mkdir -p /tmp/bench && cd /tmp/bench && base64 -d <<'EOF' | tar -xzf - && cd /")
+while read -r l; do args+=("serial $l"); done < <(COPYFILE_DISABLE=1 tar -C "$root/bench/ubuntu" -cf - --format ustar bench.sh loop.py objs.py | gzip -9 | base64 -b 76)
+"$root/scripts/vm" ctl "$name" "${args[@]}" "serial EOF" "serial bash /tmp/bench/bench.sh" >/dev/null
 for _ in $(seq 600); do
 	grep -aq "BENCH done" "$serial" && break
 	sleep 1
@@ -25,4 +30,7 @@ if grep -aqE "Segmentation fault|Illegal instruction|Aborted|Bus error" "$serial
 	grep -aE "Segmentation fault|Illegal instruction|Aborted|Bus error" "$serial" >&2
 	exit 1
 fi
-grep -a "^BENCH" "$serial" | grep -v done | awk '{printf "%-6s %s s\n", $2, $3; t += $3} END {printf "total  %.2f s\n", t}'
+tr -d '\r' <"$serial" | grep -a "^BENCH" | grep -v done | awk -v expf="$root/bench/ubuntu/expected" '
+	BEGIN { while ((getline l < expf) > 0) { split(l, f, " "); want[f[1]] = f[2] } }
+	{ printf "%-6s %s s\n", $2, $3; t += $3; if ($4 != want[$2]) { printf "BAD %s: result %s, want %s\n", $2, $4, want[$2]; bad++ } }
+	END { printf "total  %.2f s\n", t; if (bad) exit 1 }'

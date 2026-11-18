@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Recreates the save state scripts/bench-cpu loads: the Ubuntu 8.04.4 live CD
+# booted with a root shell on COM1, saved once the desktop is idle.
+# Usage: scripts/make-bench-cpu-state [STATE_DIR]; VM_BIN picks the emulator
+# binary, UBUNTU_ISO the CD (default ~/Documents/ISOs/ubuntu-8.04.4-desktop-i386.iso).
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+state=${1:-/Volumes/Projects/.workspaces/86slopper/bench/ubuntu-shell}
+iso=${UBUNTU_ISO:-$HOME/Documents/ISOs/ubuntu-8.04.4-desktop-i386.iso}
+tmp=$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || echo "${TMPDIR:-/tmp}")
+name=ubs$$
+serial=${tmp%/}/$name.serial
+: >"$serial"
+trap '"$root/scripts/vm" stop "$name" >/dev/null 2>&1 || true; rm -f "$serial"' EXIT
+vm() { "$root/scripts/vm" "$@"; }
+ctl() { vm ctl "$name" "$@" >/dev/null; }
+shot_size() { stat -f %z "$(vm shot "$name")"; }
+fail() {
+	cp "$(vm shot "$name")" "${tmp%/}/$name-fail.png"
+	echo "$1; screen at ${tmp%/}/$name-fail.png" >&2
+	exit 1
+}
+wait_serial() {
+	for _ in $(seq "$2"); do
+		grep -aqF -- "$1" "$serial" && return
+		sleep 1
+	done
+	fail "no \"$1\" on serial after $2 s"
+}
+# gfxboot draws in graphics mode, so its screens are told apart by the size
+# of their screenshots.
+wait_shot() {
+	for _ in $(seq "$4"); do
+		s=$(shot_size)
+		[ "$s" -ge "$2" ] && [ "$s" -le "$3" ] && return
+		sleep 1
+	done
+	fail "no $1 after $4 s"
+}
+
+VM_TIMEOUT=900 vm start "$name" --cdrom "$iso" --ram 512 --no-net --serial "$serial" >/dev/null
+wait_shot "boot logo" 15000 16500 60
+wait_shot "language menu" 10000 13000 30
+ctl "key enter"
+wait_shot "boot menu" 18000 20000 10
+# Esc asks to leave the graphical menu. The first one is sometimes lost, and
+# a second Esc closes the question again, so retry only after a while.
+dialog=0
+for _ in 1 2 3; do
+	ctl "key esc"
+	for _ in 1 2 3 4 5 6; do
+		sleep 1
+		s=$(shot_size)
+		[ "$s" -ge 12500 ] && [ "$s" -le 15000 ] && dialog=1 && break 2
+	done
+done
+[ $dialog = 1 ] || fail "no \"leaving the graphical boot menu\" question"
+ctl "key enter"
+wait_shot "boot: prompt" 0 4000 10
+ctl "type /casper/vmlinuz file=/cdrom/preseed/ubuntu.seed boot=casper initrd=/casper/initrd.gz break=bottom console=tty0 console=ttyS0,115200"
+# Typing is queued and keys are not, so wait until the whole line shows.
+prev=0
+for _ in $(seq 30); do
+	sleep 1
+	s=$(shot_size)
+	[ "$s" = "$prev" ] && [ "$s" -gt 4000 ] && break
+	prev=$s
+done
+ctl "key enter"
+wait_serial "(initramfs)" 120
+echo "initramfs shell"
+ctl "serial printf 'start on runlevel 2\nrespawn\nexec /sbin/getty -n -l /bin/bash 115200 ttyS0\n' > /root/etc/event.d/ttyS0" "serial exit"
+wait_serial "root@ubuntu" 180
+echo "root shell on COM1"
+
+# The desktop session starts in bursts, so wait at least 100 s and then for
+# 20 s below 5 MIPS.
+sleep 80
+low=0
+for _ in $(seq 300); do
+	sleep 1
+	m=$(vm status "$name" | sed -n 's/.*mips \([0-9.]*\).*/\1/p' | cut -d. -f1)
+	if [ "${m:-0}" -lt 5 ]; then low=$((low + 1)); else low=0; fi
+	[ $low -ge 20 ] && break
+done
+rm -rf "$state"
+mkdir -p "$(dirname "$state")"
+vm ctl "$name" "save $state"

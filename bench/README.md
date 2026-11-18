@@ -115,6 +115,20 @@ original suite from before it was lost.
 
 ## Ubuntu (`scripts/bench-cpu`)
 
-`scripts/bench-cpu` loads a save state of Ubuntu 8.04 live with a root shell
-on serial and its benchmark script in `/tmp`. That state was lost with the
-old XP CD and needs recreating; see the script.
+`scripts/bench-cpu [STATE_DIR]` loads a save state of the Ubuntu 8.04.4 live
+CD with a root shell on COM1, runs `bench/ubuntu/bench.sh` and prints the
+time of each command: a Python loop, Python dicts and regexes, a Perl loop,
+`bzip2 -9`, `gzip -9` and `md5sum`. Each command's output must match
+`bench/ubuntu/expected`, or the line reads `BAD`. `scripts/bench-cpu` copies
+`bench/ubuntu` into the guest over the serial line on every run, so the
+state only holds the booted CD and the shell. The Python, Perl and md5
+values were computed on the host; the others come from the guest, because
+Ubuntu's old `seq` prints large numbers differently.
+
+The state lives outside the repo, by default in
+`/Volumes/Projects/.workspaces/86slopper/bench/ubuntu-shell`. Recreate it
+with `scripts/make-bench-cpu-state [STATE_DIR]`, which needs
+`~/Documents/ISOs/ubuntu-8.04.4-desktop-i386.iso` (or `UBUNTU_ISO`). It boots
+the CD to the text `boot:` prompt, breaks into the initramfs to start a root
+shell on COM1, waits for the desktop to go idle and saves. A state only loads into builds
+with the same device layout, so rebuild it after device changes.
