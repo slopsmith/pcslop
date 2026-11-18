@@ -458,7 +458,7 @@ impl Radeon {
         if fence_written(reg, v & mask) {
             self.gpu_sync();
         }
-        self.poll_fences(mem);
+        self.poll_fences_sometimes(mem);
         let old = self.reg(reg);
         let scratch = match reg {
             SCRATCH_REG0..=SCRATCH_REG7 => Some((reg - SCRATCH_REG0) / 4),

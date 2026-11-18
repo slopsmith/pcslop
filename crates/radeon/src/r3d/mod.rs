@@ -185,12 +185,15 @@ pub(crate) mod op {
 const VECMEM_DWORDS: usize = 2048 * 4;
 const MAX_VERTICES: usize = 1 << 20;
 
+const FENCE_POLL: std::time::Duration = std::time::Duration::from_micros(20);
+
 /// Scratch register writes waiting for Metal: (command buffer serial,
 /// register, value), and registers whose writeback is due.
 #[derive(Default)]
 pub(crate) struct Fences {
     queue: std::collections::VecDeque<(u64, u32, u32)>,
     writebacks: Vec<u32>,
+    polled: Option<std::time::Instant>,
 }
 
 impl Fences {
@@ -390,6 +393,21 @@ impl Radeon {
         let done = self.metal.as_mut().map_or(u64::MAX, |m| m.completed());
         self.retire_fences(done);
         self.flush_writebacks(mem);
+    }
+
+    /// As `poll_fences`, but at most every `FENCE_POLL`, for register writes:
+    /// asking Metal on every one took a quarter of the command processor's
+    /// time in 3DMark 2001.
+    pub(crate) fn poll_fences_sometimes(&mut self, mem: &mut dyn BusMemory) {
+        if !self.fences_pending() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self.fences.polled.is_some_and(|t| now.duration_since(t) < FENCE_POLL) {
+            return;
+        }
+        self.fences.polled = Some(now);
+        self.poll_fences(mem);
     }
 
     pub(crate) fn retire_fences(&mut self, done: u64) {
