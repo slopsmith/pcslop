@@ -1630,7 +1630,9 @@ impl Jit {
                 i.op | if i.op32 { 0 } else { 0x4000 } | if i.rep != x86::decode::Rep::None { 0x2000 } else { 0 }
             };
             *p.entry(key).or_default() += 1;
-            *self.interp_sites.entry((key, eip)).or_default() += 1;
+            // Port I/O through DX: the port matters more than the HAL helper's EIP.
+            let site = if matches!(i.op, 0xec..=0xef) { 0xffff_0000 | (cpu.regs[2] & 0xffff) } else { eip };
+            *self.interp_sites.entry((key, site)).or_default() += 1;
         }
     }
 
