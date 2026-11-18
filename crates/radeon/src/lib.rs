@@ -496,7 +496,7 @@ impl Radeon {
                 if v & mask & (VSYNC_INT | CRTC_VBLANK_STAT) != 0 {
                     self.vblank_acked[1] = self.frame();
                 }
-                self.int_status &= !(v & mask & SW_INT_TEST);
+                self.int_status &= !(v & mask & (SW_INT_TEST | GUIDMA_INT));
                 if v & mask & SW_INT_FIRE != 0 {
                     self.int_status |= SW_INT_TEST;
                 }
@@ -649,7 +649,7 @@ impl Radeon {
 /// frame whose vertical blank was acknowledged last and the current frame.
 fn irq_level(int_status: u32, int_cntl: u32, vblank_acked: u64, frame: u64) -> bool {
     let vblank = if frame > vblank_acked { VSYNC_INT | CRTC_VBLANK_STAT } else { 0 };
-    (int_status | vblank) & int_cntl & (CRTC_VBLANK_STAT | VSYNC_INT | SW_INT_TEST) != 0
+    (int_status | vblank) & int_cntl & (CRTC_VBLANK_STAT | VSYNC_INT | SW_INT_TEST | GUIDMA_INT) != 0
 }
 
 /// SCL and SDA as the card drives them: a line is low only while its output is
@@ -660,13 +660,14 @@ fn gpio_lines(v: u32) -> (bool, bool) {
 }
 
 /// Writes after which the guest may look at finished pixels at once:
-/// software interrupts and the occlusion counter. Scratch registers and
+/// software and GUI DMA interrupts and the occlusion counter. Scratch registers and
 /// CP_RESYNC wait in `defer_fence` instead. WAIT_UNTIL needs no wait of its
 /// own: Metal runs draws in order, and everything else that touches VRAM
 /// waits for Metal first.
 fn fence_written(reg: u32, v: u32) -> bool {
     matches!(reg, r3d::regs::ZB_ZPASS_DATA | r3d::regs::ZB_ZPASS_ADDR)
         || (reg == GEN_INT_STATUS && v & SW_INT_FIRE != 0)
+        || (reg == GUI_DMA_CMD && v & (GUI_DMA_EOL | GUI_DMA_INTDIS) == GUI_DMA_EOL)
 }
 
 /// Idle polls whose busy encoding we do not know. With a worker thread

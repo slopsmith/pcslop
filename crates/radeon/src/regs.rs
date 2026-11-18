@@ -223,3 +223,13 @@ pub const RNG_CNTL: [u32; 4] = [0x1fc0, 0x1fc8, 0x1fd0, 0x1fd8];
 pub const RNG_BUSY: u32 = 1 << 0;
 pub const RNG_FLUSH: u32 = 1 << 2;
 pub const RNG_READY: u32 = 1 << 3;
+/// The last register of a GUI DMA descriptor (source, destination, command)
+/// that the CP takes at 0x720. Vista's atikmdag ends every DMA buffer with a
+/// descriptor of no bytes, EOL set and INTDIS clear, only for the GUIDMA
+/// interrupt it raises on completion.
+pub const GUI_DMA_CMD: u32 = 0x0728;
+pub const GUI_DMA_BYTES: u32 = 0x001f_ffff;
+pub const GUI_DMA_INTDIS: u32 = 1 << 30;
+pub const GUI_DMA_EOL: u32 = 1 << 31;
+/// GEN_INT_CNTL enable and GEN_INT_STATUS bit for a finished GUI DMA list.
+pub const GUIDMA_INT: u32 = 1 << 30;

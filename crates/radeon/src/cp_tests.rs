@@ -334,3 +334,18 @@ fn hostdata_blt_translates_8bpp_pixels_through_the_loaded_palette() {
     assert_eq!([1, 2, 3].map(|x| px32(&r, x, 1)), [0x0000_0000, 0x0010_0001, 0x0020_0002]);
     assert_eq!([1, 2, 3].map(|x| px32(&r, x, 2)), [0x0030_0003, 0x0050_0005, 0x00f0_000f]);
 }
+
+#[test]
+fn an_empty_gui_dma_list_at_the_end_of_a_buffer_raises_the_guidma_interrupt() {
+    let mut ram = Ram::new();
+    let mut r = card_with_ring(&mut ram);
+    r.mmio_write(GEN_INT_CNTL, 4, GUIDMA_INT, &mut ram);
+    submit(&mut r, &mut ram, &[pkt0(SCRATCH_REG0 + 0x18, 1), 0x1c, pkt0(GUI_DMA_CMD, 1), GUI_DMA_EOL | GUI_DMA_INTDIS]);
+    assert!(!r.irq(), "INTDIS must keep the list silent");
+    submit(&mut r, &mut ram, &[pkt0(SCRATCH_REG0 + 0x18, 1), 0x1d, pkt0(GUI_DMA_CMD, 1), GUI_DMA_EOL]);
+    assert!(r.irq(), "Vista's scheduler waits for this interrupt to retire the buffer");
+    assert_ne!(r.mmio_read(GEN_INT_STATUS, 4) & GUIDMA_INT, 0);
+    assert_eq!(r.mmio_read(SCRATCH_REG0 + 0x18, 4), 0x1d, "the fence must be visible when the interrupt is");
+    r.mmio_write(GEN_INT_STATUS, 4, GUIDMA_INT, &mut ram);
+    assert!(!r.irq(), "writing the status bit back acknowledges it");
+}

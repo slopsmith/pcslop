@@ -304,6 +304,15 @@ impl Radeon {
                 self.regs[(SCRATCH_REG0 / 4 + n) as usize] = self.reg(CP_RESYNC_DATA);
                 self.scratch_written(n, mem);
             }
+            GUI_DMA_CMD => {
+                let cmd = self.reg(reg);
+                if cmd & GUI_DMA_BYTES != 0 {
+                    self.note(&format!("cp: GUI DMA of {} bytes not performed", cmd & GUI_DMA_BYTES));
+                }
+                if cmd & (GUI_DMA_EOL | GUI_DMA_INTDIS) == GUI_DMA_EOL {
+                    self.int_status |= GUIDMA_INT;
+                }
+            }
             RBBM_SOFT_RESET => {
                 if self.reg(reg) & (SOFT_RESET_CP | SOFT_RESET_E2) != 0 {
                     self.cp_soft_reset();
