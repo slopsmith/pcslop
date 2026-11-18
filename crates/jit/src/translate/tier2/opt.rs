@@ -167,7 +167,7 @@ fn demand_flags(f: &mut Func) {
             let blk = &f.blocks[b];
             let out = blk.outs[FLAGS] as usize;
             let mut need = match blk.term {
-                Term::Exit(_) => ALL,
+                Term::Exit(_) => blk.exit_flags,
                 _ => 0,
             };
             for s in f.succs(b as Blk) {

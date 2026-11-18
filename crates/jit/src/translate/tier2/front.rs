@@ -88,6 +88,11 @@ pub fn build(entry: u32, byte: &mut dyn FnMut(u32) -> Option<u8>, x87: Option<(u
     if f.blocks[0].insns == 0 {
         return None;
     }
+    for b in &mut f.blocks {
+        if let Term::Exit(t) = b.term {
+            b.exit_flags = super::super::live_in(t, &mut |a| byte(a), page);
+        }
+    }
     Some(f)
 }
 
@@ -96,7 +101,7 @@ fn empty(f: &mut Func, eip: u32) -> Block {
     for (i, p) in params.iter_mut().enumerate() {
         *p = f.push(Op::Param(i as u8), eip);
     }
-    Block { eip, insns: 0, params, insts: Vec::new(), outs: params, term: Term::Exit(eip), x87_in: (0, 0) }
+    Block { eip, insns: 0, params, insts: Vec::new(), outs: params, term: Term::Exit(eip), x87_in: (0, 0), exit_flags: super::opt::ALL }
 }
 
 fn fetch(pc: u32, page: u32, byte: &mut dyn FnMut(u32) -> Option<u8>) -> Option<Insn> {

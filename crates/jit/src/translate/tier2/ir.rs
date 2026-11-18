@@ -206,6 +206,8 @@ pub struct Block {
     pub term: Term,
     /// x87 TOP relative to the entry's and the full slots, at the block's start.
     pub x87_in: (u8, u8),
+    /// For an exit, the flags the code at its EIP may read before writing.
+    pub exit_flags: u8,
 }
 
 #[derive(Clone, Debug, Default)]

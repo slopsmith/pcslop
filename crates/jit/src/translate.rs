@@ -2890,7 +2890,7 @@ fn flag_needs(eip: u32, byte: &mut impl FnMut(u32) -> Option<u8>, user: bool, ex
 
 /// Flags code at `at` may read before writing them. Stays on `page`, whose
 /// code cannot change without dropping the block that asked.
-fn live_in(at: u32, byte: &mut impl FnMut(u32) -> Option<u8>, page: u32) -> u8 {
+pub(super) fn live_in(at: u32, byte: &mut impl FnMut(u32) -> Option<u8>, page: u32) -> u8 {
     let (mut live, mut written) = (0, 0);
     let mut pc = at;
     for _ in 0..16 {
