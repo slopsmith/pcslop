@@ -689,6 +689,18 @@ fn debugctl_keeps_its_bits_and_the_branch_records_read_empty() {
 }
 
 #[test]
+fn misc_enable_reads_fast_strings_and_ignores_writes() {
+    use crate::cpu::{EAX, ECX, EDX};
+    let mut mc = Machine::new();
+    mc.cpu.regs[ECX] = 0x1a0;
+    mc.cpu.regs[EAX] = 0;
+    mc.cpu.regs[EDX] = 0;
+    mc.run(&[0x0f, 0x30]).unwrap();
+    mc.run(&[0x0f, 0x32]).unwrap();
+    assert_eq!((mc.cpu.regs[EAX], mc.cpu.regs[EDX]), (0x1801, 0));
+}
+
+#[test]
 fn rdmsr_of_an_unknown_msr_raises_gp() {
     let mut mc = Machine::new();
     mc.cpu.regs[crate::cpu::ECX] = 0x2a;

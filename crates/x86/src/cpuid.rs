@@ -42,6 +42,10 @@ pub const FEATURES_EDX: u32 = edx::FPU
 /// XP's intelppm.sys reads it on every family 15 CPU.
 pub const EBC_FREQUENCY_ID: u64 = 18 << 24 | 1 << 16;
 
+/// IA32_MISC_ENABLE (0x1A0): fast strings on, branch trace and PEBS unavailable.
+/// Vista's winload reads it; writes are ignored.
+pub const MISC_ENABLE: u64 = 1 | 1 << 11 | 1 << 12;
+
 const BRAND: &[u8; 48] = b"86slopper Virtual CPU\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
 
 fn brand_regs(part: usize) -> [u32; 4] {
