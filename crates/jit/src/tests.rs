@@ -184,7 +184,7 @@ fn loop_with_memory_and_stack() {
         0xf4, // hlt
     ];
     let stats = compare(&code, |_| {});
-    assert!(stats.blocks >= 3);
+    assert!(stats.blocks >= 2);
     assert_eq!(stats.interp_exits, 1);
 }
 
@@ -765,6 +765,58 @@ fn random_programs_match_the_interpreter() {
     // Besides each final HLT, only string instructions running with DF=1 use the interpreter.
     assert!(interp_exits < 360, "{interp_exits} interpreter exits");
     assert!(translated > 300 * 40);
+}
+
+#[test]
+fn random_programs_with_forward_branches_match_the_interpreter() {
+    let mut rng = Rng(0x5b_10c5);
+    for round in 0..400 {
+        let mut insns: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..30 {
+            let mut one = Vec::new();
+            match rng.below(6) {
+                0 => one.extend([0x9c, 0x58 + rng.reg()]),
+                1 => one.push(0x9f),
+                2 => one.extend([0x0f, 0x90 + rng.below(16) as u8, modrm_rr(0, rng.below(8) as u8)]),
+                _ => random_insn(&mut rng, &mut one),
+            }
+            insns.push(one);
+        }
+        let mut at = vec![0; insns.len() + 1];
+        let mut out = Vec::new();
+        let mut fixups = Vec::new();
+        for (i, one) in insns.iter().enumerate() {
+            if rng.below(3) == 0 {
+                let to = (i + 1 + rng.below(6) as usize).min(insns.len());
+                fixups.push((out.len(), to));
+                out.extend([0x70 + rng.below(16) as u8, 0]);
+            }
+            at[i] = out.len();
+            out.extend(one);
+        }
+        at[insns.len()] = out.len();
+        for (pos, to) in fixups {
+            out[pos + 1] = i8::try_from(at[to] - (pos + 2)).unwrap_or(0) as u8;
+        }
+        out.push(0xf4);
+        let regs: Vec<u32> = (0..8).map(|_| rng.next()).collect();
+        let flags = rng.next() & ARITH_MASK;
+        let result = std::panic::catch_unwind(|| {
+            compare(&out, |c| {
+                for (i, v) in regs.iter().enumerate() {
+                    if i != 4 {
+                        c.regs[i] = *v;
+                    }
+                }
+                c.eflags |= flags;
+                c.cr4 |= x86::cpu::cr4::OSFXSR;
+            })
+        });
+        if let Err(e) = result {
+            let hex: Vec<String> = out.iter().map(|b| format!("{b:02x}")).collect();
+            panic!("round {round} differs: {:?}\ncode: {}", e.downcast_ref::<String>(), hex.join(" "));
+        }
+    }
 }
 
 #[test]

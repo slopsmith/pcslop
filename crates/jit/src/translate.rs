@@ -101,10 +101,14 @@ struct Emit {
     /// The `flags` bits the current instruction must produce.
     need: u8,
     x87: x87::X87Block,
+    /// Whether a conditional branch may leave through a side exit and go on.
+    superblock: bool,
 }
 
 enum Step {
     Next,
+    /// A conditional branch left through a side exit; the block goes on after it.
+    Branch,
     End,
     Unsupported,
     /// STI: the next instruction must run before the dispatcher can take an interrupt.
@@ -927,8 +931,26 @@ impl Emit {
             }
             0x70..=0x7f | 0x180..=0x18f => {
                 let rel = if op < 0x100 { insn.imm as u8 as i8 as i32 as u32 } else { insn.imm };
-                if !op32 && op >= 0x100 {
+                if !op32 {
                     return Step::Unsupported;
+                }
+                let target = next.wrapping_add(rel);
+                if self.superblock {
+                    let not_taken = self.a.label();
+                    match x86_cond(op) {
+                        Some(c) => self.a.b_cond(c.invert(), not_taken),
+                        None => {
+                            self.parity_odd(T_B);
+                            if op & 1 == 0 {
+                                self.a.tbnz(T_B, 0, not_taken);
+                            } else {
+                                self.a.tbz(T_B, 0, not_taken);
+                            }
+                        }
+                    }
+                    self.goto(target);
+                    self.a.bind(not_taken);
+                    return Step::Branch;
                 }
                 let taken = self.a.label();
                 match x86_cond(op) {
@@ -944,7 +966,7 @@ impl Emit {
                 }
                 self.goto(next);
                 self.a.bind(taken);
-                self.goto(next.wrapping_add(rel));
+                self.goto(target);
                 return Step::End;
             }
             0x80..=0x83 => {
@@ -2371,17 +2393,19 @@ pub fn translatable(insn: &Insn, pc: u32, user: bool) -> bool {
         stored: false,
         need: flags::ALL,
         x87: x87::X87Block::default(),
+        superblock: false,
     };
     !matches!(e.insn(insn, pc), Step::Unsupported)
 }
 
-/// The flags each instruction of the block at `eip` must produce. With `exact`,
-/// a rejected instruction keeps them all live, as verify mode compares them all.
-fn flag_needs(eip: u32, byte: &mut impl FnMut(u32) -> Option<u8>, user: bool, exact: bool) -> Vec<u8> {
+/// The flags each instruction of the block at `eip` must produce, `superblock`
+/// meaning conditional branches leave through side exits. `exact` is verify mode.
+fn flag_needs(eip: u32, byte: &mut impl FnMut(u32) -> Option<u8>, user: bool, exact: bool, superblock: bool) -> Vec<u8> {
     let page = eip & !0xfff;
     let mut effects = Vec::new();
     let mut pc = eip;
     let mut stop_after_next = false;
+    let mut live_out = None;
     while effects.len() < MAX_INSNS {
         let Ok(insn) = decode::<()>(true, |i| byte(pc.wrapping_add(i)).ok_or(())) else { break };
         let end = pc.wrapping_add(insn.len as u32);
@@ -2392,14 +2416,63 @@ fn flag_needs(eip: u32, byte: &mut impl FnMut(u32) -> Option<u8>, user: bool, ex
         if exact && e.flow != flags::Flow::End && !translatable(&insn, pc, user) {
             e = flags::Effect { reads: flags::ALL, writes: 0, may: 0, flow: flags::Flow::End };
         }
+        if e.flow == flags::Flow::Branch && !insn.op32 {
+            e = flags::Effect { reads: flags::ALL, writes: 0, may: 0, flow: flags::Flow::End };
+        }
+        if e.flow == flags::Flow::Branch {
+            let rel = if insn.op < 0x100 { insn.imm as u8 as i8 as i32 as u32 } else { insn.imm };
+            let taken = if exact { flags::ALL } else { live_in(end.wrapping_add(rel), byte, page) };
+            e.reads |= taken;
+            e.flow = if superblock && !stop_after_next { flags::Flow::Next } else { flags::Flow::End };
+            if e.flow == flags::Flow::End {
+                live_out = Some(if exact { flags::ALL } else { live_in(end, byte, page) });
+            }
+        }
         effects.push(e);
+        pc = end;
         if stop_after_next || e.flow == flags::Flow::End {
+            if live_out.is_none() && !exact && insn.op32 && matches!(insn.op, 0xe9 | 0xeb) {
+                let rel = if insn.op == 0xeb { insn.imm as u8 as i8 as i32 as u32 } else { insn.imm };
+                live_out = Some(live_in(end.wrapping_add(rel), byte, page));
+            }
             break;
         }
         stop_after_next = e.flow == flags::Flow::EndAfterNext;
+    }
+    let live_out = live_out.unwrap_or(if exact || effects.last().is_some_and(|e| e.flow == flags::Flow::End) {
+        flags::ALL
+    } else {
+        live_in(pc, byte, page)
+    });
+    flags::needed(&effects, live_out)
+}
+
+/// Flags code at `at` may read before writing them. Stays on `page`, whose
+/// code cannot change without dropping the block that asked.
+fn live_in(at: u32, byte: &mut impl FnMut(u32) -> Option<u8>, page: u32) -> u8 {
+    let (mut live, mut written) = (0, 0);
+    let mut pc = at;
+    for _ in 0..16 {
+        if pc & !0xfff != page {
+            break;
+        }
+        let Ok(insn) = decode::<()>(true, |i| byte(pc.wrapping_add(i)).ok_or(())) else { break };
+        let end = pc.wrapping_add(insn.len as u32);
+        if end.wrapping_sub(1) & !0xfff != page {
+            break;
+        }
+        let e = flags::effect(&insn);
+        live |= e.reads & !written;
+        if e.flow != flags::Flow::Next {
+            break;
+        }
+        written |= e.writes;
+        if live | written == flags::ALL {
+            return live;
+        }
         pc = end;
     }
-    flags::needed(&effects)
+    live | (flags::ALL & !written)
 }
 
 pub fn compile(
@@ -2424,8 +2497,10 @@ pub fn compile(
         stored: false,
         need: flags::ALL,
         x87: x87::X87Block::default(),
+        superblock: false,
     };
-    let need = if self_check { Vec::new() } else { flag_needs(eip, &mut byte, user, exact_flags) };
+    let superblock = chain;
+    let need = if self_check { Vec::new() } else { flag_needs(eip, &mut byte, user, exact_flags, superblock) };
     let mut boundaries = Vec::new();
     let mut pc = eip;
     let mut insns = 0;
@@ -2446,6 +2521,8 @@ pub fn compile(
     let mut retry = false;
     let mut x87_snaps = Vec::new();
     let mut sti_x87 = x87::X87Block::default();
+    // ICOUNT is added where each stretch between side exits starts: (word, instructions before it).
+    let mut count_sites = vec![(0usize, 0usize)];
     loop {
         let mut missing = false;
         let insn = decode::<()>(true, |i| {
@@ -2487,8 +2564,9 @@ pub fn compile(
             let slow = e.a.label();
             e.check_code_bytes(page.wrapping_add(0x1000), &tail, slow);
             e.need = flags::ALL;
+            e.superblock = false;
             match e.insn(&insn, pc) {
-                Step::Next => {
+                Step::Next | Step::Branch => {
                     insns += 1;
                     e.goto(end);
                 }
@@ -2509,6 +2587,7 @@ pub fn compile(
         }
         e.stored = false;
         e.need = need.get(insns).copied().unwrap_or(flags::ALL);
+        e.superblock = superblock && sti.is_none();
         let step = e.insn(&insn, pc);
         if self_check && e.stored && matches!(step, Step::Next | Step::Sti) {
             // T_ADDR still holds the address of the last store: leave through
@@ -2551,6 +2630,16 @@ pub fn compile(
                     break;
                 }
             }
+            Step::Branch => {
+                insns += 1;
+                pc = end;
+                count_sites.push((e.a.pos(), insns));
+                e.a.nop();
+                if insns >= MAX_INSNS || !on_page(pc) {
+                    e.goto(pc);
+                    break;
+                }
+            }
             Step::End => {
                 insns += 1;
                 break;
@@ -2582,9 +2671,12 @@ pub fn compile(
         e.x87 = x87::X87Block::default();
         e.exit_with(eip, reason::STALE);
     }
-    let mut count = Asm::new();
-    count.add_imm(Size::X, ICOUNT, ICOUNT, insns as u32);
     let mut code = e.a.finish();
-    code[0] = count.code[0];
+    for (k, &(word, before)) in count_sites.iter().enumerate() {
+        let until = count_sites.get(k + 1).map_or(insns, |&(_, n)| n);
+        let mut count = Asm::new();
+        count.add_imm(Size::X, ICOUNT, ICOUNT, (until - before) as u32);
+        code[word] = count.code[0];
+    }
     Compiled { code, boundaries, insns, chains: e.chains, has_rep, recent, interp_after, retry, x87: x87_snaps }
 }

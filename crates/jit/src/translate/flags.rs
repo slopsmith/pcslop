@@ -1,7 +1,8 @@
 //! Which x86 arithmetic flags each instruction of a block must produce. A
 //! backward pass over the decoded block drops flags that a later instruction
-//! overwrites before anything reads them; at the end of the block all flags
-//! are live. Instructions not listed here count as reading every flag.
+//! overwrites before anything reads them; at the end of the block and at
+//! conditional side exits the flags the following code reads are live.
+//! Instructions not listed here count as reading every flag.
 //!
 //! The flags a guest exception handler sees after a fault in the middle of a
 //! block can therefore be stale; the handler restores them, the faulting
@@ -28,6 +29,8 @@ pub enum Flow {
     End,
     /// The block ends after the next instruction (STI's interrupt shadow).
     EndAfterNext,
+    /// A conditional branch: the block goes on at the next instruction.
+    Branch,
     /// An instruction outside the table: it reads and may write every flag.
     Unknown,
 }
@@ -104,8 +107,10 @@ fn known(insn: &Insn) -> (u8, u8, Flow) {
         0x9e => (0, CF | PF | AF | ZF | SF, Next),
         0x9f => (CF | PF | AF | ZF | SF, 0, Next),
         0x1c0 | 0x1c1 | 0x1b0 | 0x1b1 => (0, ALL, Next),
-        0x140..=0x14f | 0x190..=0x19f => (ALL, 0, Next),
-        0x70..=0x7f | 0x180..=0x18f | 0xe0..=0xe3 | 0xe8 | 0xe9 | 0xeb | 0xc2 | 0xc3 | 0x9d => (ALL, 0, End),
+        0x140..=0x14f | 0x190..=0x19f => (cond_reads(op), 0, Next),
+        0x70..=0x7f | 0x180..=0x18f => (cond_reads(op), 0, Branch),
+        0xe9 | 0xeb => (0, 0, End),
+        0xe0..=0xe3 | 0xe8 | 0xc2 | 0xc3 | 0x9d => (ALL, 0, End),
         0xff if matches!(reg, 2 | 4) => (ALL, 0, End),
         0xd8..=0xdf => match (op & 7, insn.mem.is_some(), insn.modrm) {
             (3 | 7, false, 0xe8..=0xf7) => (0, ALL, Next),
@@ -118,10 +123,24 @@ fn known(insn: &Insn) -> (u8, u8, Flow) {
     }
 }
 
+/// The flags condition code `op & 15` tests.
+pub fn cond_reads(op: u16) -> u8 {
+    match op & 15 {
+        0 | 1 => OF,
+        2 | 3 => CF,
+        4 | 5 => ZF,
+        6 | 7 => CF | ZF,
+        8 | 9 => SF,
+        10 | 11 => PF,
+        12 | 13 => SF | OF,
+        _ => ZF | SF | OF,
+    }
+}
+
 /// The flags each instruction must produce, given the effects of the
-/// instructions of the block in order.
-pub fn needed(effects: &[Effect]) -> Vec<u8> {
-    let mut live = ALL;
+/// instructions of the block in order and the flags live after the block.
+pub fn needed(effects: &[Effect], live_out: u8) -> Vec<u8> {
+    let mut live = live_out;
     let mut need = vec![ALL; effects.len()];
     for (i, e) in effects.iter().enumerate().rev() {
         need[i] = (e.writes | e.may) & live;
@@ -140,13 +159,13 @@ mod tests {
 
     #[test]
     fn flags_overwritten_before_any_read_are_dead() {
-        assert_eq!(needed(&[e(0, ALL, 0), e(0, ALL & !CF, 0), e(0, ALL, 0), e(ALL, 0, 0)]), [0, 0, ALL, 0]);
-        assert_eq!(needed(&[e(0, ALL, 0), e(0, ALL & !CF, 0), e(0, 0, 0)]), [CF, ALL & !CF, 0]);
+        assert_eq!(needed(&[e(0, ALL, 0), e(0, ALL & !CF, 0), e(0, ALL, 0), e(ALL, 0, 0)], ALL), [0, 0, ALL, 0]);
+        assert_eq!(needed(&[e(0, ALL, 0), e(0, ALL & !CF, 0), e(0, 0, 0)], ALL), [CF, ALL & !CF, 0]);
     }
 
     #[test]
     fn a_shift_by_cl_keeps_earlier_flags_and_produces_its_own() {
-        assert_eq!(needed(&[e(0, ALL, 0), e(0, 0, SHIFTED), e(0, ALL, 0)]), [0, 0, ALL]);
-        assert_eq!(needed(&[e(0, ALL, 0), e(0, 0, SHIFTED)]), [ALL, SHIFTED]);
+        assert_eq!(needed(&[e(0, ALL, 0), e(0, 0, SHIFTED), e(0, ALL, 0)], ALL), [0, 0, ALL]);
+        assert_eq!(needed(&[e(0, ALL, 0), e(0, 0, SHIFTED)], ALL), [ALL, SHIFTED]);
     }
 }
