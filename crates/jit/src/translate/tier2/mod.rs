@@ -21,7 +21,7 @@ pub fn compile_region(eip: u32, byte: &mut dyn FnMut(u32) -> Option<u8>, block_v
     let mut f = front::build(eip, byte, x87)?;
     // The x87 entry checks only pay off when the entry block runs x87 code.
     let entry_x87 = f.blocks[0].insts.iter().any(|&v| f.op(v).is_x87());
-    if f.x87.is_some_and(|x| x.touched != 0) && !entry_x87 {
+    if f.x87.is_some() && !entry_x87 {
         f = front::build(eip, byte, None)?;
     }
     opt::run(&mut f);
