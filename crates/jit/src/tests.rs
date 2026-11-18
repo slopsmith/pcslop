@@ -1443,7 +1443,7 @@ fn sysenter_sysexit_and_fs_loads_match_the_interpreter() {
         0x00cf_fb00_0000_ffff,
         0x00cf_f300_0000_ffff,
         0,
-        0x0040_9300_5000_0fff,
+        0x0040_9200_5000_0fff,
         0x0040_f300_5100_0fff,
     ];
     for (i, d) in gdt.iter().enumerate() {
@@ -1473,6 +1473,7 @@ fn sysenter_sysexit_and_fs_loads_match_the_interpreter() {
     assert_eq!(a.eip, b.eip);
     assert_eq!(a.eflags & ARITH_MASK, b.eflags & ARITH_MASK);
     assert_eq!(a.segs, b.segs);
+    assert!(bus_a.ram.as_slice() == bus_b.ram.as_slice(), "memory differs, such as a descriptor's Accessed bit");
     assert!(stats.interp_exits <= 17, "system calls left translated code: {stats:?}");
 }
 

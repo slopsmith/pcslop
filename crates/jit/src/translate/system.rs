@@ -25,6 +25,8 @@ impl Emit {
         self.a.cbz(Size::W, T_A, slow);
         self.a.str(Width::W, ZR, STATE, state::IF_FLAG as i32);
         self.a.str(Width::W, T_A, STATE, state::CS_SEL as i32);
+        self.a.add_imm(Size::W, T_B, T_A, 8);
+        self.a.str(Width::W, T_B, STATE, state::SS_SEL as i32);
         self.a.ldr(Width::W, guest_reg(4), STATE, state::SYSENTER_ESP as i32);
         self.a.ldr(Width::W, T_C, STATE, state::SYSENTER_EIP as i32);
         self.switch_tree(false);
@@ -45,6 +47,8 @@ impl Emit {
         self.a.cbz(Size::W, T_A, slow);
         self.a.add_imm(Size::W, T_A, T_A, 16 | 3);
         self.a.str(Width::W, T_A, STATE, state::CS_SEL as i32);
+        self.a.add_imm(Size::W, T_B, T_A, 8);
+        self.a.str(Width::W, T_B, STATE, state::SS_SEL as i32);
         self.a.mov(Size::W, guest_reg(4), guest_reg(1));
         self.a.mov(Size::W, T_C, guest_reg(2));
         self.switch_tree(true);
@@ -134,11 +138,18 @@ impl Emit {
             self.a.add(Size::W, T_ADDR, T_D, T_C);
             self.a.ldr(Width::X, T_D, T_ADDR, 0);
             self.a.ubfx(Size::X, T_E, T_D, 40, 8);
-            self.a.mov_imm(Size::W, T_B, 0x99);
+            self.a.mov_imm(Size::W, T_B, 0x98);
             self.a.and(Size::W, T_E, T_E, T_B);
-            self.a.mov_imm(Size::W, T_B, 0x91);
+            self.a.mov_imm(Size::W, T_B, 0x90);
             self.a.eor(Size::W, T_E, T_E, T_B);
             self.a.cbnz(Size::W, T_E, slow);
+            // Loading a descriptor sets its Accessed bit, as on x86.
+            let accessed = self.a.label();
+            self.a.tbnz(T_D, 40, accessed);
+            let ok = self.a.logic_imm(Logic::Orr, Size::X, T_D, T_D, 1 << 40);
+            assert!(ok);
+            self.a.str(Width::X, T_D, T_ADDR, 0);
+            self.a.bind(accessed);
             self.a.ubfx(Size::X, T_E, T_D, 45, 2);
             self.and_imm32(T_B, T_A, 3);
             self.a.sub(Size::W, T_E, T_E, T_B);
@@ -232,6 +243,7 @@ impl Emit {
         self.load_eflags(slow, true);
         self.a.mov(Size::W, esp, new_esp);
         self.a.str(Width::W, T_D, STATE, state::CS_SEL as i32);
+        self.a.str(Width::W, base, STATE, state::SS_SEL as i32);
         self.switch_tree(true);
         self.goto_reg(T_E);
         self.a.bind(slow);

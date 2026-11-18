@@ -1713,6 +1713,19 @@ impl Emit {
                     return Step::Unsupported;
                 }
             }
+            0x8c if insn.reg() <= 5 => {
+                let at = [state::ES_SEL, state::CS_SEL, state::SS_SEL, state::DS_SEL, state::FS_SEL, state::GS_SEL][insn.reg()];
+                self.a.ldr(Width::W, T_B, STATE, at as i32);
+                match insn.mem {
+                    Some(m) => {
+                        if !self.ea(insn, &m) {
+                            return Step::Unsupported;
+                        }
+                        self.store(Width::H, T_B);
+                    }
+                    None => self.write_gpr(if op32 { Ow::D } else { Ow::H }, insn.rm(), T_B),
+                }
+            }
             0x8e => {
                 if !self.mov_to_seg(insn, eip) {
                     return Step::Unsupported;

@@ -329,6 +329,8 @@ pub struct Jit {
     audit_seen: HashSet<(usize, u32, u32)>,
     /// Interpreter exits by opcode, when profiling is on.
     interp_profile: Option<HashMap<u16, u64>>,
+    /// Interpreter exits by (opcode key, EIP), when profiling is on.
+    interp_sites: HashMap<(u16, u32), u64>,
     /// Where the vCPU was at each kick while profiling: guest EIP of the
     /// translated block, or a runtime offset (negative keys, 64-byte buckets).
     pc_samples: HashMap<i64, u64>,
@@ -448,6 +450,7 @@ impl Jit {
             chain_in: HashMap::default(),
             stats: Stats::default(),
             interp_profile: std::env::var_os("SLOPPER_JIT_PROFILE").map(|_| HashMap::default()),
+            interp_sites: HashMap::default(),
             pc_samples: HashMap::default(),
             block_samples: HashMap::default(),
             host_samples: HashMap::default(),
@@ -565,6 +568,7 @@ impl Jit {
     pub fn set_profiling(&mut self, on: bool) {
         self.timing = on;
         self.interp_profile = on.then(HashMap::default);
+        self.interp_sites.clear();
         self.pc_samples.clear();
         self.block_samples.clear();
         self.host_samples.clear();
@@ -580,6 +584,9 @@ impl Jit {
         let mut v: Vec<_> = p.iter().collect();
         v.sort_by(|a, b| b.1.cmp(a.1));
         let top: Vec<String> = v.iter().take(40).map(|(k, n)| format!("{k:04x}:{n}")).collect();
+        let mut sites: Vec<_> = self.interp_sites.iter().collect();
+        sites.sort_by(|a, b| b.1.cmp(a.1));
+        let sites: Vec<String> = sites.iter().take(20).map(|((k, eip), n)| format!("{k:04x}@{eip:08x}:{n}")).collect();
         let total: u64 = self.pc_samples.values().sum();
         let mut pcs: Vec<_> = self.pc_samples.iter().collect();
         pcs.sort_by(|a, b| b.1.cmp(a.1));
@@ -590,13 +597,14 @@ impl Jit {
             .map(|(k, n)| if **k < 0 { format!("rt+{:#x}:{n}", -**k - 1) } else { format!("{:#x}:{n}", **k) })
             .collect();
         format!(
-            "ms in vm {:.0} miss {:.0} interp {:.0} fault {:.0} mmio {:.0}\ninterpreter exits by opcode: {}\n{total} samples, {runtime} in the runtime; hottest: {}",
+            "ms in vm {:.0} miss {:.0} interp {:.0} fault {:.0} mmio {:.0}\ninterpreter exits by opcode: {}\nby site: {}\n{total} samples, {runtime} in the runtime; hottest: {}",
             ms(s.vm_ns),
             ms(s.miss_ns),
             ms(s.interp_ns),
             ms(s.fault_ns),
             ms(s.mmio_ns),
             top.join(" "),
+            sites.join(" "),
             hot.join(" ")
         )
     }
@@ -850,6 +858,7 @@ impl Jit {
         s.mxcsr = cpu.mxcsr;
         s.fpsr = 0;
         s.ds_sel = cpu.segs[DS].selector as u32;
+        s.ss_sel = cpu.segs[SS].selector as u32;
         s.es_sel = cpu.segs[ES].selector as u32;
         s.fs_sel = cpu.segs[FS].selector as u32;
         s.gs_sel = cpu.segs[GS].selector as u32;
@@ -1535,6 +1544,7 @@ impl Jit {
                 i.op | if i.op32 { 0 } else { 0x4000 } | if i.rep != x86::decode::Rep::None { 0x2000 } else { 0 }
             };
             *p.entry(key).or_default() += 1;
+            *self.interp_sites.entry((key, eip)).or_default() += 1;
         }
     }
 

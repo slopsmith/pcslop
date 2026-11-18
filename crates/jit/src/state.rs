@@ -154,6 +154,8 @@ pub struct State {
     /// FPSR exception flags gathered at each exit from the VM.
     pub fpsr: u32,
     pub ds_sel: u32,
+    /// SS; translated SYSENTER and SYSEXIT keep it at CS + 8.
+    pub ss_sel: u32,
     pub es_sel: u32,
     pub fs_sel: u32,
     pub gs_sel: u32,
@@ -239,6 +241,7 @@ pub const MXCSR: usize = offset_of!(State, mxcsr);
 pub const SSE_FP_OK: usize = offset_of!(State, sse_fp_ok);
 pub const FPSR: usize = offset_of!(State, fpsr);
 pub const DS_SEL: usize = offset_of!(State, ds_sel);
+pub const SS_SEL: usize = offset_of!(State, ss_sel);
 pub const ES_SEL: usize = offset_of!(State, es_sel);
 pub const FS_SEL: usize = offset_of!(State, fs_sel);
 pub const GS_SEL: usize = offset_of!(State, gs_sel);
