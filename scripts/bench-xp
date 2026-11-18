@@ -3,10 +3,20 @@
 # 7-Zip's benchmark, see bench/xpbench/bench.c), reports the time to an idle
 # desktop, runs D:\run.bat and prints the results it sends to COM1.
 # Usage: scripts/bench-xp [DISK]; VM_BIN picks the emulator binary.
+# BENCH_TEST=NAME [BENCH_REPEAT=N] runs one test N times from bench-one.iso
+# (int sort memcpy fp syscall file pagefault ctxsw process).
+# BENCH_PROFILE=DIR profiles the tests: DIR gets profile.txt, status.txt
+# and the hottest blocks for scripts/jit-blocks.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 disk=${1:-$HOME/xp-nomp.img}
-iso=${BENCH_ISO:-/Volumes/Projects/.workspaces/86slopper/bench/xpbench/bench.iso}
+bench=/Volumes/Projects/.workspaces/86slopper/bench/xpbench
+iso=${BENCH_ISO:-$bench/bench.iso}
+batch='D:\run.bat'
+if [ -n "${BENCH_TEST:-}" ]; then
+	iso=${BENCH_ISO:-$bench/bench-one.iso}
+	batch="D:\one.bat $BENCH_TEST ${BENCH_REPEAT:-1}"
+fi
 tmp=$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || echo "${TMPDIR:-/tmp}")
 tmp=${tmp%/}
 name=xpb$$
@@ -18,6 +28,7 @@ trap '"$root/scripts/vm" stop "$name" >/dev/null 2>&1 || true; rm -f "$img" "$se
 vm() { "$root/scripts/vm" "$@"; }
 mips() { vm status "$name" | sed -n 's/.*mips \([0-9.]*\).*/\1/p' | cut -d. -f1; }
 start=$(date +%s)
+[ -n "${BENCH_PROFILE:-}" ] && export SLOPPER_JIT_PROFILE=1
 VM_TIMEOUT=900 vm start "$name" --hda "$img" --cdrom "$iso" --ram 256 --no-net --serial "$serial" >/dev/null
 busy=0 low=0
 for _ in $(seq 300); do
@@ -28,13 +39,22 @@ for _ in $(seq 300); do
 	[ $low -ge 4 ] && break
 done
 echo "idle desktop after $(($(date +%s) - start - 4)) s"
+if [ -n "${BENCH_PROFILE:-}" ]; then
+	mkdir -p "$BENCH_PROFILE"
+	vm ctl "$name" "profile on" >/dev/null
+fi
 vm ctl "$name" "key lwin+r" >/dev/null
 sleep 2
-vm ctl "$name" "type D:\\run.bat" >/dev/null
+vm ctl "$name" "type $batch" >/dev/null
 sleep 2
 vm ctl "$name" "key enter" >/dev/null
 for _ in $(seq 600); do
 	grep -aq "BENCH-DONE" "$serial" && break
 	sleep 1
 done
+if [ -n "${BENCH_PROFILE:-}" ]; then
+	vm ctl "$name" profile >"$BENCH_PROFILE/profile.txt"
+	vm ctl "$name" status >"$BENCH_PROFILE/status.txt"
+	vm ctl "$name" "profile blocks $BENCH_PROFILE 60" >/dev/null
+fi
 tr -d '\r' <"$serial" | grep -aE "^[a-z].* s |^total|^Avr|^Tot" || cat "$serial"
