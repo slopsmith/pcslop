@@ -29,7 +29,11 @@ const ARENA_SIZE: usize = 32 << 20;
 /// Command buffers in flight at most. Each holds an arena, so this bounds
 /// the memory a GPU that falls behind the guest can tie up; past it, a kick
 /// waits for the oldest one, as a driver's ring would fill up on the card.
-const MAX_INFLIGHT: usize = 4;
+const MAX_INFLIGHT: usize = 8;
+/// How long draws collect before they are submitted in the middle of a ring
+/// run, while fewer than half of MAX_INFLIGHT wait. Smaller command buffers
+/// cost the GPU less per frame.
+const SUBMIT_AFTER: std::time::Duration = std::time::Duration::from_micros(50);
 /// Pipelines kept at most. Each compiled variant costs the driver about a
 /// megabyte; past this the cache starts over.
 const MAX_PIPELINES: usize = 1024;
@@ -172,6 +176,7 @@ struct Batch {
     /// VRAM ranges the open encoder writes; a draw that samples one of them
     /// starts a new encoder so it sees the finished pixels.
     written: Vec<(usize, usize)>,
+    opened: std::time::Instant,
 }
 
 pub(crate) struct MetalR3d {
@@ -348,7 +353,7 @@ impl MetalR3d {
         if self.batch.is_none() {
             let cmd = self.queue.commandBuffer()?;
             let arena = self.arena()?;
-            self.batch = Some(Batch { cmd, enc: None, arena, written: Vec::new() });
+            self.batch = Some(Batch { cmd, enc: None, arena, written: Vec::new(), opened: std::time::Instant::now() });
         }
         self.batch.as_mut()
     }
@@ -499,7 +504,11 @@ impl MetalR3d {
         enc.setScissorRect(MTLScissorRect { x: x0 as usize, y: y0 as usize, width: (x1 - x0 + 1) as usize, height: (y1 - y0 + 1) as usize });
         enc.setDepthClipMode(MTLDepthClipMode::Clamp);
         if emit(&enc, &mut batch.arena).is_some() {
+            let due = batch.opened.elapsed() >= SUBMIT_AFTER;
             self.draws += 1;
+            if due && self.completed_inner() + (MAX_INFLIGHT as u64 / 2) > self.committed {
+                self.kick();
+            }
         }
     }
 
