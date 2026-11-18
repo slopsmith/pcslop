@@ -12,7 +12,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 
 use hvf::{Exit, GuestMemory, Vcpu, VcpuKicker, Vm, mem, reg, sysreg};
 use x86::bus::Bus;
-use x86::cpu::{CS, Cpu, DS, ES, FS, FlushKind, GS, SS};
+use x86::cpu::{CS, Cpu, DS, ES, FS, GS, SS};
 use x86::interp;
 
 use runtime::Entries;
@@ -63,7 +63,23 @@ struct BlockInfo {
     x87: Vec<(u32, translate::X87Snap)>,
     /// Executions checked against the interpreter in verify mode.
     verified: u32,
+    /// Chain sites as (code word, target EIP), all on the block's page.
+    chains: Vec<(u32, u32)>,
+    /// Every guest byte the translation read, by page offset; None when it
+    /// read the next page too, so the block cannot move to a copy of its page.
+    source: Option<Box<[(u16, u8)]>>,
 }
+
+/// Blocks of a code page that was written, kept in case an identical page
+/// shows up elsewhere (a copy-on-write copy of the same code).
+struct DeadPage {
+    page: u32,
+    /// By start EIP.
+    blocks: Vec<(u32, BlockInfo)>,
+}
+
+/// Dead pages kept for `revive`.
+const DEAD_PAGES: usize = 4096;
 
 /// Invalidations after which a page switches to self-checking blocks.
 const SELF_CHECK_AFTER: u32 = 4;
@@ -250,6 +266,13 @@ pub struct Stats {
     pub flushes_avoided: u64,
     pub flush_single_all: u64,
     pub flush_multi: u64,
+    /// Several interpreter TLB ops taken in without a full flush.
+    pub flush_multi_avoided: u64,
+    /// Full TLB flushes that kept the shadow leaves still matching the page tables.
+    pub revalidations: u64,
+    pub revalidate_dropped: u64,
+    /// Blocks reused for an identical copy of their code page.
+    pub revived_blocks: u64,
     pub flush_pool: u64,
     /// Shadow entries that map the graphics aperture straight to RAM.
     pub aperture_fills: u64,
@@ -296,6 +319,11 @@ pub struct Jit {
     retry: HashSet<u64>,
     by_va: BTreeMap<u64, u64>,
     code_pages: HashMap<u32, Vec<u64>>,
+    /// Dead pages by (linear page, user), oldest first.
+    dead: HashMap<(u32, bool), Vec<DeadPage>>,
+    dead_order: std::collections::VecDeque<(u32, bool)>,
+    /// Physical code pages by the (linear page, user) of their blocks.
+    code_by_lin: HashMap<(u32, bool), Vec<u32>>,
     /// Times each physical page lost its translations to writes.
     smc_counts: HashMap<u32, u32>,
     /// Pages written too often to write-protect: their blocks check their own
@@ -444,6 +472,9 @@ impl Jit {
             retry: HashSet::default(),
             by_va: BTreeMap::new(),
             code_pages: HashMap::default(),
+            dead: HashMap::default(),
+            dead_order: Default::default(),
+            code_by_lin: HashMap::default(),
             smc_counts: HashMap::default(),
             self_check: Default::default(),
             writable: [HashMap::default(), HashMap::default()],
@@ -973,6 +1004,7 @@ impl Jit {
         if std::mem::take(&mut self.state().invlpgs) != 0 {
             // The VM already dropped the pages from the shadow trees.
             cpu.tlb.flush();
+            cpu.tlb.take_ops();
             self.shadow_key = Some(cpu.tlb.generation);
         }
         let switches = std::mem::take(&mut self.state().cr3_switched);
@@ -980,6 +1012,7 @@ impl Jit {
             // The VM already cleared the non-global shadow leaves.
             cpu.cr3 = self.state().cr3;
             cpu.tlb.flush_nonglobal();
+            cpu.tlb.take_ops();
             self.shadow_key = Some(cpu.tlb.generation);
             self.pt_watch.forget();
             self.stats.vm_cr3_switches += switches as u64;
@@ -1076,9 +1109,10 @@ impl Jit {
     }
 
     /// Follows the interpreter's TLB: CR3/CR0/CR4 writes and INVLPG flush it.
-    fn check_shadow<B: Bus>(&mut self, cpu: &Cpu, bus: &mut B) {
+    fn check_shadow<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B) {
         self.check_aperture(bus);
         let key = cpu.tlb.generation;
+        let ops = cpu.tlb.take_ops();
         let paged = cpu.cr0 & x86::cpu::cr0::PG != 0;
         let was_paged = std::mem::replace(&mut self.shadow_paged, paged);
         match self.shadow_key {
@@ -1088,39 +1122,30 @@ impl Jit {
                 self.shadow_key = Some(key);
                 self.stats.flushes_avoided += 1;
             }
-            Some(k) if k + 1 == key && cpu.tlb.last_flush != FlushKind::All => {
+            Some(k) if key - k == ops.count && !ops.all => {
                 self.shadow_key = Some(key);
-                match cpu.tlb.last_flush {
-                    FlushKind::Page(lin) => {
-                        if self.state().apic_va == u64::from(lin & !0xfff) | 1 {
-                            self.disarm_apic();
-                        }
-                        self.bump_vcache();
-                        for t in &mut self.shadow {
-                            t.unmap(self.mem.as_mut_slice(), lin);
-                        }
-                        self.tlbi_page(lin);
-                    }
-                    _ => {
-                        if self.apic.is_some_and(|(_, global)| !global) {
-                            self.disarm_apic();
-                        }
-                        if self.state().ng_count.iter().any(|&n| n as usize > layout::NONGLOBAL_ENTRIES) {
-                            self.flush_shadow();
-                            return;
-                        }
-                        self.bump_vcache_nonglobal();
-                        self.pt_watch.forget();
-                        for r in 0..2 {
-                            for off in self.nonglobal_leaves(r) {
-                                self.shadow[r].clear_leaf(self.mem.as_mut_slice(), off);
-                            }
-                            self.state().ng_count[r] = 0;
-                        }
-                        self.state().ctl |= ctl::TLBI_ALL;
-                        self.stats.nonglobal_flushes += 1;
-                    }
+                if ops.nonglobal && !self.flush_nonglobal_shadow() {
+                    return;
                 }
+                if !ops.pages.is_empty() {
+                    self.bump_vcache();
+                }
+                for &lin in &ops.pages {
+                    if self.state().apic_va == u64::from(lin) | 1 {
+                        self.disarm_apic();
+                    }
+                    for t in &mut self.shadow {
+                        t.unmap(self.mem.as_mut_slice(), lin);
+                    }
+                    self.tlbi_page(lin);
+                }
+                if ops.count > 1 {
+                    self.stats.flush_multi_avoided += 1;
+                }
+            }
+            Some(_) if paged && was_paged => {
+                self.shadow_key = Some(key);
+                self.revalidate_shadow(cpu, bus);
             }
             Some(k) => {
                 if k + 1 == key {
@@ -1137,6 +1162,75 @@ impl Jit {
                 self.flush_shadow();
             }
         }
+    }
+
+    /// A full flush that keeps the leaves a fresh walk would rebuild unchanged,
+    /// without setting Accessed or Dirty bits the guest cleared.
+    fn revalidate_shadow<B: Bus>(&mut self, cpu: &Cpu, bus: &mut B) {
+        use x86::cpu::{cr0, cr4};
+        self.disarm_apic();
+        self.bump_vcache();
+        self.pt_watch.forget();
+        for r in 0..2 {
+            for off in std::mem::take(&mut self.aperture_leaves[r]) {
+                self.shadow[r].clear_leaf(self.mem.as_mut_slice(), off);
+            }
+        }
+        let pd = cpu.cr3 & !0xfff;
+        let pse = cpu.cr4 & cr4::PSE != 0;
+        let pge = cpu.cr4 & cr4::PGE != 0;
+        let wp = cpu.cr0 & cr0::WP != 0;
+        let ram = self.state().ram_size;
+        let mut dropped = 0;
+        for r in 0..2 {
+            for (lin, phys, writable, off) in self.shadow[r].leaves(self.mem.as_slice()) {
+                let pde = bus.read32(pd + (lin >> 22) * 4);
+                let big = pde & 0x80 != 0 && pse;
+                let (frame, entry, perms) = if pde & 0x21 != 0x21 {
+                    (u32::MAX, 0, 0)
+                } else if big {
+                    ((pde & 0xffc0_0000) | (lin & 0x3f_f000), pde, pde)
+                } else {
+                    let pte = bus.read32((pde & !0xfff) + ((lin >> 12) & 0x3ff) * 4);
+                    if pte & 0x21 != 0x21 { (u32::MAX, 0, 0) } else { (pte & !0xfff, pte, pde & pte) }
+                };
+                let keep = frame == phys
+                    && frame < ram
+                    && (r == 0 || perms & 4 != 0)
+                    && (entry & 0x100 != 0 && pge) == self.shadow[r].leaf_global(self.mem.as_slice(), off)
+                    && (!writable || entry & 0x40 != 0 && (perms & 2 != 0 || r == 0 && !wp));
+                if !keep {
+                    self.shadow[r].clear_leaf(self.mem.as_mut_slice(), off);
+                    dropped += 1;
+                }
+            }
+        }
+        self.state().ctl |= ctl::TLBI_ALL;
+        self.stats.revalidations += 1;
+        self.stats.revalidate_dropped += dropped;
+    }
+
+    /// Clears the non-global shadow leaves, or flushes everything when the
+    /// leaf list overflowed; false after the full flush.
+    fn flush_nonglobal_shadow(&mut self) -> bool {
+        if self.apic.is_some_and(|(_, global)| !global) {
+            self.disarm_apic();
+        }
+        if self.state().ng_count.iter().any(|&n| n as usize > layout::NONGLOBAL_ENTRIES) {
+            self.flush_shadow();
+            return false;
+        }
+        self.bump_vcache_nonglobal();
+        self.pt_watch.forget();
+        for r in 0..2 {
+            for off in self.nonglobal_leaves(r) {
+                self.shadow[r].clear_leaf(self.mem.as_mut_slice(), off);
+            }
+            self.state().ng_count[r] = 0;
+        }
+        self.state().ctl |= ctl::TLBI_ALL;
+        self.stats.nonglobal_flushes += 1;
+        true
     }
 
     /// Drops the shadow entries of addresses above RAM once the chipset's
@@ -1214,10 +1308,8 @@ impl Jit {
     }
 
     fn invalidate_code_page(&mut self, page: u32) {
-        let Some(keys) = self.code_pages.remove(&page) else { return };
-        self.set_code_bit(page, false);
-        for key in keys {
-            self.remove_block(key);
+        if !self.drop_code_page(page) {
+            return;
         }
         self.stats.smc_invalidations += 1;
         let n = self.smc_counts.entry(page).or_default();
@@ -1227,18 +1319,53 @@ impl Jit {
         }
     }
 
+    /// Removes the blocks of a physical page, keeping them for `revive`.
+    /// False when the page had none.
+    fn drop_code_page(&mut self, page: u32) -> bool {
+        let Some(keys) = self.code_pages.remove(&page) else { return false };
+        self.set_code_bit(page, false);
+        let mut dead: HashMap<(u32, bool), Vec<(u32, BlockInfo)>> = HashMap::default();
+        for key in keys {
+            let start = (key >> 33 << 12) as u32 | (key as u32 & 0xfff);
+            let slot = (start & !0xfff, key >> 32 & 1 != 0);
+            if let Some(pages) = self.code_by_lin.get_mut(&slot) {
+                pages.retain(|&p| p != page);
+            }
+            let Some(b) = self.remove_block(key) else { continue };
+            if b.source.is_some() {
+                dead.entry(slot).or_default().push((start, b));
+            }
+        }
+        for (slot, blocks) in dead {
+            if self.dead_order.len() == DEAD_PAGES
+                && let Some(old) = self.dead_order.pop_front()
+                && let Some(list) = self.dead.get_mut(&old)
+            {
+                list.remove(0);
+                if list.is_empty() {
+                    self.dead.remove(&old);
+                }
+            }
+            self.dead.entry(slot).or_default().push(DeadPage { page, blocks });
+            self.dead_order.push_back(slot);
+        }
+        true
+    }
+
     /// Forgets the block for `key`: unlinks chains into it and clears its lookup slot.
-    fn remove_block(&mut self, key: u64) {
+    fn remove_block(&mut self, key: u64) -> Option<BlockInfo> {
         self.bump_vcache();
         self.retry.remove(&key);
         for site in self.chain_in.remove(&key).unwrap_or_default() {
             self.patch_chain(site, None);
             self.chain_wanted.entry(key).or_default().push(site);
         }
-        if let Some(b) = self.blocks.remove(&key) {
+        let info = self.blocks.remove(&key);
+        if let Some(b) = &info {
             self.by_va.remove(&b.va);
         }
         self.clear_lookup(key);
+        info
     }
 
     fn clear_lookup(&mut self, key: u64) {
@@ -1260,6 +1387,9 @@ impl Jit {
         self.blocks.clear();
         self.by_va.clear();
         self.code_pages.clear();
+        self.dead.clear();
+        self.dead_order.clear();
+        self.code_by_lin.clear();
         self.mem.as_mut_slice()[layout::CODE_BITMAP..layout::CODE_BITMAP_END].fill(0);
         self.code_next = layout::CODE_CACHE;
         self.mem.as_mut_slice()[layout::LOOKUP..layout::LOOKUP + layout::LOOKUP_ENTRIES * 16].fill(0xff);
@@ -1281,15 +1411,25 @@ impl Jit {
         let entries = self.entries;
         let next_lin = lin_page.wrapping_add(0x1000);
         let mut next_phys: Option<Option<u32>> = None;
+        let self_check = self.self_check.contains(&page);
+        if !self.verify && !self_check && self.revive(bus, eip, page, user) {
+            return;
+        }
+        let mut source = Some(Vec::new());
         let compiled = translate::compile(
             eip,
             |a| {
                 if a & !0xfff == lin_page {
-                    return Some(bus.read8(page | (a & 0xfff)));
+                    let b = bus.read8(page | (a & 0xfff));
+                    if let Some(v) = &mut source {
+                        v.push(((a & 0xfff) as u16, b));
+                    }
+                    return Some(b);
                 }
                 if a & !0xfff != next_lin || next_lin == 0 {
                     return None;
                 }
+                source = None;
                 let p = *next_phys.get_or_insert_with(|| interp::translate(cpu, bus, next_lin, false).ok());
                 p.map(|p| bus.read8(p | (a & 0xfff)))
             },
@@ -1298,7 +1438,7 @@ impl Jit {
             &entries,
             !self.verify,
             user,
-            self.self_check.contains(&page),
+            self_check,
             self.verify,
         );
         let bytes = compiled.code.len() * 4;
@@ -1309,25 +1449,7 @@ impl Jit {
         let code_off = self.code_next;
         self.mem.write_words(code_off, &compiled.code);
         self.code_next += bytes.next_multiple_of(16);
-        for &(word, target) in &compiled.chains {
-            let target = block_key(page | (target & 0xfff), target, user);
-            let site = code_off + word as usize * 4;
-            match self.blocks.get(&target).map(|b| b.va) {
-                Some(va) if target != key => {
-                    self.patch_chain(site, Some(va));
-                    self.chain_in.entry(target).or_default().push(site);
-                }
-                _ if target == key => {
-                    self.patch_chain(site, Some(block_va));
-                    self.chain_in.entry(key).or_default().push(site);
-                }
-                _ => self.chain_wanted.entry(target).or_default().push(site),
-            }
-        }
-        for site in self.chain_wanted.remove(&key).unwrap_or_default() {
-            self.patch_chain(site, Some(block_va));
-            self.chain_in.entry(key).or_default().push(site);
-        }
+        self.link_chains(key, block_va, page, user, &compiled.chains);
         if !self.verify {
             self.insert_lookup(key, block_va);
         }
@@ -1341,13 +1463,39 @@ impl Jit {
         if compiled.retry {
             self.retry.insert(key);
         }
-        self.blocks.insert(key, BlockInfo { va: block_va, boundaries: compiled.boundaries, insns: compiled.insns, interp_after: compiled.interp_after, x87: compiled.x87, verified });
+        let source = source.filter(|_| !compiled.retry).map(|mut v| {
+            v.sort_unstable();
+            v.dedup();
+            v.into_boxed_slice()
+        });
+        let info = BlockInfo {
+            va: block_va,
+            boundaries: compiled.boundaries,
+            insns: compiled.insns,
+            interp_after: compiled.interp_after,
+            x87: compiled.x87,
+            verified,
+            chains: compiled.chains,
+            source,
+        };
+        self.blocks.insert(key, info);
         self.by_va.insert(block_va, key);
         self.stats.blocks += 1;
         self.stats.translated_insns += compiled.insns as u64;
         self.state().ctl |= ctl::IC_IALLU;
-        if self.self_check.contains(&page) {
+        if self_check {
             return;
+        }
+        self.add_code_page(bus, key, phys);
+    }
+
+    /// Records `key` as a block on its physical page, which starts being
+    /// watched for writes if it is the page's first.
+    fn add_code_page(&mut self, bus: &mut impl Bus, key: u64, phys: u32) {
+        let page = phys & !0xfff;
+        let by_lin = self.code_by_lin.entry(((key >> 33 << 12) as u32, key >> 32 & 1 != 0)).or_default();
+        if !by_lin.contains(&page) {
+            by_lin.push(page);
         }
         let pages = self.code_pages.entry(page).or_default();
         let new_page = pages.is_empty();
@@ -1365,6 +1513,96 @@ impl Jit {
                 }
             }
         }
+    }
+
+    /// Points the block's chain sites at the blocks they jump to, or queues
+    /// them until those exist, and points waiting sites at the block.
+    fn link_chains(&mut self, key: u64, block_va: u64, page: u32, user: bool, chains: &[(u32, u32)]) {
+        let code_off = (block_va - layout::RUNTIME_VA) as usize;
+        for &(word, target) in chains {
+            let target = block_key(page | (target & 0xfff), target, user);
+            let site = code_off + word as usize * 4;
+            match self.blocks.get(&target).map(|b| b.va) {
+                Some(va) if target != key => {
+                    self.patch_chain(site, Some(va));
+                    self.chain_in.entry(target).or_default().push(site);
+                }
+                _ if target == key => {
+                    self.patch_chain(site, Some(block_va));
+                    self.chain_in.entry(key).or_default().push(site);
+                }
+                _ => {
+                    self.patch_chain(site, None);
+                    self.chain_wanted.entry(target).or_default().push(site);
+                }
+            }
+        }
+        for site in self.chain_wanted.remove(&key).unwrap_or_default() {
+            self.patch_chain(site, Some(block_va));
+            self.chain_in.entry(key).or_default().push(site);
+        }
+    }
+
+    /// Moves the blocks of a dead page whose code bytes match the RAM page
+    /// `page` onto it, if one of them starts at `eip`. True when it did.
+    fn revive(&mut self, bus: &mut impl Bus, eip: u32, page: u32, user: bool) -> bool {
+        let slot = (eip & !0xfff, user);
+        if page as u64 + 0x1000 > self.state().ram_size as u64 {
+            return false;
+        }
+        // SAFETY: the page lies inside guest RAM, which outlives the Jit.
+        let ram = unsafe { &*((self.ram + page as usize) as *const [u8; 0x1000]) };
+        let matches = |b: &BlockInfo| b.source.as_ref().is_some_and(|src| src.iter().all(|&(o, v)| ram[o as usize] == v));
+        let find = |dead: &HashMap<(u32, bool), Vec<DeadPage>>| {
+            dead.get(&slot)?.iter().rposition(|d| d.blocks.iter().any(|(e, b)| *e == eip && matches(b)))
+        };
+        let mut found = find(&self.dead);
+        if found.is_none() {
+            // A copy of the page that is still live, likely left by an exited
+            // process: its blocks move here and come back if it runs again.
+            let live = self.code_by_lin.get(&slot).into_iter().flatten().copied().find(|&q| {
+                q != page && self.blocks.get(&block_key(q | (eip & 0xfff), eip, user)).is_some_and(matches)
+            });
+            if let Some(q) = live {
+                self.drop_code_page(q);
+                found = find(&self.dead);
+            }
+        }
+        let Some(i) = found else { return false };
+        let list = self.dead.get_mut(&slot).expect("found in this list");
+        let dead = list.remove(i);
+        if list.is_empty() {
+            self.dead.remove(&slot);
+        }
+        if let Some(j) = self.dead_order.iter().rposition(|s| *s == slot) {
+            self.dead_order.remove(j);
+        }
+        let mut revived = Vec::new();
+        for (start, b) in dead.blocks {
+            let key = block_key(page | (start & 0xfff), start, user);
+            if !matches(&b) || self.blocks.contains_key(&key) {
+                continue;
+            }
+            let site_base = (b.va - layout::RUNTIME_VA) as usize;
+            for &(word, target) in &b.chains {
+                let site = site_base + word as usize * 4;
+                if let Some(v) = self.chain_wanted.get_mut(&block_key(dead.page | (target & 0xfff), target, user)) {
+                    v.retain(|&s| s != site);
+                }
+            }
+            self.chain_wanted.remove(&block_key(dead.page | (start & 0xfff), start, user));
+            self.by_va.insert(b.va, key);
+            self.insert_lookup(key, b.va);
+            revived.push((key, b.va, b.chains.clone()));
+            self.blocks.insert(key, b);
+        }
+        for (key, va, chains) in &revived {
+            self.link_chains(*key, *va, page, user, chains);
+            self.add_code_page(bus, *key, page);
+        }
+        self.stats.revived_blocks += revived.len() as u64;
+        self.state().ctl |= ctl::IC_IALLU;
+        true
     }
 
     /// Puts `key` first in its bucket; the entry it displaces moves to the second slot.

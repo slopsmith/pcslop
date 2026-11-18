@@ -172,19 +172,53 @@ pub struct Tlb {
     /// Incremented by every flush, so other translation caches can follow.
     pub generation: u64,
     pub last_flush: FlushKind,
+    #[snap(skip)]
+    ops: TlbOps,
 }
+
+/// The flushes since the last `take_ops`, so a cache that follows the TLB
+/// can skip a full flush after several INVLPGs or CR3 loads.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TlbOps {
+    pub count: u64,
+    pub all: bool,
+    pub nonglobal: bool,
+    pub pages: Vec<u32>,
+}
+
+const TLB_OPS_PAGES: usize = 32;
 
 impl Default for Tlb {
     fn default() -> Self {
-        Tlb { entries: Box::new([TlbEntry::default(); TLB_SIZE]), generation: 0, last_flush: FlushKind::All }
+        Tlb {
+            entries: Box::new([TlbEntry::default(); TLB_SIZE]),
+            generation: 0,
+            last_flush: FlushKind::All,
+            ops: TlbOps::default(),
+        }
     }
 }
 
 impl Tlb {
+    pub fn take_ops(&mut self) -> TlbOps {
+        std::mem::take(&mut self.ops)
+    }
+
+    fn record(&mut self, kind: FlushKind) {
+        self.generation += 1;
+        self.last_flush = kind;
+        self.ops.count += 1;
+        match kind {
+            FlushKind::All => self.ops.all = true,
+            FlushKind::NonGlobal => self.ops.nonglobal = true,
+            FlushKind::Page(_) if self.ops.pages.len() == TLB_OPS_PAGES => self.ops.all = true,
+            FlushKind::Page(lin) => self.ops.pages.push(lin),
+        }
+    }
+
     pub fn flush(&mut self) {
         self.entries.fill(TlbEntry::default());
-        self.generation += 1;
-        self.last_flush = FlushKind::All;
+        self.record(FlushKind::All);
     }
 
     pub fn flush_nonglobal(&mut self) {
@@ -193,13 +227,11 @@ impl Tlb {
                 *e = TlbEntry::default();
             }
         }
-        self.generation += 1;
-        self.last_flush = FlushKind::NonGlobal;
+        self.record(FlushKind::NonGlobal);
     }
 
     pub fn flush_page(&mut self, lin: u32) {
-        self.generation += 1;
-        self.last_flush = FlushKind::Page(lin & !0xfff);
+        self.record(FlushKind::Page(lin & !0xfff));
         let e = &mut self.entries[(lin >> 12) as usize % TLB_SIZE];
         if e.tag == (lin >> 12) + 1 {
             *e = TlbEntry::default();

@@ -164,6 +164,11 @@ impl Shadow {
         out
     }
 
+    /// True when the leaf at `off` was mapped as global.
+    pub fn leaf_global(&self, mem: &[u8], off: usize) -> bool {
+        read_desc(mem, off) & LEAF_GLOBAL != 0
+    }
+
     /// Clears the leaf entry at `off`, as returned by `map`.
     pub fn clear_leaf(&mut self, mem: &mut [u8], off: usize) {
         write_desc(mem, off, 0);

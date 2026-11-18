@@ -1129,6 +1129,91 @@ fn invlpg_in_the_vm_drops_the_old_mapping() {
 }
 
 #[test]
+fn interpreted_invlpgs_drop_their_pages_without_a_full_flush() {
+    let mut code = vec![
+        0x8b, 0x35, 0x00, 0x50, 0, 0, // mov esi, [0x5000]
+        0x8b, 0x2d, 0x00, 0x70, 0, 0, // mov ebp, [0x7000]
+        0xc7, 0x05, 0x14, 0x10, 0x01, 0x00, 0x07, 0x60, 0, 0, // mov dword [0x11014], 0x6007: PTE of 0x5000
+        0xc7, 0x05, 0x1c, 0x10, 0x01, 0x00, 0x07, 0x60, 0, 0, // mov dword [0x1101c], 0x6007: PTE of 0x7000
+        0x67, 0x0f, 0x01, 0x3e, 0x00, 0x50, // invlpg [0x5000], 16-bit address
+        0x67, 0x0f, 0x01, 0x3e, 0x00, 0x70, // invlpg [0x7000], 16-bit address
+    ];
+    // Enough NOPs that the interpreter hands back to translated code.
+    code.extend([0x90; 16]);
+    code.extend([
+        0x8b, 0x3d, 0x00, 0x50, 0, 0, // mov edi, [0x5000]
+        0x8b, 0x1d, 0x00, 0x70, 0, 0, // mov ebx, [0x7000]
+        0xf4, // hlt
+    ]);
+    let setup = |cpu: &mut Cpu, bus: &mut FlatBus| {
+        paged(cpu, bus, false);
+        let mem = bus.ram.as_mut_slice();
+        mem[0x5000..0x5004].copy_from_slice(&0x1111_1111u32.to_le_bytes());
+        mem[0x6000..0x6004].copy_from_slice(&0x2222_2222u32.to_le_bytes());
+        mem[0x7000..0x7004].copy_from_slice(&0x3333_3333u32.to_le_bytes());
+    };
+    let mut a = flat_cpu(0x1000, 0x8000);
+    let mut b = a.clone();
+    let mut bus_a = bus_with(0x1000, &code);
+    let mut bus_b = bus_with(0x1000, &code);
+    setup(&mut a, &mut bus_a);
+    setup(&mut b, &mut bus_b);
+    run_interp(&mut a, &mut bus_a);
+    let stats = run_jit(&mut b, &mut bus_b);
+    assert_eq!(a.regs, b.regs);
+    assert_eq!((b.regs[6], b.regs[5]), (0x1111_1111, 0x3333_3333));
+    assert_eq!((b.regs[7], b.regs[3]), (0x2222_2222, 0x2222_2222));
+    assert_eq!(stats.flush_multi_avoided, 1, "the INVLPGs fell back to a full shadow flush: {stats:?}");
+}
+
+/// Calls a routine at linear 0x5000, writes its page, remaps the page to
+/// physical 0x6000 holding `copy` and calls it again.
+fn run_moved_routine(copy: &[u8]) -> (Cpu, Stats) {
+    let routine = [0xb8, 0x05, 0, 0, 0, 0x01, 0xd8, 0xc3]; // mov eax, 5; add eax, ebx; ret
+    let mut code = vec![0xe8, 0xfb, 0x3f, 0, 0]; // call 0x5000
+    code.extend([0x89, 0xc1]); // mov ecx, eax
+    code.extend([0xc7, 0x05, 0x00, 0x58, 0, 0, 0x78, 0x56, 0x34, 0x12]); // mov dword [0x5800], 0x12345678
+    code.extend([0xc7, 0x05, 0x14, 0x10, 0x01, 0x00, 0x07, 0x60, 0, 0]); // mov dword [0x11014], 0x6007: PTE of 0x5000
+    code.extend([0x0f, 0x01, 0x3d, 0x00, 0x50, 0, 0]); // invlpg [0x5000]
+    let rel = 0x5000u32.wrapping_sub(0x1000 + code.len() as u32 + 5);
+    code.push(0xe8);
+    code.extend(rel.to_le_bytes()); // call 0x5000
+    code.push(0xf4); // hlt
+    let setup = |cpu: &mut Cpu, bus: &mut FlatBus| {
+        paged(cpu, bus, false);
+        cpu.regs[3] = 0x100;
+        let mem = bus.ram.as_mut_slice();
+        mem[0x5000..0x5000 + routine.len()].copy_from_slice(&routine);
+        mem[0x6000..0x6000 + copy.len()].copy_from_slice(copy);
+    };
+    let mut a = flat_cpu(0x1000, 0x8000);
+    let mut b = a.clone();
+    let mut bus_a = bus_with(0x1000, &code);
+    let mut bus_b = bus_with(0x1000, &code);
+    setup(&mut a, &mut bus_a);
+    setup(&mut b, &mut bus_b);
+    run_interp(&mut a, &mut bus_a);
+    let stats = run_jit(&mut b, &mut bus_b);
+    assert_eq!(a.regs, b.regs);
+    assert_eq!(b.regs[1], 0x105, "translated code miscomputes before its page moves");
+    (b, stats)
+}
+
+#[test]
+fn blocks_move_to_an_identical_copy_of_their_page() {
+    let (cpu, stats) = run_moved_routine(&[0xb8, 0x05, 0, 0, 0, 0x01, 0xd8, 0xc3]);
+    assert_eq!(cpu.regs[0], 0x105);
+    assert!(stats.revived_blocks >= 1, "the copy was translated again: {stats:?}");
+}
+
+#[test]
+fn blocks_do_not_move_to_a_page_with_other_code() {
+    let (cpu, stats) = run_moved_routine(&[0xb8, 0x07, 0, 0, 0, 0x01, 0xd8, 0xc3]);
+    assert_eq!(cpu.regs[0], 0x107, "the old translation ran on the changed copy");
+    assert_eq!(stats.revived_blocks, 0, "changed code reused stale translations: {stats:?}");
+}
+
+#[test]
 fn random_programs_match_the_interpreter_with_paging() {
     let mut rng = Rng(0x5ad0_77);
     let mut fills = 0;
