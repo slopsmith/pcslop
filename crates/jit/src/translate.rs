@@ -194,6 +194,12 @@ impl Emit {
             self.chains.push((self.a.pos() as u32, eip));
             self.a.b(slow);
             self.a.bind(slow);
+        } else if self.page.is_some() {
+            // Another page cannot be chained, but a probe of its own predicts better than the dispatcher.
+            return self.flushed(|e| {
+                e.a.mov_imm(Size::W, r(0), eip as u64);
+                e.goto_indirect(r(0));
+            });
         }
         self.flushed(|e| e.goto_dispatch(eip));
     }
