@@ -1,0 +1,29 @@
+--- a/linpackc.c
++++ b/linpackc.c
+@@ -64,7 +64,7 @@
+ static void *mempool;
+ 
+ 
+-void main(void)
++int main(void)
+ 
+     {
+     char    buf[80];
+@@ -77,7 +77,7 @@
+         printf("Enter array size (q to quit) [200]:  ");
+         fgets(buf,79,stdin);
+         if (buf[0]=='q' || buf[0]=='Q')
+-            break;
++            return 0;
+         if (buf[0]=='\0' || buf[0]=='\n')
+             arsize=200;
+         else
+@@ -105,7 +105,7 @@
+         printf("    Reps Time(s) DGEFA   DGESL  OVERHEAD    KFLOPS\n");
+         printf("----------------------------------------------------\n");
+         nreps=1;
+-        while (linpack(nreps,arsize)<10.)
++        while (linpack(nreps,arsize)<1.)
+             nreps*=2;
+         free(mempool);
+         printf("\n");

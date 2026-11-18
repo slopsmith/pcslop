@@ -1,0 +1,38 @@
+--- a/whetstone.c
++++ b/whetstone.c
+@@ -94,7 +94,7 @@
+ 
+ 	/* added for this version */
+ 	long loopstart;
+-	long startsec, finisec;
++	double startsec, finisec;
+ 	float KIPS;
+ 	int continuous;
+ 
+@@ -120,7 +120,7 @@
+ C	Start benchmark timing at this point.
+ C
+ */
+-	startsec = time(0);
++	startsec = (double)clock() / CLOCKS_PER_SEC;
+ 
+ /*
+ C
+@@ -355,7 +355,7 @@
+ C      Stop benchmark timing at this point.
+ C
+ */
+-	finisec = time(0);
++	finisec = (double)clock() / CLOCKS_PER_SEC;
+ 
+ /*
+ C----------------------------------------------------------------
+@@ -372,7 +372,7 @@
+ 		return(1);
+ 	}
+ 
+-	printf("Loops: %ld, Iterations: %d, Duration: %ld sec.\n",
++	printf("Loops: %ld, Iterations: %d, Duration: %.3f sec.\n",
+ 			LOOP, II, finisec-startsec);
+ 
+ 	KIPS = (100.0*LOOP*II)/(float)(finisec-startsec);

@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Builds the XP benchmark CD at target/bench/xpbench.iso from bench/xp and
+# the pinned downloads in nix/xpbench.nix. See bench/README.md.
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+if [ -z "${XPBENCH_DEPS:-}" ]; then
+	exec nix develop "$root#xpbench" -c "$0" "$@"
+fi
+
+src=$root/bench/xp
+out=$root/target/bench
+build=$out/build
+cd=$out/cd
+rm -rf "$build" "$cd"
+mkdir -p "$build/lib" "$cd"
+
+cc=i686-w64-mingw32-gcc
+# The toolchain links every program against mcfgthread, which needs
+# Windows 7; nothing here uses it, so an empty archive satisfies the linker.
+i686-w64-mingw32-ar rc "$build/lib/libmcfgthread.a"
+cflags=(-O2 -static -L"$build/lib" -Wall -Wno-unused-result)
+
+echo "bench.exe"
+$cc "${cflags[@]}" -mmmx -c "$src/blit.c" -o "$build/blit.o"
+i686-w64-mingw32-g++ -O2 -Wall -fno-exceptions -fno-rtti -fno-threadsafe-statics -c "$src/entity.cpp" -o "$build/entity.o"
+$cc "${cflags[@]}" -o "$cd/bench.exe" "$src/bench.c" "$src/xform.c" "$src/path.c" "$src/raster.c" "$src/physics.c" \
+	"$build/blit.o" "$build/entity.o"
+
+echo "7za.exe"
+unzip -q -o "$XPBENCH_DEPS/7za920.zip" 7za.exe license.txt -d "$build/7za"
+cp "$build/7za/7za.exe" "$cd/7za.exe"
+cp "$build/7za/license.txt" "$cd/7za-lic.txt"
+
+echo "coremark.exe"
+mkdir -p "$build/coremark"
+tar -xzf "$XPBENCH_DEPS/coremark.tar.gz" -C "$build/coremark" --strip-components 1
+cm=$build/coremark
+$cc "${cflags[@]}" -I"$cm" -I"$cm/simple" -DPERFORMANCE_RUN=1 -DITERATIONS=30000 -DFLAGS_STR='"-O2"' \
+	-o "$cd/coremark.exe" "$cm"/core_{list_join,main,matrix,state,util}.c "$cm/simple/core_portme.c"
+cp "$cm/LICENSE.md" "$cd/coremark-lic.txt"
+
+echo "scimark2.exe"
+unzip -q -o "$XPBENCH_DEPS/scimark2_1c.zip" -d "$build/scimark"
+sm=$build/scimark
+$cc "${cflags[@]}" -o "$cd/scimark2.exe" "$sm"/{scimark2,FFT,kernel,Stopwatch,Random,SOR,SparseCompRow,LU,MonteCarlo,array}.c -lm
+
+echo "whetstone.exe"
+mkdir -p "$build/whetstone"
+cp "$XPBENCH_DEPS/whetstone.c" "$build/whetstone/whetstone.c"
+chmod u+w "$build/whetstone/whetstone.c"
+patch -s -d "$build/whetstone" -p1 <"$src/patches/whetstone.patch"
+$cc "${cflags[@]}" -w -o "$cd/whetstone.exe" "$build/whetstone/whetstone.c" -lm
+
+echo "linpack.exe"
+mkdir -p "$build/linpack"
+cp "$XPBENCH_DEPS/linpackc.new" "$build/linpack/linpackc.c"
+chmod u+w "$build/linpack/linpackc.c"
+patch -s -d "$build/linpack" -p1 <"$src/patches/linpack.patch"
+$cc "${cflags[@]}" -std=gnu89 -w -o "$cd/linpack.exe" "$build/linpack/linpackc.c" -lm
+cp "$src/linpack.in" "$cd/linpack.in"
+
+for f in run.bat one.bat; do
+	sed 's/\r*$/\r/' "$src/$f" >"$cd/$f"
+done
+
+xorriso -as mkisofs -quiet -J -R -V XPBENCH -o "$out/xpbench.iso.tmp" "$cd" </dev/null 2>"$build/xorriso.log" ||
+	{ cat "$build/xorriso.log" >&2; exit 1; }
+mv "$out/xpbench.iso.tmp" "$out/xpbench.iso"
+echo "$out/xpbench.iso"
