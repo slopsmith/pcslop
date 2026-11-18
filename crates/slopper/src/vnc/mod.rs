@@ -295,9 +295,7 @@ impl Session {
         if resize {
             proto::rect_header(out, Rect { x: 0, y: 0, w: w as u16, h: h as u16 }, ENC_DESKTOP_SIZE);
         }
-        for r in rects {
-            self.encoder.rect(out, &self.pf, &self.view, w, r);
-        }
+        self.encoder.rects(out, &self.pf, &self.view, w, &rects);
         std::mem::swap(&mut self.sent, &mut self.view);
         self.request = None;
         true

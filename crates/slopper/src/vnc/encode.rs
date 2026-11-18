@@ -11,6 +11,8 @@ pub const ENC_TIGHT: i32 = 7;
 pub const ENC_ZRLE: i32 = 16;
 const ENC_COMPRESS_LEVEL_0: i32 = -256;
 const ENC_COMPRESS_LEVEL_9: i32 = -247;
+const ENC_JPEG_QUALITY_0: i32 = -32;
+const ENC_JPEG_QUALITY_9: i32 = -23;
 
 const ZRLE_TILE: usize = 64;
 const ZRLE_MAX_PALETTE: usize = 127;
@@ -24,6 +26,9 @@ const TIGHT_FILTER_PALETTE: u8 = 1;
 const TIGHT_STREAM_FULL: usize = 0;
 const TIGHT_STREAM_MONO: usize = 1;
 const TIGHT_STREAM_PALETTE: usize = 2;
+const TIGHT_JPEG: u8 = 0x90;
+/// JPEG quality for each Tight quality level, as TigerVNC chooses them.
+const JPEG_QUALITY: [u8; 10] = [15, 29, 41, 42, 62, 77, 79, 86, 92, 100];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -37,6 +42,8 @@ pub enum Kind {
 pub struct Encoder {
     pub kind: Kind,
     level: u32,
+    /// The Tight quality level the client asked for, which allows JPEG.
+    jpeg: Option<usize>,
     zrle: Option<Compress>,
     tight: [Option<Compress>; 4],
     palette: Palette,
@@ -48,7 +55,8 @@ impl Encoder {
     pub fn new() -> Encoder {
         Encoder {
             kind: Kind::Raw,
-            level: 6,
+            level: 1,
+            jpeg: None,
             zrle: None,
             tight: [None, None, None, None],
             palette: Palette::new(),
@@ -72,6 +80,42 @@ impl Encoder {
             .unwrap_or(Kind::Raw);
         if let Some(&e) = encs.iter().find(|&&e| (ENC_COMPRESS_LEVEL_0..=ENC_COMPRESS_LEVEL_9).contains(&e)) {
             self.level = (e - ENC_COMPRESS_LEVEL_0) as u32;
+        }
+        self.jpeg = encs
+            .iter()
+            .find(|&&e| (ENC_JPEG_QUALITY_0..=ENC_JPEG_QUALITY_9).contains(&e))
+            .map(|&e| (e - ENC_JPEG_QUALITY_0) as usize);
+    }
+
+    /// Appends rectangles `rects` of `pixels`. Tight rectangles with too many
+    /// colours for a palette go out as JPEG when the client allows it, encoded
+    /// on several threads since each one stands alone.
+    pub fn rects(&mut self, out: &mut Vec<u8>, pf: &PixelFormat, pixels: &[u32], stride: usize, rects: &[Rect]) {
+        let quality = self.jpeg.filter(|_| self.kind == Kind::Tight && TPixel::new(pf).rgb).map(|q| JPEG_QUALITY[q]);
+        let mut jpegs: Vec<Option<Vec<u8>>> = vec![None; rects.len()];
+        if let Some(quality) = quality {
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let workers = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8).min(rects.len());
+            let done = std::sync::Mutex::new(&mut jpegs);
+            std::thread::scope(|s| {
+                for _ in 0..workers {
+                    s.spawn(|| {
+                        let mut palette = Palette::new();
+                        loop {
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some(&r) = rects.get(i) else { break };
+                            let jpeg = jpeg_rect(pixels, stride, r, quality, &mut palette);
+                            done.lock().unwrap()[i] = jpeg;
+                        }
+                    });
+                }
+            });
+        }
+        for (&r, jpeg) in rects.iter().zip(jpegs) {
+            match jpeg {
+                Some(bytes) => out.extend_from_slice(&bytes),
+                None => self.rect(out, pf, pixels, stride, r),
+            }
         }
     }
 
@@ -176,6 +220,29 @@ impl Encoder {
         tight_length(packed.len(), out);
         out.extend_from_slice(&packed);
     }
+}
+
+/// Rectangle `r` as a Tight JPEG rectangle, unless a palette holds its colours.
+fn jpeg_rect(pixels: &[u32], stride: usize, r: Rect, quality: u8, palette: &mut Palette) -> Option<Vec<u8>> {
+    let (x, y, w, h) = (r.x as usize, r.y as usize, r.w as usize, r.h as usize);
+    let rows = (y..y + h).map(|row| &pixels[row * stride + x..row * stride + x + w]);
+    palette.clear();
+    if rows.clone().flatten().all(|&p| palette.index(p, 256).is_some()) {
+        return None;
+    }
+    let bgrx: Vec<u8> = rows.flatten().flat_map(|p| p.to_le_bytes()).collect();
+    let mut jpeg = Vec::new();
+    let mut enc = jpeg_encoder::Encoder::new(&mut jpeg, quality);
+    if quality < 90 {
+        enc.set_sampling_factor(jpeg_encoder::SamplingFactor::R_4_2_0);
+    }
+    enc.encode(&bgrx, w as u16, h as u16, jpeg_encoder::ColorType::Bgra).ok()?;
+    let mut out = Vec::with_capacity(jpeg.len() + 16);
+    proto::rect_header(&mut out, r, ENC_TIGHT);
+    out.push(TIGHT_JPEG);
+    tight_length(jpeg.len(), &mut out);
+    out.extend_from_slice(&jpeg);
+    Some(out)
 }
 
 // Ends with a sync flush so the client can decode everything before the next message.
@@ -580,6 +647,49 @@ mod tests {
         assert_eq!(e.kind, Kind::Raw);
     }
 
+    fn smooth(w: usize, h: usize) -> Vec<u32> {
+        (0..w * h).map(|i| ((i % w) as u32 & 0xff) << 16 | ((i / w) as u32 * 2 & 0xff) << 8 | 0x40).collect()
+    }
+
+    fn tight_jpeg(px: &[u32], w: usize, r: Rect, encs: &[i32]) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.set_encodings(encs);
+        let mut out = Vec::new();
+        e.rects(&mut out, &PixelFormat::NATIVE, px, w, &[r]);
+        out
+    }
+
+    #[test]
+    fn tight_sends_many_colours_as_jpeg_when_the_client_sets_a_quality() {
+        let (w, h) = (200, 120);
+        let px = smooth(w, h);
+        let r = Rect { x: 10, y: 20, w: 150, h: 90 };
+        let out = tight_jpeg(&px, w, r, &[ENC_TIGHT, ENC_JPEG_QUALITY_9]);
+        assert_eq!(rect_header(&out), (r, ENC_TIGHT));
+        assert_eq!(out[12], TIGHT_JPEG);
+        let (len, at) = match out[13] {
+            b if b < 0x80 => (b as usize, 14),
+            b if out[14] < 0x80 => ((b & 0x7f) as usize | (out[14] as usize) << 7, 15),
+            b => ((b & 0x7f) as usize | (out[14] as usize & 0x7f) << 7 | (out[15] as usize) << 14, 16),
+        };
+        assert_eq!(out.len(), at + len, "the JPEG length disagrees with the data that follows");
+        let rgb = zune_jpeg::JpegDecoder::new(std::io::Cursor::new(&out[at..])).decode().unwrap();
+        for (got, want) in rgb.chunks(3).zip(crop(&px, w, r)) {
+            for (c, shift) in got.iter().zip([16, 8, 0]) {
+                let diff = (*c as i32 - (want >> shift & 0xff) as i32).abs();
+                assert!(diff <= 6, "a client decodes a colour off by {diff}");
+            }
+        }
+    }
+
+    #[test]
+    fn tight_keeps_few_colours_lossless_and_needs_a_quality_for_jpeg() {
+        let (w, h) = (200, 120);
+        let few: Vec<u32> = (0..w * h).map(|i| [0xffffff, 0x3a6ea5, 0][i % 3]).collect();
+        assert_ne!(tight_jpeg(&few, w, whole(w, h), &[ENC_TIGHT, ENC_JPEG_QUALITY_0])[12], TIGHT_JPEG);
+        assert_ne!(tight_jpeg(&smooth(w, h), w, whole(w, h), &[ENC_TIGHT])[12], TIGHT_JPEG);
+    }
+
     #[test]
     fn reads_the_compress_level() {
         let mut e = Encoder::new();
@@ -734,3 +844,4 @@ mod tests {
         assert_eq!(p.index(9999, 127), Some(0));
     }
 }
+

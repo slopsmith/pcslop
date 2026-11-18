@@ -21,6 +21,7 @@ usb = { path = "../usb" }
 jit = { path = "../jit" }
 net = { path = "../net" }
 x86 = { path = "../x86" }
+jpeg-encoder = "0.7"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 winit = { version = "0.30", optional = true, default-features = false, features = ["rwh_06"] }
@@ -30,3 +31,6 @@ objc2-metal = { version = "0.3", optional = true, default-features = false, feat
 objc2-quartz-core = { version = "0.3", optional = true, default-features = false, features = ["std", "CALayer", "CAMetalLayer", "objc2-metal", "objc2-core-foundation", "objc2-core-graphics"] }
 objc2-core-foundation = { version = "0.3", optional = true, default-features = false, features = ["std", "CFCGTypes", "CFString"] }
 objc2-core-graphics = { version = "0.3", optional = true, default-features = false, features = ["std", "CGColorSpace"] }
+
+[dev-dependencies]
+zune-jpeg = "0.5"
