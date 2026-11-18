@@ -133,6 +133,8 @@ pub(super) enum K {
     Xch(usize),
     /// FFREE: tags ST(i) empty.
     Free(usize),
+    /// FPREM: the remainder of ST(0) / ST(1), truncating.
+    Prem,
     Chs,
     Abs,
     LdConst { mant: u64 },
@@ -196,6 +198,7 @@ pub(super) fn classify(insn: &Insn) -> Option<K> {
         (1, 0xc0..=0xc7) => K::LdReg(i),
         (1, 0xc8..=0xcf) => K::Xch(i),
         (5, 0xc0..=0xc7) => K::Free(i),
+        (1, 0xf8) => K::Prem,
         (5, 0xd0..=0xd7) => K::StReg { i, pop: false },
         (5, 0xd8..=0xdf) => K::StReg { i, pop: true },
         (1, 0xe0) => K::Chs,
@@ -391,6 +394,49 @@ impl Emit {
                 if pop {
                     self.fpop();
                 }
+            }
+            K::Prem => {
+                self.x87_need(0, true, bail);
+                self.x87_need(1, true, bail);
+                let a = self.st_val(0, bail);
+                let b = self.st_val(1, bail);
+                let (zero, done) = (self.a.label(), self.a.label());
+                self.a.fmov_xd(T_A, b);
+                self.a.lsl_imm(Size::X, T_A, T_A, 1);
+                self.a.cbz(Size::X, T_A, bail);
+                // n = trunc(a / b), below 2^52 so that a - n * b is exact.
+                self.a.fp2(true, 1, FR, a, b);
+                self.a.fp1(true, 11, FR, FR);
+                self.a.fmov_xd(T_A, FR);
+                self.a.ubfx(Size::X, T_B, T_A, 52, 11);
+                self.a.sub_imm(Size::W, T_B, T_B, 1023 + 52);
+                self.a.tbz(T_B, 31, bail);
+                self.a.fmadd_d(true, FS, FR, b, a);
+                // A remainder of the wrong sign means a / b rounded up to n.
+                self.a.fmov_xd(T_A, FS);
+                self.a.lsl_imm(Size::X, T_B, T_A, 1);
+                self.a.cbz(Size::X, T_B, zero);
+                self.a.fmov_xd(T_C, a);
+                self.a.eor(Size::X, T_C, T_C, T_A);
+                self.a.tbnz(T_C, 63, bail);
+                self.a.b(done);
+                self.a.bind(zero);
+                self.a.fmov_xd(T_C, a);
+                self.a.lsr_imm(Size::X, T_C, T_C, 63);
+                self.a.lsl_imm(Size::X, T_C, T_C, 63);
+                self.a.fmov_dx(FS, T_C);
+                self.a.bind(done);
+                self.a.fcvtzs(true, Size::X, T_A, FR);
+                self.a.asr_imm(Size::X, T_B, T_A, 63);
+                self.a.eor(Size::X, T_A, T_A, T_B);
+                self.a.sub(Size::X, T_A, T_A, T_B);
+                self.a.mov_imm(Size::W, T_B, (C0 | C1 | C2 | C3) as u64);
+                self.a.bic(Size::W, SW, SW, T_B);
+                for (bit, at) in [(1, 14), (0, 9), (2, 8)] {
+                    self.a.ubfx(Size::W, T_B, T_A, bit, 1);
+                    self.a.logic_shift(Logic::Orr, false, Size::W, SW, SW, T_B, Shift::Lsl, at);
+                }
+                self.fset(0, FS);
             }
             K::Free(i) => {
                 let bit = 1u8 << self.slot(i);

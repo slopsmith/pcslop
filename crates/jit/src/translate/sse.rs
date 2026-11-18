@@ -56,6 +56,7 @@ pub(super) fn is_sse(insn: &Insn) -> bool {
         0x173 => pfx == P66 && !mem && matches!(insn.reg(), 2 | 3 | 6 | 7),
         0x1c4 => pfx == P66,
         0x1c5 | 0x1d7 => pfx == P66 && !mem,
+        0x150 => pfx <= P66 && !mem,
         0x1d1..=0x1d3 | 0x1e1 | 0x1e2 | 0x1f1..=0x1f3 => pfx == P66,
         _ => false,
     }
@@ -84,6 +85,22 @@ impl Emit {
         self.a.ldr(Width::W, T_A, STATE, if arith { state::SSE_FP_OK } else { state::SSE_OK } as i32);
         self.a.cbz(Size::W, T_A, bail);
         match (op, pfx) {
+            (0x150, _) => {
+                let d = guest_reg(reg);
+                self.a.ldr(Width::X, T_A, STATE, xmm(rm));
+                self.a.ldr(Width::X, T_B, STATE, xmm(rm) + 8);
+                if pfx == P66 {
+                    self.a.lsr_imm(Size::X, d, T_A, 63);
+                    self.a.lsr_imm(Size::X, T_C, T_B, 63);
+                    self.a.logic_shift(Logic::Orr, false, Size::W, d, d, T_C, a64::Shift::Lsl, 1);
+                } else {
+                    self.a.ubfx(Size::X, d, T_A, 31, 1);
+                    for (src, bit, at) in [(T_A, 63, 1), (T_B, 31, 2), (T_B, 63, 3)] {
+                        self.a.ubfx(Size::X, T_C, src, bit, 1);
+                        self.a.logic_shift(Logic::Orr, false, Size::W, d, d, T_C, a64::Shift::Lsl, at);
+                    }
+                }
+            }
             (0x110, NP | P66) | (0x128, _) | (0x16f, _) => {
                 self.src(insn, 16, op != 0x110 && !(op == 0x16f && pfx == F3), XB, bail);
                 self.a.str_q(XB, STATE, xmm(reg));

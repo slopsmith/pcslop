@@ -252,6 +252,35 @@ fn xlat_looks_up_al_in_the_table_at_ebx() {
 }
 
 #[test]
+fn fprem_sets_the_quotient_bits_and_remainder_sign() {
+    let code = [
+        0xdd, 0x05, 0x00, 0x30, 0, 0, // fld qword [0x3000]: 2
+        0xdd, 0x05, 0x08, 0x30, 0, 0, // fld qword [0x3008]: 13, or -4
+        0xd9, 0xf8, // fprem
+        0xdf, 0xe0, // fnstsw ax
+        0xdd, 0x1d, 0x10, 0x30, 0, 0, // fstp qword [0x3010]
+        0xdd, 0xd8, // fstp st0
+        0xf4, // hlt
+    ];
+    for x in [13.0f64, -4.0, 7.5, -0.75] {
+        let mut a = flat_cpu(0x1000, 0x8000);
+        let mut b = a.clone();
+        let mut bus_a = bus_with(0x1000, &code);
+        let mut bus_b = bus_with(0x1000, &code);
+        for bus in [&mut bus_a, &mut bus_b] {
+            let m = bus.ram.as_mut_slice();
+            m[0x3000..0x3008].copy_from_slice(&2.0f64.to_le_bytes());
+            m[0x3008..0x3010].copy_from_slice(&x.to_le_bytes());
+        }
+        run_interp(&mut a, &mut bus_a);
+        let stats = run_jit(&mut b, &mut bus_b);
+        assert_eq!(a.regs[0] & 0xffff, b.regs[0] & 0xffff, "FPREM of {x} reports a different quotient");
+        assert_eq!(bus_a.ram.as_slice()[0x3010..0x3018], bus_b.ram.as_slice()[0x3010..0x3018], "FPREM of {x} leaves a different remainder");
+        assert!(stats.interp_exits <= 1, "FPREM left translated code: {stats:?}");
+    }
+}
+
+#[test]
 fn loop_with_memory_and_stack() {
     let code = [
         0xb8, 0x05, 0, 0, 0, // mov eax, 5
@@ -1490,7 +1519,7 @@ fn random_x87(rng: &mut Rng, out: &mut Vec<u8>) {
         7 => out.extend([0xd9, 0xc8 | i]),
         8 => out.extend([0xd9, 0xc0 | i]),
         9 => out.extend([0xdd, [0xd0, 0xd8][rng.below(2) as usize] | i]),
-        10 => out.extend([0xd9, [0xe0, 0xe1, 0xee, 0xe8, 0xfa, 0xfc, 0xe4, 0xe5][rng.below(8) as usize]]),
+        10 => out.extend([0xd9, [0xe0, 0xe1, 0xee, 0xe8, 0xfa, 0xfc, 0xe4, 0xe5, 0xf8][rng.below(9) as usize]]),
         11 => out.extend([0xd8, 0xd0 | i]),
         12 => out.extend([0xd8, 0xd8 | i]),
         13 => out.extend([[0xde, 0xd9], [0xda, 0xe9]][rng.below(2) as usize]),
@@ -1777,7 +1806,8 @@ fn random_sse(rng: &mut Rng, out: &mut Vec<u8>) {
         0xfc, 0xfd, 0xfe, 0xdb,
     ];
     const SHIFT_OPS: [u8; 8] = [0xd1, 0xd2, 0xd3, 0xe1, 0xe2, 0xf1, 0xf2, 0xf3];
-    match rng.below(27) {
+    match rng.below(28) {
+        27 => sse_op(out, packed_pfx, 0x50, rng.reg(), Some(reg), 0),
         24 => sse_op(out, 0x66, SHIFT_OPS[rng.below(8) as usize], reg, rm, slot),
         25 => {
             out.extend([0xc7, 0x05, 0x80, 0x31, 0, 0]);
