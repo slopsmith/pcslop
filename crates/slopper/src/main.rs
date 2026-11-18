@@ -860,11 +860,12 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                                 j.set_profiling(rest == "on");
                                 format!("profiling {rest}")
                             }
-                            (Some(j), r) if r.starts_with("blocks ") => {
-                                let mut words = r["blocks ".len()..].split_whitespace();
+                            (Some(j), r) if r.starts_with("blocks ") || r.starts_with("counts ") => {
+                                let by_count = r.starts_with("counts ");
+                                let mut words = r[7..].split_whitespace();
                                 let dir = words.next().unwrap_or(".");
                                 let n = words.next().and_then(|w| w.parse().ok()).unwrap_or(30);
-                                j.dump_hot_blocks(&mut board, Path::new(dir), n).unwrap_or_else(|e| format!("cannot write {dir}: {e}"))
+                                j.dump_hot_blocks(&mut board, Path::new(dir), n, by_count).unwrap_or_else(|e| format!("cannot write {dir}: {e}"))
                             }
                             (Some(j), _) => j.profile_report(),
                         },

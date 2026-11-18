@@ -949,6 +949,14 @@ impl Asm {
         self.emit(0x1400_0000 | (words as u32 & 0x03ff_ffff))
     }
 
+    /// ADRP: `rd` gets the address of the 4 KiB page `pages` pages from this
+    /// instruction's page.
+    pub fn adrp_offset(&mut self, rd: Reg, pages: i64) {
+        assert!((-(1 << 20)..(1 << 20)).contains(&pages));
+        let p = pages as u32;
+        self.emit(0x9000_0000 | (p & 3) << 29 | ((p >> 2) & 0x7ffff) << 5 | reg(rd))
+    }
+
     /// BL to a target `words` instructions away, for code outside this buffer.
     pub fn bl_offset(&mut self, words: i32) {
         assert!((-(1 << 25)..(1 << 25)).contains(&words));

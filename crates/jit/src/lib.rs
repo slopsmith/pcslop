@@ -65,6 +65,9 @@ struct BlockInfo {
     verified: u32,
     /// Chain sites as (code word, target EIP), all on the block's page.
     chains: Vec<(u32, u32)>,
+    /// The block's first execution counter (entries) and its exits' targets,
+    /// whose counters follow.
+    counters: Option<(usize, Vec<u32>)>,
     /// Every guest byte the translation read, by page offset; None when it
     /// read the next page too, so the block cannot move to a copy of its page.
     source: Option<Box<[(u16, u8)]>>,
@@ -313,6 +316,10 @@ pub struct Jit {
     /// Which tree TTBR0 points at.
     root: usize,
     shadow_key: Option<u64>,
+    /// Whether new blocks count their entries and exits.
+    counting: bool,
+    /// Next free counter in `layout::COUNTERS`.
+    counters_next: usize,
     /// Whether the shadow tables were filled with x86 paging enabled.
     shadow_paged: bool,
     /// Physical APIC page and whether its x86 mapping is global, while
@@ -471,6 +478,8 @@ impl Jit {
             },
             root: 0,
             shadow_key: None,
+            counting: std::env::var_os("SLOPPER_JIT_PROFILE").is_some() || std::env::var_os("SLOPPER_JIT_COUNT").is_some(),
+            counters_next: 0,
             shadow_paged: false,
             apic: None,
             code_next: layout::CODE_CACHE,
@@ -616,6 +625,8 @@ impl Jit {
         self.pc_samples.clear();
         self.block_samples.clear();
         self.host_samples.clear();
+        let n = 4 * self.counters_next;
+        self.mem.as_mut_slice()[layout::COUNTERS..layout::COUNTERS + n].fill(0);
         let s = &mut self.stats;
         (s.vm_ns, s.miss_ns, s.interp_ns, s.fault_ns, s.mmio_ns, s.shadow_ns) = (0, 0, 0, 0, 0, 0);
     }
@@ -669,14 +680,31 @@ impl Jit {
     /// `NN.a64` (its translation), plus `index.txt` listing rank, samples,
     /// guest address, instruction count and host size. `scripts/jit-blocks`
     /// disassembles them side by side.
-    pub fn dump_hot_blocks<B: Bus>(&self, bus: &mut B, dir: &std::path::Path, n: usize) -> std::io::Result<String> {
+    /// With `by_count`, ranks blocks by entries times x86 instructions from the
+    /// execution counters instead of by samples, and writes `NN.exits`: each
+    /// counted exit's target and how often it was taken.
+    pub fn dump_hot_blocks<B: Bus>(&self, bus: &mut B, dir: &std::path::Path, n: usize, by_count: bool) -> std::io::Result<String> {
         std::fs::create_dir_all(dir)?;
-        let mut hot: Vec<(u64, u64)> = self.block_samples.iter().map(|(k, n)| (*k, *n)).collect();
+        let counter = |i: usize| {
+            let at = layout::COUNTERS + 4 * i;
+            u32::from_le_bytes(self.mem.as_slice()[at..at + 4].try_into().unwrap()) as u64
+        };
+        let entries = |b: &BlockInfo| b.counters.as_ref().map_or(0, |(i, _)| counter(*i));
+        let mut hot: Vec<(u64, u64)> = if by_count {
+            self.blocks.iter().map(|(k, b)| (*k, entries(b) * b.insns as u64)).filter(|(_, w)| *w > 0).collect()
+        } else {
+            self.block_samples.iter().map(|(k, n)| (*k, *n)).collect()
+        };
         hot.sort_by(|a, b| b.1.cmp(&a.1));
-        let total: u64 = self.pc_samples.values().sum();
-        let mut index = format!("# rank samples share eip phys user insns host_bytes (of {total} samples)\n");
+        let total: u64 = if by_count { hot.iter().map(|h| h.1).sum() } else { self.pc_samples.values().sum() };
+        let what = if by_count { "x86 instructions run" } else { "samples" };
+        let mut index = format!("# rank weight share eip phys user insns host_bytes entries (weight: {what}, of {total})\n");
         for (rank, (key, samples)) in hot.iter().take(n).enumerate() {
             let Some(b) = self.blocks.get(key) else { continue };
+            if let Some((i, exits)) = &b.counters {
+                let lines: String = exits.iter().enumerate().map(|(k, t)| format!("{t:08x} {}\n", counter(i + 1 + k))).collect();
+                std::fs::write(dir.join(format!("{rank:02}.exits")), lines)?;
+            }
             let end = self.by_va.range(b.va + 1..).next().map_or(layout::va(self.code_next), |(va, _)| *va);
             let off = (b.va - layout::RUNTIME_VA) as usize;
             let host = &self.mem.as_slice()[off..off + (end - b.va) as usize];
@@ -695,15 +723,32 @@ impl Jit {
             }
             std::fs::write(dir.join(format!("{rank:02}.hits")), hits)?;
             index += &format!(
-                "{rank:02} {samples} {:.1}% {first:08x} {phys:08x} {} {} {}\n",
+                "{rank:02} {samples} {:.1}% {first:08x} {phys:08x} {} {} {} {}\n",
                 *samples as f64 * 100.0 / total.max(1) as f64,
                 (key >> 32) & 1,
                 b.insns,
-                host.len()
+                host.len(),
+                entries(b)
             );
         }
         std::fs::write(dir.join("index.txt"), &index)?;
         Ok(index)
+    }
+
+    /// Each counted block's first EIP, entries, and exits as (target, taken).
+    pub fn block_counts(&self) -> Vec<(u32, u64, Vec<(u32, u64)>)> {
+        let counter = |i: usize| {
+            let at = layout::COUNTERS + 4 * i;
+            u32::from_le_bytes(self.mem.as_slice()[at..at + 4].try_into().unwrap()) as u64
+        };
+        self.blocks
+            .values()
+            .filter_map(|b| {
+                let (i, exits) = b.counters.as_ref()?;
+                let eip = b.boundaries.first()?.1;
+                Some((eip, counter(*i), exits.iter().enumerate().map(|(k, &t)| (t, counter(i + 1 + k))).collect()))
+            })
+            .collect()
     }
 
     /// Writes back the x87 state held in registers at the boundary before `pc`
@@ -1438,6 +1483,8 @@ impl Jit {
         self.code_pages.clear();
         self.dead.clear();
         self.dead_order.clear();
+        self.counters_next = 0;
+        self.mem.as_mut_slice()[layout::COUNTERS..layout::COUNTERS_END].fill(0);
         self.code_by_lin.clear();
         self.mem.as_mut_slice()[layout::CODE_BITMAP..layout::CODE_BITMAP_END].fill(0);
         self.code_next = layout::CODE_CACHE;
@@ -1464,6 +1511,11 @@ impl Jit {
         if !self.verify && !self_check && self.revive(bus, eip, page, user) {
             return;
         }
+        const MAX_COUNTERS: usize = 1024;
+        if self.counting && layout::COUNTERS + 4 * (self.counters_next + MAX_COUNTERS) > layout::COUNTERS_END {
+            self.reset_code_cache();
+        }
+        let counter_base = self.counting.then_some(self.counters_next);
         let mut source = Some(Vec::new());
         let compiled = translate::compile(
             eip,
@@ -1489,7 +1541,9 @@ impl Jit {
             user,
             self_check,
             self.verify,
+            counter_base.map(|n| layout::va(layout::COUNTERS + 4 * n)),
         );
+        assert!(compiled.exits.len() < MAX_COUNTERS, "a block has more exits than counters were set aside for");
         self.stats.x87_loops += compiled.x87_loop as u64;
         let bytes = compiled.code.len() * 4;
         if self.code_next + bytes > layout::CODE_CACHE_END {
@@ -1526,8 +1580,12 @@ impl Jit {
             x87: compiled.x87,
             verified,
             chains: compiled.chains,
+            counters: counter_base.map(|n| (n, compiled.exits.clone())),
             source,
         };
+        if counter_base.is_some() {
+            self.counters_next += 1 + compiled.exits.len();
+        }
         self.blocks.insert(key, info);
         self.by_va.insert(block_va, key);
         self.stats.blocks += 1;

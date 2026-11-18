@@ -166,6 +166,28 @@ fn compare(code: &[u8], setup: impl Fn(&mut Cpu)) -> Stats {
 }
 
 #[test]
+fn execution_counters_count_block_entries_and_exits() {
+    let code = [
+        0xb9, 0x0a, 0, 0, 0, // mov ecx, 10
+        0x49, // dec ecx
+        0x75, 0xfd, // jnz 0x1005
+        0xf4, // hlt
+    ];
+    let mut cpu = flat_cpu(0x1000, 0x8000);
+    let mut bus = bus_with(0x1000, &code);
+    let mut counts = Vec::new();
+    run_jit_with(&mut cpu, &mut bus, |j| j.counting = true, |j| counts = j.block_counts());
+    assert_eq!(cpu.regs[1], 0);
+    let first = counts.iter().find(|c| c.0 == 0x1000).expect("the first block was not counted");
+    let looped = counts.iter().find(|c| c.0 == 0x1005).expect("the loop block was not counted");
+    assert_eq!(first.1, 1, "block entries are miscounted, so profiles rank blocks wrongly: {counts:x?}");
+    let taken = |c: &(u32, u64, Vec<(u32, u64)>)| c.2.iter().find(|e| e.0 == 0x1005).map(|e| e.1);
+    assert_eq!(taken(first), Some(1), "a side exit is miscounted, so branch profiles lie: {counts:x?}");
+    assert_eq!(looped.1, 9, "loop entries are miscounted, so profiles rank blocks wrongly: {counts:x?}");
+    assert_eq!(taken(looped), Some(8), "a back edge is miscounted, so branch profiles lie: {counts:x?}");
+}
+
+#[test]
 fn loop_with_memory_and_stack() {
     let code = [
         0xb8, 0x05, 0, 0, 0, // mov eax, 5

@@ -173,6 +173,8 @@ const CASES: &[Case] = &[
     ("rmif x3, #9, #2", |a| a.rmif(r(3), 9, 2)),
     ("setf8 w4", |a| a.setf8(r(4))),
     ("setf16 w5", |a| a.setf16(r(5))),
+    ("adrp x16, #8192", |a| a.adrp_offset(r(16), 2)),
+    ("adrp x3, #-4096", |a| a.adrp_offset(r(3), -1)),
     ("ldr w1, [x2, #8]", |a| a.ldr(Width::W, r(1), r(2), 8)),
     ("ldr x1, [sp, #32760]", |a| a.ldr(Width::X, r(1), SP, 32760)),
     ("ldrb w1, [x2, #4095]", |a| a.ldr(Width::B, r(1), r(2), 4095)),

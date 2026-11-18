@@ -38,7 +38,11 @@ pub const SHADOW_POOL_END: usize = 0x100_0000;
 pub const VLOOKUP: usize = 0x200_0000;
 pub const VLOOKUP_ENTRIES: usize = 1 << 16;
 pub const CODE_CACHE: usize = VLOOKUP + VLOOKUP_ENTRIES * 16;
-pub const CODE_CACHE_END: usize = RUNTIME_SIZE;
+pub const CODE_CACHE_END: usize = COUNTERS;
+/// Execution counters of translated code, u32 each: a block's entries and
+/// the exits it leaves through.
+pub const COUNTERS: usize = RUNTIME_SIZE - (8 << 20);
+pub const COUNTERS_END: usize = RUNTIME_SIZE;
 
 pub const fn va(offset: usize) -> u64 {
     RUNTIME_VA + offset as u64
