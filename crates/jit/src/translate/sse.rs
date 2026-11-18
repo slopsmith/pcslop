@@ -352,9 +352,7 @@ impl Emit {
             }
             _ => unreachable!("is_sse accepted {op:#x} with prefix {pfx}"),
         }
-        self.a.b(done);
-        self.a.bind(bail);
-        self.exit_interp(eip);
+        self.cold_exit(bail, eip);
         self.a.bind(done);
         true
     }

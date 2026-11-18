@@ -365,6 +365,14 @@ impl Emit {
         }
     }
 
+    /// Leaves for the interpreter at `eip` from `slow`, in cold code.
+    fn cold_exit(&mut self, slow: Label, eip: u32) {
+        self.defer(move |e| {
+            e.a.bind(slow);
+            e.exit_interp(eip);
+        });
+    }
+
     /// Emits `f` after the block's hot path, with the x87 state as it is now.
     fn defer(&mut self, f: impl FnOnce(&mut Emit) + 'static) {
         self.cold.push((self.a.pos(), self.x87, Box::new(f)));
@@ -1191,9 +1199,7 @@ impl Emit {
         self.a.msub(Size::X, T_D, T_RES, T_B, T_C);
         self.a.mov(Size::W, eax, T_RES);
         self.a.mov(Size::W, edx, T_D);
-        self.a.b(done);
-        self.a.bind(slow);
-        self.exit_interp(eip);
+        self.cold_exit(slow, eip);
         self.a.bind(done);
         true
     }
@@ -1447,9 +1453,7 @@ impl Emit {
                 self.a.ldr(Width::X, T_B, STATE, state::PM_ADD as i32);
                 self.a.add(Size::X, T_A, T_A, T_B);
                 self.a.ubfx(Size::W, guest_reg(0), T_A, 0, 24);
-                self.a.b(done);
-                self.a.bind(slow);
-                self.exit_interp(eip);
+                self.cold_exit(slow, eip);
                 self.a.bind(done);
             }
             0x131 if !self.user => {
@@ -2175,9 +2179,7 @@ impl Emit {
                     self.a.str(Width::W, ZR, STATE, state::FPSR as i32);
                     self.a.msr(a64::sysreg::FPSR, ZR);
                 }
-                self.a.b(done);
-                self.a.bind(slow);
-                self.exit_interp(eip);
+                self.cold_exit(slow, eip);
                 self.a.bind(done);
             }
             0x1a3 | 0x1ab | 0x1b3 | 0x1bb if op32 => {
@@ -2250,9 +2252,7 @@ impl Emit {
                 self.a.ldr(Width::X, T_C, STATE, x + 8);
                 self.a.str(Width::X, T_B, T_ADDR, 0);
                 self.a.str(Width::X, T_C, T_ADDR, 8);
-                self.a.b(done);
-                self.a.bind(slow);
-                self.exit_interp(eip);
+                self.cold_exit(slow, eip);
                 self.a.bind(done);
             }
             _ => return Step::Unsupported,
@@ -2390,9 +2390,7 @@ impl Emit {
         self.a.add_imm(Size::W, esp, esp, 4);
         if self.user {
             let done = self.a.label();
-            self.a.b(done);
-            self.a.bind(slow);
-            self.exit_interp(eip);
+            self.cold_exit(slow, eip);
             self.a.bind(done);
             return Step::Next;
         }
@@ -2486,9 +2484,7 @@ impl Emit {
         self.a.cbz(Size::W, T_B, ok);
         let off = self.branch_offset(self.unstale_va);
         self.a.bl_offset(off);
-        self.a.b(ok);
-        self.a.bind(slow);
-        self.exit_interp(eip);
+        self.cold_exit(slow, eip);
         self.a.bind(ok);
         let mut written = None;
         match op {

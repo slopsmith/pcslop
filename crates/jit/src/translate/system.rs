@@ -84,9 +84,7 @@ impl Emit {
         self.load(Width::H, T_A);
         self.load_seg(seg, slow);
         self.a.add_imm(Size::W, esp, esp, 4);
-        self.a.b(done);
-        self.a.bind(slow);
-        self.exit_interp(eip);
+        self.cold_exit(slow, eip);
         self.a.bind(done);
         true
     }
@@ -108,9 +106,7 @@ impl Emit {
         }
         let (slow, done) = (self.a.label(), self.a.label());
         self.load_seg(seg, slow);
-        self.a.b(done);
-        self.a.bind(slow);
-        self.exit_interp(eip);
+        self.cold_exit(slow, eip);
         self.a.bind(done);
         true
     }
@@ -214,9 +210,7 @@ impl Emit {
         self.a.ubfx(Size::W, T_C, T_C, cr4::OSFXSR.trailing_zeros(), 1);
         self.a.and(Size::W, T_C, T_C, T_E);
         self.a.str(Width::W, T_C, STATE, state::SSE_OK as i32);
-        self.a.b(done);
-        self.a.bind(slow);
-        self.exit_interp(eip);
+        self.cold_exit(slow, eip);
         self.a.bind(done);
         true
     }
@@ -269,9 +263,7 @@ impl Emit {
         self.a.ldr(Width::W, T_A, STATE, state::CR3_SWITCHED as i32);
         self.a.add_imm(Size::W, T_A, T_A, 1);
         self.a.str(Width::W, T_A, STATE, state::CR3_SWITCHED as i32);
-        self.a.b(done);
-        self.a.bind(slow);
-        self.exit_interp(eip);
+        self.cold_exit(slow, eip);
         self.a.bind(done);
         true
     }
@@ -320,9 +312,7 @@ impl Emit {
             self.a.add_imm(Size::W, T_C, T_C, 1);
             self.a.str(Width::W, T_C, STATE, at as i32);
         }
-        self.a.b(done);
-        self.a.bind(slow);
-        self.exit_interp(eip);
+        self.cold_exit(slow, eip);
         self.a.bind(done);
         true
     }
@@ -447,9 +437,7 @@ impl Emit {
         self.a.str(Width::W, T_A, STATE, state::LDTR_SEL as i32);
         self.a.movz(Size::W, T_B, 1, 0);
         self.a.str(Width::W, T_B, STATE, state::LDTR_NULLED as i32);
-        self.a.b(done);
-        self.a.bind(slow);
-        self.exit_interp(eip);
+        self.cold_exit(slow, eip);
         self.a.bind(done);
         true
     }
