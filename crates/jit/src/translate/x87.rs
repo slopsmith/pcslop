@@ -36,6 +36,7 @@ const C1: u32 = 1 << 9;
 const C2: u32 = 1 << 10;
 const C3: u32 = 1 << 14;
 const PE_SHIFT: u32 = 5;
+const SINGLE: u32 = 16;
 const SQRT: u32 = 9;
 
 /// What the translator knows about the x87 state at the current point of a
@@ -698,6 +699,12 @@ impl Emit {
         self.a.tbnz(U, 8, bail);
         self.a.ldr(Width::W, SW, STATE, state::FSW as i32);
         self.a.ubfx(Size::W, TOP, SW, 11, 3);
+        // SW bit 16, never stored as part of FSW, notes FCW's 24-bit precision.
+        self.a.ldr(Width::W, U, STATE, state::FCW as i32);
+        self.a.ubfx(Size::W, U, U, 8, 2);
+        self.a.sub_imm(Size::W, U, U, 1);
+        self.a.lsr_imm(Size::W, U, U, 31);
+        self.a.bfi(Size::W, SW, U, SINGLE, 1);
         self.a.ldr(Width::W, TAGS, STATE, state::FTAGS as i32);
         let (tainted, x87_fpcr) = (self.a.label(), self.a.label());
         self.a.ldr(Width::W, U, STATE, state::X87_TAINT as i32);
@@ -1250,9 +1257,7 @@ impl Emit {
     /// Single precision rounds to an f32 and takes its range, as the interpreter does.
     fn apply_precision(&mut self, bail: Label) {
         let (normal, inexact_known, done) = (self.a.label(), self.a.label(), self.a.label());
-        self.a.ldr(Width::W, T_B, STATE, state::FCW as i32);
-        self.a.ubfx(Size::W, T_B, T_B, 8, 2);
-        self.a.cbnz(Size::W, T_B, done);
+        self.a.tbz(SW, SINGLE, done);
         self.a.fp1(true, 4, FS, FR);
         self.a.fmov_ws(T_A, FS);
         self.a.ubfx(Size::W, T_B, T_A, 23, 8);
