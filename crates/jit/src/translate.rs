@@ -107,6 +107,8 @@ struct Emit {
     fold: Option<Fold>,
     /// Whether `ea_fold` may fold: self-checking blocks need T_ADDR after a store.
     fold_ok: bool,
+    /// EIP of the instruction being translated.
+    at: u32,
 }
 
 /// `[base + disp]`. An index is not folded: x86 code often holds negative
@@ -153,8 +155,11 @@ impl Emit {
         self.x87_flush();
         if self.page == Some(eip & !0xfff) {
             let slow = self.a.label();
-            self.a.ldr(Width::W, CHAIN_TMP, STATE, state::PENDING as i32);
-            self.a.cbnz(Size::W, CHAIN_TMP, slow);
+            // Only a backward jump can close a loop of chained blocks.
+            if eip <= self.at {
+                self.a.ldr(Width::W, CHAIN_TMP, STATE, state::PENDING as i32);
+                self.a.cbnz(Size::W, CHAIN_TMP, slow);
+            }
             self.chains.push((self.a.pos() as u32, eip));
             self.a.b(slow);
             self.a.bind(slow);
@@ -2476,6 +2481,7 @@ pub fn translatable(insn: &Insn, pc: u32, user: bool) -> bool {
         superblock: false,
         fold: None,
         fold_ok: false,
+        at: 0,
     };
     !matches!(e.insn(insn, pc), Step::Unsupported)
 }
@@ -2582,6 +2588,7 @@ pub fn compile(
         superblock: false,
         fold: None,
         fold_ok: false,
+        at: 0,
     };
     let superblock = chain;
     let need = if self_check { Vec::new() } else { flag_needs(eip, &mut byte, user, exact_flags, superblock) };
@@ -2650,6 +2657,7 @@ pub fn compile(
             e.check_code_bytes(page.wrapping_add(0x1000), &tail, slow);
             e.need = flags::ALL;
             e.superblock = false;
+            e.at = pc;
             match e.insn(&insn, pc) {
                 Step::Next | Step::Branch => {
                     insns += 1;
@@ -2673,6 +2681,7 @@ pub fn compile(
         e.stored = false;
         e.need = need.get(insns).copied().unwrap_or(flags::ALL);
         e.superblock = superblock && sti.is_none();
+        e.at = pc;
         let step = e.insn(&insn, pc);
         if self_check && e.stored && matches!(step, Step::Next | Step::Sti) {
             // T_ADDR still holds the address of the last store: leave through
