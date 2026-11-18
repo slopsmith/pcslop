@@ -1097,12 +1097,14 @@ impl Jit {
             cpu.segs[CS] = Segment { selector: cs_sel, attr: flat | attr::CODE | dpl, base: 0, limit: 0xffff_ffff };
             cpu.segs[SS] = Segment { selector: ss_sel, attr: flat | dpl, base: 0, limit: 0xffff_ffff };
         }
-        // The same selector can come back with another base: XP rewrites the
-        // TEB descriptor on every thread switch.
+        // XP and Linux rewrite these descriptors per thread; when the GDT entry
+        // changed again since the load, keep what the load cached.
         for (seg, sel, base) in [(FS, fs, fs_base), (GS, gs, gs_base)] {
             if sel != cpu.segs[seg].selector as u32 || base != cpu.segs[seg].base {
-                let ok = interp::load_segment(cpu, bus, seg, sel as u16);
-                assert!(ok, "translated code loaded selector {sel:#x} that the interpreter rejects");
+                if !interp::load_segment(cpu, bus, seg, sel as u16) {
+                    let flat = attr::P | attr::S | attr::RW | attr::ACCESSED | attr::DB | attr::G;
+                    cpu.segs[seg] = Segment { selector: sel as u16, attr: flat | ((sel as u16 & 3) << 5), base, limit: 0xffff_ffff };
+                }
                 cpu.segs[seg].base = base;
             }
         }

@@ -2072,6 +2072,35 @@ fn sysenter_sysexit_and_fs_loads_match_the_interpreter() {
     assert!(stats.interp_exits <= 17, "system calls left translated code: {stats:?}");
 }
 
+#[test]
+fn a_segment_keeps_its_cached_base_after_its_descriptor_changes() {
+    let code = [
+        0x66, 0xb8, 0x30, 0x00, // mov ax, 0x30
+        0x8e, 0xe0, // mov fs, ax
+        0xc7, 0x05, 0x34, 0x40, 0, 0, 0, 0, 0, 0, // mov dword [0x4034], 0: the descriptor is gone
+        0x0f, 0xa2, // cpuid: an exit to the host
+        0x64, 0x8b, 0x1d, 0, 0, 0, 0, // mov ebx, fs:[0]
+        0xf4, // hlt
+    ];
+    let mut a = flat_cpu(0x1000, 0x8000);
+    let mut bus_a = bus_with(0x1000, &code);
+    let mem = bus_a.ram.as_mut_slice();
+    let gdt: [u64; 7] = [0, 0x00cf_9b00_0000_ffff, 0x00cf_9300_0000_ffff, 0, 0, 0, 0x0040_9200_5000_0fff];
+    for (i, d) in gdt.iter().enumerate() {
+        mem[0x4000 + 8 * i..0x4008 + 8 * i].copy_from_slice(&d.to_le_bytes());
+    }
+    mem[0x5000..0x5004].copy_from_slice(&0x1111_1111u32.to_le_bytes());
+    a.gdtr = x86::cpu::DescriptorTable { base: 0x4000, limit: 0x37 };
+    let mut b = a.clone();
+    let mut bus_b = FlatBus { ram: GuestMemory::new(RAM).unwrap(), gart: None };
+    bus_b.ram.as_mut_slice().copy_from_slice(bus_a.ram.as_slice());
+    run_interp(&mut a, &mut bus_a);
+    run_jit(&mut b, &mut bus_b);
+    assert_eq!(a.regs[3], 0x1111_1111, "the interpreter forgot the cached FS base");
+    assert_eq!(b.regs, a.regs, "the JIT lost FS's cached base when its descriptor changed");
+    assert_eq!(b.segs[4].base, 0x5000, "FS should keep the base the load cached");
+}
+
 fn ring_test_machine(user: &[u8], kernel: &[u8]) -> (Cpu, FlatBus) {
     let mut cpu = flat_cpu(0x2000, 0x9000);
     let mut bus = bus_with(0x1000, user);
