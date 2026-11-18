@@ -712,3 +712,53 @@ fn undefined_opcodes_raise_ud() {
     let mut mc = Machine::new();
     assert_eq!(mc.run(&[0x0f, 0x3f]), Err(Exception::new(vector::UD)), "CPU-Z probes VIA's ALTINST jump");
 }
+
+fn descriptor(base: u32, limit: u32, access: u8, flags: u8) -> [u8; 8] {
+    let lo = (limit & 0xffff) | (base & 0xffff) << 16;
+    let hi = (base >> 16 & 0xff) | (access as u32) << 8 | (limit & 0xf_0000) | ((flags as u32) << 20) | (base & 0xff00_0000);
+    let mut d = [0; 8];
+    d[..4].copy_from_slice(&lo.to_le_bytes());
+    d[4..].copy_from_slice(&hi.to_le_bytes());
+    d
+}
+
+#[test]
+fn double_fault_through_a_task_gate_switches_tasks_and_iret_returns() {
+    use crate::cpu::{ESP, Segment};
+    const GDT: u32 = 0x3000;
+    const IDT: u32 = 0x3800;
+    const TSS_A: u32 = 0x4000;
+    const TSS_B: u32 = 0x4100;
+    const HANDLER: u32 = 0x5000;
+    let mut mc = Machine::new();
+    mc.put(GDT + 0x08, &descriptor(0, 0xfffff, 0x9b, 0xc));
+    mc.put(GDT + 0x10, &descriptor(0, 0xfffff, 0x93, 0xc));
+    mc.put(GDT + 0x18, &descriptor(TSS_A, 0x67, 0x8b, 0));
+    mc.put(GDT + 0x20, &descriptor(TSS_B, 0x67, 0x89, 0));
+    mc.put(IDT + 8 * 8, &[0, 0, 0x20, 0, 0, 0x85, 0, 0]);
+    let fields: [(u32, u32); 6] = [(0x20, HANDLER), (0x24, 0x2), (0x38, 0x9000), (0x4c, 0x08), (0x50, 0x10), (0x54, 0x10)];
+    for (off, v) in fields {
+        mc.put(TSS_B + off, &v.to_le_bytes());
+    }
+    mc.put(TSS_B + 0x48, &0x10u32.to_le_bytes());
+    mc.cpu.gdtr = crate::cpu::DescriptorTable { base: GDT, limit: 0x27 };
+    mc.cpu.idtr = crate::cpu::DescriptorTable { base: IDT, limit: 0x7ff };
+    mc.cpu.tr = Segment { selector: 0x18, attr: 0x8b, base: TSS_A, limit: 0x67 };
+    mc.cpu.regs[ESP] = 0x8000;
+    mc.cpu.eip = 0x1234;
+
+    super::deliver_fault(&mut mc.cpu, &mut mc.ram, Exception::with_error(vector::DF, 0));
+    assert_eq!((mc.cpu.tr.selector, mc.cpu.eip, mc.cpu.regs[ESP]), (0x20, HANDLER, 0x8ffc));
+    assert!(mc.cpu.flag(flags::NT) && mc.cpu.cr0 & cr0::TS != 0);
+    assert_eq!(mc.get(TSS_B, 2), [0x18, 0], "back link");
+    assert_eq!(mc.get(TSS_A + 0x20, 4), 0x1234u32.to_le_bytes(), "saved EIP");
+    assert_eq!(mc.get(TSS_A + 0x38, 4), 0x8000u32.to_le_bytes(), "saved ESP");
+    assert_eq!(mc.get(GDT + 0x25, 1)[0] & 0xf, 0xb, "new TSS busy");
+
+    mc.put(HANDLER, &[0xcf]);
+    let mut ctx = Ctx { cpu: &mut mc.cpu, bus: &mut mc.ram, insn: Insn::default(), start_eip: HANDLER };
+    assert!(ctx.exec().is_ok());
+    assert_eq!((mc.cpu.tr.selector, mc.cpu.eip, mc.cpu.regs[ESP]), (0x18, 0x1234, 0x8000));
+    assert!(!mc.cpu.flag(flags::NT));
+    assert_eq!(mc.get(GDT + 0x25, 1)[0] & 0xf, 0x9, "IRET frees the handler's TSS");
+}

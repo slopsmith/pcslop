@@ -3,7 +3,7 @@
 
 use super::{Ctx, Exception, Res, Source, Trap, gp, vector};
 use crate::bus::Bus;
-use crate::cpu::{CS, DS, ES, FS, GS, SS, Segment, attr, flags};
+use crate::cpu::{CS, DS, ES, FS, GS, SS, Segment, attr, cr0, cr4, flags};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Descriptor {
@@ -69,6 +69,18 @@ impl Descriptor {
     pub fn gate_selector(&self) -> u16 {
         (self.lo >> 16) as u16
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TaskSwitch {
+    /// Through a task gate in the IDT, saving this EIP in the old task.
+    Gate(u32),
+    /// IRET with NT set, back to the task in the TSS back link.
+    Iret,
+}
+
+fn ts<T>(sel: u16) -> Res<T> {
+    Err(Exception::with_error(vector::TS, sel_error(sel)).into())
 }
 
 fn sel_error(sel: u16) -> u32 {
@@ -341,7 +353,8 @@ impl<B: Bus> Ctx<'_, B> {
             return Ok(());
         }
         if self.cpu.flag(flags::NT) {
-            return Err(Trap::Unimplemented("IRET task return".into()));
+            let back = self.read_sys(self.cpu.tr.base, 2)? as u16;
+            return self.task_switch(back, TaskSwitch::Iret, None);
         }
         let eip = self.peek(0, sz)?;
         let sel = self.peek(sz, sz)? as u16;
@@ -456,7 +469,7 @@ impl<B: Bus> Ctx<'_, B> {
             return Err(Exception::with_error(vector::NP, idt_err).into());
         }
         let (gate32, trap) = match gate.typ() {
-            5 => return Err(Trap::Unimplemented(format!("task gate for vector {vec}"))),
+            5 => return self.task_switch(gate.gate_selector(), TaskSwitch::Gate(ret_eip), e.error),
             6 => (false, false),
             7 => (false, true),
             14 => (true, false),
@@ -548,6 +561,141 @@ impl<B: Bus> Ctx<'_, B> {
         self.cpu.eflags &= !(flags::TF | flags::NT | flags::VM | flags::RF);
         if !trap {
             self.cpu.eflags &= !flags::IF;
+        }
+        Ok(())
+    }
+
+    /// Switches to the task whose 32-bit TSS `sel` names, as an interrupt
+    /// gate or IRET does (Intel SDM vol. 3A, 7.3), pushing `error` on the new stack.
+    fn task_switch(&mut self, sel: u16, how: TaskSwitch, error: Option<u32>) -> Res<()> {
+        if sel & 4 != 0 {
+            return ts(sel);
+        }
+        let (mut d, addr) = self.descriptor(sel)?;
+        let want = if how == TaskSwitch::Iret { 11 } else { 9 };
+        if !d.system() {
+            return gp(sel_error(sel));
+        }
+        if d.typ() & !2 == 1 {
+            return Err(Trap::Unimplemented("16-bit task switch".into()));
+        }
+        if d.typ() != want {
+            return if how == TaskSwitch::Iret { ts(sel) } else { gp(sel_error(sel)) };
+        }
+        if !d.present() {
+            return Err(Exception::with_error(vector::NP, sel_error(sel)).into());
+        }
+        if d.limit() < 0x67 {
+            return ts(sel);
+        }
+
+        let new = d.base();
+        let mut regs = [0u32; 8];
+        for (i, r) in regs.iter_mut().enumerate() {
+            *r = self.read_sys(new.wrapping_add(0x28 + 4 * i as u32), 4)?;
+        }
+        let new_cr3 = self.read_sys(new.wrapping_add(0x1c), 4)?;
+        let new_eip = self.read_sys(new.wrapping_add(0x20), 4)?;
+        let mut new_flags = self.read_sys(new.wrapping_add(0x24), 4)?;
+        let mut sels = [0u16; 6];
+        for (i, s) in sels.iter_mut().enumerate() {
+            *s = self.read_sys(new.wrapping_add(0x48 + 4 * i as u32), 2)? as u16;
+        }
+        let new_ldt = self.read_sys(new.wrapping_add(0x60), 2)? as u16;
+
+        let old = self.cpu.tr;
+        let eip = match how {
+            TaskSwitch::Gate(eip) => eip,
+            TaskSwitch::Iret => self.cpu.eip,
+        };
+        let mut old_flags = self.cpu.eflags;
+        if how == TaskSwitch::Iret {
+            old_flags &= !flags::NT;
+        }
+        self.write_sys(old.base.wrapping_add(0x20), 4, eip)?;
+        self.write_sys(old.base.wrapping_add(0x24), 4, old_flags)?;
+        for i in 0..8 {
+            self.write_sys(old.base.wrapping_add(0x28 + 4 * i as u32), 4, self.cpu.regs[i])?;
+        }
+        for i in 0..6 {
+            self.write_sys(old.base.wrapping_add(0x48 + 4 * i as u32), 2, self.cpu.segs[i].selector as u32)?;
+        }
+
+        if how == TaskSwitch::Iret {
+            let (mut od, oaddr) = self.descriptor(old.selector)?;
+            od.hi &= !(2 << 8);
+            self.write_sys(oaddr.wrapping_add(4), 4, od.hi)?;
+        } else {
+            self.write_sys(new, 2, old.selector as u32)?;
+            new_flags |= flags::NT;
+            d.hi |= 2 << 8;
+            self.write_sys(addr.wrapping_add(4), 4, d.hi)?;
+        }
+        self.cpu.tr = d.segment(sel);
+        self.cpu.cr0 |= cr0::TS;
+
+        if self.cpu.cr0 & cr0::PG != 0 && new_cr3 != self.cpu.cr3 {
+            self.cpu.cr3 = new_cr3;
+            if self.cpu.cr4 & cr4::PGE != 0 {
+                self.cpu.tlb.flush_nonglobal();
+            } else {
+                self.cpu.tlb.flush();
+            }
+        }
+        self.cpu.regs = regs;
+        self.cpu.eip = new_eip;
+        self.cpu.eflags = new_flags | flags::FIXED1;
+        if new_flags & flags::VM != 0 {
+            for (i, &s) in sels.iter().enumerate() {
+                let mut seg = Segment::real(s);
+                seg.attr |= 3 << 5;
+                if i == CS {
+                    seg.attr |= attr::CODE;
+                }
+                self.cpu.segs[i] = seg;
+            }
+            return Ok(());
+        }
+
+        // Errors while loading the new task's segments surface as #TS in its context.
+        if new_ldt & 4 != 0 {
+            return ts(new_ldt);
+        }
+        self.lldt(new_ldt).or_else(|_| ts(new_ldt))?;
+        let cpl = (sels[CS] & 3) as u8;
+        let (cs_d, _) = self.descriptor(sels[CS]).or_else(|_| ts(sels[CS]))?;
+        if sels[CS] & !3 == 0 || !cs_d.is_code() {
+            return ts(sels[CS]);
+        }
+        if !cs_d.present() {
+            return Err(Exception::with_error(vector::NP, sel_error(sels[CS])).into());
+        }
+        self.cpu.segs[CS] = cs_d.segment(sels[CS]);
+        let (ss_d, _) = self.descriptor(sels[SS]).or_else(|_| ts(sels[SS]))?;
+        if sels[SS] & !3 == 0 || (sels[SS] & 3) as u8 != cpl || ss_d.dpl() != cpl || !ss_d.writable_data() {
+            return ts(sels[SS]);
+        }
+        if !ss_d.present() {
+            return Err(Exception::with_error(vector::SS, sel_error(sels[SS])).into());
+        }
+        self.cpu.segs[SS] = ss_d.segment(sels[SS]);
+        for seg in [DS, ES, FS, GS] {
+            let s = sels[seg];
+            if s & !3 == 0 {
+                self.cpu.segs[seg] = Segment { selector: s, ..Default::default() };
+                continue;
+            }
+            let (sd, _) = self.descriptor(s).or_else(|_| ts(s))?;
+            if !sd.readable() {
+                return ts(s);
+            }
+            if !sd.present() {
+                return Err(Exception::with_error(vector::NP, sel_error(s)).into());
+            }
+            self.cpu.segs[seg] = sd.segment(s);
+        }
+        if let Some(code) = error {
+            self.push(code, 4)?;
         }
         Ok(())
     }
