@@ -164,9 +164,29 @@ impl Shadow {
         out
     }
 
-    /// True when the leaf at `off` was mapped as global.
-    pub fn leaf_global(&self, mem: &[u8], off: usize) -> bool {
-        read_desc(mem, off) & LEAF_GLOBAL != 0
+    /// Calls `f(linear page, descriptor, leaf offset)` for every valid leaf.
+    pub fn for_each_leaf(&self, mem: &[u8], mut f: impl FnMut(u32, u64, usize)) {
+        let table_of = |d: u64| (d & 0x0000_ffff_ffff_f000) as usize - layout::RUNTIME_IPA as usize;
+        for i1 in 0..4usize {
+            let d1 = read_desc(mem, self.root + i1 * 8);
+            if d1 & VALID == 0 {
+                continue;
+            }
+            let l2 = table_of(d1);
+            for i2 in 0..512usize {
+                let d2 = read_desc(mem, l2 + i2 * 8);
+                if d2 & VALID == 0 {
+                    continue;
+                }
+                let l3 = table_of(d2);
+                for (i3, d) in mem[l3..l3 + PAGE_SIZE].chunks_exact(8).enumerate() {
+                    let d = u64::from_le_bytes(d.try_into().unwrap());
+                    if d & VALID != 0 {
+                        f(((i1 << 30) | (i2 << 21) | (i3 << 12)) as u32, d, l3 + i3 * 8);
+                    }
+                }
+            }
+        }
     }
 
     /// Clears the leaf entry at `off`, as returned by `map`.

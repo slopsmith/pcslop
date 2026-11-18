@@ -361,7 +361,8 @@ pub struct Jit {
     /// Interpreter exits by opcode, when profiling is on.
     interp_profile: Option<HashMap<u16, u64>>,
     /// Interpreter exits by (opcode key, EIP), when profiling is on.
-    interp_sites: HashMap<(u16, u32), u64>,
+    /// Interpreter exits and the nanoseconds their first instruction took, by (opcode key, site).
+    interp_sites: HashMap<(u16, u32), (u64, u64)>,
     /// Translations by block start, when profiling is on.
     translated_at: HashMap<u32, u64>,
     /// Where the vCPU was at each kick while profiling: guest EIP of the
@@ -622,8 +623,11 @@ impl Jit {
         v.sort_by(|a, b| b.1.cmp(a.1));
         let top: Vec<String> = v.iter().take(40).map(|(k, n)| format!("{k:04x}:{n}")).collect();
         let mut sites: Vec<_> = self.interp_sites.iter().collect();
-        sites.sort_by(|a, b| b.1.cmp(a.1));
-        let sites: Vec<String> = sites.iter().take(20).map(|((k, eip), n)| format!("{k:04x}@{eip:08x}:{n}")).collect();
+        sites.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+        let site = |((k, eip), n): &(&(u16, u32), &(u64, u64))| format!("{k:04x}@{eip:08x}:{}", n.0);
+        let by_count: Vec<String> = sites.iter().take(20).map(site).collect();
+        sites.sort_by(|a, b| b.1.1.cmp(&a.1.1));
+        let by_time: Vec<String> = sites.iter().take(20).map(|s| format!("{}/{:.1}ms", site(s), s.1.1 as f64 / 1e6)).collect();
         let mut again: Vec<_> = self.translated_at.iter().filter(|(_, n)| **n > 1).collect();
         again.sort_by(|a, b| b.1.cmp(a.1));
         let retranslated: u64 = again.iter().map(|(_, n)| **n - 1).sum();
@@ -638,14 +642,15 @@ impl Jit {
             .map(|(k, n)| if **k < 0 { format!("rt+{:#x}:{n}", -**k - 1) } else { format!("{:#x}:{n}", **k) })
             .collect();
         format!(
-            "ms in vm {:.0} miss {:.0} interp {:.0} fault {:.0} mmio {:.0}\ninterpreter exits by opcode: {}\nby site: {}\n{} translations, {retranslated} of blocks translated before; most often: {}\n{total} samples, {runtime} in the runtime; hottest: {}",
+            "ms in vm {:.0} miss {:.0} interp {:.0} fault {:.0} mmio {:.0}\ninterpreter exits by opcode: {}\nby site: {}\nby time in the exiting instruction: {}\n{} translations, {retranslated} of blocks translated before; most often: {}\n{total} samples, {runtime} in the runtime; hottest: {}",
             ms(s.vm_ns),
             ms(s.miss_ns),
             ms(s.interp_ns),
             ms(s.fault_ns),
             ms(s.mmio_ns),
             top.join(" "),
-            sites.join(" "),
+            by_count.join(" "),
+            by_time.join(" "),
             self.translated_at.values().sum::<u64>(),
             again.join(" "),
             hot.join(" ")
@@ -1181,29 +1186,46 @@ impl Jit {
         let pge = cpu.cr4 & cr4::PGE != 0;
         let wp = cpu.cr0 & cr0::WP != 0;
         let ram = self.state().ram_size;
-        let mut dropped = 0;
+        let base = self.ram;
+        let mut read = |addr: u32| {
+            if addr < ram & !3 {
+                // SAFETY: inside guest RAM, which outlives the Jit.
+                unsafe { ((base + addr as usize) as *const u32).read_unaligned() }
+            } else {
+                bus.read32(addr)
+            }
+        };
+        let mut dead = Vec::new();
         for r in 0..2 {
-            for (lin, phys, writable, off) in self.shadow[r].leaves(self.mem.as_slice()) {
-                let pde = bus.read32(pd + (lin >> 22) * 4);
+            let mut pde_at = (u32::MAX, 0);
+            self.shadow[r].for_each_leaf(self.mem.as_slice(), |lin, desc, off| {
+                if pde_at.0 != lin >> 22 {
+                    pde_at = (lin >> 22, read(pd + (lin >> 22) * 4));
+                }
+                let pde = pde_at.1;
                 let big = pde & 0x80 != 0 && pse;
                 let (frame, entry, perms) = if pde & 0x21 != 0x21 {
                     (u32::MAX, 0, 0)
                 } else if big {
                     ((pde & 0xffc0_0000) | (lin & 0x3f_f000), pde, pde)
                 } else {
-                    let pte = bus.read32((pde & !0xfff) + ((lin >> 12) & 0x3ff) * 4);
+                    let pte = read((pde & !0xfff) + ((lin >> 12) & 0x3ff) * 4);
                     if pte & 0x21 != 0x21 { (u32::MAX, 0, 0) } else { (pte & !0xfff, pte, pde & pte) }
                 };
-                let keep = frame == phys
+                let writable = desc & shadow::LEAF_RO == 0;
+                let keep = frame == (desc & 0xffff_f000) as u32
                     && frame < ram
                     && (r == 0 || perms & 4 != 0)
-                    && (entry & 0x100 != 0 && pge) == self.shadow[r].leaf_global(self.mem.as_slice(), off)
+                    && (entry & 0x100 != 0 && pge) == (desc & shadow::LEAF_GLOBAL != 0)
                     && (!writable || entry & 0x40 != 0 && (perms & 2 != 0 || r == 0 && !wp));
                 if !keep {
-                    self.shadow[r].clear_leaf(self.mem.as_mut_slice(), off);
-                    dropped += 1;
+                    dead.push((r, off));
                 }
-            }
+            });
+        }
+        let dropped = dead.len() as u64;
+        for (r, off) in dead {
+            self.shadow[r].clear_leaf(self.mem.as_mut_slice(), off);
         }
         self.state().ctl |= ctl::TLBI_ALL;
         self.stats.revalidations += 1;
@@ -1738,10 +1760,12 @@ impl Jit {
                             self.stats.interp_exits += 1;
                             self.store_state(cpu);
                             self.drop_retry_block(cpu, bus);
-                            if self.interp_profile.is_some() {
-                                self.profile_interp(cpu, bus);
-                            }
+                            let site = if self.interp_profile.is_some() { self.profile_interp(cpu, bus) } else { None };
+                            let t = site.map(|_| std::time::Instant::now());
                             let e = self.step_interp(cpu, bus);
+                            if let (Some(site), Some(t)) = (site, t) {
+                                self.interp_sites.entry(site).or_default().1 += t.elapsed().as_nanos() as u64;
+                            }
                             if e != interp::Exit::Continue || cpu.halted || !supported(cpu) {
                                 return Ok(RunExit::Interp(e));
                             }
@@ -1855,9 +1879,9 @@ impl Jit {
         panic!("JIT block at {:#x} differs from the interpreter:\n{}\ncode: {}", exp.eip, diffs.join("\n"), bytes);
     }
 
-    fn profile_interp<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B) {
+    fn profile_interp<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B) -> Option<(u16, u32)> {
         let eip = cpu.eip;
-        let Ok(phys) = interp::translate(cpu, bus, eip, false) else { return };
+        let Ok(phys) = interp::translate(cpu, bus, eip, false) else { return None };
         let insn = x86::decode::decode::<()>(true, |i| Ok(bus.read8(phys.wrapping_add(i))));
         if let (Ok(i), Some(p)) = (insn, self.interp_profile.as_mut()) {
             let key = if matches!(i.op, 0xd8..=0xdf) && i.mem.is_none() {
@@ -1870,8 +1894,10 @@ impl Jit {
             *p.entry(key).or_default() += 1;
             // Port I/O through DX: the port matters more than the HAL helper's EIP.
             let site = if matches!(i.op, 0xec..=0xef) { 0xffff_0000 | (cpu.regs[2] & 0xffff) } else { eip };
-            *self.interp_sites.entry((key, site)).or_default() += 1;
+            self.interp_sites.entry((key, site)).or_default().0 += 1;
+            return Some((key, site));
         }
+        None
     }
 
     /// Takes in the shadow fills the runtime did inside the VM since the last exit.
