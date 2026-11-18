@@ -207,11 +207,10 @@ pub(crate) struct MetalR3d {
 // The Metal objects are only touched while the card's owner holds it.
 unsafe impl Send for MetalR3d {}
 
+/// Waits for submitted work, which writes VRAM that the owner frees next.
 impl Drop for MetalR3d {
     fn drop(&mut self) {
-        if let Some(enc) = self.batch.as_mut().and_then(|b| b.enc.take()) {
-            enc.endEncoding();
-        }
+        self.sync();
     }
 }
 

@@ -109,6 +109,14 @@ pub struct Radeon {
     status: std::sync::Arc<card::Status>,
 }
 
+/// Metal may still be drawing into VRAM: the backend waits for it while
+/// `vga`, which owns VRAM, is alive.
+impl Drop for Radeon {
+    fn drop(&mut self) {
+        self.metal = None;
+    }
+}
+
 impl Radeon {
     pub fn new(rom: Vec<u8>) -> Self {
         let mut r = Radeon {
