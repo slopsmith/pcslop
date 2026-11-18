@@ -938,6 +938,9 @@ impl Emit {
         let top = self.a.label();
         self.a.ldr(Width::W, T_D, STATE, state::DF as i32);
         self.a.cbnz(Size::W, T_D, slow);
+        if rep && matches!(op, 0xa4 | 0xa5 | 0xaa | 0xab) {
+            self.bulk_string(op, w, n);
+        }
         self.a.bind(top);
         if rep {
             self.a.cbz(Size::W, ecx, done);
@@ -989,6 +992,55 @@ impl Emit {
         self.exit_interp(eip);
         self.a.bind(done);
         true
+    }
+
+    /// Forward REP MOVS/STOS 16 bytes at a time while that much is left. Single
+    /// registers keep MMIO syndromes valid; registers advance after each chunk.
+    fn bulk_string(&mut self, op: u16, w: Ow, n: u32) {
+        let (esi, edi, ecx) = (guest_reg(6), guest_reg(7), guest_reg(1));
+        let per = 16 / n;
+        let (top, out) = (self.a.label(), self.a.label());
+        if matches!(op, 0xa4 | 0xa5) {
+            // A destination less than 16 bytes ahead must see each element's copy.
+            self.a.sub(Size::W, T_B, edi, esi);
+            self.a.lsr_imm(Size::W, T_B, T_B, 4);
+            self.a.cbz(Size::W, T_B, out);
+        } else {
+            let v = self.read_gpr(w, 0, T_A);
+            match w {
+                Ow::B => {
+                    self.a.mov_imm(Size::X, T_C, 0x0101_0101_0101_0101);
+                    self.a.uxtb(T_B, v);
+                    self.a.mul(Size::X, T_B, T_B, T_C);
+                }
+                Ow::H => {
+                    self.a.mov_imm(Size::X, T_C, 0x0001_0001_0001_0001);
+                    self.a.uxth(T_B, v);
+                    self.a.mul(Size::X, T_B, T_B, T_C);
+                }
+                Ow::D => {
+                    self.a.mov(Size::W, T_B, v);
+                    self.a.logic_shift(Logic::Orr, false, Size::X, T_B, T_B, T_B, Shift::Lsl, 32);
+                }
+            }
+        }
+        self.a.bind(top);
+        self.a.sub_imm(Size::W, T_C, ecx, per);
+        self.a.tbnz(T_C, 31, out);
+        if matches!(op, 0xa4 | 0xa5) {
+            self.a.ldr(Width::X, T_A, esi, 0);
+            self.a.ldr(Width::X, T_D, esi, 8);
+            self.a.str(Width::X, T_A, edi, 0);
+            self.a.str(Width::X, T_D, edi, 8);
+            self.a.add_imm(Size::W, esi, esi, 16);
+        } else {
+            self.a.str(Width::X, T_B, edi, 0);
+            self.a.str(Width::X, T_B, edi, 8);
+        }
+        self.a.add_imm(Size::W, edi, edi, 16);
+        self.a.mov(Size::W, ecx, T_C);
+        self.a.b(top);
+        self.a.bind(out);
     }
 
     /// 32-bit DIV/IDIV; division by zero and quotient overflow go to the

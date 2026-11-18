@@ -306,6 +306,34 @@ fn an_instruction_across_a_page_does_not_reuse_the_folded_operand_before_it() {
 }
 
 #[test]
+fn bulk_rep_movs_and_stos_match_the_interpreter_with_overlaps() {
+    let ops: [&[u8]; 6] = [&[0xf3, 0xa4], &[0xf3, 0x66, 0xa5], &[0xf3, 0xa5], &[0xf3, 0xaa], &[0xf3, 0x66, 0xab], &[0xf3, 0xab]];
+    for op in ops {
+        for count in [0u32, 1, 3, 4, 15, 16, 17, 33, 100] {
+            for gap in [-40i32, -8, -1, 1, 4, 15, 16, 17, 64, 400] {
+                let mut code = op.to_vec();
+                code.push(0xf4);
+                let src = 0x3000u32;
+                let dst = (src as i32 + gap) as u32;
+                let mut a = flat_cpu(0x1000, 0x8000);
+                (a.regs[6], a.regs[7], a.regs[1], a.regs[0]) = (src, dst, count, 0x1234_56a5);
+                let mut b = a.clone();
+                let mut bus_a = bus_with(0x1000, &code);
+                let mut bus_b = bus_with(0x1000, &code);
+                for (i, byte) in bus_a.ram.as_mut_slice()[0x2c00..0x3800].iter_mut().enumerate() {
+                    *byte = (i * 7 + 3) as u8;
+                }
+                bus_b.ram.as_mut_slice()[0x2c00..0x3800].copy_from_slice(&bus_a.ram.as_slice()[0x2c00..0x3800]);
+                run_interp(&mut a, &mut bus_a);
+                run_jit(&mut b, &mut bus_b);
+                assert_eq!(a.regs, b.regs, "{op:02x?} count {count} gap {gap}: registers");
+                assert!(bus_a.ram.as_slice() == bus_b.ram.as_slice(), "{op:02x?} count {count} gap {gap}: memory");
+            }
+        }
+    }
+}
+
+#[test]
 fn rep_ret_runs_translated() {
     let code = [
         0xb9, 0x40, 0, 0, 0, // mov ecx, 64
