@@ -1537,10 +1537,11 @@ impl Jit {
             let p = *next_phys.get_or_insert_with(|| interp::translate(cpu, bus, next_lin, false).ok());
             p.map(|p| bus.read8(p | (a & 0xfff)))
         };
-        let tier2 = (self.tier2_eager && !self.verify && !self_check && counter_base.is_none())
+        let tier2 = (self.tier2_eager && !self.verify && !self_check)
             .then(|| translate::tier2::compile_region(eip, &mut byte, block_va, rt_va, &entries, user))
             .flatten();
         self.stats.tier2_regions += tier2.is_some() as u64;
+        let counter_base = counter_base.filter(|_| tier2.is_none());
         let compiled = match tier2 {
             Some(c) => c,
             None => translate::compile(

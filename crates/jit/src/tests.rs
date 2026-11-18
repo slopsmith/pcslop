@@ -98,6 +98,40 @@ fn run_interp(cpu: &mut Cpu, bus: &mut FlatBus) {
     panic!("interpreter did not halt");
 }
 
+thread_local! {
+    /// Set by the tier-2 variants of tests: every block goes through tier 2 first.
+    static TIER2: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn in_tier2(test: fn()) {
+    TIER2.with(|t| t.set(true));
+    test();
+}
+
+#[test]
+fn random_programs_match_the_interpreter_in_tier_2() {
+    in_tier2(random_programs_match_the_interpreter);
+}
+
+#[test]
+fn random_programs_with_forward_branches_match_the_interpreter_in_tier_2() {
+    in_tier2(random_programs_with_forward_branches_match_the_interpreter);
+}
+
+#[test]
+fn random_programs_with_paging_match_the_interpreter_in_tier_2() {
+    in_tier2(random_programs_match_the_interpreter_with_paging);
+}
+
+#[test]
+fn mixed_code_matches_the_interpreter_in_tier_2() {
+    in_tier2(random_x87_programs_match_the_interpreter);
+    in_tier2(random_mmx_programs_match_the_interpreter);
+    in_tier2(random_sse_programs_match_the_interpreter);
+    in_tier2(sysenter_sysexit_and_fs_loads_match_the_interpreter);
+    in_tier2(loop_with_memory_and_stack);
+}
+
 fn run_jit(cpu: &mut Cpu, bus: &mut FlatBus) -> Stats {
     run_jit_with(cpu, bus, |_| {}, |_| {})
 }
@@ -106,6 +140,7 @@ fn run_jit_with(cpu: &mut Cpu, bus: &mut FlatBus, before: impl FnOnce(&mut Jit),
     let _vm = VM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut jit = unsafe { Jit::new(bus.ram.as_ptr(), RAM).unwrap() };
     jit.vm_fill = true;
+    jit.tier2_eager |= TIER2.with(|t| t.get());
     before(&mut jit);
     let kicker = jit.kicker();
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

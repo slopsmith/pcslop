@@ -59,6 +59,9 @@ struct BlockLower<'a> {
     fused_cond: Option<Val>,
     /// Bin results whose flags were set by the instruction computing them.
     flags_done: Vec<Val>,
+    /// `base + constant` values used only as addresses: each access adds the
+    /// constant itself, so they are never computed.
+    folded: HashMap<Val, (Val, i32)>,
 }
 
 const END: usize = usize::MAX;
@@ -81,6 +84,7 @@ impl<'a> BlockLower<'a> {
             home,
             fused_cond: None,
             flags_done: Vec::new(),
+            folded: HashMap::new(),
         }
     }
 
@@ -92,10 +96,44 @@ impl<'a> BlockLower<'a> {
         self.f.op(v)
     }
 
+    /// Finds address arithmetic the accesses can absorb (see `folded`).
+    fn find_folds(&mut self) {
+        let blk = self.blk();
+        let mut uses: HashMap<Val, (usize, usize)> = HashMap::new();
+        for &v in &blk.insts {
+            let op = self.op(v);
+            let addr = match op {
+                Op::Load { addr, .. } | Op::Store { addr, .. } => Some(addr),
+                _ => None,
+            };
+            for a in op.args() {
+                let e = uses.entry(a).or_default();
+                e.0 += 1;
+                if Some(a) == addr && !matches!(op, Op::Store { val, .. } if val == a) {
+                    e.1 += 1;
+                }
+            }
+        }
+        let escapes = |v: Val| blk.outs.contains(&v) || self.f.snaps.values().any(|s| s.contains(&v)) || matches!(blk.term, Term::Branch { cond, .. } if cond == v);
+        for &v in &blk.insts {
+            if let Op::Bin(Alu::Add, x, y, None) = self.op(v)
+                && let Some(d) = self.konst(y)
+                && (-256..4096).contains(&(d as i32))
+                && uses.get(&v).is_some_and(|&(all, addr)| all == addr && all > 0)
+                && !escapes(v)
+                && self.konst(x).is_none()
+            {
+                self.folded.insert(v, (x, d as i32));
+            }
+        }
+    }
+
     fn liveness(&mut self) {
+        self.find_folds();
         let blk = self.blk();
         for (i, &v) in blk.insts.iter().enumerate() {
             for a in self.op(v).args() {
+                let a = self.folded.get(&a).map_or(a, |&(x, _)| x);
                 self.last.insert(a, i);
             }
             if let Some(snap) = self.f.snaps.get(&v) {
@@ -234,9 +272,11 @@ impl<'a> BlockLower<'a> {
     /// The Flags value right after `bin` in the block that takes its result
     /// with NZCV demanded and nothing in between that forbids setting them early.
     fn fusable_flags(&self, bin: Val, i: usize) -> Option<Val> {
+        let Op::Bin(bop, ba, bb, _) = self.op(bin) else { return None };
         let insts = &self.blk().insts;
         for (j, &v) in insts.iter().enumerate().skip(i + 1) {
             match self.op(v) {
+                Op::Flags { r, op, a, b, .. } if r == bin && (op != bop || a != ba || b != bb) => return None,
                 Op::Flags { r, bits, op, .. } if r == bin => {
                     let stores_between = insts[i + 1..j].iter().any(|&w| matches!(self.op(w), Op::Store { .. }));
                     return (bits & NZCV_BITS != 0 && !(stores_between && matches!(op, Alu::Adc | Alu::Sbb))).then_some(v);
@@ -294,27 +334,34 @@ impl<'a> BlockLower<'a> {
     /// Base register and offset for an access to `addr`, folding a small
     /// constant added to a register.
     fn address(&mut self, addr: Val) -> (Reg, i32) {
-        if let Op::Bin(Alu::Add, x, y, None) = self.op(addr)
-            && !self.temp_of.contains_key(&addr)
-            && let Some(d) = self.konst(y)
-            && ((d as i32) >= -256 && (d as i32) < 4096)
-            && (self.temp_of.contains_key(&x) || self.home.contains(&x))
-        {
-            return (self.get(x, SCRATCH), d as i32);
+        if let Some(&(x, d)) = self.folded.get(&addr) {
+            return (self.get(x, SCRATCH), d);
         }
         (self.get(addr, SCRATCH), 0)
     }
 
     fn bin(&mut self, v: Val, i: usize, op: Alu, a: Val, b: Val, c: Option<Val>) -> Option<()> {
-        if !self.last.contains_key(&v) && self.fusable_flags(v, i).is_none() && c.is_none() {
+        if self.folded.contains_key(&v) || (!self.last.contains_key(&v) && self.fusable_flags(v, i).is_none() && c.is_none()) {
             return Some(());
         }
-        let flags = self.fusable_flags(v, i).is_some();
+        let fused = self.fusable_flags(v, i);
+        let flags = fused.is_some();
+        let cf = fused.is_some_and(|fl| matches!(self.op(fl), Op::Flags { bits, .. } if bits & CF != 0));
         if flags {
             self.flags_done.push(v);
         }
-        let x = self.get(a, SCRATCH);
         let imm = self.konst(b);
+        if let (Alu::Add | Alu::Sub, Some(k)) = (op, imm)
+            && !flags
+            && k > 0x8000_0000
+            && k.wrapping_neg() < 4096
+        {
+            let x = self.get(a, SCRATCH);
+            let d = self.alloc(v)?;
+            if op == Alu::Add { self.e.a.sub_imm(Size::W, d, x, k.wrapping_neg()) } else { self.e.a.add_imm(Size::W, d, x, k.wrapping_neg()) }
+            return Some(());
+        }
+        let x = self.get(a, SCRATCH);
         let d = self.alloc(v)?;
         let e = &mut self.e.a;
         match op {
@@ -323,7 +370,9 @@ impl<'a> BlockLower<'a> {
                 match (op, flags) {
                     (Alu::Add, true) => {
                         e.adds_imm(Size::W, d, x, k);
-                        e.cfinv();
+                        if cf {
+                            e.cfinv();
+                        }
                     }
                     (Alu::Add, false) => e.add_imm(Size::W, d, x, k),
                     (_, true) => e.subs_imm(Size::W, d, x, k),
@@ -340,7 +389,9 @@ impl<'a> BlockLower<'a> {
                 assert!(ok, "an encodable logical immediate was refused");
                 if flags {
                     e.tst(Size::W, d, d);
-                    e.cfinv();
+                    if cf {
+                        e.cfinv();
+                    }
                 }
             }
             Alu::Shl | Alu::Shr | Alu::Sar if imm.is_some() => {
@@ -357,7 +408,9 @@ impl<'a> BlockLower<'a> {
                 match op {
                     Alu::Add if flags => {
                         e.adds(Size::W, d, x, y);
-                        e.cfinv();
+                        if cf {
+                            e.cfinv();
+                        }
                     }
                     Alu::Add => e.add(Size::W, d, x, y),
                     Alu::Sub if flags => e.subs(Size::W, d, x, y),
@@ -370,7 +423,9 @@ impl<'a> BlockLower<'a> {
                         }
                         if flags {
                             e.tst(Size::W, d, d);
-                            e.cfinv();
+                            if cf {
+                                e.cfinv();
+                            }
                         }
                     }
                     Alu::Adc => {
@@ -400,10 +455,13 @@ impl<'a> BlockLower<'a> {
             let x = self.get(a, SCRATCH);
             let y = self.get(b, SCRATCH2);
             let e = &mut self.e.a;
+            let cf = bits & CF != 0;
             match op {
                 Alu::Add => {
                     e.adds(Size::W, Reg(31), x, y);
-                    e.cfinv();
+                    if cf {
+                        e.cfinv();
+                    }
                 }
                 Alu::Sub => e.subs(Size::W, Reg(31), x, y),
                 Alu::Adc => {
@@ -416,7 +474,9 @@ impl<'a> BlockLower<'a> {
                     let rr = self.get(r, SCRATCH);
                     let e = &mut self.e.a;
                     e.tst(Size::W, rr, rr);
-                    e.cfinv();
+                    if cf {
+                        e.cfinv();
+                    }
                 }
             }
         }

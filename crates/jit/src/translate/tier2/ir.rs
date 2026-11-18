@@ -36,14 +36,14 @@ impl Alu {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Width {
     B,
     H,
     W,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Op {
     Const(u32),
     /// Block parameter `n`.
@@ -81,6 +81,49 @@ impl Op {
             Op::Load { addr, .. } => vec![addr],
             Op::Store { addr, val, .. } => vec![addr, val],
         }
+    }
+
+    /// Replaces every operand with `f(operand)`.
+    pub fn map_args(&mut self, f: impl Fn(Val) -> Val) {
+        match self {
+            Op::Const(_) | Op::Param(_) | Op::FsBase => {}
+            Op::Bin(_, a, b, c) => {
+                *a = f(*a);
+                *b = f(*b);
+                if let Some(c) = c {
+                    *c = f(*c);
+                }
+            }
+            Op::Flags { a, b, c, r, .. } => {
+                *a = f(*a);
+                *b = f(*b);
+                *r = f(*r);
+                if let Some(c) = c {
+                    *c = f(*c);
+                }
+            }
+            Op::IncDecFlags { a, r, old, .. } => {
+                *a = f(*a);
+                *r = f(*r);
+                *old = f(*old);
+            }
+            Op::Cond(_, fl) => *fl = f(*fl),
+            Op::Extract { v, .. } => *v = f(*v),
+            Op::Insert { dst, src, .. } => {
+                *dst = f(*dst);
+                *src = f(*src);
+            }
+            Op::Load { addr, .. } => *addr = f(*addr),
+            Op::Store { addr, val, .. } => {
+                *addr = f(*addr);
+                *val = f(*val);
+            }
+        }
+    }
+
+    /// Whether two values with this operation and operands are always equal.
+    pub fn pure(&self) -> bool {
+        matches!(self, Op::Const(_) | Op::Bin(_, _, _, None) | Op::Extract { .. } | Op::Insert { .. } | Op::FsBase)
     }
 
     pub fn has_effect(&self) -> bool {

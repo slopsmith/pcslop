@@ -26,8 +26,76 @@ pub fn cond_reads(cc: u8) -> u8 {
 
 pub fn run(f: &mut Func) {
     fold(f);
+    simplify(f);
     demand_flags(f);
     dce(f);
+}
+
+/// Replaces values by equal earlier ones: identities (`x & x`, `x + 0`) and
+/// repeated pure operations within a block.
+fn simplify(f: &mut Func) {
+    let n = f.insts.len();
+    let mut repl: Vec<Val> = (0..n as Val).collect();
+    let find = |repl: &Vec<Val>, mut v: Val| {
+        while repl[v as usize] != v {
+            v = repl[v as usize];
+        }
+        v
+    };
+    for b in 0..f.blocks.len() {
+        let mut seen: std::collections::HashMap<Op, Val> = std::collections::HashMap::new();
+        for i in 0..f.blocks[b].insts.len() {
+            let v = f.blocks[b].insts[i];
+            let mut op = f.insts[v as usize].op;
+            op.map_args(|a| find(&repl, a));
+            let konst = |x: Val| match f.insts[x as usize].op {
+                Op::Const(c) => Some(c),
+                _ => None,
+            };
+            let same = match op {
+                Op::Bin(Alu::And | Alu::Or, x, y, None) if x == y => Some(x),
+                Op::Bin(Alu::Add | Alu::Sub | Alu::Or | Alu::Xor | Alu::Shl | Alu::Shr | Alu::Sar, x, y, None) if konst(y) == Some(0) => Some(x),
+                Op::Bin(Alu::Add | Alu::Or | Alu::Xor, x, y, None) if konst(x) == Some(0) => Some(y),
+                Op::Bin(Alu::And, x, y, None) if konst(y) == Some(u32::MAX) => Some(x),
+                _ => None,
+            };
+            if let Op::Bin(Alu::Xor | Alu::Sub, x, y, None) = op
+                && x == y
+            {
+                op = Op::Const(0);
+            }
+            f.insts[v as usize].op = op;
+            if let Some(x) = same {
+                repl[v as usize] = x;
+                continue;
+            }
+            if op.pure() {
+                match seen.get(&op) {
+                    Some(&w) => repl[v as usize] = w,
+                    None => {
+                        seen.insert(op, v);
+                    }
+                }
+            }
+        }
+    }
+    let map = |repl: &Vec<Val>, v: Val| find(repl, v);
+    for b in &mut f.blocks {
+        for o in &mut b.outs {
+            *o = map(&repl, *o);
+        }
+        if let Term::Branch { cond, .. } = &mut b.term {
+            *cond = map(&repl, *cond);
+        }
+    }
+    for snap in f.snaps.values_mut() {
+        for s in snap.iter_mut() {
+            *s = map(&repl, *s);
+        }
+    }
+    for b in 0..f.blocks.len() {
+        f.blocks[b].insts.retain(|&v| repl[v as usize] == v);
+    }
 }
 
 /// Folds operations on constants and drops identities.
