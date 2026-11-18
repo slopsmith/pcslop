@@ -17,6 +17,11 @@ pub(crate) mod op {
     pub const NOP: u8 = 0x10;
     pub const NEXTCHAR: u8 = 0x19;
     pub const SET_SCISSORS: u8 = 0x1e;
+    /// Undocumented, seen from Vista's WDDM driver: [slot, address].
+    pub const SET_BASE: u8 = 0x24;
+    /// Undocumented, seen from Vista's WDDM driver: [slot, ?, offset,
+    /// register / 4] writes the slot's base plus the offset to the register.
+    pub const BASE_REG_WR: u8 = 0x25;
     pub const LOAD_PALETTE: u8 = 0x2c;
     pub const PAINT: u8 = 0x91;
     pub const BITBLT: u8 = 0x92;
@@ -43,6 +48,10 @@ pub(crate) struct Cp {
     /// CP_RB_RPTR where the ring run in `streams[0]` started, and the ring's size.
     #[snap(skip)]
     ring_start: (u32, u32),
+    /// Base addresses set by `SET_BASE`. Vista's driver sets one before
+    /// each use, so a save state need not keep them.
+    #[snap(skip)]
+    bases: [u32; 4],
 }
 
 /// Dwords fetched for the ring or an indirect buffer, and the next packet in them.
@@ -249,6 +258,11 @@ impl Radeon {
         }
         match opcode {
             op::NOP => {}
+            op::SET_BASE if body.len() >= 2 => self.cp.bases[body[0] as usize % 4] = body[1],
+            op::BASE_REG_WR if body.len() >= 4 => {
+                let v = self.cp.bases[body[0] as usize % 4].wrapping_add(body[2]);
+                self.cp_reg_write(mem, (body[3] & 0x1fff) << 2, v);
+            }
             op::NEXTCHAR => self.next_char(body, mem),
             op::SET_SCISSORS => {
                 for (reg, &v) in [SC_TOP_LEFT, SC_BOTTOM_RIGHT].into_iter().zip(body) {

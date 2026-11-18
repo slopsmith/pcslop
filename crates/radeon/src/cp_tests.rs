@@ -349,3 +349,18 @@ fn an_empty_gui_dma_list_at_the_end_of_a_buffer_raises_the_guidma_interrupt() {
     r.mmio_write(GEN_INT_STATUS, 4, GUIDMA_INT, &mut ram);
     assert!(!r.irq(), "writing the status bit back acknowledges it");
 }
+
+#[test]
+fn base_reg_wr_writes_the_slot_base_plus_its_offset() {
+    let mut ram = Ram::new();
+    let mut r = card_with_ring(&mut ram);
+    submit(
+        &mut r,
+        &mut ram,
+        &[
+            pkt3(0x24, 2), 1, 0xf805_2000,
+            pkt3(0x25, 4), 1, 0x2e10_0000, 0x5_5c20, SCRATCH_REG0 >> 2,
+        ],
+    );
+    assert_eq!(r.mmio_read(SCRATCH_REG0, 4), 0xf80a_7c20, "Vista's DWM draws read vertices from this address");
+}
