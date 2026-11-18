@@ -381,17 +381,39 @@ impl Emit {
     /// Like `ea`, but the next `load`/`store` address memory from guest registers.
     /// Past 4 GiB, where x86 wraps, that faults and the host interprets it.
     fn ea_fold(&mut self, insn: &Insn, m: &MemOperand) -> bool {
-        if self.fold_ok && insn.addr32 && insn.seg_override.is_none_or(|s| s < 4) {
-            let disp = m.disp as i32;
-            match (m.base, m.index) {
-                (b, NO_REG) if b != NO_REG && (-256..16384).contains(&disp) => {
-                    self.fold = Some(Fold(guest_reg(b as usize), disp));
-                    return true;
-                }
-                _ => {}
-            }
+        if !(self.fold_ok && insn.addr32 && insn.seg_override.is_none_or(|s| s < 4)) {
+            return self.ea(insn, m);
         }
-        self.ea(insn, m)
+        let disp = m.disp as i32;
+        let base = match (m.base, m.index) {
+            (NO_REG, NO_REG) => return self.ea(insn, m),
+            (b, NO_REG) => guest_reg(b as usize),
+            (NO_REG, i) => {
+                self.a.lsl_imm(Size::W, T_ADDR, guest_reg(i as usize), m.scale as u32);
+                T_ADDR
+            }
+            (b, i) => {
+                self.a.add_shift(Size::W, T_ADDR, guest_reg(b as usize), guest_reg(i as usize), Shift::Lsl, m.scale as u32);
+                T_ADDR
+            }
+        };
+        // Sums of guest values stay 32-bit, so they wrap as on x86; only the
+        // final offset in the access itself can pass 4 GiB.
+        let (base, off) = if (-256..4096).contains(&disp) {
+            (base, disp)
+        } else if disp > 0 && disp < 1 << 24 {
+            self.a.add_imm(Size::W, T_ADDR, base, disp as u32 & !0xfff);
+            (T_ADDR, disp & 0xfff)
+        } else if disp < 0 && disp > -(1 << 24) {
+            let hi = (disp.unsigned_abs() + 0xfff) & !0xfff;
+            self.a.sub_imm(Size::W, T_ADDR, base, hi);
+            (T_ADDR, hi as i32 + disp)
+        } else {
+            self.add_const(T_ADDR, base, disp as u32);
+            (T_ADDR, 0)
+        };
+        self.fold = Some(Fold(base, off));
+        true
     }
 
     /// The folded operand for an access of width `w`, or None after putting
@@ -454,6 +476,14 @@ impl Emit {
         }
     }
 
+    /// A sign-extending 8- or 16-bit load into a W register.
+    fn load_signed(&mut self, w: Width, dst: Reg) {
+        match self.folded(w) {
+            Some(Fold(b, d)) => self.a.ldst(true, w, true, false, dst, b, d),
+            None => self.a.ldrs(w, Size::W, dst, T_ADDR, 0),
+        }
+    }
+
     fn store(&mut self, w: Width, src: Reg) {
         self.stored = true;
         match self.folded(w) {
@@ -480,50 +510,104 @@ impl Emit {
     }
 
     fn result_flags(&mut self, a: Reg, b: Reg, logic: bool) {
+        self.result_flags_of(T_RES, a, b, logic);
+    }
+
+    fn result_flags_of(&mut self, res: Reg, a: Reg, b: Reg, logic: bool) {
         if self.needs(flags::PF) {
-            self.a.mov(Size::W, PF_RESULT, T_RES);
+            self.a.mov(Size::W, PF_RESULT, res);
         }
         if self.needs(flags::AF) {
             if logic {
                 self.a.mov(Size::W, AF_AUX, ZR);
             } else {
-                self.set_af(a, b, T_RES);
+                self.set_af(a, b, res);
             }
         }
     }
 
+    /// Where a 32-bit ALU op writing guest register `n` may put its result:
+    /// the register itself, unless AF still needs an operand it would overwrite.
+    fn alu_dst(&self, n: usize, a: Reg, b: Reg) -> Reg {
+        let d = guest_reg(n);
+        if self.needs(flags::AF) && (d == a || d == b) { T_RES } else { d }
+    }
+
     /// Group-1 operation `op` on 32-bit values; result in T_RES, flags in NZCV.
     fn alu32(&mut self, op: usize, a: Reg, b: Reg) -> bool {
+        self.alu32_to(op, T_RES, a, b)
+    }
+
+    /// `alu32` with the result in `d`, which may be `a` or `b` only while AF is dead.
+    fn alu32_to(&mut self, op: usize, d: Reg, a: Reg, b: Reg) -> bool {
         let nzcv = self.needs(flags::NZCV);
         match op {
             0 if nzcv => {
-                self.a.adds(Size::W, T_RES, a, b);
+                self.a.adds(Size::W, d, a, b);
                 self.a.cfinv();
             }
-            0 => self.a.add(Size::W, T_RES, a, b),
+            0 => self.a.add(Size::W, d, a, b),
             1 | 4 | 6 => {
                 match op {
-                    1 => self.a.orr(Size::W, T_RES, a, b),
-                    4 => self.a.and(Size::W, T_RES, a, b),
-                    _ => self.a.eor(Size::W, T_RES, a, b),
+                    1 => self.a.orr(Size::W, d, a, b),
+                    4 => self.a.and(Size::W, d, a, b),
+                    _ => self.a.eor(Size::W, d, a, b),
                 }
                 if nzcv {
-                    self.a.tst(Size::W, T_RES, T_RES);
+                    self.a.tst(Size::W, d, d);
                     self.a.cfinv();
                 }
-                self.result_flags(a, b, true);
+                self.result_flags_of(d, a, b, true);
                 return true;
             }
             2 => {
                 self.a.cfinv();
-                self.a.adcs(Size::W, T_RES, a, b);
+                self.a.adcs(Size::W, d, a, b);
                 self.a.cfinv();
             }
-            3 => self.a.sbcs(Size::W, T_RES, a, b),
-            _ if nzcv => self.a.subs(Size::W, T_RES, a, b),
-            _ => self.a.sub(Size::W, T_RES, a, b),
+            3 => self.a.sbcs(Size::W, d, a, b),
+            _ if nzcv => self.a.subs(Size::W, d, a, b),
+            _ => self.a.sub(Size::W, d, a, b),
         }
-        self.result_flags(a, b, false);
+        self.result_flags_of(d, a, b, false);
+        true
+    }
+
+    /// `alu32` with an immediate `b`, when an A64 immediate form fits and AF,
+    /// which needs `b` in a register, is dead. False when nothing was emitted.
+    fn alu32_imm(&mut self, op: usize, d: Reg, a: Reg, b: u32) -> bool {
+        if self.needs(flags::AF) || matches!(op, 2 | 3) {
+            return false;
+        }
+        let nzcv = self.needs(flags::NZCV);
+        let arith_ok = b < 4096 || (b & 0xfff == 0 && b >> 12 < 4096);
+        match op {
+            0 if arith_ok && nzcv => {
+                self.a.adds_imm(Size::W, d, a, b);
+                self.a.cfinv();
+            }
+            0 if arith_ok => self.a.add_imm(Size::W, d, a, b),
+            5 | 7 if arith_ok && nzcv => self.a.subs_imm(Size::W, d, a, b),
+            5 | 7 if arith_ok => self.a.sub_imm(Size::W, d, a, b),
+            1 | 4 | 6 => {
+                let kind = match op {
+                    1 => Logic::Orr,
+                    4 => Logic::And,
+                    _ => Logic::Eor,
+                };
+                if !self.a.logic_imm(kind, Size::W, d, a, b as u64) {
+                    return false;
+                }
+                if nzcv {
+                    self.a.tst(Size::W, d, d);
+                    self.a.cfinv();
+                }
+            }
+            _ => return false,
+        }
+        if self.needs(flags::PF) {
+            self.a.mov(Size::W, PF_RESULT, d);
+        }
         true
     }
 
@@ -652,6 +736,17 @@ impl Emit {
                 scratch
             }
         }
+    }
+
+    /// `read_gpr` for an operand of group-1 `op`: with NZCV dead only its low
+    /// bits matter (but ADC/SBB's carry), so AL..BL and 16-bit registers are used in place.
+    fn read_alu_operand(&mut self, op: usize, w: Ow, n: usize, scratch: Reg) -> Reg {
+        let in_place = match w {
+            Ow::D => true,
+            Ow::H => true,
+            Ow::B => n < 4,
+        };
+        if in_place && !self.needs(flags::NZCV) && !matches!(op, 2 | 3) { guest_reg(n) } else { self.read_gpr(w, n, scratch) }
     }
 
     fn write_gpr(&mut self, w: Ow, n: usize, src: Reg) {
@@ -948,26 +1043,55 @@ impl Emit {
                 let writes = aop != 7;
                 match op & 7 {
                     0 | 1 => {
-                        let Some(a) = self.rm_w(insn, w, writes) else { return Step::Unsupported };
-                        let b = self.read_gpr(w, insn.reg(), T_B);
-                        self.alu(aop, w, a, b);
-                        if writes {
+                        let a = match insn.mem {
+                            None => self.read_alu_operand(aop, w, insn.rm(), T_A),
+                            Some(_) => {
+                                let Some(a) = self.rm_w(insn, w, writes) else { return Step::Unsupported };
+                                a
+                            }
+                        };
+                        let b = self.read_alu_operand(aop, w, insn.reg(), T_B);
+                        let d = if writes && insn.mem.is_none() && matches!(w, Ow::D) { self.alu_dst(insn.rm(), a, b) } else { T_RES };
+                        if d == T_RES {
+                            self.alu(aop, w, a, b);
+                        } else {
+                            self.alu32_to(aop, d, a, b);
+                        }
+                        if writes && d == T_RES {
                             self.write_rm(insn, w, T_RES);
                         }
                     }
                     2 | 3 => {
-                        let Some(b) = self.rm_w(insn, w, false) else { return Step::Unsupported };
-                        let a = self.read_gpr(w, insn.reg(), T_B);
-                        self.alu(aop, w, a, b);
-                        if writes {
+                        let b = match insn.mem {
+                            None => self.read_alu_operand(aop, w, insn.rm(), T_A),
+                            Some(_) => {
+                                let Some(b) = self.rm_w(insn, w, false) else { return Step::Unsupported };
+                                b
+                            }
+                        };
+                        let a = self.read_alu_operand(aop, w, insn.reg(), T_B);
+                        let d = if writes && matches!(w, Ow::D) { self.alu_dst(insn.reg(), a, b) } else { T_RES };
+                        if d == T_RES {
+                            self.alu(aop, w, a, b);
+                        } else {
+                            self.alu32_to(aop, d, a, b);
+                        }
+                        if writes && d == T_RES {
                             self.write_gpr(w, insn.reg(), T_RES);
                         }
                     }
                     _ => {
                         let a = self.read_gpr(w, 0, T_A);
-                        self.a.mov_imm(Size::W, T_B, insn.imm as u64 & w.mask());
-                        self.alu(aop, w, a, T_B);
-                        if writes {
+                        let d = if writes && matches!(w, Ow::D) { self.alu_dst(0, a, a) } else { T_RES };
+                        if !(matches!(w, Ow::D) && self.alu32_imm(aop, d, a, insn.imm)) {
+                            self.a.mov_imm(Size::W, T_B, insn.imm as u64 & w.mask());
+                            if d == T_RES {
+                                self.alu(aop, w, a, T_B);
+                            } else {
+                                self.alu32_to(aop, d, a, T_B);
+                            }
+                        }
+                        if writes && d == T_RES {
                             self.write_gpr(w, 0, T_RES);
                         }
                     }
@@ -1035,9 +1159,16 @@ impl Emit {
                 let w = Ow::of(op, op32);
                 let imm = if op == 0x81 { insn.imm } else { insn.imm as u8 as i8 as i32 as u32 };
                 let Some(a) = self.rm_w(insn, w, aop != 7) else { return Step::Unsupported };
-                self.a.mov_imm(Size::W, T_B, imm as u64 & w.mask());
-                self.alu(aop, w, a, T_B);
-                if aop != 7 {
+                let d = if aop != 7 && insn.mem.is_none() && matches!(w, Ow::D) { self.alu_dst(insn.rm(), a, a) } else { T_RES };
+                if !(matches!(w, Ow::D) && self.alu32_imm(aop, d, a, imm)) {
+                    self.a.mov_imm(Size::W, T_B, imm as u64 & w.mask());
+                    if d == T_RES {
+                        self.alu(aop, w, a, T_B);
+                    } else {
+                        self.alu32_to(aop, d, a, T_B);
+                    }
+                }
+                if aop != 7 && d == T_RES {
                     self.write_rm(insn, w, T_RES);
                 }
             }
@@ -1418,11 +1549,11 @@ impl Emit {
                 let to = if op32 { guest_reg(insn.reg()) } else { T_A };
                 match insn.mem {
                     Some(m) => {
-                        if !self.ea(insn, &m) {
+                        if !self.ea_fold(insn, &m) {
                             return Step::Unsupported;
                         }
                         if signed {
-                            self.a.ldrs(Width::B, Size::W, to, T_ADDR, 0);
+                            self.load_signed(Width::B, to);
                         } else {
                             self.load(Width::B, to);
                         }
@@ -1442,11 +1573,11 @@ impl Emit {
                 let signed = op == 0x1bf;
                 match insn.mem {
                     Some(m) => {
-                        if !self.ea(insn, &m) {
+                        if !self.ea_fold(insn, &m) {
                             return Step::Unsupported;
                         }
                         if signed {
-                            self.a.ldrs(Width::H, Size::W, T_A, T_ADDR, 0);
+                            self.load_signed(Width::H, T_A);
                         } else {
                             self.load(Width::H, T_A);
                         }
