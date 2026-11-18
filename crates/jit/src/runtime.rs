@@ -279,16 +279,41 @@ fn try_fill(a: &mut Asm, fail: Label) {
     a.b_cond(Cond::Lo, fail);
     a.bind(not_hole);
 
-    let read_only = a.label();
-    let mapped = a.label();
-    a.cbz(Size::X, write, read_only);
-    a.mov_imm(Size::X, t7, layout::va(layout::CODE_BITMAP));
-    a.lsr_imm(Size::W, eff, phys, 15);
-    a.add(Size::X, t7, t7, eff);
-    a.ldr(Width::B, t7, t7, 0);
-    a.ubfx(Size::W, eff, phys, 12, 3);
-    a.lsrv(Size::W, t7, t7, eff);
-    a.tbnz(t7, 0, fail);
+    let (read_only, mapped, writable, write_path) = (a.label(), a.label(), a.label(), a.label());
+    let code_page = |a: &mut Asm, code: Label| {
+        a.mov_imm(Size::X, t7, layout::va(layout::CODE_BITMAP));
+        a.lsr_imm(Size::W, eff, phys, 15);
+        a.add(Size::X, t7, t7, eff);
+        a.ldr(Width::B, t7, t7, 0);
+        a.ubfx(Size::W, eff, phys, 12, 3);
+        a.lsrv(Size::W, t7, t7, eff);
+        a.tbnz(t7, 0, code);
+    };
+    a.cbnz(Size::X, write, write_path);
+    // A read of a page already Dirty and writable maps it writable at once,
+    // which saves the write fault that would follow.
+    let (small_d, d_known, kernel_rw, rw_ok) = (a.label(), a.label(), a.label(), a.label());
+    a.cbnz(Size::W, pte, small_d);
+    a.mov(Size::W, t7, pde);
+    a.mov(Size::W, eff, pde);
+    a.b(d_known);
+    a.bind(small_d);
+    a.and(Size::W, t7, pde, pte);
+    a.mov(Size::W, eff, pte);
+    a.bind(d_known);
+    a.tbz(eff, 6, read_only);
+    a.cbz(Size::W, user, kernel_rw);
+    a.tbz(t7, 1, read_only);
+    a.b(rw_ok);
+    a.bind(kernel_rw);
+    a.tbz(flags, walk::WP.trailing_zeros(), rw_ok);
+    a.tbz(t7, 1, read_only);
+    a.bind(rw_ok);
+    code_page(a, read_only);
+    a.b(writable);
+    a.bind(write_path);
+    code_page(a, fail);
+    a.bind(writable);
     logic(a, Logic::Orr, Size::W, t6, t6, fill::WRITABLE as u64);
     a.mov_imm(Size::X, t7, crate::shadow::LEAF_ATTRS);
     a.b(mapped);
