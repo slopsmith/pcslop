@@ -117,6 +117,8 @@ pub struct State {
     /// can take up its predecessor's registers without converting them.
     pub fp64: [u64; 8],
     pub fp64_valid: u32,
+    /// Bit p: register p's value is only in `fp64`; its 80-bit copy is stale.
+    pub fp80_stale: u32,
     /// Set once x87 code ran since SSE code or the last entry: FPSR then holds
     /// x87 flags, and `fpsr_saved` the MXCSR flags gathered before them.
     pub x87_taint: u32,
@@ -229,6 +231,7 @@ pub const SSE_OK: usize = offset_of!(State, sse_ok);
 pub const MM: usize = offset_of!(State, mm);
 pub const FP64: usize = offset_of!(State, fp64);
 pub const FP64_VALID: usize = offset_of!(State, fp64_valid);
+pub const FP80_STALE: usize = offset_of!(State, fp80_stale);
 pub const X87_TAINT: usize = offset_of!(State, x87_taint);
 pub const FPSR_SAVED: usize = offset_of!(State, fpsr_saved);
 pub const FPCR_X87: usize = offset_of!(State, fpcr_x87);

@@ -1219,6 +1219,9 @@ fn random_x87_programs_match_the_interpreter() {
         let n = 30;
         for _ in 0..n {
             random_x87(&mut rng, &mut code);
+            if rng.below(4) == 0 {
+                code.extend([0xeb, 0x00]);
+            }
         }
         code.push(0xf4);
         let mem = x87_memory(&mut rng);

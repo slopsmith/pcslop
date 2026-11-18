@@ -2085,9 +2085,12 @@ impl Emit {
         if !supported {
             return false;
         }
-        let ok = self.a.label();
+        let (ok, slow) = (self.a.label(), self.a.label());
         self.a.ldr(Width::W, T_B, STATE, state::MMX_OK as i32);
-        self.a.cbnz(Size::W, T_B, ok);
+        self.a.cbz(Size::W, T_B, slow);
+        self.a.ldr(Width::W, T_B, STATE, state::FP80_STALE as i32);
+        self.a.cbz(Size::W, T_B, ok);
+        self.a.bind(slow);
         self.exit_interp(eip);
         self.a.bind(ok);
         let mut written = None;

@@ -9,7 +9,7 @@ use a64::{Fcm, Label, Logic, Reg, Shift, Size, V, Width, ZR, sysreg};
 use x86::decode::Insn;
 use x86::trig::{self, Op as TrigOp};
 
-use super::{Emit, T_A, T_ADDR, T_B, T_C, T_E};
+use super::{Emit, T_A, T_ADDR, T_B, T_C, T_D, T_E};
 use crate::runtime::{AF_AUX, PF_RESULT, STATE, guest_reg};
 use crate::state;
 
@@ -327,30 +327,20 @@ impl Emit {
                     self.fpop();
                 }
             }
+            // Registers move as their doubles; values that are not an exact
+            // double leave for the interpreter, as they do for arithmetic.
             K::LdReg(i) => {
                 self.x87_need(i, true, bail);
                 self.x87_need(7, false, bail);
-                if self.is_cached(i) {
-                    let v = cv(self.slot(i));
-                    self.clear_c1();
-                    self.fpush_val(v);
-                } else {
-                    self.fget(i, M, S);
-                    self.clear_c1();
-                    self.fpush();
-                }
+                let v = self.st_val(i, bail);
+                self.clear_c1();
+                self.fpush_val(v);
             }
             K::StReg { i, pop } => {
                 self.x87_need(0, true, bail);
+                let v = self.st_val(0, bail);
                 self.clear_c1();
-                if self.is_cached(0) {
-                    let v = cv(self.slot(0));
-                    self.fset(i, v);
-                } else {
-                    self.fget(0, M, S);
-                    self.fput(i, M, S);
-                    self.uncache(i);
-                }
+                self.fset(i, v);
                 if pop {
                     self.fpop();
                 }
@@ -358,50 +348,23 @@ impl Emit {
             K::Xch(i) => {
                 self.x87_need(0, true, bail);
                 self.x87_need(i, true, bail);
+                self.st_val(0, bail);
+                self.st_val(i, bail);
                 self.clear_c1();
                 let (a, b) = (self.slot(0), self.slot(i));
-                if self.x87.cached & (1 << a | 1 << b) == 1 << a | 1 << b {
-                    self.a.fp1(true, 0, FS, cv(a));
-                    self.a.fp1(true, 0, cv(a), cv(b));
-                    self.a.fp1(true, 0, cv(b), FS);
-                    if a != b {
-                        self.x87.dirty |= 1 << a | 1 << b;
-                    }
-                } else {
-                    self.write_back(a);
-                    self.write_back(b);
-                    self.fget(0, M, S);
-                    self.fget(i, T_A, T_B);
-                    self.fput(0, T_A, T_B);
-                    self.fput(i, M, S);
-                    let (ca, cb) = (self.x87.cached & 1 << a != 0, self.x87.cached & 1 << b != 0);
-                    if ca {
-                        self.a.fp1(true, 0, cv(b), cv(a));
-                    } else if cb {
-                        self.a.fp1(true, 0, cv(a), cv(b));
-                    }
-                    if ca != cb {
-                        self.x87.cached ^= 1 << a | 1 << b;
-                    }
+                self.a.fp1(true, 0, FS, cv(a));
+                self.a.fp1(true, 0, cv(a), cv(b));
+                self.a.fp1(true, 0, cv(b), FS);
+                if a != b {
+                    self.x87.dirty |= 1 << a | 1 << b;
                 }
             }
             K::Chs | K::Abs => {
                 self.x87_need(0, true, bail);
+                let v = self.st_val(0, bail);
                 self.clear_c1();
-                if self.is_cached(0) {
-                    let v = cv(self.slot(0));
-                    self.a.fp1(true, if matches!(k, K::Chs) { 2 } else { 1 }, v, v);
-                    self.fset(0, v);
-                } else {
-                    self.fget(0, M, S);
-                    if matches!(k, K::Chs) {
-                        let ok = self.a.logic_imm(Logic::Eor, Size::W, S, S, 0x8000);
-                        assert!(ok);
-                    } else {
-                        self.and_imm(Size::W, S, S, 0x7fff);
-                    }
-                    self.fput(0, M, S);
-                }
+                self.a.fp1(true, if matches!(k, K::Chs) { 2 } else { 1 }, v, v);
+                self.fset(0, v);
             }
             K::LdConst { mant } => {
                 self.x87_need(7, false, bail);
@@ -869,11 +832,6 @@ impl Emit {
         self.x87.cached |= 1 << r;
     }
 
-    fn uncache(&mut self, i: usize) {
-        let bit = 1u8 << self.slot(i);
-        self.x87.cached &= !bit;
-        self.x87.dirty &= !bit;
-    }
 
     /// Makes `v` the value of ST(i), leaving the state's copy stale.
     fn fset(&mut self, i: usize, v: V) {
@@ -897,14 +855,6 @@ impl Emit {
         self.fset(0, v);
     }
 
-    /// Writes slot `r` to the state if it is dirty.
-    fn write_back(&mut self, r: usize) {
-        if self.x87.dirty & 1 << r == 0 {
-            return;
-        }
-        self.f80_from_cache(r);
-        self.x87.dirty &= !(1 << r);
-    }
 
     fn f80_from_cache(&mut self, r: usize) {
         let (zero, done) = (self.a.label(), self.a.label());
@@ -940,23 +890,9 @@ impl Emit {
         self.a.ldr(Width::W, T_E, STATE, state::FP64_VALID as i32);
         self.a.orr(Size::W, T_E, T_E, U);
         self.a.str(Width::W, T_E, STATE, state::FP64_VALID as i32);
-    }
-
-    /// Saves the cached f64 of slot `r`, whose 80-bit value is current, for the next block.
-    fn keep_fp64(&mut self, r: usize) {
-        if r == 0 {
-            self.a.mov(Size::W, P, TOP);
-        } else {
-            self.a.add_imm(Size::W, P, TOP, r as u32);
-            self.and_imm(Size::W, P, P, 7);
-        }
-        self.a.add_shift(Size::X, U, STATE, P, Shift::Lsl, 3);
-        self.a.str_d(cv(r), U, state::FP64 as i32);
-        self.a.movz(Size::W, U, 1, 0);
-        self.a.lslv(Size::W, U, U, P);
-        self.a.ldr(Width::W, T_E, STATE, state::FP64_VALID as i32);
-        self.a.orr(Size::W, T_E, T_E, U);
-        self.a.str(Width::W, T_E, STATE, state::FP64_VALID as i32);
+        self.a.ldr(Width::W, T_E, STATE, state::FP80_STALE as i32);
+        self.a.bic(Size::W, T_E, T_E, U);
+        self.a.str(Width::W, T_E, STATE, state::FP80_STALE as i32);
     }
 
     /// Writes everything newer in registers back to the state, on the path
@@ -973,12 +909,40 @@ impl Emit {
             return;
         }
         let saved = self.x87;
+        // Results go back as doubles only; `fget` and the host make the
+        // 80-bit form when something needs it. T_D: valid bits, T_C: stale bits.
+        if saved.cached != 0 {
+            self.a.movz(Size::W, T_D, 0, 0);
+            self.a.movz(Size::W, T_C, 0, 0);
+        }
         for r in 0..8 {
-            if saved.dirty & 1 << r != 0 {
-                self.f80_from_cache(r);
-            } else if saved.cached & 1 << r != 0 {
-                self.keep_fp64(r);
+            if saved.cached & 1 << r == 0 {
+                continue;
             }
+            if r == 0 {
+                self.a.mov(Size::W, P, TOP);
+            } else {
+                self.a.add_imm(Size::W, P, TOP, r as u32);
+                self.and_imm(Size::W, P, P, 7);
+            }
+            self.a.add_shift(Size::X, U, STATE, P, Shift::Lsl, 3);
+            self.a.str_d(cv(r), U, state::FP64 as i32);
+            self.a.movz(Size::W, U, 1, 0);
+            self.a.lslv(Size::W, U, U, P);
+            self.a.orr(Size::W, T_D, T_D, U);
+            if saved.dirty & 1 << r != 0 {
+                self.a.orr(Size::W, T_C, T_C, U);
+            }
+        }
+        if saved.cached != 0 {
+            self.a.ldr(Width::W, T_E, STATE, state::FP64_VALID as i32);
+            self.a.orr(Size::W, T_E, T_E, T_D);
+            self.a.str(Width::W, T_E, STATE, state::FP64_VALID as i32);
+        }
+        if saved.dirty != 0 {
+            self.a.ldr(Width::W, T_E, STATE, state::FP80_STALE as i32);
+            self.a.orr(Size::W, T_E, T_E, T_C);
+            self.a.str(Width::W, T_E, STATE, state::FP80_STALE as i32);
         }
         if saved.meta {
             self.a.str(Width::W, SW, STATE, state::FSW as i32);
@@ -1054,22 +1018,39 @@ impl Emit {
         self.a.bind(done);
     }
 
+    /// The 80-bit ST(i) into `m` (significand) and `s` (sign and exponent).
     fn fget(&mut self, i: usize, m: Reg, s: Reg) {
+        let (stale, zero, done) = (self.a.label(), self.a.label(), self.a.label());
         self.phys(i);
+        self.a.ldr(Width::W, T_E, STATE, state::FP80_STALE as i32);
+        self.a.lsrv(Size::W, T_E, T_E, P);
+        self.a.tbnz(T_E, 0, stale);
         self.a.add_shift(Size::X, U, STATE, P, Shift::Lsl, 3);
         self.a.ldr(Width::X, m, U, state::MM as i32);
         self.a.add_shift(Size::X, U, STATE, P, Shift::Lsl, 1);
         self.a.ldr(Width::H, s, U, state::FSE as i32);
+        self.a.b(done);
+        // Only zeros and normal doubles reach `fp64`.
+        self.a.bind(stale);
+        self.a.add_shift(Size::X, U, STATE, P, Shift::Lsl, 3);
+        self.a.ldr(Width::X, T_C, U, state::FP64 as i32);
+        self.a.ubfx(Size::X, T_E, T_C, 52, 11);
+        self.a.cbz(Size::W, T_E, zero);
+        self.a.lsl_imm(Size::X, m, T_C, 11);
+        let ok = self.a.logic_imm(Logic::Orr, Size::X, m, m, 1 << 63);
+        assert!(ok);
+        self.a.add_imm(Size::W, s, T_E, 0xc00);
+        self.a.add_imm(Size::W, s, s, 0x3000);
+        self.a.lsr_imm(Size::X, U, T_C, 63);
+        self.a.logic_shift(Logic::Orr, false, Size::W, s, s, U, Shift::Lsl, 15);
+        self.a.b(done);
+        self.a.bind(zero);
+        self.a.movz(Size::X, m, 0, 0);
+        self.a.lsr_imm(Size::X, s, T_C, 63);
+        self.a.lsl_imm(Size::W, s, s, 15);
+        self.a.bind(done);
     }
 
-    fn fput(&mut self, i: usize, m: Reg, s: Reg) {
-        self.phys(i);
-        self.write_phys(m, s);
-        let bit = 1u8 << self.slot(i);
-        self.x87.full |= bit;
-        self.x87.empty &= !bit;
-        self.x87.dirty &= !bit;
-    }
 
     fn write_phys(&mut self, m: Reg, s: Reg) {
         self.a.add_shift(Size::X, U, STATE, P, Shift::Lsl, 3);
@@ -1079,9 +1060,11 @@ impl Emit {
         self.a.movz(Size::W, U, 1, 0);
         self.a.lslv(Size::W, U, U, P);
         self.a.orr(Size::W, TAGS, TAGS, U);
-        self.a.ldr(Width::W, T_E, STATE, state::FP64_VALID as i32);
-        self.a.bic(Size::W, T_E, T_E, U);
-        self.a.str(Width::W, T_E, STATE, state::FP64_VALID as i32);
+        for at in [state::FP64_VALID, state::FP80_STALE] {
+            self.a.ldr(Width::W, T_E, STATE, at as i32);
+            self.a.bic(Size::W, T_E, T_E, U);
+            self.a.str(Width::W, T_E, STATE, at as i32);
+        }
     }
 
     fn fpush(&mut self) {

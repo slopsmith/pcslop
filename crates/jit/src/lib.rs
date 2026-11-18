@@ -668,6 +668,7 @@ impl Jit {
                 let s = self.state();
                 s.mm[p] = f.mant;
                 s.fse[p] = f.se;
+                s.fp80_stale &= !(1 << p);
             }
         }
         if snap.meta {
@@ -840,6 +841,7 @@ impl Jit {
         s.mmx_ok = (cpu.cr0 & ts_em == 0 && cpu.fpu.sw & x86::fpu::sw::ES == 0) as u32;
         s.mm_used = 0;
         s.fp64_valid = 0;
+        s.fp80_stale = 0;
         let f = &cpu.fpu;
         s.fse = std::array::from_fn(|i| f.regs[i].se);
         s.fcw = f.cw as u32;
@@ -900,7 +902,11 @@ impl Jit {
         s.fpsr = 0;
         let f = &mut cpu.fpu;
         for i in 0..8 {
-            f.regs[i] = x86::fpu::F80 { mant: s.mm[i], se: s.fse[i] };
+            f.regs[i] = if s.fp80_stale & 1 << i != 0 {
+                x86::fpu::F80::from_f64(f64::from_bits(s.fp64[i]))
+            } else {
+                x86::fpu::F80 { mant: s.mm[i], se: s.fse[i] }
+            };
         }
         f.cw = s.fcw as u16;
         f.sw = s.fsw as u16;
