@@ -697,7 +697,7 @@ impl Radeon {
         let base = off & !31;
         let kind = bits(f1, 25, 2);
         let depth = 1 << bits(f0, 22, 4);
-        let mut t = Texture::new(TexMem::Vram(0), width, height, format, levels, pitch, kind, depth);
+        let mut t = Texture::new(TexMem::Vram(0), width, height, format, levels, pitch, kind, depth, off & 0x1c);
         t.mem = match self.surface_vram(base) {
             Some(o) => TexMem::Vram(o),
             None => {

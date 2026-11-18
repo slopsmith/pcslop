@@ -1,8 +1,9 @@
 //! Texture units: TX_FORMAT0..2, TX_FILTER0 and TX_OFFSET, texel formats,
 //! wrap modes and point or bilinear filtering. Formats are numbered as in
 //! the R3xx register reference; DXT1/3/5 take the reserved numbers 15 to 17,
-//! as in Mesa's r300_reg.h. Mipmap level layout follows Mesa's
-//! r300_texture_desc.c (MIT license; Marek Olšák and others).
+//! as in Mesa's r300_reg.h. Mipmap level layout, including the alignments
+//! micro- and macrotiled levels get, follows Mesa's r300_texture_desc.c (MIT
+//! license; Corbin Simpson, Marek Olšák and others).
 
 use super::V4;
 
@@ -50,27 +51,51 @@ pub(crate) fn block(format: u32) -> (usize, u32) {
     }
 }
 
+/// The width and height in pixels a level's pitch and rows are aligned to,
+/// by bytes per pixel, macrotiling and TX_OFFSET's MICRO_TILE; None for
+/// layouts the card lacks. Mesa's r300_get_pixel_alignment.
+fn tile_size(bytes: usize, macro_tiled: bool, micro: u32) -> Option<(u32, u32)> {
+    const TABLE: [[[(u32, u32); 3]; 5]; 2] = [
+        [[(32, 1), (8, 4), (0, 0)], [(16, 1), (8, 2), (4, 4)], [(8, 1), (4, 2), (0, 0)], [(4, 1), (2, 2), (0, 0)], [(2, 1), (0, 0), (0, 0)]],
+        [[(256, 8), (64, 32), (0, 0)], [(128, 8), (64, 16), (32, 32)], [(64, 8), (32, 16), (0, 0)], [(32, 8), (16, 16), (0, 0)], [(16, 8), (0, 0), (0, 0)]],
+    ];
+    let t = *TABLE[macro_tiled as usize].get(bytes.trailing_zeros() as usize)?.get(micro as usize)?;
+    (bytes.is_power_of_two() && t.0 != 0).then_some(t)
+}
+
 impl Texture {
     /// Lays out `levels` mipmap levels after the base at `mem`, as the
     /// hardware addresses them when TXPITCH_EN is clear, for a 2D map
     /// (`kind` 0), a volume (`kind` 1, `depth` slices) or a cube map (`kind`
     /// 2). Each level holds its slices, or its six faces in the order +X,
     /// -X, +Y, -Y, +Z, -Z, one after the other, as Mesa's
-    /// r300_texture_desc.c lays them out.
-    pub fn new(mem: TexMem, width: u32, height: u32, format: u32, num_levels: u32, pitch_texels: Option<u32>, kind: u32, depth: u32) -> Self {
+    /// r300_texture_desc.c lays them out. `tiling` is TX_OFFSET's
+    /// MACRO_TILE and MICRO_TILE (bits 2 to 4): tiled levels are padded to
+    /// whole tiles, and R300 macrotiles only levels larger than a macrotile.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(mem: TexMem, width: u32, height: u32, format: u32, num_levels: u32, pitch_texels: Option<u32>, kind: u32, depth: u32, tiling: u32) -> Self {
         let (bytes, bw) = block(format);
+        let micro = (tiling >> 3) & 3;
+        let macro_tile = tile_size(bytes, true, micro);
         let mut levels = Vec::new();
         let mut slices = Vec::new();
         let mut off = 0usize;
         for l in 0..=num_levels.min(11) {
             let w = (width >> l).max(1);
             let h = (height >> l).max(1);
+            let macro_tiled = tiling & 4 != 0 && macro_tile.is_some_and(|(tw, th)| w > tw && h > th);
+            let align = if bw == 1 { tile_size(bytes, macro_tiled, micro).or(tile_size(bytes, false, 0)) } else { None };
             let blocks_x = w.div_ceil(bw) as usize;
-            let pitch = match (l, pitch_texels) {
-                (0, Some(p)) => p.div_ceil(bw) as usize * bytes,
+            let pitch = match (l, pitch_texels, align) {
+                (0, Some(p), _) => p.div_ceil(bw) as usize * bytes,
+                (_, _, Some((tw, _))) => w.next_multiple_of(tw) as usize * bytes,
                 _ => (blocks_x * bytes).next_multiple_of(32),
             };
-            let rows = if num_levels > 0 { h.next_power_of_two() } else { h }.div_ceil(bw) as usize;
+            let rows = if num_levels > 0 { h.next_power_of_two() } else { h };
+            let rows = match align {
+                Some((_, th)) => rows.next_multiple_of(th) as usize,
+                None => rows.div_ceil(bw) as usize,
+            };
             let layers = match kind {
                 1 => (depth >> l).max(1) as usize,
                 2 => 6,
@@ -85,17 +110,15 @@ impl Texture {
 
     /// Bytes the texture spans from its base.
     pub fn span(&self) -> usize {
-        let (bytes, bw) = block(self.format);
+        let (bytes, _) = block(self.format);
         let mut end = 0;
-        for (l, &(off, pitch)) in self.levels.iter().enumerate() {
-            let h = (self.height >> l).max(1);
-            let rows = if self.levels.len() > 1 { h.next_power_of_two() } else { h }.div_ceil(bw) as usize;
+        for (l, &(off, _)) in self.levels.iter().enumerate() {
             let layers = match self.kind {
                 1 => (self.depth >> l).max(1) as usize,
                 2 => 6,
                 _ => 1,
             };
-            end = end.max(off + pitch * rows.max(1) * layers).max(off + bytes);
+            end = end.max(off + self.slices[l] * layers).max(off + bytes);
         }
         end
     }
@@ -360,4 +383,26 @@ fn dxt(format: u32, rd: &dyn Fn(usize) -> u8, x: u32, y: u32) -> V4 {
         alpha = v / 255.0;
     }
     [rgb[2], rgb[1], rgb[0], alpha]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn micro_and_macrotiled_levels_follow_catalysts_layout() {
+        let t = Texture::new(TexMem::Vram(0), 256, 256, 12, 8, None, 0, 1, 0xc);
+        let offsets: Vec<usize> = t.levels.iter().map(|l| l.0).collect();
+        let pitches: Vec<usize> = t.levels.iter().map(|l| l.1).collect();
+        assert_eq!(offsets, [0, 0x40000, 0x50000, 0x54000, 0x55000, 0x55400, 0x55500, 0x55540, 0x55560], "ARGB8888 256x256 level offsets as Catalyst uploads them");
+        assert_eq!(pitches[6..], [16, 16, 16], "microtiled 4x4, 2x2 and 1x1 levels are four texels wide");
+    }
+
+    #[test]
+    fn linear_levels_keep_32_byte_pitches() {
+        let t = Texture::new(TexMem::Vram(0), 8, 8, 12, 3, None, 0, 1, 0);
+        let pitches: Vec<usize> = t.levels.iter().map(|l| l.1).collect();
+        assert_eq!(pitches, [32, 32, 32, 32]);
+        assert_eq!(t.levels[3].0, 32 * 8 + 32 * 4 + 32 * 2);
+    }
 }
