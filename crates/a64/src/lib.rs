@@ -252,7 +252,7 @@ impl Asm {
     /// labels or out-of-range branches.
     pub fn finish(mut self) -> Vec<u32> {
         for &(at, l, fix) in &self.fixups {
-            let target = self.labels[l.0].expect("unbound label");
+            let target = self.labels[l.0].unwrap_or_else(|| panic!("unbound label {} at word {at} of {}", l.0, self.code.len()));
             let delta = target as i64 - at as i64;
             let w = &mut self.code[at];
             match fix {

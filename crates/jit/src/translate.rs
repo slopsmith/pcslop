@@ -119,7 +119,14 @@ struct Emit {
     counters: Option<u64>,
     /// Targets of the exits counted after the entry counter, in counter order.
     exits: Vec<u32>,
+    /// Rarely run code to emit after the block's hot path, with the code
+    /// position and x87 state when it was deferred (see `defer`).
+    cold: Vec<(usize, x87::X87Block, Cold)>,
+    /// Each instruction's first code word and how much cold code preceded it.
+    starts: Vec<(usize, usize)>,
 }
+
+type Cold = Box<dyn FnOnce(&mut Emit)>;
 
 /// A block that jumps back to its own start with x87 values in registers.
 #[derive(Default)]
@@ -358,12 +365,39 @@ impl Emit {
         }
     }
 
-    /// Drops the code from an STI on and leaves the STI to the interpreter,
-    /// which runs the instruction after it before taking interrupts.
-    fn back_to_sti(&mut self, (start, eip, insns, nb): (usize, u32, usize, usize), pc: &mut u32, n: &mut usize, boundaries: &mut Vec<(u32, u32)>) {
+    /// Emits `f` after the block's hot path, with the x87 state as it is now.
+    fn defer(&mut self, f: impl FnOnce(&mut Emit) + 'static) {
+        self.cold.push((self.a.pos(), self.x87, Box::new(f)));
+    }
+
+    fn emit_cold(&mut self) {
+        let mut i = 0;
+        while i < self.cold.len() {
+            let (_, x87, f) = std::mem::replace(&mut self.cold[i], (0, Default::default(), Box::new(|_| {})));
+            let saved = std::mem::replace(&mut self.x87, x87);
+            self.fold = None;
+            f(self);
+            self.x87 = saved;
+            i += 1;
+        }
+        self.cold.clear();
+    }
+
+    /// Drops the code from word `start` on, with what refers to it.
+    fn truncate_to(&mut self, start: usize) {
         self.a.truncate(start);
         self.chains.retain(|&(w, _)| (w as usize) < start);
         self.lp.counts.retain(|&w| w < start);
+        match self.starts.iter().find(|m| m.0 == start) {
+            Some(&(_, n)) => self.cold.truncate(n),
+            None => self.cold.retain(|c| c.0 < start),
+        }
+    }
+
+    /// Drops the code from an STI on and leaves the STI to the interpreter,
+    /// which runs the instruction after it before taking interrupts.
+    fn back_to_sti(&mut self, (start, eip, insns, nb): (usize, u32, usize, usize), pc: &mut u32, n: &mut usize, boundaries: &mut Vec<(u32, u32)>) {
+        self.truncate_to(start);
         boundaries.truncate(nb + 1);
         *pc = eip;
         *n = insns;
@@ -2782,6 +2816,8 @@ pub fn translatable(insn: &Insn, pc: u32, user: bool) -> bool {
         lp: X87Loop::default(),
         counters: None,
         exits: Vec::new(),
+        cold: Vec::new(),
+        starts: Vec::new(),
     };
     !matches!(e.insn(insn, pc), Step::Unsupported)
 }
@@ -2926,6 +2962,8 @@ fn compile_pass(
         lp: X87Loop::default(),
         counters: None,
         exits: Vec::new(),
+        cold: Vec::new(),
+        starts: Vec::new(),
     };
     let superblock = chain;
     e.fold_ok = !self_check;
@@ -2985,6 +3023,7 @@ fn compile_pass(
             x87_snaps.push((e.a.pos() as u32, snap));
         }
         let x87_before = e.x87;
+        e.starts.push((e.a.pos(), e.cold.len()));
         has_rep |= insn.rep != Rep::None && matches!(insn.op, 0xa4..=0xa7 | 0xaa..=0xaf);
         let start = e.a.pos();
         let end = pc.wrapping_add(insn.len as u32);
@@ -3010,9 +3049,7 @@ fn compile_pass(
                 }
                 Step::End => insns += 1,
                 Step::Unsupported | Step::Sti => {
-                    e.a.truncate(start);
-                    e.chains.retain(|&(w, _)| (w as usize) < start);
-                    e.lp.counts.retain(|&w| w < start);
+                    e.truncate_to(start);
                     e.x87 = x87_before;
                     e.exit_interp(pc);
                     interp_after = Some(insns);
@@ -3089,9 +3126,7 @@ fn compile_pass(
                     e.x87 = sti_x87;
                 e.back_to_sti(at, &mut pc, &mut insns, &mut boundaries);
                 } else {
-                    e.a.truncate(start);
-                    e.chains.retain(|&(w, _)| (w as usize) < start);
-                    e.lp.counts.retain(|&w| w < start);
+                    e.truncate_to(start);
                     e.x87 = x87_before;
                     e.exit_interp(pc);
                     interp_after = Some(insns);
@@ -3100,6 +3135,7 @@ fn compile_pass(
             }
         }
     }
+    e.emit_cold();
     if self_check {
         e.a.bind(check);
         let page_end = page.wrapping_add(0x1000);

@@ -540,12 +540,19 @@ impl Emit {
             self.a.movz(Size::W, AF_AUX, 0, 0);
         }
         self.a.b(done);
-        self.a.bind(bail);
-        let after = std::mem::replace(&mut self.x87, before);
-        self.exit_interp(eip);
-        self.x87 = after;
+        self.x87_bail(bail, before, eip);
         self.a.bind(done);
         true
+    }
+
+    /// Leaves for the interpreter at `eip` from `bail`, writing back the x87
+    /// state `before` the instruction, in cold code.
+    fn x87_bail(&mut self, bail: Label, before: X87Block, eip: u32) {
+        self.defer(move |e| {
+            e.a.bind(bail);
+            e.x87 = before;
+            e.exit_interp(eip);
+        });
     }
 
     fn fconst(&mut self, v: V, bits: u64) {
@@ -882,11 +889,13 @@ impl Emit {
             self.a.tbz(T_E, 0, convert);
             self.a.add_shift(Size::X, U, STATE, P, Shift::Lsl, 3);
             self.a.ldr_d(cv(r), U, state::FP64 as i32);
-            self.a.b(done);
-            self.a.bind(convert);
-            self.fget(i, M, S);
-            self.to_f64(bail, true);
-            self.a.fmov_dx(cv(r), T_C);
+            self.defer(move |e| {
+                e.a.bind(convert);
+                e.fget(i, M, S);
+                e.to_f64(bail, true);
+                e.a.fmov_dx(cv(r), T_C);
+                e.a.b(done);
+            });
             self.a.bind(done);
             self.x87.cached |= 1 << r;
         }
@@ -1070,9 +1079,7 @@ impl Emit {
             }
         }
         self.a.b(done);
-        self.a.bind(bail);
-        self.x87 = before;
-        self.exit_interp(eip);
+        self.x87_bail(bail, before, eip);
         self.a.bind(done);
         self.x87 = head;
     }
