@@ -769,8 +769,8 @@ impl Emit {
         }
     }
 
-    /// With `probe`, a memory operand is written back first, so the later
-    /// store cannot fault after the flags have changed.
+    /// With `probe`, a memory operand is written back first, so the later store
+    /// cannot fault after an instruction that reads the flags has changed them.
     fn rm_w(&mut self, insn: &Insn, w: Ow, probe: bool) -> Option<Reg> {
         match insn.mem {
             Some(m) => {
@@ -1126,7 +1126,7 @@ impl Emit {
                         let a = match insn.mem {
                             None => self.read_alu_operand(aop, w, insn.rm(), T_A),
                             Some(_) => {
-                                let Some(a) = self.rm_w(insn, w, writes) else { return Step::Unsupported };
+                                let Some(a) = self.rm_w(insn, w, writes && matches!(aop, 2 | 3)) else { return Step::Unsupported };
                                 a
                             }
                         };
@@ -1238,7 +1238,7 @@ impl Emit {
                 let aop = insn.reg();
                 let w = Ow::of(op, op32);
                 let imm = if op == 0x81 { insn.imm } else { insn.imm as u8 as i8 as i32 as u32 };
-                let Some(a) = self.rm_w(insn, w, aop != 7) else { return Step::Unsupported };
+                let Some(a) = self.rm_w(insn, w, matches!(aop, 2 | 3)) else { return Step::Unsupported };
                 let d = if aop != 7 && insn.mem.is_none() && matches!(w, Ow::D) { self.alu_dst(insn.rm(), a, a) } else { T_RES };
                 if !(matches!(w, Ow::D) && self.alu32_imm(aop, d, a, imm)) {
                     self.a.mov_imm(Size::W, T_B, imm as u64 & w.mask());
@@ -1320,7 +1320,7 @@ impl Emit {
                 return Step::End;
             }
             0xfe if insn.reg() < 2 => {
-                let Some(a) = self.rm_w(insn, Ow::B, true) else { return Step::Unsupported };
+                let Some(a) = self.rm_w(insn, Ow::B, false) else { return Step::Unsupported };
                 self.inc_dec_narrow(insn.reg() == 1, a, 8);
                 self.write_rm(insn, Ow::B, T_RES);
             }
@@ -1689,7 +1689,7 @@ impl Emit {
             }
             0xf6 | 0xf7 if matches!(insn.reg(), 2 | 3) && !(op == 0xf7 && op32) => {
                 let w = Ow::of(op, op32);
-                let Some(a) = self.rm_w(insn, w, true) else { return Step::Unsupported };
+                let Some(a) = self.rm_w(insn, w, false) else { return Step::Unsupported };
                 if insn.reg() == 3 {
                     self.alu_narrow(5, ZR, a, if w == Ow::B { 24 } else { 16 });
                 } else {
@@ -1704,7 +1704,7 @@ impl Emit {
                 self.write_gpr(Ow::H, n, T_RES);
             }
             0xff if insn.reg() < 2 => {
-                let Some(a) = self.rm_w(insn, Ow::H, true) else { return Step::Unsupported };
+                let Some(a) = self.rm_w(insn, Ow::H, false) else { return Step::Unsupported };
                 self.inc_dec_narrow(insn.reg() == 1, a, 16);
                 self.write_rm(insn, Ow::H, T_RES);
             }
