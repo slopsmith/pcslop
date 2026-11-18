@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use a64::{Cond, Label, Logic, Reg, Size, Width as AW};
+use a64::{Cond, Label, Logic, Reg, Shift, Size, Width as AW};
 
 use a64::V;
 
@@ -47,9 +47,10 @@ pub fn lower(e: &mut Emit, f: &Func, fallback: Label) -> Option<Lowered> {
     if let Some(x) = f.x87 {
         x87_prologue(e, &x, fallback);
     }
-    for b in 0..f.blocks.len() {
+    let order = layout(f);
+    for (i, &b) in order.iter().enumerate() {
         e.a.bind(labels[b]);
-        let next = labels.get(b + 1).copied();
+        let next = order.get(i + 1).map(|&n| labels[n]);
         BlockLower::new(e, f, b, &labels, next, &mut boundaries).run()?;
         insns += f.blocks[b].insns as usize;
     }
@@ -58,6 +59,32 @@ pub fn lower(e: &mut Emit, f: &Func, fallback: Label) -> Option<Lowered> {
         None => Vec::new(),
     };
     Some(Lowered { boundaries, insns, x87 })
+}
+
+/// Block order: traces from the entry, each block followed by its likely
+/// successor (a loop's back edge, else the x86 fall-through).
+fn layout(f: &Func) -> Vec<usize> {
+    let mut placed = vec![false; f.blocks.len()];
+    let mut order = Vec::with_capacity(f.blocks.len());
+    for start in 0..f.blocks.len() {
+        let mut b = start;
+        while !placed[b] {
+            placed[b] = true;
+            order.push(b);
+            let back = |t: Blk| f.blocks[t as usize].eip <= f.blocks[b].eip;
+            let likely = match f.blocks[b].term {
+                Term::Jump(t) => vec![t],
+                Term::Branch { t, f: fb, .. } if back(t) && !back(fb) => vec![t, fb],
+                Term::Branch { t, f: fb, .. } => vec![fb, t],
+                Term::Exit(_) => vec![],
+            };
+            match likely.into_iter().find(|&t| !placed[t as usize]) {
+                Some(t) => b = t as usize,
+                None => break,
+            }
+        }
+    }
+    order
 }
 
 /// Checks the control word the region was compiled for and the stack tags
@@ -107,6 +134,11 @@ struct BlockLower<'a> {
     /// `base + constant` values used only as addresses: each access adds the
     /// constant itself, so they are never computed.
     folded: HashMap<Val, (Val, i32)>,
+    /// `base + constant` address values computed without the constant's low
+    /// 12 bits, which each access adds itself.
+    split: HashMap<Val, i32>,
+    /// Single-use `x << n` values each `add` taking them shifts itself.
+    shifted: HashMap<Val, (Val, u32)>,
     /// The guest register each value will be committed to, if any.
     want_home: HashMap<Val, usize>,
     /// Index of the instruction being lowered.
@@ -135,6 +167,8 @@ impl<'a> BlockLower<'a> {
             fused_cond: None,
             flags_done: Vec::new(),
             folded: HashMap::new(),
+            split: HashMap::new(),
+            shifted: HashMap::new(),
             want_home: HashMap::new(),
             cur: 0,
         }
@@ -195,6 +229,41 @@ impl<'a> BlockLower<'a> {
             {
                 self.folded.insert(v, (x, d as i32));
             }
+            if let Op::Bin(Alu::Add, x, y, None) = self.op(v)
+                && !self.folded.contains_key(&v)
+                && let Some(d) = self.konst(y)
+                && d >= 4096
+                && d < 1 << 24
+                && d & 0xfff != 0
+                && fits(v, (d & 0xfff) as i32)
+                && uses.get(&v).is_some_and(|&(all, addr)| all == addr && all > 0)
+                && !escapes(v)
+                && self.konst(x).is_none()
+            {
+                self.split.insert(v, (d & 0xfff) as i32);
+            }
+        }
+        for &v in &blk.insts {
+            if let Op::Bin(Alu::Add, x, y, None) = self.op(v)
+                && !self.folded.contains_key(&v)
+                && !self.split.contains_key(&v)
+            {
+                for (other, sh) in [(x, y), (y, x)] {
+                    if let Op::Bin(Alu::Shl, z, n, None) = self.op(sh)
+                        && let Some(n) = self.konst(n)
+                        && n < 32
+                        && self.konst(z).is_none()
+                        && self.konst(other).is_none()
+                        && sh != other
+                        && blk.insts.contains(&sh)
+                        && uses.get(&sh).is_some_and(|&(all, _)| all == 1)
+                        && !escapes(sh)
+                    {
+                        self.shifted.insert(sh, (z, n));
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -204,6 +273,7 @@ impl<'a> BlockLower<'a> {
         for (i, &v) in blk.insts.iter().enumerate() {
             for a in self.op(v).args() {
                 let a = self.folded.get(&a).map_or(a, |&(x, _)| x);
+                let a = self.shifted.get(&a).map_or(a, |&(z, _)| z);
                 self.last.insert(a, i);
             }
             if let Some(snap) = self.f.snaps.get(&v) {
@@ -598,14 +668,35 @@ impl<'a> BlockLower<'a> {
         if let Some(&(x, d)) = self.folded.get(&addr) {
             return (self.get(x, SCRATCH), d);
         }
+        if let Some(&lo) = self.split.get(&addr) {
+            return (self.get(addr, SCRATCH), lo);
+        }
         (self.get(addr, SCRATCH), 0)
     }
 
     fn bin(&mut self, v: Val, i: usize, op: Alu, a: Val, b: Val, c: Option<Val>) -> Option<()> {
-        if self.folded.contains_key(&v) || (!self.last.contains_key(&v) && self.fusable_flags(v, i).is_none() && c.is_none()) {
+        if self.folded.contains_key(&v) || self.shifted.contains_key(&v) || (!self.last.contains_key(&v) && self.fusable_flags(v, i).is_none() && c.is_none()) {
+            return Some(());
+        }
+        if let Some(&lo) = self.split.get(&v) {
+            let x = self.get(a, SCRATCH);
+            let d = self.alloc(v)?;
+            let k = self.konst(b).unwrap();
+            self.e.a.add_imm(Size::W, d, x, k & !0xfff);
+            debug_assert_eq!(lo as u32, k & 0xfff);
             return Some(());
         }
         let fused = self.fusable_flags(v, i);
+        if op == Alu::Add && fused.is_none() {
+            let sh = [(a, b), (b, a)].into_iter().find_map(|(o, s)| self.shifted.get(&s).map(|&(z, n)| (o, z, n)));
+            if let Some((o, z, n)) = sh {
+                let x = self.get(o, SCRATCH);
+                let zr = self.get(z, SCRATCH2);
+                let d = self.alloc(v)?;
+                self.e.a.add_shift(Size::W, d, x, zr, Shift::Lsl, n);
+                return Some(());
+            }
+        }
         let flags = fused.is_some();
         let cf = fused.is_some_and(|fl| matches!(self.op(fl), Op::Flags { bits, .. } if bits & CF != 0));
         if flags {
@@ -621,6 +712,24 @@ impl<'a> BlockLower<'a> {
             let d = self.alloc(v)?;
             if op == Alu::Add { self.e.a.sub_imm(Size::W, d, x, k.wrapping_neg()) } else { self.e.a.add_imm(Size::W, d, x, k.wrapping_neg()) }
             return Some(());
+        }
+        if let (Alu::Add | Alu::Sub, Some(k)) = (op, imm)
+            && !flags
+        {
+            let (sub, k) = if k > 0x8000_0000 { (op == Alu::Add, k.wrapping_neg()) } else { (op == Alu::Sub, k) };
+            if k >= 4096 && k < 1 << 24 && k & 0xfff != 0 {
+                let x = self.get(a, SCRATCH);
+                let d = self.alloc(v)?;
+                let e = &mut self.e.a;
+                if sub {
+                    e.sub_imm(Size::W, d, x, k & !0xfff);
+                    e.sub_imm(Size::W, d, d, k & 0xfff);
+                } else {
+                    e.add_imm(Size::W, d, x, k & !0xfff);
+                    e.add_imm(Size::W, d, d, k & 0xfff);
+                }
+                return Some(());
+            }
         }
         let x = self.get(a, SCRATCH);
         let imm_ok = match op {
@@ -871,6 +980,10 @@ impl<'a> BlockLower<'a> {
         } else {
             self.labels[t as usize]
         };
+        self.cond_branch(cond, cc, flip, target);
+    }
+
+    fn cond_branch(&mut self, cond: Val, cc: u8, flip: bool, target: Label) {
         if self.fused_cond == Some(cond) {
             self.e.a.b_cond(x86_cond((cc ^ flip as u8) as u16).unwrap(), target);
         } else {
@@ -886,7 +999,15 @@ impl<'a> BlockLower<'a> {
             Term::Jump(t) => self.jump(t),
             Term::Branch { cond, t, f } => {
                 let cc = self.cond_cc(cond);
-                if Some(self.labels[t as usize]) == self.next && !self.backward(t) {
+                // A loop edge is likely taken: check for interrupts inline
+                // and go round with one taken branch.
+                if self.backward(t) && !self.backward(f) {
+                    self.cond_branch(cond, cc, true, self.labels[f as usize]);
+                    self.jump(t);
+                } else if self.backward(f) && !self.backward(t) {
+                    self.cond_branch(cond, cc, false, self.labels[t as usize]);
+                    self.jump(f);
+                } else if Some(self.labels[t as usize]) == self.next && !self.backward(t) {
                     self.branch_to(cond, cc, true, f);
                     self.jump(t);
                 } else {
