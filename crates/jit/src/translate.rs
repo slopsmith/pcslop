@@ -1825,6 +1825,8 @@ impl Emit {
                 self.a.lsl_imm(Size::W, T_B, T_B, 1);
                 self.a.rmif(T_B, 0, 0b0010);
             }
+            0xdb if insn.modrm == 0xe3 => self.fpu_reset(eip, true),
+            0x177 if !insn.opsize_prefix && insn.rep == Rep::None => self.fpu_reset(eip, false),
             0xd8..=0xdf => {
                 if !self.x87(insn, eip) {
                     return Step::Unsupported;

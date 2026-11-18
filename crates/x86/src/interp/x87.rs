@@ -14,6 +14,7 @@ use super::{Ctx, Exception, Res, ud, vector};
 use crate::bus::Bus;
 use crate::cpu::{CS, EAX, cr0, flags};
 use crate::fparith::{self, Op};
+use crate::trig;
 use crate::fpu::{F80, exc, rc, sw};
 
 const EQ: u8 = 0;
@@ -734,6 +735,16 @@ impl<B: Bus> Ctx<'_, B> {
             }
             _ => {
                 let f = |v: f64| -> (f64, f64) {
+                    let op = match modrm {
+                        0xf2 => Some(trig::Op::Tan),
+                        0xfb => Some(trig::Op::SinCos),
+                        0xfe => Some(trig::Op::Sin),
+                        0xff => Some(trig::Op::Cos),
+                        _ => None,
+                    };
+                    if let Some(r) = op.filter(|_| trig::fast(v)).and_then(|op| trig::eval(v, op)) {
+                        return r;
+                    }
                     match modrm {
                         0xf0 => ((v * std::f64::consts::LN_2).exp_m1(), 0.0),
                         0xf2 => (v.tan(), 1.0),

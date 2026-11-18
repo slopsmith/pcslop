@@ -851,6 +851,7 @@ impl Jit {
         s.fip = f.fip;
         s.fdp = f.fdp;
         s.fnote = 0;
+        s.finit = 0;
         s.fdseg = 0;
         let sse_ok = cpu.cr0 & ts_em == 0 && cpu.cr4 & x86::cpu::cr4::OSFXSR != 0;
         s.sse_ok = sse_ok as u32;
@@ -903,6 +904,9 @@ impl Jit {
         }
         f.cw = s.fcw as u16;
         f.sw = s.fsw as u16;
+        if std::mem::take(&mut s.finit) != 0 {
+            (f.fip, f.fcs, f.fop, f.fdp, f.fds) = (0, 0, 0, 0, 0);
+        }
         f.tags = s.ftags as u8;
         if s.fnote != 0 {
             f.fop = s.fnote as u16 & 0x7ff;
@@ -914,12 +918,12 @@ impl Jit {
             f.fds = cpu.segs[(s.fdseg & 7) as usize].selector;
         }
         let used = s.mm_used;
-        if used != 0 {
-            for i in 0..8 {
-                if used & 1 << i != 0 {
-                    cpu.fpu.set_mm(i, s.mm[i]);
-                }
+        for i in 0..8 {
+            if used & 1 << i != 0 {
+                cpu.fpu.set_mm(i, s.mm[i]);
             }
+        }
+        if used & 0x100 != 0 {
             cpu.fpu.enter_mmx();
         }
     }

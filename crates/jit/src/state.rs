@@ -144,6 +144,9 @@ pub struct State {
     pub fnote: u32,
     /// 0x100 plus the segment register index of FDS once translated code set FDP; 0 if not.
     pub fdseg: u32,
+    /// Set by a translated FNINIT: FIP, FCS, FOP, FDP and FDS are zero unless
+    /// `fnote` or `fdseg` name newer ones.
+    pub finit: u32,
     /// 1 when SSE instructions may run: CR0.TS and CR0.EM clear, CR4.OSFXSR set.
     pub sse_ok: u32,
     pub xmm: [u128; 8],
@@ -275,6 +278,7 @@ pub const FIP: usize = offset_of!(State, fip);
 pub const FDP: usize = offset_of!(State, fdp);
 pub const FNOTE: usize = offset_of!(State, fnote);
 pub const FDSEG: usize = offset_of!(State, fdseg);
+pub const FINIT: usize = offset_of!(State, finit);
 
 /// FPCR for SSE arithmetic under `mxcsr` (with FEAT_AFP): AH for x86 NaN and
 /// MIN/MAX rules, FIZ for DAZ, FZ for FTZ with underflow masked, RMode from RC.

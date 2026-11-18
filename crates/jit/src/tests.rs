@@ -1152,6 +1152,62 @@ fn x87_memory(rng: &mut Rng) -> Vec<u8> {
 }
 
 #[test]
+fn fninit_and_emms_match_the_interpreter() {
+    let code = [
+        0xd9, 0xe8, // fld1
+        0xd9, 0x05, 0x00, 0x31, 0, 0, // fld dword [0x3100]
+        0xdb, 0xe3, // fninit
+        0xd9, 0xeb, // fldpi
+        0xd9, 0x35, 0x00, 0x30, 0, 0, // fnstenv [0x3000]
+        0x0f, 0x6e, 0xc0, // movd mm0, eax
+        0x0f, 0x77, // emms
+        0xd9, 0x35, 0x40, 0x30, 0, 0, // fnstenv [0x3040]
+        0x0f, 0x6e, 0xc8, // movd mm1, eax
+        0xdb, 0xe3, // fninit
+        0xd9, 0x35, 0x80, 0x30, 0, 0, // fnstenv [0x3080]
+        0xd9, 0xe8, // fld1
+        0xdd, 0x1d, 0xc0, 0x30, 0, 0, // fstp qword [0x30c0]
+        0xf4, // hlt
+    ];
+    let stats = compare(&code, |c| {
+        c.fpu.cw = 0x27f;
+        (c.fpu.fip, c.fpu.fop, c.fpu.fdp) = (0x6666, 0x123, 0x5555);
+    });
+    assert!(stats.interp_exits <= 4, "FNINIT and EMMS should stay translated: {stats:?}");
+}
+
+#[test]
+fn x87_sine_cosine_and_tangent_match_the_interpreter() {
+    let mut exits = 0;
+    let mut runs = 0;
+    for &x in &[0.5f64, -0.5, 1.0, 3.0, -7.25, 100.0, 1.0e5, -1.0e6, 1.0e-9, 0.0, -0.0, 1.0e7, 1.5707963267948966, 3.141592653589793, 1.0e-30] {
+        for op in [0xfe, 0xff, 0xf2, 0xfb] {
+            let code = [
+                0xdd, 0x05, 0x00, 0x30, 0, 0, // fld qword [0x3000]
+                0xd9, op, // the instruction under test
+                0xdd, 0x1d, 0x08, 0x30, 0, 0, // fstp qword [0x3008]
+                0xdd, 0x1d, 0x10, 0x30, 0, 0, // fstp qword [0x3010]
+                0xdf, 0xe0, // fnstsw ax
+                0xf4, // hlt
+            ];
+            let mut a = flat_cpu(0x1000, 0x8000);
+            let mut b = a.clone();
+            let mut bus_a = bus_with(0x1000, &code);
+            let mut bus_b = bus_with(0x1000, &code);
+            bus_a.ram.as_mut_slice()[0x3000..0x3008].copy_from_slice(&x.to_le_bytes());
+            bus_b.ram.as_mut_slice()[0x3000..0x3008].copy_from_slice(&x.to_le_bytes());
+            run_interp(&mut a, &mut bus_a);
+            let stats = run_jit(&mut b, &mut bus_b);
+            assert_eq!(a.regs, b.regs, "x {x:e} op {op:#x}: registers (FSW in AX)");
+            assert!(bus_a.ram.as_slice() == bus_b.ram.as_slice(), "x {x:e} op {op:#x}: results differ");
+            exits += stats.interp_exits;
+            runs += 1;
+        }
+    }
+    assert!(exits < runs * 2 - 20, "{exits} interpreter exits in {runs} runs: in-range inputs should stay translated");
+}
+
+#[test]
 fn random_x87_programs_match_the_interpreter() {
     let mut rng = Rng(0x87_87);
     let (mut exits, mut insns) = (0, 0);

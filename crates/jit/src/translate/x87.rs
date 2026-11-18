@@ -7,6 +7,7 @@
 
 use a64::{Fcm, Label, Logic, Reg, Shift, Size, V, Width, ZR, sysreg};
 use x86::decode::Insn;
+use x86::trig::{self, Op as TrigOp};
 
 use super::{Emit, T_A, T_ADDR, T_B, T_C, T_E};
 use crate::runtime::{AF_AUX, PF_RESULT, STATE, guest_reg};
@@ -25,6 +26,10 @@ const FR: V = V(20);
 const FS: V = V(21);
 const E1: V = V(26);
 const E2: V = V(27);
+const W0: V = V(28);
+const W1: V = V(29);
+const W2: V = V(30);
+const W3: V = V(31);
 
 const C0: u32 = 1 << 8;
 const C1: u32 = 1 << 9;
@@ -104,6 +109,7 @@ enum K {
     Tst,
     Comi { i: usize, pop: bool },
     Sqrt,
+    Trig(TrigOp),
     Rndint,
     StswAx,
     StswMem,
@@ -161,6 +167,10 @@ fn classify(insn: &Insn) -> Option<K> {
         (1, 0xe8) => K::LdConst { mant: 1 << 63 },
         (1, 0xee) => K::LdConst { mant: 0 },
         (1, 0xfa) => K::Sqrt,
+        (1, 0xfe) => K::Trig(TrigOp::Sin),
+        (1, 0xff) => K::Trig(TrigOp::Cos),
+        (1, 0xf2) => K::Trig(TrigOp::Tan),
+        (1, 0xfb) => K::Trig(TrigOp::SinCos),
         (1, 0xfc) => K::Rndint,
         (3, 0xe8..=0xf7) => K::Comi { i, pop: false },
         (7, 0xe8..=0xf7) => K::Comi { i, pop: true },
@@ -466,6 +476,20 @@ impl Emit {
                 self.clear_c1();
                 self.fset(0, FR);
             }
+            K::Trig(op) => {
+                self.x87_need(0, true, bail);
+                if matches!(op, TrigOp::Tan | TrigOp::SinCos) {
+                    self.x87_need(7, false, bail);
+                }
+                self.check_rc_nearest(bail);
+                let a = self.st_val(0, bail);
+                self.and_imm(Size::W, SW, SW, !(C1 | C2) as u64);
+                self.trig(op, a, bail);
+                self.fset(0, FR);
+                if matches!(op, TrigOp::Tan | TrigOp::SinCos) {
+                    self.fpush_val(FS);
+                }
+            }
             K::Rndint => {
                 self.x87_need(0, true, bail);
                 let a = self.st_val(0, bail);
@@ -505,6 +529,161 @@ impl Emit {
         self.x87 = after;
         self.a.bind(done);
         true
+    }
+
+    fn fconst(&mut self, v: V, bits: u64) {
+        self.a.mov_imm(Size::X, T_C, bits);
+        self.a.fmov_dx(v, T_C);
+    }
+
+    /// FR = `x86::trig::eval(x, op).0` and FS the value to push, by the same
+    /// operations in order; ±0 is exact and leaves PE alone, as in the interpreter.
+    fn trig(&mut self, op: TrigOp, x: V, bail: Label) {
+        let (nonzero, out) = (self.a.label(), self.a.label());
+        self.a.fp1(true, 0, FA, x);
+        self.a.fmov_xd(T_A, FA);
+        self.a.lsl_imm(Size::X, T_B, T_A, 1);
+        self.a.cbnz(Size::X, T_B, nonzero);
+        self.fconst(FS, 1.0f64.to_bits());
+        self.a.fp1(true, 0, FR, if op == TrigOp::Cos { FS } else { FA });
+        self.a.b(out);
+        self.a.bind(nonzero);
+        self.a.ubfx(Size::X, T_B, T_A, 52, 11);
+        self.a.sub_imm(Size::W, T_B, T_B, trig::MIN_EXP as u32);
+        self.a.tbnz(T_B, 31, bail);
+        self.a.sub_imm(Size::W, T_B, T_B, (trig::MAX_EXP - trig::MIN_EXP) as u32);
+        self.a.tbz(T_B, 31, bail);
+
+        self.fconst(E2, trig::INVPIO2);
+        self.a.fp2(true, 0, FB, FA, E2);
+        self.a.fp1(true, 8, FB, FB);
+        self.a.fcvtzs(true, Size::X, T_A, FB);
+        self.fconst(E2, trig::PIO2[0]);
+        self.a.fmadd_d(true, FR, FB, E2, FA);
+        for part in &trig::PIO2[1..] {
+            self.fconst(E2, *part);
+            self.a.fmadd_d(true, FR, FB, E2, FR);
+        }
+        self.a.fp2(true, 0, FS, FR, FR);
+
+        self.fconst(E1, trig::S[5]);
+        for c in trig::S[..5].iter().rev() {
+            self.fconst(E2, *c);
+            self.a.fmadd_d(false, E1, FS, E1, E2);
+        }
+        self.a.fp2(true, 0, W2, FS, FR);
+        self.a.fmadd_d(false, W0, W2, E1, FR);
+
+        self.fconst(E1, trig::C[2]);
+        for c in [trig::C[1], trig::C[0]] {
+            self.fconst(E2, c);
+            self.a.fmadd_d(false, E1, FS, E1, E2);
+        }
+        self.fconst(W1, trig::C[5]);
+        for c in [trig::C[4], trig::C[3]] {
+            self.fconst(E2, c);
+            self.a.fmadd_d(false, W1, FS, W1, E2);
+        }
+        self.a.fp2(true, 0, W2, FS, FS);
+        self.a.fp2(true, 0, W2, W2, W2);
+        self.a.fp2(true, 0, W3, FS, E1);
+        self.a.fmadd_d(false, E1, W2, W1, W3);
+        self.fconst(E2, 0.5f64.to_bits());
+        self.a.fp2(true, 0, W3, E2, FS);
+        self.fconst(E2, 1.0f64.to_bits());
+        self.a.fp2(true, 3, W2, E2, W3);
+        self.a.fp2(true, 3, FB, E2, W2);
+        self.a.fp2(true, 3, FB, FB, W3);
+        self.a.fmadd_d(false, FB, FS, E1, FB);
+        self.a.fp2(true, 2, W1, W2, FB);
+
+        // W0 = sin r, W1 = cos r; the low bits of T_A pick the quadrant.
+        if op == TrigOp::Tan {
+            let (even, done) = (self.a.label(), self.a.label());
+            self.a.fmov_xd(T_B, W0);
+            self.a.lsl_imm(Size::X, T_B, T_B, 1);
+            self.a.cbz(Size::X, T_B, bail);
+            self.a.tbz(T_A, 0, even);
+            self.a.fp2(true, 1, FR, W1, W0);
+            self.a.fp1(true, 2, FR, FR);
+            self.a.b(done);
+            self.a.bind(even);
+            self.a.fp2(true, 1, FR, W0, W1);
+            self.a.bind(done);
+            self.fconst(FS, 1.0f64.to_bits());
+        } else {
+            self.trig_quadrant(op);
+        }
+        let ok = self.a.logic_imm(Logic::Orr, Size::W, SW, SW, 1 << PE_SHIFT);
+        assert!(ok);
+        self.a.bind(out);
+    }
+
+    /// FR (and FS for FSINCOS) from W0 = sin r and W1 = cos r for quadrant T_A.
+    fn trig_quadrant(&mut self, op: TrigOp) {
+        let swap = self.a.label();
+        self.a.tbz(T_A, 0, swap);
+        self.a.fp1(true, 0, FA, W0);
+        self.a.fp1(true, 0, W0, W1);
+        self.a.fp1(true, 0, W1, FA);
+        self.a.bind(swap);
+        let (sin_pos, cos_pos) = (self.a.label(), self.a.label());
+        self.a.tbz(T_A, 1, sin_pos);
+        self.a.fp1(true, 2, W0, W0);
+        self.a.bind(sin_pos);
+        self.a.logic_shift(Logic::Eor, false, Size::W, T_B, T_A, T_A, Shift::Lsr, 1);
+        self.a.tbz(T_B, 0, cos_pos);
+        self.a.fp1(true, 2, W1, W1);
+        self.a.bind(cos_pos);
+        let (first, second) = match op {
+            TrigOp::Sin => (W0, None),
+            TrigOp::Cos => (W1, None),
+            _ => (W0, Some(W1)),
+        };
+        self.a.fp1(true, 0, FR, first);
+        if let Some(v) = second {
+            self.a.fp1(true, 0, FS, v);
+        }
+    }
+
+    /// FNINIT (`init`) or EMMS. Both empty every tag; FNINIT also resets FCW,
+    /// FSW and the instruction and operand pointers.
+    pub(super) fn fpu_reset(&mut self, eip: u32, init: bool) {
+        self.x87_flush();
+        self.x87 = X87Block::default();
+        let ok = self.a.label();
+        self.a.ldr(Width::W, U, STATE, state::X87_BASE as i32);
+        self.a.cbnz(Size::W, U, ok);
+        self.exit_interp(eip);
+        self.a.bind(ok);
+        // An MMX instruction since the last exit left TOP at 0 and every tag valid.
+        let (no_mmx, done) = (self.a.label(), self.a.label());
+        self.a.ldr(Width::W, T_B, STATE, state::MM_USED as i32);
+        self.a.tbz(T_B, 8, no_mmx);
+        self.and_imm(Size::W, T_B, T_B, !0x100u32 as u64);
+        self.a.str(Width::W, T_B, STATE, state::MM_USED as i32);
+        if !init {
+            self.a.ldr(Width::W, T_B, STATE, state::FSW as i32);
+            self.and_imm(Size::W, T_B, T_B, !0x3800u32 as u64);
+            self.a.str(Width::W, T_B, STATE, state::FSW as i32);
+        }
+        self.a.bind(no_mmx);
+        self.a.str(Width::W, ZR, STATE, state::FTAGS as i32);
+        if init {
+            self.a.mov_imm(Size::W, T_A, 0x37f);
+            self.a.str(Width::W, T_A, STATE, state::FCW as i32);
+            self.a.str(Width::W, U, STATE, state::X87_OK as i32);
+            for at in [state::FSW, state::FNOTE, state::FDSEG] {
+                self.a.str(Width::W, ZR, STATE, at as i32);
+            }
+            self.a.movz(Size::W, T_A, 1, 0);
+            self.a.str(Width::W, T_A, STATE, state::FINIT as i32);
+            self.a.ldr(Width::W, T_B, STATE, state::FPCR_X87 as i32);
+            self.a.cbz(Size::W, T_B, done);
+            self.a.movz(Size::W, T_B, 2, 0);
+            self.a.str(Width::W, T_B, STATE, state::FPCR_X87 as i32);
+        }
+        self.a.bind(done);
     }
 
     /// FWAIT: nothing to do unless an x87 exception could be pending.

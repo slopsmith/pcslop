@@ -5,3 +5,4 @@ pub mod decode;
 pub mod fparith;
 pub mod fpu;
 pub mod interp;
+pub mod trig;
