@@ -266,6 +266,10 @@ pub struct Cpu {
     pub sysenter_eip: u32,
     /// IA32_DEBUGCTL. Stored only: we record no branches and never trap on them.
     pub debugctl: u32,
+    /// IA32_PAT. Stored only: we give every page the same memory type. Not
+    /// saved, so save states from before it existed still load.
+    #[snap(skip)]
+    pub pat: u64,
     pub halted: bool,
     pub interrupt_shadow: bool,
     pub fpu: crate::fpu::Fpu,
@@ -310,6 +314,7 @@ impl Cpu {
             sysenter_esp: 0,
             sysenter_eip: 0,
             debugctl: 0,
+            pat: crate::cpuid::PAT_RESET,
             halted: false,
             interrupt_shadow: false,
             fpu: crate::fpu::Fpu::default(),
@@ -346,6 +351,7 @@ impl Cpu {
         self.cr3 = 0;
         self.cr4 = 0;
         self.dr = [0, 0, 0, 0, 0, 0, 0xffff_0ff0, 0x400];
+        self.pat = crate::cpuid::PAT_RESET;
         self.write_tsc(0);
         self.halted = false;
         self.interrupt_shadow = false;

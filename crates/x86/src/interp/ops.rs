@@ -1275,6 +1275,7 @@ impl<B: Bus> Ctx<'_, B> {
             0x176 => self.cpu.sysenter_eip as u64,
             0x1d7 | 0x1d8 | 0x1da..=0x1de => 0,
             0x1d9 => self.cpu.debugctl as u64,
+            0x277 => self.cpu.pat,
             _ => return self.bus.rdmsr(msr).map_or_else(|| gp(0), Ok),
         })
     }
@@ -1287,6 +1288,7 @@ impl<B: Bus> Ctx<'_, B> {
             0x175 => self.cpu.sysenter_esp = v as u32,
             0x176 => self.cpu.sysenter_eip = v as u32,
             0x1d9 => self.cpu.debugctl = v as u32 & DEBUGCTL_BITS,
+            0x277 if v.to_le_bytes().iter().all(|&t| matches!(t, 0 | 1 | 4..=7)) => self.cpu.pat = v,
             _ if self.bus.wrmsr(msr, v) => {}
             _ => return gp(0),
         }

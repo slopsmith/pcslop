@@ -15,6 +15,7 @@ pub mod edx {
     pub const MTRR: u32 = 1 << 12;
     pub const PGE: u32 = 1 << 13;
     pub const CMOV: u32 = 1 << 15;
+    pub const PAT: u32 = 1 << 16;
     pub const CLFSH: u32 = 1 << 19;
     pub const MMX: u32 = 1 << 23;
     pub const FXSR: u32 = 1 << 24;
@@ -32,6 +33,7 @@ pub const FEATURES_EDX: u32 = edx::FPU
     | edx::SEP
     | edx::PGE
     | edx::CMOV
+    | edx::PAT
     | edx::CLFSH
     | edx::MMX
     | edx::FXSR
@@ -41,6 +43,9 @@ pub const FEATURES_EDX: u32 = edx::FPU
 /// MSR_EBC_FREQUENCY_ID (0x2C) of a 2.4 GHz Northwood: a 133 MHz bus and a core ratio of 18.
 /// XP's intelppm.sys reads it on every family 15 CPU.
 pub const EBC_FREQUENCY_ID: u64 = 18 << 24 | 1 << 16;
+
+/// IA32_PAT's power-on value: WB, WT, UC-, UC in both halves (SDM vol. 3, 13.12.4).
+pub const PAT_RESET: u64 = 0x0007_0406_0007_0406;
 
 /// IA32_MISC_ENABLE (0x1A0): fast strings on, branch trace and PEBS unavailable.
 /// Vista's winload reads it; writes are ignored.

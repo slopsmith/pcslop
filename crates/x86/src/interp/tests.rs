@@ -701,6 +701,38 @@ fn misc_enable_reads_fast_strings_and_ignores_writes() {
 }
 
 #[test]
+fn cpuid_reports_pat() {
+    assert_ne!(crate::cpuid::cpuid(1, 0)[3] & crate::cpuid::edx::PAT, 0, "Vista maps RAM write-combined only through PAT");
+}
+
+#[test]
+fn ia32_pat_starts_at_its_power_on_value_and_keeps_writes() {
+    use crate::cpu::{EAX, ECX, EDX};
+    let mut mc = Machine::new();
+    mc.cpu.regs[ECX] = 0x277;
+    mc.run(&[0x0f, 0x32]).unwrap();
+    assert_eq!((mc.cpu.regs[EAX], mc.cpu.regs[EDX]), (0x0007_0406, 0x0007_0406));
+    mc.cpu.regs[EAX] = 0x0007_0106;
+    mc.cpu.regs[EDX] = 0x0007_0406;
+    mc.run(&[0x0f, 0x30]).unwrap();
+    mc.cpu.regs[EAX] = 0;
+    mc.run(&[0x0f, 0x32]).unwrap();
+    assert_eq!(mc.cpu.regs[EAX], 0x0007_0106);
+}
+
+#[test]
+fn ia32_pat_rejects_reserved_memory_types() {
+    use crate::cpu::{EAX, ECX, EDX};
+    let mut mc = Machine::new();
+    mc.cpu.regs[ECX] = 0x277;
+    mc.cpu.regs[EAX] = 0x0007_0402;
+    mc.cpu.regs[EDX] = 0;
+    assert_eq!(mc.run(&[0x0f, 0x30]), Err(Exception::with_error(vector::GP, 0)));
+    mc.cpu.regs[EAX] = 0x0807_0406;
+    assert_eq!(mc.run(&[0x0f, 0x30]), Err(Exception::with_error(vector::GP, 0)));
+}
+
+#[test]
 fn rdmsr_of_an_unknown_msr_raises_gp() {
     let mut mc = Machine::new();
     mc.cpu.regs[crate::cpu::ECX] = 0x2a;
