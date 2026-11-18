@@ -4,6 +4,7 @@ using namespace metal;
 // Texture fetch and filtering, the alpha test, depth and stencil, blending,
 // the ROP and colour packing, ported from tex.rs and raster.rs so both
 // backends draw the same pixels. Everything reads and writes the VRAM buffer.
+// The S_ macros are the draw's back end state, which msl.rs bakes in.
 
 struct TexDesc {
     uint enabled, stage, base, limit, width, height, format, nlevels, filter, border;
@@ -295,7 +296,7 @@ static float omod(float v, uint m) {
 }
 
 static bool inside_clip(constant Uniforms &u, int x, int y) {
-    if (u.clip_rule == 0xffff) return true;
+    if (S_CLIP_ALL) return true;
     uint n = 0;
     for (uint k = 0; k < 4; k++) {
         if (x >= u.clips[4 * k] && x <= u.clips[4 * k + 2] && y >= u.clips[4 * k + 1] && y <= u.clips[4 * k + 3]) n |= 1u << k;
@@ -342,30 +343,30 @@ static void write_px(device uchar *v, uint a, uint bpp, uint x) {
 }
 
 static bool depth_stencil(constant Uniforms &u, device uchar *vram, uint x, uint y, float z, bool front) {
-    if (!u.has_depth || (u.zb_cntl & 3) == 0) return true;
-    uint bpp = u.z16 ? 2 : 4;
+    if (!S_HAS_DEPTH || (S_ZB & 3) == 0) return true;
+    uint bpp = S_Z16 ? 2 : 4;
     uint a = u.depth_base + (y * u.depth_pitch + x) * bpp;
     if (a + bpp > u.vram_size) return true;
-    if (u.cb_clear) {
+    if (S_CB_CLEAR) {
         write_px(vram, a, bpp, u.cb_clear_value);
         return true;
     }
     uint old = read_px(vram, a, bpp);
     float ds = u.depth_scale != 0.0 ? u.depth_scale : 16777215.0;
     uint z24 = uint(clamp(round(z * ds + u.depth_bias), 0.0, 16777215.0));
-    uint zval = u.z16 ? z24 >> 8 : z24;
-    uint zold = u.z16 ? old & 0xffff : old >> 8;
-    bool z_on = (u.zb_cntl & 2) != 0;
-    bool z_pass = !z_on || test(u.zs_cntl & 7, zval, zold);
-    bool stencil_on = (u.zb_cntl & 1) != 0 && !u.z16;
+    uint zval = S_Z16 ? z24 >> 8 : z24;
+    uint zold = S_Z16 ? old & 0xffff : old >> 8;
+    bool z_on = (S_ZB & 2) != 0;
+    bool z_pass = !z_on || test(S_ZS & 7, zval, zold);
+    bool stencil_on = (S_ZB & 1) != 0 && !S_Z16;
     uint nv = old;
     bool pass = z_pass;
     if (stencil_on) {
-        bool back = (u.zb_cntl & (1 << 4)) != 0 && !front;
-        uint func = (u.zs_cntl >> (back ? 15 : 3)) & 7;
-        uint fail_op = (u.zs_cntl >> (back ? 18 : 6)) & 7;
-        uint zpass_op = (u.zs_cntl >> (back ? 21 : 9)) & 7;
-        uint zfail_op = (u.zs_cntl >> (back ? 24 : 12)) & 7;
+        bool back = (S_ZB & (1 << 4)) != 0 && !front;
+        uint func = (S_ZS >> (back ? 15 : 3)) & 7;
+        uint fail_op = (S_ZS >> (back ? 18 : 6)) & 7;
+        uint zpass_op = (S_ZS >> (back ? 21 : 9)) & 7;
+        uint zfail_op = (S_ZS >> (back ? 24 : 12)) & 7;
         uint ref = u.stencil_ref & 0xff, mask = (u.stencil_ref >> 8) & 0xff, wmask = (u.stencil_ref >> 16) & 0xff;
         uint s = old & 0xff;
         bool s_pass = test(func, s & mask, ref & mask);
@@ -374,7 +375,7 @@ static bool depth_stencil(constant Uniforms &u, device uchar *vram, uint x, uint
         nv = (nv & ~wmask) | (ns & wmask);
         pass = s_pass && z_pass;
     }
-    if (pass && z_on && (u.zb_cntl & 4) != 0) nv = u.z16 ? zval : (zval << 8) | (nv & 0xff);
+    if (pass && z_on && (S_ZB & 4) != 0) nv = S_Z16 ? zval : (zval << 8) | (nv & 0xff);
     if (nv != old) write_px(vram, a, bpp, nv);
     return pass;
 }
@@ -438,9 +439,9 @@ static uint rop2(uint r, uint s, uint d) {
 }
 
 static float4 blend_fog(constant Uniforms &u, float4 c, float value) {
-    if (!(u.fog & 1)) return c;
+    if (!(S_FOG & 1)) return c;
     float amount;
-    switch ((u.fog >> 1) & 3) {
+    switch ((S_FOG >> 1) & 3) {
     case 0: amount = value; break;
     case 1: amount = 1.0 - exp2(-16.0 * value); break;
     case 2: amount = 1.0 - exp2(-16.0 * value * value); break;
@@ -451,22 +452,22 @@ static float4 blend_fog(constant Uniforms &u, float4 c, float value) {
 }
 
 static void backend(constant Uniforms &u, device uchar *vram, device atomic_uint *counter, uint x, uint y, float4 colour, float z, bool front) {
-    if (u.alpha_func & (1 << 11)) {
+    if (S_ALPHA & (1 << 11)) {
         uint a = uint(round(clamp(colour.w, 0.0, 1.0) * 255.0));
         const uint alpha_to_z[8] = {0, 1, 3, 2, 5, 6, 4, 7};
-        if (!test(alpha_to_z[(u.alpha_func >> 8) & 7], a, u.alpha_func & 0xff)) return;
+        if (!test(alpha_to_z[(S_ALPHA >> 8) & 7], a, u.alpha_func & 0xff)) return;
     }
     if (!depth_stencil(u, vram, x, y, z, front)) return;
     atomic_fetch_add_explicit(counter, 1, memory_order_relaxed);
     uint sel[4];
     for (uint k = 0; k < 4; k++) {
-        uint s = (u.out_fmt >> (8 + 2 * k)) & 3;
+        uint s = (S_OUT_FMT >> (8 + 2 * k)) & 3;
         sel[k] = s == 0 ? 3 : s - 1;
     }
     float4 src = clamp(float4(colour[sel[0]], colour[sel[1]], colour[sel[2]], colour[sel[3]]), 0.0, 1.0);
     float4 cc = float4(float(u.constant_colour & 0xff), float((u.constant_colour >> 8) & 0xff), float((u.constant_colour >> 16) & 0xff), float(u.constant_colour >> 24)) / 255.0;
-    for (uint i = 0; i < u.ncb; i++) {
-        uint fmt = u.cb[i].format;
+    for (uint i = 0; i < S_NCB; i++) {
+        uint fmt = S_FMT(i);
         uint bpp = bytes_per_pixel(fmt);
         uint a = u.cb[i].offset + (y * u.cb[i].pitch + x) * bpp;
         if (a + bpp > u.vram_size) continue;
@@ -480,9 +481,9 @@ static void backend(constant Uniforms &u, device uchar *vram, device atomic_uint
             shift += w[k];
         }
         float4 out = src;
-        if (u.blend & 1) {
+        if (S_BLEND & 1) {
             for (uint k = 0; k < 4; k++) {
-                uint cntl = (k == 3 && (u.blend & 2)) ? u.ablend : u.blend;
+                uint cntl = (k == 3 && (S_BLEND & 2)) ? S_ABLEND : S_BLEND;
                 out[k] = combine(cntl, k, src, dst, cc);
             }
         }
@@ -491,10 +492,10 @@ static void backend(constant Uniforms &u, device uchar *vram, device atomic_uint
         for (uint k = 0; k < n; k++) {
             uint mx = (1u << w[k]) - 1u;
             packed |= uint(round(clamp(out[k], 0.0, 1.0) * float(mx))) << shift;
-            if (u.channel_mask & (1u << k)) mask |= mx << shift;
+            if (S_CMASK & (1u << k)) mask |= mx << shift;
             shift += w[k];
         }
-        if (u.rop & 4) packed = rop2((u.rop >> 8) & 15, packed, old);
+        if (S_ROP & 4) packed = rop2((S_ROP >> 8) & 15, packed, old);
         uint nv = (old & ~mask) | (packed & mask);
         if (nv != old) write_px(vram, a, bpp, nv);
     }
@@ -502,7 +503,7 @@ static void backend(constant Uniforms &u, device uchar *vram, device atomic_uint
 
 // As Raster::offset_depth in raster.rs, whose slopes are per 1/16 pixel.
 static float poly_offset(constant Uniforms &u, float z, bool front) {
-    if ((u.poly_enable & (front ? 1u : 2u)) == 0) return z;
+    if ((S_POLY & (front ? 1u : 2u)) == 0) return z;
     float scale = front ? u.poly[0] : u.poly[2], offset = front ? u.poly[1] : u.poly[3];
     float ds = u.depth_scale != 0.0 ? u.depth_scale : 16777215.0;
     float slope = max(abs(dfdx(z)), abs(dfdy(z))) / 16.0;

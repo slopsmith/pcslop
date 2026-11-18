@@ -269,19 +269,22 @@ impl MetalR3d {
         })
     }
 
-    /// The pipeline for a fragment program, built from MSL the first time.
-    /// The key holds only the instructions the program runs, as the MSL
-    /// does: drivers leave stale words in the slots around a program, and
-    /// keying on them built a new pipeline for every combination.
+    /// The pipeline for a fragment program and the back end state it is
+    /// compiled for (`msl::Backend`), built from MSL the first time. The key
+    /// holds only the instructions the program runs, as the MSL does:
+    /// drivers leave stale words in the slots around a program, and keying
+    /// on them built a new pipeline for every combination.
     fn pipeline(&mut self, r: &Raster, slots: &[usize]) -> Option<Pipeline> {
-        let key = pipeline_key(&r.us, slots, r.perspective);
+        let backend = msl::Backend::new(r);
+        let mut key = pipeline_key(&r.us, slots, r.perspective);
+        key.extend(backend.key());
         if let Some(p) = self.pipelines.get(&key) {
             return p.clone();
         }
         if self.pipelines.len() >= MAX_PIPELINES {
             self.pipelines.clear();
         }
-        let built = self.build(&msl::shader(&r.us, slots, r.perspective));
+        let built = self.build(&msl::shader(&r.us, slots, r.perspective, &backend));
         if built.is_none() {
             eprintln!("radeon: Metal pipeline failed; drawing on the CPU instead");
         }
@@ -292,7 +295,9 @@ impl MetalR3d {
     /// The pipeline for a draw whose vertices `vs` describes, keyed like
     /// `pipeline` plus the vertex state.
     fn vs_pipeline(&mut self, r: &Raster, slots: &[usize], vs: &VsDesc) -> Option<Pipeline> {
+        let backend = msl::Backend::new(r);
         let mut key = pipeline_key(&r.us, slots, r.perspective);
+        key.extend(backend.key());
         key.push(u32::MAX);
         key.extend(vs.key());
         if let Some(p) = self.pipelines.get(&key) {
@@ -301,7 +306,7 @@ impl MetalR3d {
         if self.pipelines.len() >= MAX_PIPELINES {
             self.pipelines.clear();
         }
-        let built = self.build(&msl::shader_gpu(&r.us, slots, r.perspective, vs));
+        let built = self.build(&msl::shader_gpu(&r.us, slots, r.perspective, &backend, vs));
         if built.is_none() {
             eprintln!("radeon: Metal vertex pipeline failed; running vertices on the CPU instead");
         }

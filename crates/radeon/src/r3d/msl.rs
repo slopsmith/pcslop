@@ -2,6 +2,7 @@
 //! instruction semantics as us.rs, unrolled into straight-line code, with
 //! textures, constants and the back end state left to a uniform buffer.
 
+use super::raster::Raster;
 use super::us::Program;
 use super::vsgen::VsDesc;
 use std::fmt::Write;
@@ -39,15 +40,131 @@ fn outputs(slots: &[usize], perspective: bool, flat: &[u32]) -> String {
     )
 }
 
+/// The back end state a fragment shader is compiled for: the colour
+/// buffers' formats, depth and stencil, the alpha test, blending, the ROP,
+/// fog and the output swizzle, as the prelude's `S_` macros read them.
+/// What the state makes irrelevant is zero, so draws that differ only
+/// there share a pipeline; values drivers change often stay in `Uniforms`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) struct Backend {
+    ncb: u32,
+    formats: [u32; 4],
+    has_depth: u32,
+    z16: u32,
+    zb: u32,
+    zs: u32,
+    cb_clear: u32,
+    blend: u32,
+    ablend: u32,
+    cmask: u32,
+    rop: u32,
+    alpha: u32,
+    out_fmt: u32,
+    fog: u32,
+    clip_all: u32,
+    poly: u32,
+}
+
+impl Backend {
+    pub fn new(r: &Raster) -> Self {
+        let ncb = r.colour.len().min(4);
+        let mut formats = [0; 4];
+        for (f, cb) in formats.iter_mut().zip(&r.colour) {
+            *f = cb.format;
+        }
+        let mut b = Backend {
+            ncb: ncb as u32,
+            formats,
+            cmask: r.channel_mask & 0xf,
+            out_fmt: r.out_fmt & 0xff00,
+            clip_all: (r.clip_rule == 0xffff) as u32,
+            poly: r.poly_offset.0 & 3,
+            ..Default::default()
+        };
+        if let Some(d) = r.depth
+            && r.zb_cntl & 3 != 0
+        {
+            b.has_depth = 1;
+            b.z16 = d.z16 as u32;
+            b.zb = r.zb_cntl & 0x17;
+            if r.cb_clear.is_some() {
+                b.cb_clear = 1;
+                b.zb &= 3;
+            } else {
+                b.zs = r.zs_cntl;
+                if b.zb & 1 == 0 || d.z16 {
+                    b.zb &= !0x11;
+                    b.zs &= 7;
+                }
+                if b.zb & 2 == 0 {
+                    b.zs &= !7;
+                }
+            }
+        }
+        const COMBINE: u32 = 7 << 12 | 63 << 16 | 63 << 24;
+        if r.blend & 1 != 0 {
+            b.blend = r.blend & (3 | COMBINE);
+            if r.blend & 2 != 0 {
+                b.ablend = r.ablend & COMBINE;
+            }
+        }
+        if r.rop & 4 != 0 {
+            b.rop = r.rop & 0xf04;
+        }
+        if r.alpha_func & (1 << 11) != 0 {
+            b.alpha = r.alpha_func & 0xf00;
+        }
+        if r.fog & 1 != 0 {
+            b.fog = r.fog & 7;
+        }
+        b
+    }
+
+    /// Words for a pipeline cache key.
+    pub fn key(&self) -> [u32; 19] {
+        let [f0, f1, f2, f3] = self.formats;
+        [
+            self.ncb, f0, f1, f2, f3, self.has_depth, self.z16, self.zb, self.zs, self.cb_clear, self.blend, self.ablend,
+            self.cmask, self.rop, self.alpha, self.out_fmt, self.fog, self.clip_all, self.poly,
+        ]
+    }
+
+    fn defines(&self) -> String {
+        let [f0, f1, f2, f3] = self.formats;
+        let mut d = format!("#define S_FMT(i) ((i) == 0 ? {f0}u : (i) == 1 ? {f1}u : (i) == 2 ? {f2}u : {f3}u)\n");
+        for (name, v) in [
+            ("NCB", self.ncb),
+            ("HAS_DEPTH", self.has_depth),
+            ("Z16", self.z16),
+            ("ZB", self.zb),
+            ("ZS", self.zs),
+            ("CB_CLEAR", self.cb_clear),
+            ("BLEND", self.blend),
+            ("ABLEND", self.ablend),
+            ("CMASK", self.cmask),
+            ("ROP", self.rop),
+            ("ALPHA", self.alpha),
+            ("OUT_FMT", self.out_fmt),
+            ("FOG", self.fog),
+            ("CLIP_ALL", self.clip_all),
+            ("POLY", self.poly),
+        ] {
+            let _ = writeln!(d, "#define S_{name} {v}u");
+        }
+        d
+    }
+}
+
 /// Generates the vertex and fragment functions (`vs` and `fs`) for a draw
 /// of triangles the CPU set up, whose rasterizer fills pixel stack
 /// registers `slots`.
-pub(crate) fn shader(prog: &Program, slots: &[usize], perspective: bool) -> String {
+pub(crate) fn shader(prog: &Program, slots: &[usize], perspective: bool, backend: &Backend) -> String {
     let mut copy = String::new();
     for (i, _) in slots.iter().enumerate() {
         let _ = writeln!(copy, "    o.v{i} = v[{}];", 2 + i);
     }
-    let mut src = String::from(PRELUDE);
+    let mut src = backend.defines();
+    src.push_str(PRELUDE);
     src.push_str(&outputs(slots, perspective, &[]));
     src.push_str(&CAPTURED_VS.replace("@COPY@", &copy).replace("@STRIDE@", &(2 + slots.len()).to_string()));
     src.push_str(&fragment(prog, slots, &[], false));
@@ -56,8 +173,9 @@ pub(crate) fn shader(prog: &Program, slots: &[usize], perspective: bool) -> Stri
 
 /// Generates `vs` and `fs` for a draw whose vertices the GPU processes, as
 /// `vs` describes.
-pub(crate) fn shader_gpu(prog: &Program, slots: &[usize], perspective: bool, vs: &VsDesc) -> String {
-    let mut src = String::from(PRELUDE);
+pub(crate) fn shader_gpu(prog: &Program, slots: &[usize], perspective: bool, backend: &Backend, vs: &VsDesc) -> String {
+    let mut src = backend.defines();
+    src.push_str(PRELUDE);
     let flat = vs.flat(slots);
     src.push_str(&outputs(slots, perspective, &flat));
     src.push_str(&vs.msl(slots, &flat));
