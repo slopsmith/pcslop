@@ -782,6 +782,13 @@ impl Emit {
 
     /// Writes everything newer in registers back to the state, on the path
     /// being emitted; the translator's view stays as it was.
+    /// Emits `f` as if the x87 cache were already flushed.
+    pub(super) fn flushed(&mut self, f: impl FnOnce(&mut Self)) {
+        let entered = std::mem::replace(&mut self.x87.entered, false);
+        f(self);
+        self.x87.entered = entered;
+    }
+
     pub(super) fn x87_flush(&mut self) {
         if !self.x87.entered {
             return;

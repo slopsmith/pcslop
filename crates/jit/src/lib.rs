@@ -414,6 +414,7 @@ impl Jit {
         rt.write_words(layout::VECTORS, &code);
         shadow::build_ttbr1(rt.as_mut_slice());
         rt.as_mut_slice()[layout::LOOKUP..layout::LOOKUP + layout::LOOKUP_ENTRIES * 16].fill(0xff);
+        rt.as_mut_slice()[layout::RSTACK..layout::RSTACK + layout::RSTACK_BYTES].fill(0xff);
         unsafe { vm.map(rt.as_ptr(), layout::RUNTIME_IPA, layout::RUNTIME_SIZE, mem::RWX)? };
 
         let vcpu = Vcpu::new(&vm)?;

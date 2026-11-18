@@ -161,6 +161,7 @@ These are the starting decisions for phase 3.
 
 **Control flow**
 - A lookup table in runtime memory maps x86 EIP to translated code: the dispatcher translates EIP to a physical address with `AT S1E1R` and looks the block up in a 2-way table of 2^18 entries indexed by a Fibonacci hash. A miss makes a VM exit, the host translates the block into the shared code cache, and the guest resumes. Jumps within a page are chained directly.
+- Returns skip the dispatcher when predicted. A translated CALL enters the callee with `bl`, so x30 and the CPU's return-address predictor point at code in the calling block that continues at the return address. It also pushes that address and the EIP onto a 64-entry ring in runtime memory, tagged like the dispatcher's cache with the user bit and `VEPOCH`. RET pops the ring and, when the tag names the EIP it loaded, jumps there with `ret`. Any mismatch, including after a VEPOCH bump, falls back to the dispatcher.
 - Port I/O, unimplemented instructions and mode changes exit to the host. The interpreter runs anything the JIT does not handle: real mode, V86, task switches.
 - Interrupts: the host sets a pending word in the state block, which translated code checks on backward branches and block exits.
 

@@ -983,6 +983,11 @@ impl Asm {
         self.emit(0xd65f_03c0)
     }
 
+    /// RET to `rn`: a branch the CPU predicts from its return stack.
+    pub fn ret_to(&mut self, rn: Reg) {
+        self.emit(0xd65f_0000 | reg(rn) << 5)
+    }
+
     pub fn eret(&mut self) {
         self.emit(0xd69f_03e0)
     }

@@ -88,6 +88,8 @@ pub struct State {
     /// host bumps it whenever a mapping or a block they could name goes away.
     pub vlookup: u64,
     pub vepoch: u32,
+    /// Byte offset of the newest entry in `layout::RSTACK`.
+    pub rs_top: u32,
     /// x86 instructions retired by translated code.
     pub icount: u64,
     /// When non-zero, counts dispatches down and exits with PENDING at zero.
@@ -210,6 +212,7 @@ pub const TLBI_PAGE: usize = offset_of!(State, tlbi_page);
 pub const LOOKUP: usize = offset_of!(State, lookup);
 pub const VLOOKUP: usize = offset_of!(State, vlookup);
 pub const VEPOCH: usize = offset_of!(State, vepoch);
+pub const RS_TOP: usize = offset_of!(State, rs_top);
 pub const ICOUNT: usize = offset_of!(State, icount);
 pub const BUDGET: usize = offset_of!(State, budget);
 pub const INFO: usize = offset_of!(State, info);

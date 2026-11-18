@@ -24,6 +24,10 @@ pub const FILL_LOG_ENTRIES: usize = 256;
 /// One bit per 4 KiB physical page that holds translated code, for the in-VM fill.
 pub const CODE_BITMAP: usize = 0x16_0000;
 pub const CODE_BITMAP_END: usize = 0x18_0000;
+/// Ring of predicted returns, 16 bytes each: the tag of the return address
+/// (as in `VLOOKUP`) and the host code that continues there.
+pub const RSTACK: usize = 0x18_0000;
+pub const RSTACK_BYTES: usize = 64 * 16;
 pub const SHADOW_POOL: usize = 0x20_0000;
 pub const SHADOW_POOL_END: usize = 0x100_0000;
 /// The dispatcher's cache from (EIP, CPL 3) to block, ahead of the address translation.

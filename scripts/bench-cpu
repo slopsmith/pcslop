@@ -20,4 +20,9 @@ for _ in $(seq 600); do
 	grep -aq "BENCH done" "$serial" && break
 	sleep 1
 done
+if grep -aqE "Segmentation fault|Illegal instruction|Aborted|Bus error" "$serial"; then
+	echo "a benchmark crashed in the guest:" >&2
+	grep -aE "Segmentation fault|Illegal instruction|Aborted|Bus error" "$serial" >&2
+	exit 1
+fi
 grep -a "^BENCH" "$serial" | grep -v done | awk '{printf "%-6s %s s\n", $2, $3; t += $3} END {printf "total  %.2f s\n", t}'

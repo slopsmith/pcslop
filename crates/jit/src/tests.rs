@@ -227,6 +227,51 @@ fn call_and_return() {
 }
 
 #[test]
+fn returns_deeper_than_the_prediction_ring_or_to_a_changed_address() {
+    let mut code = vec![
+        0xb9, 100, 0, 0, 0, // mov ecx, 100
+        0xe8, 0x16, 0, 0, 0, // call f
+        0x89, 0xc3, // mov ebx, eax
+        0xe8, 0x2f, 0, 0, 0, // call g
+        0x46, // inc esi, skipped by g
+        0xf4, // hlt
+    ];
+    code.resize(0x20, 0x90);
+    code.extend([
+        0x40, // f: inc eax
+        0x49, // dec ecx
+        0x74, 0x05, // jz +5
+        0xe8, 0xf7, 0xff, 0xff, 0xff, // call f
+        0x01, 0xc2, // add edx, eax
+        0xc3, // ret
+    ]);
+    code.resize(0x40, 0x90);
+    code.extend([
+        0x83, 0x04, 0x24, 0x01, // g: add dword [esp], 1
+        0xc3, // ret
+    ]);
+    compare(&code, |_| {});
+}
+
+#[test]
+fn calls_and_returns_with_x87_values_in_registers() {
+    let mut code = vec![
+        0xb8, 0x20, 0x10, 0, 0, // mov eax, 0x1020
+        0xd9, 0xe8, // fld1
+        0xff, 0xd0, // call eax
+        0xd9, 0x1d, 0x00, 0x30, 0, 0, // fstp dword [0x3000]
+        0xd9, 0x1d, 0x04, 0x30, 0, 0, // fstp dword [0x3004]
+        0xf4, // hlt
+    ];
+    code.resize(0x20, 0x90);
+    code.extend([
+        0xd9, 0xeb, // fldpi
+        0xc3, // ret
+    ]);
+    compare(&code, |_| {});
+}
+
+#[test]
 fn rep_ret_runs_translated() {
     let code = [
         0xb9, 0x40, 0, 0, 0, // mov ecx, 64

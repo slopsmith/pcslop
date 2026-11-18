@@ -4,10 +4,11 @@
 //! registers, so a fault on any access leaves the x86 state of the
 //! instruction's start (apart from NZCV, which a restart recomputes).
 
-use a64::{Asm, Cond, Extend, Label, Narrow, Reg, Shift, Size, V, Width, ZR, r};
+use a64::{Asm, Cond, Extend, Label, Logic, Narrow, Reg, Shift, Size, V, Width, ZR, r};
 use x86::decode::{Insn, MemOperand, NO_REG, Rep, decode};
 
 use crate::runtime::{AF_AUX, Entries, ICOUNT, PF_RESULT, STATE, guest_reg};
+use crate::layout;
 use crate::state::{self, reason};
 
 mod flags;
@@ -27,6 +28,8 @@ const T_C: Reg = Reg(13);
 const T_D: Reg = Reg(14);
 const T_E: Reg = Reg(15);
 const CHAIN_TMP: Reg = Reg(16);
+/// The AArch64 link register: a guest CALL's `bl` leaves its return path here.
+const RA: Reg = Reg(30);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Ow {
@@ -143,7 +146,63 @@ impl Emit {
             self.a.b(slow);
             self.a.bind(slow);
         }
-        self.goto_dispatch(eip);
+        self.flushed(|e| e.goto_dispatch(eip));
+    }
+
+    /// Ends a CALL returning to `next`, pushing the prediction `ret_predicted` checks.
+    fn call_predicted(&mut self, next: u32, jump: impl FnOnce(&mut Self)) {
+        if self.page.is_none() {
+            return jump(self);
+        }
+        self.x87_flush();
+        self.flushed(|e| {
+            let go = e.a.label();
+            e.a.bl(go);
+            e.goto(next);
+            e.a.bind(go);
+            let (top, slot, tag) = (T_B, T_D, T_E);
+            e.a.ldr(Width::W, top, STATE, state::RS_TOP as i32);
+            e.a.add_imm(Size::W, top, top, 16);
+            let ok = e.a.logic_imm(Logic::And, Size::W, top, top, layout::RSTACK_BYTES as u64 - 1);
+            assert!(ok);
+            e.a.str(Width::W, top, STATE, state::RS_TOP as i32);
+            e.a.add_imm(Size::X, slot, STATE, (layout::RSTACK - layout::STATE) as u32);
+            e.a.add(Size::X, slot, slot, top);
+            e.a.ldr(Width::W, top, STATE, state::VEPOCH as i32);
+            e.a.mov_imm(Size::X, tag, next as u64 | (e.user as u64) << 32);
+            e.a.logic_shift(Logic::Orr, false, Size::X, tag, tag, top, Shift::Lsl, 33);
+            e.a.stp(Size::X, tag, RA, slot, 0);
+            jump(e);
+        });
+    }
+
+    /// Ends a RET to `eip`, skipping the dispatcher when the newest prediction names it.
+    fn ret_predicted(&mut self, eip: Reg) {
+        if self.page.is_some() {
+            self.a.mov(Size::W, r(0), eip);
+            let eip = r(0);
+            self.x87_flush();
+            let (top, slot, want, host, tag) = (T_B, T_D, T_E, T_C, T_RES);
+            let miss = self.a.label();
+            self.a.ldr(Width::W, top, STATE, state::RS_TOP as i32);
+            self.a.add_imm(Size::X, slot, STATE, (layout::RSTACK - layout::STATE) as u32);
+            self.a.add(Size::X, slot, slot, top);
+            self.a.ldp(Size::X, want, host, slot, 0);
+            self.a.sub_imm(Size::W, top, top, 16);
+            let ok = self.a.logic_imm(Logic::And, Size::W, top, top, layout::RSTACK_BYTES as u64 - 1);
+            assert!(ok);
+            self.a.str(Width::W, top, STATE, state::RS_TOP as i32);
+            self.a.ldr(Width::W, top, STATE, state::VEPOCH as i32);
+            self.a.mov_imm(Size::X, tag, (self.user as u64) << 32);
+            self.a.logic_shift(Logic::Orr, false, Size::X, tag, tag, eip, Shift::Lsl, 0);
+            self.a.logic_shift(Logic::Orr, false, Size::X, tag, tag, top, Shift::Lsl, 33);
+            self.a.eor(Size::X, tag, tag, want);
+            self.a.cbnz(Size::X, tag, miss);
+            self.a.ret_to(host);
+            self.a.bind(miss);
+            return self.flushed(|e| e.goto_reg(eip));
+        }
+        self.goto_reg(eip);
     }
 
     /// Jumps through the dispatcher even within the page, so it can check for interrupts.
@@ -1072,7 +1131,7 @@ impl Emit {
                 self.load(Width::W, T_A);
                 let release = 4 + if op == 0xc2 { insn.imm & 0xffff } else { 0 };
                 self.add_const(esp, esp, release);
-                self.goto_reg(T_A);
+                self.ret_predicted(T_A);
                 return Step::End;
             }
             0xc6 if insn.reg() == 0 => {
@@ -1103,7 +1162,7 @@ impl Emit {
             0xe8 if op32 => {
                 self.a.mov_imm(Size::W, T_B, next as u64);
                 self.push(T_B);
-                self.goto(next.wrapping_add(insn.imm));
+                self.call_predicted(next, |e| e.goto(next.wrapping_add(insn.imm)));
                 return Step::End;
             }
             0xe9 | 0xeb if op32 => {
@@ -1174,8 +1233,11 @@ impl Emit {
                     if insn.reg() == 2 {
                         self.a.mov_imm(Size::W, T_B, next as u64);
                         self.push(T_B);
+                        self.a.mov(Size::W, r(0), T_C);
+                        self.call_predicted(next, |e| e.goto_reg(r(0)));
+                    } else {
+                        self.goto_reg(T_C);
                     }
-                    self.goto_reg(T_C);
                     return Step::End;
                 }
                 6 => {
