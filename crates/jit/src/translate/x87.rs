@@ -79,6 +79,12 @@ impl X87Block {
         (self.entered && (self.dirty != 0 || self.meta)).then_some(Snap { dirty: self.dirty, meta: self.meta, note: self.note })
     }
 
+    /// The state of a tier-2 region's body: every slot it uses is in its
+    /// register and written back on the way out, with SW and TAGS.
+    pub(super) fn region_body(touched: u8) -> X87Block {
+        X87Block { entered: true, cached: touched, dirty: touched, meta: true, ..X87Block::default() }
+    }
+
     /// Whether a jump back to the block's start with this state could keep
     /// the cached registers: x87 code ran and TOP is back where it started.
     pub(super) fn balanced(&self) -> bool {
@@ -102,12 +108,12 @@ impl X87Block {
     }
 }
 
-fn cv(slot: usize) -> V {
+pub(super) fn cv(slot: usize) -> V {
     V(8 + slot as u8)
 }
 
-#[derive(Clone, Copy)]
-enum Src {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Src {
     F32,
     F64,
     I16,
@@ -115,7 +121,7 @@ enum Src {
 }
 
 #[derive(Clone, Copy)]
-enum K {
+pub(super) enum K {
     LdMem(Src),
     Ild(Width),
     Ld80,
@@ -125,6 +131,8 @@ enum K {
     LdReg(usize),
     StReg { i: usize, pop: bool },
     Xch(usize),
+    /// FFREE: tags ST(i) empty.
+    Free(usize),
     Chs,
     Abs,
     LdConst { mant: u64 },
@@ -145,7 +153,7 @@ enum K {
     Ldcw,
 }
 
-fn classify(insn: &Insn) -> Option<K> {
+pub(super) fn classify(insn: &Insn) -> Option<K> {
     let op = (insn.op & 7) as u8;
     let reg = insn.reg();
     let modrm = insn.modrm;
@@ -187,6 +195,7 @@ fn classify(insn: &Insn) -> Option<K> {
         (2, 0xe9) => K::Com { i: 1, pops: 2 },
         (1, 0xc0..=0xc7) => K::LdReg(i),
         (1, 0xc8..=0xcf) => K::Xch(i),
+        (5, 0xc0..=0xc7) => K::Free(i),
         (5, 0xd0..=0xd7) => K::StReg { i, pop: false },
         (5, 0xd8..=0xdf) => K::StReg { i, pop: true },
         (1, 0xe0) => K::Chs,
@@ -276,11 +285,19 @@ impl Emit {
             K::StMem { double, pop } => {
                 self.x87_need(0, true, bail);
                 if double && !self.is_cached(0) {
-                    self.check_rc_nearest(bail);
+                    // Rounding to a double only depends on RC when the value is not exact.
+                    let (directed, stored) = (self.a.label(), self.a.label());
                     self.fget(0, M, S);
+                    self.a.ldr(Width::W, T_A, STATE, state::FCW as i32);
+                    self.a.ubfx(Size::W, T_A, T_A, 10, 2);
+                    self.a.cbnz(Size::W, T_A, directed);
                     self.to_f64(bail, false);
                     self.and_imm(Size::X, T_B, M, 0x7ff);
                     self.flag_nonzero_to_pe(T_B);
+                    self.a.b(stored);
+                    self.a.bind(directed);
+                    self.to_f64(bail, true);
+                    self.a.bind(stored);
                     self.store(Width::X, T_C);
                 } else if double {
                     self.a.fmov_xd(T_C, cv(self.slot(0)));
@@ -374,6 +391,12 @@ impl Emit {
                 if pop {
                     self.fpop();
                 }
+            }
+            K::Free(i) => {
+                let bit = 1u8 << self.slot(i);
+                self.set_tag(i, false);
+                self.x87.full &= !bit;
+                self.x87.empty |= bit;
             }
             K::Xch(i) => {
                 self.x87_need(0, true, bail);
@@ -755,7 +778,7 @@ impl Emit {
         assert!(ok);
     }
 
-    fn x87_enter(&mut self, bail: Label) {
+    pub(super) fn x87_enter(&mut self, bail: Label) {
         if self.x87.entered {
             return;
         }
@@ -861,7 +884,7 @@ impl Emit {
     }
 
     /// Leaves unless ST(i) is full (`full`) or empty.
-    fn x87_need(&mut self, i: usize, full: bool, bail: Label) {
+    pub(super) fn x87_need(&mut self, i: usize, full: bool, bail: Label) {
         let bit = 1u8 << self.slot(i);
         let known = if full { self.x87.full } else { self.x87.empty };
         if known & bit != 0 {
@@ -879,7 +902,7 @@ impl Emit {
 
     /// The V register holding ST(i) as an exact f64, loading it if needed;
     /// leaves unless the value is zero or a normal f64.
-    fn st_val(&mut self, i: usize, bail: Label) -> V {
+    pub(super) fn st_val(&mut self, i: usize, bail: Label) -> V {
         let r = self.slot(i);
         if self.x87.cached & 1 << r == 0 {
             let (convert, done) = (self.a.label(), self.a.label());

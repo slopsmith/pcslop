@@ -140,7 +140,6 @@ fn displacements_any_access_width_cannot_encode_match_the_interpreter_in_tier_2(
 
 #[test]
 fn mixed_code_matches_the_interpreter_in_tier_2() {
-    in_tier2(random_x87_programs_match_the_interpreter);
     in_tier2(random_mmx_programs_match_the_interpreter);
     in_tier2(random_sse_programs_match_the_interpreter);
     in_tier2(sysenter_sysexit_and_fs_loads_match_the_interpreter);
@@ -235,6 +234,21 @@ fn execution_counters_count_block_entries_and_exits() {
     assert_eq!(taken(first), Some(1), "a side exit is miscounted, so branch profiles lie: {counts:x?}");
     assert_eq!(looped.1, 9, "loop entries are miscounted, so profiles rank blocks wrongly: {counts:x?}");
     assert_eq!(taken(looped), Some(8), "a back edge is miscounted, so branch profiles lie: {counts:x?}");
+}
+
+#[test]
+fn xlat_looks_up_al_in_the_table_at_ebx() {
+    let code = [
+        0xbb, 0x00, 0x30, 0, 0, // mov ebx, 0x3000
+        0xb0, 0x05, // mov al, 5
+        0xd7, // xlat
+        0x88, 0xc1, // mov cl, al
+        0xb8, 0xff, 0x12, 0x34, 0x56, // mov eax, 0x563412ff
+        0xd7, // xlat: AL 0xff, upper bits kept
+        0xf4, // hlt
+    ];
+    let stats = compare(&code, |_| {});
+    assert_eq!(stats.interp_exits, 1, "XLAT left translated code: {stats:?}");
 }
 
 #[test]
@@ -1460,8 +1474,9 @@ fn mem_abs(out: &mut Vec<u8>, op: u8, reg: u8, addr: u32) {
 fn random_x87(rng: &mut Rng, out: &mut Vec<u8>) {
     let i = rng.below(8) as u8;
     let k = rng.below(8);
-    match rng.below(26) {
+    match rng.below(27) {
         24 => mem_abs(out, 0xdb, [5, 7][rng.below(2) as usize], 0x3540 + 10 * k),
+        25 => out.extend([0xdd, 0xc0 | i]),
         0 => mem_abs(out, 0xdd, 0, 0x3000 + 8 * k),
         1 => mem_abs(out, 0xd9, 0, 0x3100 + 4 * k),
         2 => mem_abs(out, 0xdb, 0, 0x3200 + 4 * k),
@@ -1625,6 +1640,115 @@ fn random_x87_programs_match_the_interpreter() {
         insns += n + 4;
     }
     assert!(exits * 4 < insns, "{exits} interpreter exits for {insns} x87 instructions");
+}
+
+/// An x87 instruction tier 2 compiles that keeps the stack between 1 and 8
+/// deep: `depth` is how many registers are full.
+fn random_tier2_x87(rng: &mut Rng, out: &mut Vec<u8>, depth: &mut u32) {
+    let k = rng.below(8);
+    let i = rng.below((*depth).max(1)) as u8;
+    let push = *depth < 8;
+    let pop = *depth > 1;
+    match rng.below(14) {
+        0 if push => {
+            let (op, base) = [(0xdd, 0x3000), (0xd9, 0x3100), (0xdb, 0x3200)][rng.below(3) as usize];
+            mem_abs(out, op, 0, base + if op == 0xdd { 8 * k } else { 4 * k });
+            *depth += 1;
+        }
+        1 if push => {
+            out.extend([0xd9, 0xc0 | i]);
+            *depth += 1;
+        }
+        2 if push => {
+            out.extend([0xd9, [0xe8, 0xee][rng.below(2) as usize]]);
+            *depth += 1;
+        }
+        3 => {
+            let p = pop && rng.below(2) == 0;
+            mem_abs(out, [0xd9, 0xdd][rng.below(2) as usize], 2 + p as u8, 0x3400 + 8 * k);
+            *depth -= p as u32;
+        }
+        4 if pop => {
+            mem_abs(out, 0xdb, 3, 0x3480 + 4 * k);
+            *depth -= 1;
+        }
+        5 => out.extend([0xd9, 0xc8 | i]),
+        6 => out.extend([0xd9, [0xe0, 0xe1][rng.below(2) as usize]]),
+        7 => {
+            let reg = [0, 1, 4, 5][rng.below(4) as usize];
+            let op = [0xd8, 0xdc][rng.below(2) as usize];
+            out.extend([op, 0xc0 | reg << 3 | i]);
+        }
+        8 if pop && i > 0 => {
+            let reg = [0, 1, 4, 5][rng.below(4) as usize];
+            out.extend([0xde, 0xc0 | reg << 3 | i]);
+            *depth -= 1;
+        }
+        9 => {
+            let reg = [0, 1, 4, 5][rng.below(4) as usize];
+            mem_abs(out, [0xd8, 0xdc][rng.below(2) as usize], reg, if rng.below(2) == 0 { 0x3100 + 4 * k } else { 0x3000 + 8 * k });
+        }
+        10 => out.extend([0xd8, 0xd0 | i]),
+        11 if pop => {
+            out.extend([0xdb, 0xf0 | i]);
+        }
+        12 => out.extend([0xdf, 0xe0]),
+        _ => mem_abs(out, 0xd8, 2, 0x3100 + 4 * k),
+    }
+}
+
+/// Tier 2 keeps neither PE nor C1, FIP, FDP and FOP, nor what empty
+/// registers hold, and computes overflows and NaNs as plain doubles.
+#[test]
+fn random_x87_programs_match_the_interpreter_in_tier_2() {
+    TIER2.with(|t| t.set(true));
+    let mut rng = Rng(0x87_87);
+    let mut compared = 0;
+    for round in 0..400 {
+        let mut code = Vec::new();
+        for k in 0..4 {
+            mem_abs(&mut code, 0xdd, 0, 0x3000 + 8 * k);
+        }
+        let mut depth = 4;
+        for _ in 0..30 {
+            random_tier2_x87(&mut rng, &mut code, &mut depth);
+            if rng.below(4) == 0 {
+                code.extend([0xeb, 0x00]);
+            }
+        }
+        code.push(0xf4);
+        let mem = x87_memory(&mut rng);
+        let mut a = flat_cpu(0x1000, 0x8000);
+        a.fpu.cw = [0x37f, 0x27f, 0x07f][round % 3];
+        let mut b = a.clone();
+        let mut bus_a = bus_with(0x1000, &code);
+        let mut bus_b = bus_with(0x1000, &code);
+        bus_a.ram.as_mut_slice()[0x3000..0x3600].copy_from_slice(&mem);
+        bus_b.ram.as_mut_slice()[0x3000..0x3600].copy_from_slice(&mem);
+        run_interp(&mut a, &mut bus_a);
+        let clears_exceptions = code.windows(2).any(|w| w == [0xdb, 0xe2]);
+        if a.fpu.sw & 0x1f != 0 || clears_exceptions {
+            continue;
+        }
+        run_jit(&mut b, &mut bus_b);
+        let hex: Vec<String> = code.iter().map(|b| format!("{b:02x}")).collect();
+        let relaxed = 0x220;
+        let regs = |c: &Cpu| { let mut r = c.regs; r[0] &= !relaxed; r };
+        assert_eq!(regs(&a), regs(&b), "round {round} registers\ncode: {}", hex.join(" "));
+        assert_eq!(a.eflags & ARITH_MASK, b.eflags & ARITH_MASK, "round {round} flags\ncode: {}", hex.join(" "));
+        assert_eq!((a.fpu.cw, a.fpu.sw & !relaxed as u16, a.fpu.tags), (b.fpu.cw, b.fpu.sw & !relaxed as u16, b.fpu.tags), "round {round} x87 control\ncode: {}", hex.join(" "));
+        for p in 0..8 {
+            if a.fpu.tags & 1 << p != 0 {
+                assert_eq!(a.fpu.regs[p], b.fpu.regs[p], "round {round} R{p}\ncode: {}", hex.join(" "));
+            }
+        }
+        let (ma, mb) = (bus_a.ram.as_slice(), bus_b.ram.as_slice());
+        if let Some(i) = (0..RAM).find(|&i| ma[i] != mb[i] && !(0x3520..0x3540).contains(&i)) {
+            panic!("round {round} memory at {i:#x}\ncode: {}", hex.join(" "));
+        }
+        compared += 1;
+    }
+    assert!(compared > 100, "only {compared} rounds stayed clear of exceptions");
 }
 
 fn sse_op(out: &mut Vec<u8>, pfx: u8, op: u8, reg: u8, rm: Option<u8>, addr: u32) {

@@ -91,6 +91,20 @@ pub struct Compiled {
     pub exits: Vec<u32>,
 }
 
+impl Compiled {
+    /// Appends `tail`, translated for the address right after this code.
+    pub fn append(mut self, tail: Compiled) -> Compiled {
+        let off = self.code.len() as u32;
+        self.code.extend(tail.code);
+        self.boundaries.extend(tail.boundaries.into_iter().map(|(w, e)| (w + off, e)));
+        self.chains.extend(tail.chains.into_iter().map(|(w, e)| (w + off, e)));
+        self.x87.extend(tail.x87.into_iter().map(|(w, s)| (w + off, s)));
+        self.has_rep |= tail.has_rep;
+        self.x87_loop |= tail.x87_loop;
+        self
+    }
+}
+
 struct Emit {
     a: Asm,
     block_va: u64,
@@ -1283,6 +1297,12 @@ impl Emit {
             0x40..=0x4f if op32 => {
                 let reg = guest_reg((op & 7) as usize);
                 self.inc_dec(op >= 0x48, reg, reg);
+            }
+            0xd7 if insn.addr32 && insn.seg_override.is_none_or(|s| s < 4) => {
+                self.a.ubfx(Size::W, T_A, guest_reg(0), 0, 8);
+                self.a.add(Size::W, T_ADDR, guest_reg(3), T_A);
+                self.load(Width::B, T_A);
+                self.a.bfi(Size::W, guest_reg(0), T_A, 0, 8);
             }
             0x50..=0x57 if op32 => self.push(guest_reg((op & 7) as usize)),
             0x58..=0x5f if op32 => {

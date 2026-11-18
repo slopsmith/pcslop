@@ -11,6 +11,9 @@ use std::collections::HashMap;
 
 use a64::{Cond, Label, Logic, Reg, Size, Width as AW};
 
+use a64::V;
+
+use super::super::x87::{Snap, X87Block, cv};
 use super::super::{Emit, ICOUNT, x86_cond};
 use super::ir::*;
 use super::opt::{AF, CF, OF, PF, SF, ZF, cond_reads};
@@ -27,20 +30,63 @@ const SCRATCH2: Reg = Reg(14);
 pub struct Lowered {
     pub boundaries: Vec<(u32, u32)>,
     pub insns: usize,
+    pub x87: Vec<(u32, Snap)>,
 }
 
+const FA: V = V(18);
+const FB: V = V(19);
+
 /// Emits `f` into `e`, or None when the allocator ran out of registers.
-pub fn lower(e: &mut Emit, f: &Func) -> Option<Lowered> {
+/// Emits `f` into `e`, or None when the allocator ran out of registers. A
+/// region whose entry checks can fail branches to `fallback` then: the tier-1
+/// translation of the same code, placed right after the region.
+pub fn lower(e: &mut Emit, f: &Func, fallback: Label) -> Option<Lowered> {
     let labels: Vec<Label> = (0..f.blocks.len()).map(|_| e.a.label()).collect();
     let mut boundaries = Vec::new();
     let mut insns = 0;
+    if let Some(x) = f.x87 {
+        x87_prologue(e, &x, fallback);
+    }
     for b in 0..f.blocks.len() {
         e.a.bind(labels[b]);
         let next = labels.get(b + 1).copied();
         BlockLower::new(e, f, b, &labels, next, &mut boundaries).run()?;
         insns += f.blocks[b].insns as usize;
     }
-    Some(Lowered { boundaries, insns })
+    let x87 = match f.x87 {
+        Some(x) => boundaries.iter().map(|&(w, _)| (w, Snap { dirty: x.touched, meta: true, note: (0, 0) })).collect(),
+        None => Vec::new(),
+    };
+    Some(Lowered { boundaries, insns, x87 })
+}
+
+/// Checks the control word the region was compiled for and the stack tags
+/// it relies on, and loads the slots it reads; any mismatch goes to `fallback`.
+fn x87_prologue(e: &mut Emit, x: &X87Info, fallback: Label) {
+    let bail = e.a.label();
+    // Masked exceptions and rounding to nearest; precision is checked per result.
+    e.a.ldr(AW::W, Reg(15), STATE, state::FCW as i32);
+    e.a.mov_imm(Size::W, SCRATCH, 0xc3f);
+    e.a.and(Size::W, Reg(15), Reg(15), SCRATCH);
+    e.a.mov_imm(Size::W, SCRATCH, 0x3f);
+    e.a.eor(Size::W, SCRATCH, SCRATCH, Reg(15));
+    e.a.cbnz(Size::W, SCRATCH, fallback);
+    e.x87_enter(bail);
+    for i in 0..8 {
+        if x.touched & 1 << i != 0 {
+            e.x87_need(i, x.entry_full & 1 << i != 0, bail);
+        }
+    }
+    for i in 0..8 {
+        if x.touched & x.entry_full & 1 << i != 0 {
+            e.st_val(i, bail);
+        }
+    }
+    e.defer(move |e| {
+        e.a.bind(bail);
+        e.a.b(fallback);
+    });
+    e.x87 = X87Block::region_body(x.touched);
 }
 
 struct BlockLower<'a> {
@@ -84,7 +130,8 @@ impl<'a> BlockLower<'a> {
             boundaries,
             last: HashMap::new(),
             temp_of: HashMap::new(),
-            free: TEMPS.iter().rev().map(|&n| Reg(n)).collect(),
+            // x2..x4 hold TOP, TAGS and SW in regions with x87 code, as in tier 1.
+            free: TEMPS.iter().rev().filter(|&&n| f.x87.is_none() || !(2..=4).contains(&n)).map(|&n| Reg(n)).collect(),
             home,
             fused_cond: None,
             flags_done: Vec::new(),
@@ -109,8 +156,14 @@ impl<'a> BlockLower<'a> {
         let mut widths: HashMap<Val, Vec<i32>> = HashMap::new();
         for &v in &blk.insts {
             let op = self.op(v);
+            let fw = |src: FSrc| match src {
+                FSrc::F64 => Width::W,
+                FSrc::I16 => Width::H,
+                _ => Width::B,
+            };
             let addr = match op {
                 Op::Load { addr, w } | Op::Store { addr, w, .. } => Some((addr, w)),
+                Op::FLoad { addr, src, .. } | Op::FStore { addr, dst: src, .. } | Op::FArith { b: FOperand::Mem(src, addr), .. } | Op::FCom { b: FOperand::Mem(src, addr), .. } => Some((addr, fw(src))),
                 _ => None,
             };
             for a in op.args() {
@@ -121,11 +174,13 @@ impl<'a> BlockLower<'a> {
                     && !matches!(op, Op::Store { val, .. } if val == a)
                 {
                     e.1 += 1;
-                    widths.entry(a).or_default().push(match w {
-                        Width::B => 1,
-                        Width::H => 2,
-                        Width::W => 4,
-                    });
+                    let n = match (w, op.is_x87()) {
+                        (Width::B, false) => 1,
+                        (Width::H, _) => 2,
+                        (Width::W, true) => 8,
+                        _ => 4,
+                    };
+                    widths.entry(a).or_default().push(n);
                 }
             }
         }
@@ -328,6 +383,9 @@ impl<'a> BlockLower<'a> {
     }
 
     fn inst(&mut self, v: Val, i: usize) -> Option<()> {
+        if self.op(v).is_x87() {
+            return self.x87(v);
+        }
         match self.op(v) {
             Op::Const(_) | Op::Param(_) | Op::FsBase => {}
             Op::Bin(op, a, b, c) => self.bin(v, i, op, a, b, c)?,
@@ -369,6 +427,167 @@ impl<'a> BlockLower<'a> {
                 let (base, off) = self.address(addr);
                 self.e.a.ldst(false, aw(w), false, false, s, base, off);
             }
+            _ => unreachable!("x87 operations are lowered by x87"),
+        }
+        Some(())
+    }
+
+    /// Loads an x87 memory operand into `dst` as a double.
+    fn fload(&mut self, src: FSrc, addr: Val, dst: V) {
+        let (base, off) = self.address(addr);
+        let e = &mut self.e.a;
+        match src {
+            FSrc::F32 => {
+                e.ldst(true, AW::W, false, false, Reg(15), base, off);
+                e.fmov_sw(dst, Reg(15));
+                e.fp1(false, 5, dst, dst);
+            }
+            FSrc::F64 => {
+                e.ldst(true, AW::X, false, false, Reg(15), base, off);
+                e.fmov_dx(dst, Reg(15));
+            }
+            FSrc::I32 => {
+                e.ldst(true, AW::W, false, false, Reg(15), base, off);
+                e.scvtf(true, Size::W, dst, Reg(15));
+            }
+            FSrc::I16 => {
+                e.ldst(true, AW::H, true, false, Reg(15), base, off);
+                e.scvtf(true, Size::W, dst, Reg(15));
+            }
+        }
+    }
+
+    /// Rounds a result to single precision when the control word asks for it
+    /// (SW bit 16, set from FCW on entry as in tier 1).
+    fn precision(&mut self, r: V) {
+        let done = self.e.a.label();
+        self.e.a.tbz(Reg(4), 16, done);
+        self.e.a.fp1(true, 4, r, r);
+        self.e.a.fp1(false, 5, r, r);
+        self.e.a.bind(done);
+    }
+
+    fn x87(&mut self, v: Val) -> Option<()> {
+        let s = |slot: u8| cv(slot as usize);
+        match self.op(v) {
+            Op::FLoad { slot, src, addr } => self.fload(src, addr, s(slot)),
+            Op::FStore { slot, dst, addr } => {
+                let src = s(slot);
+                match dst {
+                    FSrc::F32 => {
+                        self.e.a.fp1(true, 4, FA, src);
+                        self.e.a.fmov_ws(Reg(15), FA);
+                    }
+                    FSrc::F64 => self.e.a.fmov_xd(Reg(15), src),
+                    _ => {
+                        let ok = self.e.a.label();
+                        self.e.a.fp1(true, 8, FA, src);
+                        self.e.a.fcvtzs(true, Size::X, Reg(15), FA);
+                        if dst == FSrc::I32 {
+                            self.e.a.sxtw(Reg(16), Reg(15));
+                        } else {
+                            self.e.a.sxth(Size::X, Reg(16), Reg(15));
+                        }
+                        self.e.a.sub(Size::X, Reg(16), Reg(16), Reg(15));
+                        self.e.a.cbz(Size::X, Reg(16), ok);
+                        self.e.a.mov_imm(Size::W, Reg(15), if dst == FSrc::I32 { 0x8000_0000 } else { 0x8000 });
+                        self.e.a.bind(ok);
+                    }
+                }
+                let w = match dst {
+                    FSrc::F64 => AW::X,
+                    FSrc::I16 => AW::H,
+                    _ => AW::W,
+                };
+                let (base, off) = self.address(addr);
+                self.e.a.ldst(false, w, false, false, Reg(15), base, off);
+            }
+            Op::FCopy { dst, src } => self.e.a.fp1(true, 0, s(dst), s(src)),
+            Op::FConst { slot, one } => {
+                self.e.a.mov_imm(Size::X, Reg(15), if one { 1.0f64.to_bits() } else { 0 });
+                self.e.a.fmov_dx(s(slot), Reg(15));
+            }
+            Op::FArith { reg, dst, a, b } => {
+                let y = match b {
+                    FOperand::Slot(b) => s(b),
+                    FOperand::Mem(src, addr) => {
+                        self.fload(src, addr, FB);
+                        FB
+                    }
+                };
+                let x = s(a);
+                let (x, y) = if reg == 5 || reg == 7 { (y, x) } else { (x, y) };
+                let op = match reg {
+                    0 => 2,
+                    1 => 0,
+                    4 | 5 => 3,
+                    _ => 1,
+                };
+                self.e.a.fp2(true, op, s(dst), x, y);
+                self.precision(s(dst));
+            }
+            Op::FUnary { op, slot } => {
+                self.e.a.fp1(true, [2, 1, 3][op as usize], s(slot), s(slot));
+                if op == 2 {
+                    self.precision(s(slot));
+                }
+            }
+            Op::FXch { a, b } => {
+                self.e.a.fp1(true, 0, FA, s(a));
+                self.e.a.fp1(true, 0, s(a), s(b));
+                self.e.a.fp1(true, 0, s(b), FA);
+            }
+            Op::FCom { a, b } => {
+                let y = match b {
+                    FOperand::Slot(b) => s(b),
+                    FOperand::Mem(src, addr) => {
+                        self.fload(src, addr, FB);
+                        FB
+                    }
+                };
+                let x = s(a);
+                let sw = Reg(4);
+                let e = &mut self.e.a;
+                e.mov_imm(Size::W, SCRATCH, (1 << 8 | 1 << 9 | 1 << 10 | 1 << 14) as u64);
+                e.bic(Size::W, sw, sw, SCRATCH);
+                e.fcm(a64::Fcm::Eq, true, FA, x, y);
+                e.fmov_xd(SCRATCH, FA);
+                let ok = e.logic_imm(Logic::And, Size::W, SCRATCH, SCRATCH, 1);
+                assert!(ok, "and with 1 must encode");
+                e.logic_shift(Logic::Orr, false, Size::W, sw, sw, SCRATCH, a64::Shift::Lsl, 14);
+                e.fcm(a64::Fcm::Gt, true, FA, y, x);
+                e.fmov_xd(SCRATCH, FA);
+                let ok = e.logic_imm(Logic::And, Size::W, SCRATCH, SCRATCH, 1);
+                assert!(ok, "and with 1 must encode");
+                e.logic_shift(Logic::Orr, false, Size::W, sw, sw, SCRATCH, a64::Shift::Lsl, 8);
+            }
+            Op::FComi { a, b } => {
+                let e = &mut self.e.a;
+                e.fcmp(true, false, s(a), s(b));
+                e.axflag();
+                e.movz(Size::W, PF_RESULT, 1, 0);
+                e.movz(Size::W, AF_AUX, 0, 0);
+            }
+            Op::FSw => {
+                let d = self.alloc(v)?;
+                self.e.a.mov(Size::W, d, Reg(4));
+            }
+            Op::FTop { d, set, clear } => {
+                let e = &mut self.e.a;
+                e.add_imm(Size::W, SCRATCH, Reg(2), d as u32);
+                let ok = e.logic_imm(Logic::And, Size::W, SCRATCH, SCRATCH, 7);
+                assert!(ok, "and with 7 must encode");
+                e.bfi(Size::W, Reg(4), SCRATCH, 11, 3);
+                if set != 0 {
+                    let ok = e.logic_imm(Logic::Orr, Size::W, Reg(3), Reg(3), set as u64);
+                    assert!(ok, "a single tag bit must encode");
+                }
+                if clear != 0 {
+                    let ok = e.logic_imm(Logic::And, Size::W, Reg(3), Reg(3), !(clear as u32) as u64);
+                    assert!(ok, "all but one tag bit must encode");
+                }
+            }
+            _ => unreachable!("not an x87 operation"),
         }
         Some(())
     }

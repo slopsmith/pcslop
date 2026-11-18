@@ -322,6 +322,8 @@ pub struct Jit {
     counting: bool,
     /// Whether every block goes through tier 2 first (SLOPPER_JIT_TIER2=eager).
     tier2_eager: bool,
+    /// Whether x87 code stays with tier 1 (SLOPPER_JIT_TIER2_X87=exact).
+    tier2_exact_x87: bool,
     /// Next free counter in `layout::COUNTERS`.
     counters_next: usize,
     /// Whether the shadow tables were filled with x86 paging enabled.
@@ -485,6 +487,7 @@ impl Jit {
             counting: std::env::var_os("SLOPPER_JIT_PROFILE").is_some() || std::env::var_os("SLOPPER_JIT_COUNT").is_some(),
             counters_next: 0,
             tier2_eager: std::env::var("SLOPPER_JIT_TIER2").is_ok_and(|v| v == "eager"),
+            tier2_exact_x87: std::env::var("SLOPPER_JIT_TIER2_X87").is_ok_and(|v| v == "exact"),
             shadow_paged: false,
             apic: None,
             code_next: layout::CODE_CACHE,
@@ -1521,6 +1524,13 @@ impl Jit {
             self.reset_code_cache();
         }
         let counter_base = self.counting.then_some(self.counters_next);
+        let exact_x87 = self.tier2_exact_x87;
+        let x87_entry = {
+            let st = self.state();
+            let top = (st.fsw >> 11) & 7;
+            let rel = (0..8).fold(0u8, |m, s| m | (((st.ftags >> ((top + s) & 7)) & 1) as u8) << s);
+            (!exact_x87).then_some((st.fcw as u16, rel))
+        };
         let mut source = Some(Vec::new());
         let mut byte = |a: u32| {
             if a & !0xfff == lin_page {
@@ -1538,12 +1548,16 @@ impl Jit {
             p.map(|p| bus.read8(p | (a & 0xfff)))
         };
         let tier2 = (self.tier2_eager && !self.verify && !self_check)
-            .then(|| translate::tier2::compile_region(eip, &mut byte, block_va, rt_va, &entries, user))
+            .then(|| translate::tier2::compile_region(eip, &mut byte, block_va, rt_va, &entries, user, x87_entry))
             .flatten();
         self.stats.tier2_regions += tier2.is_some() as u64;
         let counter_base = counter_base.filter(|_| tier2.is_none());
         let compiled = match tier2 {
-            Some(c) => c,
+            Some(c) => {
+                let tail_va = block_va + 4 * c.code.len() as u64;
+                let tail = translate::compile(eip, byte, tail_va, rt_va, &entries, true, user, false, false, None);
+                c.append(tail)
+            }
             None => translate::compile(
                 eip,
                 byte,

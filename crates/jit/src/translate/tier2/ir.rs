@@ -36,6 +36,15 @@ impl Alu {
     }
 }
 
+pub(crate) use super::super::x87::Src as FSrc;
+
+/// The second operand of x87 arithmetic and compares: a stack slot or memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FOperand {
+    Slot(u8),
+    Mem(FSrc, Val),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Width {
     B,
@@ -66,6 +75,26 @@ pub enum Op {
     Store { w: Width, addr: Val, val: Val },
     /// The FS segment base.
     FsBase,
+    // x87 operations name stack slots relative to TOP at the region's entry.
+    FLoad { slot: u8, src: FSrc, addr: Val },
+    /// Stores a slot as a float or, for I32 and I16, rounded to an integer.
+    FStore { slot: u8, dst: FSrc, addr: Val },
+    FCopy { dst: u8, src: u8 },
+    FConst { slot: u8, one: bool },
+    /// Slot `dst` gets slot `a` and `b` combined by the ModRM operation `reg`.
+    FArith { reg: u8, dst: u8, a: u8, b: FOperand },
+    /// FCHS (0), FABS (1) or FSQRT (2) on a slot.
+    FUnary { op: u8, slot: u8 },
+    FXch { a: u8, b: u8 },
+    /// Sets C0, C2 and C3 of the status word from comparing slot `a` with `b`.
+    FCom { a: u8, b: FOperand },
+    /// The x86 flags FCOMI sets from comparing slot `a` with slot `b`.
+    FComi { a: u8, b: u8 },
+    /// The status word.
+    FSw,
+    /// TOP is now `d` slots from where it was at entry; `set` and `clear`
+    /// are slots that became full or empty.
+    FTop { d: u8, set: u8, clear: u8 },
 }
 
 impl Op {
@@ -80,6 +109,9 @@ impl Op {
             Op::Insert { dst, src, .. } => vec![dst, src],
             Op::Load { addr, .. } => vec![addr],
             Op::Store { addr, val, .. } => vec![addr, val],
+            Op::FLoad { addr, .. } | Op::FStore { addr, .. } => vec![addr],
+            Op::FArith { b: FOperand::Mem(_, addr), .. } | Op::FCom { b: FOperand::Mem(_, addr), .. } => vec![addr],
+            Op::FCopy { .. } | Op::FConst { .. } | Op::FArith { .. } | Op::FUnary { .. } | Op::FXch { .. } | Op::FCom { .. } | Op::FComi { .. } | Op::FSw | Op::FTop { .. } => vec![],
         }
     }
 
@@ -118,6 +150,9 @@ impl Op {
                 *addr = f(*addr);
                 *val = f(*val);
             }
+            Op::FLoad { addr, .. } | Op::FStore { addr, .. } => *addr = f(*addr),
+            Op::FArith { b: FOperand::Mem(_, addr), .. } | Op::FCom { b: FOperand::Mem(_, addr), .. } => *addr = f(*addr),
+            _ => {}
         }
     }
 
@@ -127,11 +162,18 @@ impl Op {
     }
 
     pub fn has_effect(&self) -> bool {
-        matches!(self, Op::Store { .. } | Op::Load { .. })
+        matches!(self, Op::Store { .. } | Op::Load { .. }) || self.is_x87()
+    }
+
+    pub fn is_x87(&self) -> bool {
+        matches!(
+            self,
+            Op::FLoad { .. } | Op::FStore { .. } | Op::FCopy { .. } | Op::FConst { .. } | Op::FArith { .. } | Op::FUnary { .. } | Op::FXch { .. } | Op::FCom { .. } | Op::FComi { .. } | Op::FSw | Op::FTop { .. }
+        )
     }
 
     pub fn is_flags(&self) -> bool {
-        matches!(self, Op::Flags { .. } | Op::IncDecFlags { .. })
+        matches!(self, Op::Flags { .. } | Op::IncDecFlags { .. } | Op::FComi { .. })
     }
 }
 
@@ -162,6 +204,8 @@ pub struct Block {
     /// Values of the guest registers and flags at the end.
     pub outs: [Val; PARAMS],
     pub term: Term,
+    /// x87 TOP relative to the entry's and the full slots, at the block's start.
+    pub x87_in: (u8, u8),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -171,6 +215,16 @@ pub struct Func {
     /// For each guest memory access, the guest registers and flags as its x86
     /// instruction found them: what a fault there must leave in place.
     pub snaps: std::collections::HashMap<Val, [Val; PARAMS]>,
+    pub x87: Option<X87Info>,
+}
+
+/// What a region with x87 code assumes and touches.
+#[derive(Clone, Copy, Debug)]
+pub struct X87Info {
+    /// Slots full at entry, relative to TOP.
+    pub entry_full: u8,
+    /// Slots the region reads or writes.
+    pub touched: u8,
 }
 
 impl Func {

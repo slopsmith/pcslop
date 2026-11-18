@@ -101,7 +101,7 @@ fn known(insn: &Insn) -> (u8, u8, Flow) {
         0x1a3 | 0x1ab | 0x1b3 | 0x1bb | 0x1ba => (0, CF, Next),
         0xf5 => (CF, CF, Next),
         0xf8 | 0xf9 => (0, CF, Next),
-        0xfa | 0xfc | 0xfd => (0, 0, Next),
+        0xfa | 0xfc | 0xfd | 0xd7 => (0, 0, Next),
         0xfb => (0, 0, EndAfterNext),
         0x9c => (ALL, 0, Next),
         0x9e => (0, CF | PF | AF | ZF | SF, Next),

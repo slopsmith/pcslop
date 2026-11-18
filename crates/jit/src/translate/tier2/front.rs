@@ -4,8 +4,10 @@
 
 use std::collections::HashMap;
 
+use a64::Width as AW;
 use x86::decode::{Insn, MemOperand, Rep, decode};
 
+use super::super::x87::{K, classify};
 use super::ir::*;
 
 const NO_REG: u8 = 0xff;
@@ -16,18 +18,25 @@ const MAX_BLOCK_INSNS: u32 = 64;
 
 /// The region starting at `entry`, or None when its first instruction is
 /// not one the front end handles.
-pub fn build(entry: u32, byte: &mut dyn FnMut(u32) -> Option<u8>) -> Option<Func> {
+/// `x87` is the control word and the slots full (relative to TOP) as the
+/// region is entered, when x87 instructions may be compiled.
+pub fn build(entry: u32, byte: &mut dyn FnMut(u32) -> Option<u8>, x87: Option<(u16, u8)>) -> Option<Func> {
     let page = entry & !0xfff;
     let mut f = Func::default();
+    // Exceptions masked and rounding to nearest, as the region's entry checks.
+    let x87 = x87.filter(|&(cw, _)| cw & 0x3f == 0x3f && (cw >> 10) & 3 == 0);
+    f.x87 = x87.map(|(_, entry_full)| X87Info { entry_full, touched: 0 });
     let mut index: HashMap<u32, Blk> = HashMap::new();
     let mut work = vec![entry];
     let mut total = 0;
     index.insert(entry, 0);
-    let first = empty(&mut f, entry);
+    let mut first = empty(&mut f, entry);
+    first.x87_in = (0, x87.map_or(0, |x| x.1));
     f.blocks.push(first);
     while let Some(eip) = work.pop() {
         let b = index[&eip];
-        let mut sb = Builder { f: &mut f, cur: [0; PARAMS], blk: b };
+        let (xd, xfull) = f.blocks[b as usize].x87_in;
+        let mut sb = Builder { f: &mut f, cur: [0; PARAMS], blk: b, xd, xfull };
         sb.cur = sb.f.blocks[b as usize].params;
         let mut pc = eip;
         let mut n = 0u32;
@@ -87,7 +96,7 @@ fn empty(f: &mut Func, eip: u32) -> Block {
     for (i, p) in params.iter_mut().enumerate() {
         *p = f.push(Op::Param(i as u8), eip);
     }
-    Block { eip, insns: 0, params, insts: Vec::new(), outs: params, term: Term::Exit(eip) }
+    Block { eip, insns: 0, params, insts: Vec::new(), outs: params, term: Term::Exit(eip), x87_in: (0, 0) }
 }
 
 fn fetch(pc: u32, page: u32, byte: &mut dyn FnMut(u32) -> Option<u8>) -> Option<Insn> {
@@ -114,6 +123,9 @@ struct Builder<'a> {
     f: &'a mut Func,
     blk: Blk,
     cur: [Val; PARAMS],
+    /// x87 TOP relative to the entry's, and the full slots.
+    xd: u8,
+    xfull: u8,
 }
 
 impl Builder<'_> {
@@ -139,13 +151,14 @@ impl Builder<'_> {
             return None;
         }
         if let Some(&b) = index.get(&t) {
-            return Some(b);
+            return (self.f.blocks[b as usize].x87_in == (self.xd, self.xfull)).then_some(b);
         }
         if self.f.blocks.len() >= MAX_BLOCKS {
             return None;
         }
         let b = self.f.blocks.len() as Blk;
-        let blk = empty(self.f, t);
+        let mut blk = empty(self.f, t);
+        blk.x87_in = (self.xd, self.xfull);
         self.f.blocks.push(blk);
         index.insert(t, b);
         work.push(t);
@@ -292,6 +305,9 @@ impl Builder<'_> {
 
     fn insn_inner(&mut self, insn: &Insn, eip: u32, next: u32) -> Option<Flow> {
         let op = insn.op;
+        if (0xd8..=0xdf).contains(&op) {
+            return self.x87(insn, eip).map(|_| Flow::Next);
+        }
         let size = |byte: bool| if byte { 1 } else if insn.op32 { 4 } else { 2 };
         match op {
             0x00..=0x3f if op & 7 < 6 => {
@@ -457,6 +473,227 @@ impl Builder<'_> {
             _ => return None,
         }
         Some(Flow::Next)
+    }
+
+    fn slot(&self, i: u8) -> u8 {
+        (self.xd + i) & 7
+    }
+
+    fn full(&self, i: u8) -> bool {
+        self.xfull & 1 << self.slot(i) != 0
+    }
+
+    fn touch(&mut self, slots: &[u8]) {
+        if let Some(x) = &mut self.f.x87 {
+            for &s in slots {
+                x.touched |= 1 << s;
+            }
+        }
+    }
+
+    fn x87_push(&mut self, eip: u32) -> u8 {
+        self.xd = (self.xd + 7) & 7;
+        let s = self.slot(0);
+        self.xfull |= 1 << s;
+        self.push(Op::FTop { d: self.xd, set: 1 << s, clear: 0 }, eip);
+        s
+    }
+
+    fn x87_pop(&mut self, eip: u32) {
+        let s = self.slot(0);
+        self.xfull &= !(1 << s);
+        self.xd = (self.xd + 1) & 7;
+        self.push(Op::FTop { d: self.xd, set: 0, clear: 1 << s }, eip);
+    }
+
+    /// An x87 instruction whose stack state is known here: anything that
+    /// would overflow or underflow the stack is left to tier 1.
+    fn x87(&mut self, insn: &Insn, eip: u32) -> Option<()> {
+        self.f.x87?;
+        let k = classify(insn)?;
+        let mem = |e: &mut Self| -> Option<Val> {
+            let m = insn.mem?;
+            e.ea(insn, &m, eip)
+        };
+        let snap = |e: &mut Self, v: Val| {
+            e.f.snaps.insert(v, e.cur);
+        };
+        match k {
+            K::LdMem(_) | K::Ild(_) => {
+                let src = match k {
+                    K::LdMem(src) => src,
+                    K::Ild(AW::W) => FSrc::I32,
+                    K::Ild(AW::H) => FSrc::I16,
+                    _ => return None,
+                };
+                if self.full(7) {
+                    return None;
+                }
+                let addr = mem(self)?;
+                let s = self.slot(7);
+                let v = self.push(Op::FLoad { slot: s, src, addr }, eip);
+                snap(self, v);
+                self.touch(&[s]);
+                self.x87_push(eip);
+            }
+            K::StMem { double, pop } => {
+                if !self.full(0) {
+                    return None;
+                }
+                let addr = mem(self)?;
+                let s = self.slot(0);
+                let v = self.push(Op::FStore { slot: s, dst: if double { FSrc::F64 } else { FSrc::F32 }, addr }, eip);
+                snap(self, v);
+                self.touch(&[s]);
+                if pop {
+                    self.x87_pop(eip);
+                }
+            }
+            K::Ist { w, pop } => {
+                let dst = match w {
+                    AW::W => FSrc::I32,
+                    AW::H => FSrc::I16,
+                    _ => return None,
+                };
+                if !self.full(0) {
+                    return None;
+                }
+                let addr = mem(self)?;
+                let s = self.slot(0);
+                let v = self.push(Op::FStore { slot: s, dst, addr }, eip);
+                snap(self, v);
+                self.touch(&[s]);
+                if pop {
+                    self.x87_pop(eip);
+                }
+            }
+            K::LdReg(i) => {
+                let i = i as u8;
+                if !self.full(i) || self.full(7) {
+                    return None;
+                }
+                let (src, dst) = (self.slot(i), self.slot(7));
+                self.push(Op::FCopy { dst, src }, eip);
+                self.touch(&[src, dst]);
+                self.x87_push(eip);
+            }
+            K::StReg { i, pop } => {
+                let i = i as u8;
+                if !self.full(0) {
+                    return None;
+                }
+                let (src, dst) = (self.slot(0), self.slot(i));
+                if src != dst {
+                    self.push(Op::FCopy { dst, src }, eip);
+                }
+                self.touch(&[src, dst]);
+                if !self.full(i) {
+                    self.xfull |= 1 << dst;
+                    self.push(Op::FTop { d: self.xd, set: 1 << dst, clear: 0 }, eip);
+                }
+                if pop {
+                    self.x87_pop(eip);
+                }
+            }
+            K::Xch(i) => {
+                let i = i as u8;
+                if !self.full(0) || !self.full(i) {
+                    return None;
+                }
+                let (a, b) = (self.slot(0), self.slot(i));
+                if a != b {
+                    self.push(Op::FXch { a, b }, eip);
+                }
+                self.touch(&[a, b]);
+            }
+            K::Chs | K::Abs | K::Sqrt => {
+                if !self.full(0) {
+                    return None;
+                }
+                let s = self.slot(0);
+                let op = match k {
+                    K::Chs => 0,
+                    K::Abs => 1,
+                    _ => 2,
+                };
+                self.push(Op::FUnary { op, slot: s }, eip);
+                self.touch(&[s]);
+            }
+            K::LdConst { mant } => {
+                if self.full(7) {
+                    return None;
+                }
+                let s = self.slot(7);
+                self.push(Op::FConst { slot: s, one: mant != 0 }, eip);
+                self.touch(&[s]);
+                self.x87_push(eip);
+            }
+            K::Arith { reg, i, dst, pop } => {
+                let (i, dst) = (i as u8, dst as u8);
+                if !self.full(0) || !self.full(i) {
+                    return None;
+                }
+                let (a, b, d) = (self.slot(0), self.slot(i), self.slot(dst));
+                self.push(Op::FArith { reg: reg as u8, dst: d, a, b: FOperand::Slot(b) }, eip);
+                self.touch(&[a, b, d]);
+                if pop {
+                    self.x87_pop(eip);
+                }
+            }
+            K::ArithMem { reg, src } => {
+                if !self.full(0) {
+                    return None;
+                }
+                let addr = mem(self)?;
+                let a = self.slot(0);
+                let v = self.push(Op::FArith { reg: reg as u8, dst: a, a, b: FOperand::Mem(src, addr) }, eip);
+                snap(self, v);
+                self.touch(&[a]);
+            }
+            K::Com { i, pops } => {
+                let i = i as u8;
+                if !self.full(0) || !self.full(i) {
+                    return None;
+                }
+                let (a, b) = (self.slot(0), self.slot(i));
+                self.push(Op::FCom { a, b: FOperand::Slot(b) }, eip);
+                self.touch(&[a, b]);
+                for _ in 0..pops {
+                    self.x87_pop(eip);
+                }
+            }
+            K::ComMem { src, pop } => {
+                if !self.full(0) {
+                    return None;
+                }
+                let addr = mem(self)?;
+                let a = self.slot(0);
+                let v = self.push(Op::FCom { a, b: FOperand::Mem(src, addr) }, eip);
+                snap(self, v);
+                self.touch(&[a]);
+                if pop {
+                    self.x87_pop(eip);
+                }
+            }
+            K::Comi { i, pop } => {
+                let i = i as u8;
+                if !self.full(0) || !self.full(i) {
+                    return None;
+                }
+                let (a, b) = (self.slot(0), self.slot(i));
+                self.cur[FLAGS] = self.push(Op::FComi { a, b }, eip);
+                self.touch(&[a, b]);
+                if pop {
+                    self.x87_pop(eip);
+                }
+            }
+            K::StswAx => {
+                let v = self.push(Op::FSw, eip);
+                self.set_reg(0, 2, v, eip);
+            }
+            _ => return None,
+        }
+        Some(())
     }
 
     fn inc_dec(&mut self, dec: bool, a: Val, write: impl FnOnce(&mut Self, Val), eip: u32) {
