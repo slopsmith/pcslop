@@ -68,6 +68,11 @@ struct BlockInfo {
     /// The block's first execution counter (entries) and its exits' targets,
     /// whose counters follow.
     counters: Option<(usize, Vec<u32>)>,
+    /// Whether tier 2 compiled it.
+    tier2: bool,
+    /// The x87 control word and full slots when it was first translated,
+    /// what a later tier-2 compile assumes at its entry.
+    x87_entry: Option<(u16, u8)>,
     /// Every guest byte the translation read, by page offset; None when it
     /// read the next page too, so the block cannot move to a copy of its page.
     source: Option<Box<[(u16, u8)]>>,
@@ -324,6 +329,14 @@ pub struct Jit {
     tier2_eager: bool,
     /// Whether x87 code stays with tier 1 (SLOPPER_JIT_TIER2_X87=exact).
     tier2_exact_x87: bool,
+    /// Whether blocks that turn out hot are compiled again by tier 2 (SLOPPER_JIT_TIER2=auto).
+    tier2_auto: bool,
+    /// Samples per tier-1 block, from the periodic kicks.
+    tier2_samples: HashMap<u64, u32>,
+    /// Blocks to compile with tier 2 at the next dispatch.
+    tier2_queue: Vec<u64>,
+    /// Blocks tier 2 already compiled or declined.
+    tier2_tried: HashSet<u64>,
     /// Next free counter in `layout::COUNTERS`.
     counters_next: usize,
     /// Whether the shadow tables were filled with x86 paging enabled.
@@ -488,6 +501,10 @@ impl Jit {
             counters_next: 0,
             tier2_eager: std::env::var("SLOPPER_JIT_TIER2").is_ok_and(|v| v == "eager"),
             tier2_exact_x87: std::env::var("SLOPPER_JIT_TIER2_X87").is_ok_and(|v| v == "exact"),
+            tier2_auto: std::env::var("SLOPPER_JIT_TIER2").is_ok_and(|v| v == "auto"),
+            tier2_samples: HashMap::default(),
+            tier2_queue: Vec::new(),
+            tier2_tried: HashSet::default(),
             shadow_paged: false,
             apic: None,
             code_next: layout::CODE_CACHE,
@@ -811,6 +828,37 @@ impl Jit {
             regs.join(" ")
         );
         Ok(())
+    }
+
+    /// Counts a kick's sample against the tier-1 block the vCPU was in, and
+    /// queues the block for tier 2 once it is clearly hot.
+    fn tier2_sample(&mut self) -> hvf::Result<()> {
+        const HOT: u32 = 8;
+        let pc = self.vcpu.reg(reg::PC)?;
+        let Some((_, &key)) = self.by_va.range(..=pc).next_back() else { return Ok(()) };
+        if self.tier2_tried.contains(&key) || !self.blocks.get(&key).is_some_and(|b| !b.tier2 && b.source.is_some()) {
+            return Ok(());
+        }
+        let n = self.tier2_samples.entry(key).or_default();
+        *n += 1;
+        if *n == HOT {
+            self.tier2_queue.push(key);
+        }
+        Ok(())
+    }
+
+    /// Compiles the queued hot blocks with tier 2, at a dispatch so no
+    /// translated code is running.
+    fn tier_up<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B) {
+        for key in std::mem::take(&mut self.tier2_queue) {
+            self.tier2_tried.insert(key);
+            self.tier2_samples.remove(&key);
+            let Some(x87) = self.blocks.get(&key).map(|b| b.x87_entry) else { continue };
+            let (phys, user) = (key as u32, key >> 32 & 1 != 0);
+            let eip = (key >> 33 << 12) as u32 | (phys & 0xfff);
+            self.remove_block(key);
+            self.translate_block_as(cpu, bus, eip, phys, user, Some(x87));
+        }
     }
 
     fn sample_pc(&mut self) -> hvf::Result<()> {
@@ -1494,6 +1542,9 @@ impl Jit {
         self.dead.clear();
         self.dead_order.clear();
         self.counters_next = 0;
+        self.tier2_samples.clear();
+        self.tier2_queue.clear();
+        self.tier2_tried.clear();
         self.mem.as_mut_slice()[layout::COUNTERS..layout::COUNTERS_END].fill(0);
         self.code_by_lin.clear();
         self.mem.as_mut_slice()[layout::CODE_BITMAP..layout::CODE_BITMAP_END].fill(0);
@@ -1503,6 +1554,11 @@ impl Jit {
     }
 
     fn translate_block<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B, eip: u32, phys: u32, user: bool) {
+        self.translate_block_as(cpu, bus, eip, phys, user, None);
+    }
+
+    /// `tier2` sends the block through tier 2 with that x87 entry state.
+    fn translate_block_as<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B, eip: u32, phys: u32, user: bool, tier2: Option<Option<(u16, u8)>>) {
         if self.code_next + MAX_BLOCK_BYTES > layout::CODE_CACHE_END {
             self.reset_code_cache();
         }
@@ -1518,7 +1574,7 @@ impl Jit {
         let next_lin = lin_page.wrapping_add(0x1000);
         let mut next_phys: Option<Option<u32>> = None;
         let self_check = self.self_check.contains(&page);
-        if !self.verify && !self_check && self.revive(bus, eip, page, user) {
+        if !self.verify && !self_check && tier2.is_none() && self.revive(bus, eip, page, user) {
             return;
         }
         const MAX_COUNTERS: usize = 1024;
@@ -1549,9 +1605,14 @@ impl Jit {
             let p = *next_phys.get_or_insert_with(|| interp::translate(cpu, bus, next_lin, false).ok());
             p.map(|p| bus.read8(p | (a & 0xfff)))
         };
-        let tier2 = (self.tier2_eager && !self.verify && !self_check)
-            .then(|| translate::tier2::compile_region(eip, &mut byte, block_va, rt_va, &entries, user, x87_entry))
+        let (want_tier2, tier2_x87) = match tier2 {
+            Some(x) => (true, x),
+            None => (self.tier2_eager, x87_entry),
+        };
+        let tier2 = (want_tier2 && !self.verify && !self_check)
+            .then(|| translate::tier2::compile_region(eip, &mut byte, block_va, rt_va, &entries, user, tier2_x87))
             .flatten();
+        let tier2_done = tier2.is_some();
         self.stats.tier2_regions += tier2.is_some() as u64;
         let counter_base = counter_base.filter(|_| tier2.is_none());
         let compiled = match tier2 {
@@ -1611,6 +1672,8 @@ impl Jit {
             verified,
             chains: compiled.chains,
             counters: counter_base.map(|n| (n, compiled.exits.clone())),
+            tier2: tier2_done,
+            x87_entry,
             source,
         };
         if counter_base.is_some() {
@@ -1842,6 +1905,9 @@ impl Jit {
                     if self.interp_profile.is_some() {
                         self.sample_pc()?;
                     }
+                    if self.tier2_auto {
+                        self.tier2_sample()?;
+                    }
                     canceled += 1;
                     if canceled == 4000 {
                         self.report_stuck()?;
@@ -1895,6 +1961,7 @@ impl Jit {
                             self.state().irq = bus.intr() as u32;
                         }
                         reason::PENDING => {
+                            self.tier_up(cpu, bus);
                             self.store_state(cpu);
                             return Ok(RunExit::Kicked);
                         }
