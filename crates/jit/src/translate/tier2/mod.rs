@@ -37,6 +37,9 @@ pub fn compile_region(eip: u32, byte: &mut dyn FnMut(u32) -> Option<u8>, block_v
         cold: Vec::new(),
         starts: Vec::new(),
     };
+    if std::env::var_os("SLOPPER_TIER2_DUMP").is_some() {
+        eprintln!("{f}");
+    }
     let lowered = back::lower(&mut e, &f)?;
     e.emit_cold();
     let code = e.a.finish();

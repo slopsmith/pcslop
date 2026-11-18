@@ -124,6 +124,21 @@ fn random_programs_with_paging_match_the_interpreter_in_tier_2() {
 }
 
 #[test]
+fn displacements_any_access_width_cannot_encode_match_the_interpreter_in_tier_2() {
+    fn test() {
+        let code = [
+            0x8b, 0x83, 0x1d, 0x01, 0, 0, // mov eax, [ebx+0x11d]
+            0x66, 0x8b, 0x8b, 0x01, 0x01, 0, 0, // mov cx, [ebx+0x101]
+            0x89, 0x83, 0x3f, 0x01, 0, 0, // mov [ebx+0x13f], eax
+            0x8b, 0x53, 0xfd, // mov edx, [ebx-3]
+            0xf4, // hlt
+        ];
+        compare(&code, |c| c.regs[3] = 0x3000);
+    }
+    in_tier2(test);
+}
+
+#[test]
 fn mixed_code_matches_the_interpreter_in_tier_2() {
     in_tier2(random_x87_programs_match_the_interpreter);
     in_tier2(random_mmx_programs_match_the_interpreter);

@@ -62,6 +62,10 @@ struct BlockLower<'a> {
     /// `base + constant` values used only as addresses: each access adds the
     /// constant itself, so they are never computed.
     folded: HashMap<Val, (Val, i32)>,
+    /// The guest register each value will be committed to, if any.
+    want_home: HashMap<Val, usize>,
+    /// Index of the instruction being lowered.
+    cur: usize,
 }
 
 const END: usize = usize::MAX;
@@ -85,6 +89,8 @@ impl<'a> BlockLower<'a> {
             fused_cond: None,
             flags_done: Vec::new(),
             folded: HashMap::new(),
+            want_home: HashMap::new(),
+            cur: 0,
         }
     }
 
@@ -100,25 +106,35 @@ impl<'a> BlockLower<'a> {
     fn find_folds(&mut self) {
         let blk = self.blk();
         let mut uses: HashMap<Val, (usize, usize)> = HashMap::new();
+        let mut widths: HashMap<Val, Vec<i32>> = HashMap::new();
         for &v in &blk.insts {
             let op = self.op(v);
             let addr = match op {
-                Op::Load { addr, .. } | Op::Store { addr, .. } => Some(addr),
+                Op::Load { addr, w } | Op::Store { addr, w, .. } => Some((addr, w)),
                 _ => None,
             };
             for a in op.args() {
                 let e = uses.entry(a).or_default();
                 e.0 += 1;
-                if Some(a) == addr && !matches!(op, Op::Store { val, .. } if val == a) {
+                if let Some((addr, w)) = addr
+                    && a == addr
+                    && !matches!(op, Op::Store { val, .. } if val == a)
+                {
                     e.1 += 1;
+                    widths.entry(a).or_default().push(match w {
+                        Width::B => 1,
+                        Width::H => 2,
+                        Width::W => 4,
+                    });
                 }
             }
         }
+        let fits = |v: Val, d: i32| widths.get(&v).is_some_and(|ws| ws.iter().all(|&n| (-256..256).contains(&d) || (d >= 0 && d % n == 0 && d / n < 4096)));
         let escapes = |v: Val| blk.outs.contains(&v) || self.f.snaps.values().any(|s| s.contains(&v)) || matches!(blk.term, Term::Branch { cond, .. } if cond == v);
         for &v in &blk.insts {
             if let Op::Bin(Alu::Add, x, y, None) = self.op(v)
                 && let Some(d) = self.konst(y)
-                && (-256..4096).contains(&(d as i32))
+                && fits(v, d as i32)
                 && uses.get(&v).is_some_and(|&(all, addr)| all == addr && all > 0)
                 && !escapes(v)
                 && self.konst(x).is_none()
@@ -142,8 +158,16 @@ impl<'a> BlockLower<'a> {
                 }
             }
         }
-        for &v in &blk.outs[..8] {
+        for (r, &v) in blk.outs[..8].iter().enumerate() {
             self.last.insert(v, END);
+            self.want_home.entry(v).or_insert(r);
+        }
+        for &v in &blk.insts {
+            if let Some(snap) = self.f.snaps.get(&v) {
+                for (r, &s) in snap[..8].iter().enumerate() {
+                    self.want_home.entry(s).or_insert(r);
+                }
+            }
         }
         if let Term::Branch { cond, .. } = blk.term {
             self.last.insert(cond, END);
@@ -184,6 +208,7 @@ impl<'a> BlockLower<'a> {
                     self.commit(r, s, i)?;
                 }
             }
+            self.cur = i;
             self.inst(v, i)?;
             self.release(i);
         }
@@ -202,6 +227,19 @@ impl<'a> BlockLower<'a> {
     }
 
     fn alloc(&mut self, v: Val) -> Option<Reg> {
+        if let Some(&h) = self.want_home.get(&v) {
+            let old = self.home[h];
+            let dead = self.last.get(&old).is_none_or(|&l| l != END && l <= self.cur);
+            let elsewhere = self.home.iter().enumerate().any(|(o, &x)| o != h && x == old) || self.temp_of.contains_key(&old);
+            if old != v && (dead || elsewhere) && self.konst(v).is_none() {
+                self.home[h] = v;
+                return Some(guest_reg(h));
+            }
+        }
+        self.alloc_temp(v)
+    }
+
+    fn alloc_temp(&mut self, v: Val) -> Option<Reg> {
         let r = self.free.pop()?;
         self.temp_of.insert(v, r);
         Some(r)
@@ -245,7 +283,7 @@ impl<'a> BlockLower<'a> {
         let elsewhere = self.temp_of.contains_key(&old) || self.home.iter().enumerate().any(|(h, &x)| h != r && x == old);
         let needed = self.last.get(&old).is_some_and(|&l| l == END || l >= i);
         if needed && !elsewhere && self.konst(old).is_none() {
-            let t = self.alloc(old)?;
+            let t = self.alloc_temp(old)?;
             self.e.a.mov(Size::W, t, guest_reg(r));
         }
         if let Some(c) = self.konst(v) {
@@ -311,9 +349,13 @@ impl<'a> BlockLower<'a> {
                 }
             }
             Op::Insert { dst, src, lsb, width } => {
-                let s = self.get(src, SCRATCH2);
+                let mut s = self.get(src, SCRATCH2);
                 let dreg = self.get(dst, SCRATCH);
                 let d = self.alloc(v)?;
+                if s == d && dreg != d {
+                    self.e.a.mov(Size::W, SCRATCH2, s);
+                    s = SCRATCH2;
+                }
                 self.e.a.mov(Size::W, d, dreg);
                 self.e.a.bfi(Size::W, d, s, lsb as u32, width as u32);
             }
@@ -362,6 +404,13 @@ impl<'a> BlockLower<'a> {
             return Some(());
         }
         let x = self.get(a, SCRATCH);
+        let imm_ok = match op {
+            Alu::Add | Alu::Sub => imm.is_some_and(|k| k < 4096 || (k & 0xfff == 0 && k >> 12 < 4096)),
+            Alu::And | Alu::Or | Alu::Xor => imm.is_some_and(|k| a64::encode_bitmask(k as u64, Size::W).is_some()),
+            Alu::Shl | Alu::Shr | Alu::Sar => imm.is_some(),
+            _ => false,
+        };
+        let y = if imm_ok { SCRATCH2 } else { self.get(b, SCRATCH2) };
         let d = self.alloc(v)?;
         let e = &mut self.e.a;
         match op {
@@ -403,7 +452,6 @@ impl<'a> BlockLower<'a> {
                 }
             }
             _ => {
-                let y = self.get(b, SCRATCH2);
                 let e = &mut self.e.a;
                 match op {
                     Alu::Add if flags => {
