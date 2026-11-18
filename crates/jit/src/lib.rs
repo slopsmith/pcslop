@@ -965,6 +965,14 @@ impl Jit {
         self.stats.vcache_bumps += 1;
         let s = self.state();
         s.vepoch = s.vepoch.wrapping_add(1);
+        s.gepoch = s.gepoch.wrapping_add(1);
+    }
+
+    /// Invalidates the dispatcher cache entries for code on non-global pages.
+    fn bump_vcache_nonglobal(&mut self) {
+        self.stats.vcache_bumps += 1;
+        let s = self.state();
+        s.vepoch = s.vepoch.wrapping_add(1);
     }
 
     fn disarm_apic(&mut self) {
@@ -1018,7 +1026,7 @@ impl Jit {
                         if self.apic.is_some_and(|(_, global)| !global) {
                             self.disarm_apic();
                         }
-                        self.bump_vcache();
+                        self.bump_vcache_nonglobal();
                         self.pt_watch.forget();
                         for r in 0..2 {
                             for off in std::mem::take(&mut self.nonglobal[r]) {
@@ -1090,12 +1098,12 @@ impl Jit {
                 self.bump_vcache();
             }
         }
-        let leaf = match self.shadow[r].map(self.mem.as_mut_slice(), lin, phys, writable) {
+        let leaf = match self.shadow[r].map(self.mem.as_mut_slice(), lin, phys, writable, global) {
             Some(off) => off,
             None => {
                 self.stats.flush_pool += 1;
                 self.flush_shadow();
-                self.shadow[r].map(self.mem.as_mut_slice(), lin, phys, writable).expect("shadow pool smaller than one mapping")
+                self.shadow[r].map(self.mem.as_mut_slice(), lin, phys, writable, global).expect("shadow pool smaller than one mapping")
             }
         };
         if writable {

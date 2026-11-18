@@ -19,6 +19,8 @@ const PAGE_SIZE: usize = 4096;
 /// Attributes of a writable shadow leaf, without the output address.
 pub const LEAF_ATTRS: u64 = AF | SH_INNER | PXN | UXN | NG | PAGE | VALID;
 pub const LEAF_RO: u64 = AP_RO;
+/// Software bit: the x86 entry is global, so the mapping outlives CR3 switches.
+pub const LEAF_GLOBAL: u64 = 1 << 55;
 
 fn write_desc(mem: &mut [u8], off: usize, desc: u64) {
     mem[off..off + 8].copy_from_slice(&desc.to_le_bytes());
@@ -171,12 +173,15 @@ impl Shadow {
     /// offset of the leaf entry. Returns None when the pool is exhausted;
     /// flush and retry in that case.
     #[must_use]
-    pub fn map(&mut self, mem: &mut [u8], lin: u32, phys: u32, writable: bool) -> Option<usize> {
+    pub fn map(&mut self, mem: &mut [u8], lin: u32, phys: u32, writable: bool, global: bool) -> Option<usize> {
         let l2 = self.table(mem, self.root + ((lin >> 30) as usize) * 8)?;
         let l3 = self.table(mem, l2 + (((lin >> 21) & 511) as usize) * 8)?;
         let mut d = (phys as u64 & !0xfff) | LEAF_ATTRS;
         if !writable {
             d |= AP_RO;
+        }
+        if global {
+            d |= LEAF_GLOBAL;
         }
         let off = l3 + (((lin >> 12) & 511) as usize) * 8;
         write_desc(mem, off, d);

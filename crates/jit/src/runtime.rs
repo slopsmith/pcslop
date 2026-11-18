@@ -109,6 +109,34 @@ fn restore_scratch(a: &mut Asm) {
     }
 }
 
+/// `dst` = `base` | 1 << 33 | GEPOCH << 34, the dispatcher tag of code on a global page.
+fn global_tag(a: &mut Asm, dst: Reg, base: Reg) {
+    a.ldr(Width::W, r(2), STATE, state::GEPOCH as i32);
+    a.logic_shift(Logic::Orr, false, Size::X, dst, base, r(2), Shift::Lsl, 34);
+    let ok = a.logic_imm(Logic::Orr, Size::X, dst, dst, 1 << 33);
+    assert!(ok);
+}
+
+/// x1 = the current shadow tree's leaf for the page of EIP (x0), or a branch
+/// to `absent`. Clobbers x2 and x4.
+fn shadow_leaf(a: &mut Asm, absent: Label) {
+    a.ldr(Width::X, r(1), STATE, state::SHADOW_ROOT as i32);
+    for (shift, bits) in [(30, 2), (21, 9)] {
+        a.ubfx(Size::X, r(2), r(0), shift, bits);
+        a.add_shift(Size::X, r(1), r(1), r(2), Shift::Lsl, 3);
+        a.ldr(Width::X, r(2), r(1), 0);
+        a.tbz(r(2), 0, absent);
+        let ok = a.logic_imm(Logic::And, Size::X, r(2), r(2), 0x0000_ffff_ffff_f000);
+        assert!(ok);
+        a.mov_imm(Size::X, r(4), layout::RUNTIME_VA.wrapping_sub(layout::RUNTIME_IPA));
+        a.add(Size::X, r(1), r(2), r(4));
+    }
+    a.ubfx(Size::X, r(2), r(0), 12, 9);
+    a.add_shift(Size::X, r(1), r(1), r(2), Shift::Lsl, 3);
+    a.ldr(Width::X, r(1), r(1), 0);
+    a.tbz(r(1), 0, absent);
+}
+
 /// Fills a shadow leaf for the current fault from the x86 page tables; cases
 /// for the host branch to `fail`, with x0..x17 saved in `State::scratch`.
 fn try_fill(a: &mut Asm, fail: Label) {
@@ -268,6 +296,8 @@ fn try_fill(a: &mut Asm, fail: Label) {
     a.mov_imm(Size::X, t7, crate::shadow::LEAF_ATTRS | crate::shadow::LEAF_RO);
     a.bind(mapped);
     a.orr(Size::X, t7, t7, phys);
+    a.ubfx(Size::X, eff, t6, fill::GLOBAL.trailing_zeros(), 1);
+    a.logic_shift(Logic::Orr, false, Size::X, t7, t7, eff, Shift::Lsl, crate::shadow::LEAF_GLOBAL.trailing_zeros());
     a.str(Width::X, t7, leaf, 0);
 
     a.mov_imm(Size::X, t7, layout::va(layout::FILL_LOG));
@@ -441,39 +471,46 @@ pub fn build() -> (Vec<u32>, Entries) {
     a.str(Width::W, r(1), STATE, state::BUDGET as i32);
     a.cbz(Size::W, r(1), pending);
     a.bind(unlimited);
-    let (tag, entry) = (r(6), r(7));
-    let translate = a.label();
-    a.ldr(Width::W, tag, STATE, state::USER as i32);
-    a.logic_shift(Logic::Orr, false, Size::X, tag, r(0), tag, Shift::Lsl, 32);
+    // Tags are EIP | user << 32 | global << 33 | epoch << 34, with `GEPOCH`
+    // for code on x86-global pages and `VEPOCH` for the rest.
+    let (base, entry, tag_v) = (r(6), r(7), r(3));
+    let (translate, not_vepoch) = (a.label(), a.label());
+    a.ldr(Width::W, base, STATE, state::USER as i32);
+    a.logic_shift(Logic::Orr, false, Size::X, base, r(0), base, Shift::Lsl, 32);
     a.ldr(Width::W, entry, STATE, state::VEPOCH as i32);
-    a.logic_shift(Logic::Orr, false, Size::X, tag, tag, entry, Shift::Lsl, 33);
+    a.logic_shift(Logic::Orr, false, Size::X, tag_v, base, entry, Shift::Lsl, 34);
     a.logic_shift(Logic::Eor, false, Size::W, entry, r(0), r(0), Shift::Lsr, 16);
     let ok = a.logic_imm(Logic::And, Size::W, entry, entry, layout::VLOOKUP_ENTRIES as u64 - 1);
     assert!(ok);
     a.ldr(Width::X, r(2), STATE, state::VLOOKUP as i32);
     a.add_shift(Size::X, entry, r(2), entry, Shift::Lsl, 4);
     a.ldp(Size::X, r(4), r(5), entry, 0);
-    a.eor(Size::X, r(4), r(4), tag);
-    a.cbnz(Size::X, r(4), translate);
+    a.eor(Size::X, r(2), r(4), tag_v);
+    a.cbnz(Size::X, r(2), not_vepoch);
+    a.br(r(5));
+    a.bind(not_vepoch);
+    global_tag(&mut a, r(1), base);
+    a.eor(Size::X, r(1), r(4), r(1));
+    a.cbnz(Size::X, r(1), translate);
     a.br(r(5));
     a.bind(translate);
-    let (probe, probe_done, translated) = (a.label(), a.label(), a.label());
-    a.at_s1e1r(r(0));
-    a.isb();
-    a.mrs(r(1), sysreg::PAR_EL1);
-    a.tbz(r(1), 0, translated);
+    let (probe, translated, nonglobal, tagged) = (a.label(), a.label(), a.label(), a.label());
+    shadow_leaf(&mut a, probe);
+    a.b(translated);
     // The code page is not in the shadow tree: a load from it lets the fault
     // handler fill it, or resume at `miss` when the x86 page tables lack it.
     a.bind(probe);
     a.ldr(Width::B, ZR, r(0), 0);
-    a.bind(probe_done);
-    a.at_s1e1r(r(0));
-    a.isb();
-    a.mrs(r(1), sysreg::PAR_EL1);
-    a.tbnz(r(1), 0, miss);
+    shadow_leaf(&mut a, miss);
     a.bind(translated);
-    a.ubfx(Size::X, r(1), r(1), 12, 36);
-    a.lsl_imm(Size::X, r(1), r(1), 12);
+    a.tbz(r(1), crate::shadow::LEAF_GLOBAL.trailing_zeros(), nonglobal);
+    global_tag(&mut a, base, base);
+    a.b(tagged);
+    a.bind(nonglobal);
+    a.mov(Size::X, base, tag_v);
+    a.bind(tagged);
+    let ok = a.logic_imm(Logic::And, Size::X, r(1), r(1), 0xffff_f000);
+    assert!(ok);
     a.bfxil(Size::X, r(1), r(0), 0, 12);
     a.ldr(Width::W, r(2), STATE, state::USER as i32);
     a.logic_shift(Logic::Orr, false, Size::X, r(1), r(1), r(2), Shift::Lsl, 32);
@@ -488,13 +525,13 @@ pub fn build() -> (Vec<u32>, Entries) {
     a.ldp(Size::X, r(4), r(5), r(2), 0);
     a.eor(Size::X, r(4), r(4), r(1));
     a.cbnz(Size::X, r(4), second);
-    a.stp(Size::X, tag, r(5), entry, 0);
+    a.stp(Size::X, base, r(5), entry, 0);
     a.br(r(5));
     a.bind(second);
     a.ldp(Size::X, r(4), r(5), r(2), 16);
     a.eor(Size::X, r(4), r(4), r(1));
     a.cbnz(Size::X, r(4), miss);
-    a.stp(Size::X, tag, r(5), entry, 0);
+    a.stp(Size::X, base, r(5), entry, 0);
     a.br(r(5));
 
     a.bind(miss);
