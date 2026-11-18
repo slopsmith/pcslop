@@ -1376,7 +1376,6 @@ impl Jit {
 
     /// Forgets the block for `key`: unlinks chains into it and clears its lookup slot.
     fn remove_block(&mut self, key: u64) -> Option<BlockInfo> {
-        self.bump_vcache();
         self.retry.remove(&key);
         for site in self.chain_in.remove(&key).unwrap_or_default() {
             self.patch_chain(site, None);
@@ -1385,13 +1384,24 @@ impl Jit {
         let info = self.blocks.remove(&key);
         if let Some(b) = &info {
             self.by_va.remove(&b.va);
+            let start = (key >> 33 << 12) as u32 | (key as u32 & 0xfff);
+            self.forget_dispatch(start, b.va);
         }
         self.clear_lookup(key);
         info
     }
 
+    /// Drops the dispatcher's EIP cache entry for the block at `va`. Predicted
+    /// returns into its code stay valid: they land on a chained jump.
+    fn forget_dispatch(&mut self, eip: u32, va: u64) {
+        let m = self.mem.as_mut_slice();
+        let slot = layout::VLOOKUP + (((eip ^ eip >> 16) as usize) & (layout::VLOOKUP_ENTRIES - 1)) * 16;
+        if u64::from_le_bytes(m[slot + 8..slot + 16].try_into().unwrap()) == va {
+            m[slot..slot + 8].fill(0xff);
+        }
+    }
+
     fn clear_lookup(&mut self, key: u64) {
-        self.bump_vcache();
         let b = bucket(key);
         for off in [b, b + 16] {
             let slot = &mut self.mem.as_mut_slice()[off..off + 16];
@@ -1839,6 +1849,7 @@ impl Jit {
         if let Some(b) = self.blocks.get_mut(&exp.key) {
             b.verified += 1;
             if b.verified < VERIFY_RUNS {
+                self.bump_vcache();
                 self.clear_lookup(exp.key);
             }
         }

@@ -254,6 +254,21 @@ fn returns_deeper_than_the_prediction_ring_or_to_a_changed_address() {
 }
 
 #[test]
+fn a_return_after_its_caller_was_rewritten_runs_the_new_code() {
+    let mut code = vec![
+        0xe8, 0xfb, 0x0f, 0, 0, // call 0x2000
+        0xb8, 0x01, 0, 0, 0, // mov eax, 1, which the callee turns into mov eax, 2
+        0xf4, // hlt
+    ];
+    code.resize(0x1000, 0x90);
+    code.extend([
+        0xc6, 0x05, 0x06, 0x10, 0, 0, 0x02, // mov byte [0x1006], 2
+        0xc3, // ret
+    ]);
+    compare(&code, |_| {});
+}
+
+#[test]
 fn calls_and_returns_with_x87_values_in_registers() {
     let mut code = vec![
         0xb8, 0x20, 0x10, 0, 0, // mov eax, 0x1020
