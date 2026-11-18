@@ -592,6 +592,9 @@ pub fn build() -> (Vec<u32>, Entries) {
     a.str(Width::W, r(0), STATE, state::EIP as i32);
     a.str(Width::W, r(1), STATE, state::REASON as i32);
     store_guest(&mut a, None);
+    // Hypervisor.framework answers HVC itself when x0 reads as an SMCCC fast
+    // call it implements (0x8xxxff03 asks for a revision), so x0 must not be guest data.
+    a.movz(Size::W, r(0), 0, 0);
     a.hvc(0);
     a.b(resume);
 
@@ -625,6 +628,9 @@ pub fn build() -> (Vec<u32>, Entries) {
         store_guest(&mut a, Some(r(3)));
         a.movz(Size::W, r(1), why, 0);
         a.str(Width::W, r(1), STATE, state::REASON as i32);
+        // Hypervisor.framework answers HVC itself when x0 reads as an SMCCC fast
+        // call it implements (0x8xxxff03 asks for a revision), so x0 must not be guest data.
+        a.movz(Size::W, r(0), 0, 0);
         a.hvc(1);
         ctl_maintenance(&mut a);
         let redispatch = a.label();

@@ -1074,6 +1074,33 @@ fn cr3_switches_in_the_vm_drop_the_old_non_global_mappings() {
 }
 
 #[test]
+fn code_at_an_address_hypervisor_framework_reads_as_an_smccc_query_runs() {
+    let code = [
+        0xb8, 0x03, 0xff, 0x00, 0x83, // mov eax, 0x8300ff03
+        0xff, 0xe0, // jmp eax
+    ];
+    let target = [
+        0x40, // inc eax
+        0xf4, // hlt
+    ];
+    let mut a = flat_cpu(0x1000, 0x8000);
+    let mut bus_a = bus_with(0x1000, &code);
+    paged(&mut a, &mut bus_a, false);
+    let mem = bus_a.ram.as_mut_slice();
+    mem[0x10000 + 4 * (0x8300_ff03usize >> 22)..][..4].copy_from_slice(&0x12007u32.to_le_bytes());
+    let pte_at = 0x12000 + 4 * ((0x8300_ff03usize >> 12) & 0x3ff);
+    mem[pte_at..pte_at + 4].copy_from_slice(&0x5007u32.to_le_bytes());
+    mem[0x5f03..0x5f03 + target.len()].copy_from_slice(&target);
+    let mut b = a.clone();
+    let mut bus_b = FlatBus { ram: GuestMemory::new(RAM).unwrap(), gart: None };
+    bus_b.ram.as_mut_slice().copy_from_slice(bus_a.ram.as_slice());
+    run_interp(&mut a, &mut bus_a);
+    run_jit(&mut b, &mut bus_b);
+    assert_eq!(a.regs, b.regs);
+    assert_eq!(b.regs[0], 0x8300_ff04);
+}
+
+#[test]
 fn random_programs_match_the_interpreter_with_paging() {
     let mut rng = Rng(0x5ad0_77);
     let mut fills = 0;

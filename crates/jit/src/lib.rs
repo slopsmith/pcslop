@@ -690,6 +690,21 @@ impl Jit {
         self.x87_deopt(elr, xregs).expect("reading the vCPU's SIMD registers");
     }
 
+    /// Logs where the vCPU is when kicks keep ending runs that never reach
+    /// a dispatch, which would otherwise hang the emulator silently.
+    fn report_stuck(&mut self) -> hvf::Result<()> {
+        let pc = self.vcpu.reg(reg::PC)?;
+        let regs: Vec<String> = (0..31).map(|i| self.vcpu.reg(reg::X0 + i).map(|v| format!("x{i}={v:x}"))).collect::<hvf::Result<_>>()?;
+        let (elr, esr, far) = (self.vcpu.sys_reg(sysreg::ELR_EL1)?, self.vcpu.sys_reg(sysreg::ESR_EL1)?, self.vcpu.sys_reg(sysreg::FAR_EL1)?);
+        let (eip, reason) = (self.state().eip, self.state().reason);
+        eprintln!(
+            "jit: 4000 kicked runs in a row never reached a dispatch: pc {pc:#x} (x86 {:x?}) elr {elr:#x} esr {esr:#x} far {far:#x}, last exit eip {eip:#x} reason {reason}\n{}",
+            self.eip_at(pc),
+            regs.join(" ")
+        );
+        Ok(())
+    }
+
     fn sample_pc(&mut self) -> hvf::Result<()> {
         let pc = self.vcpu.reg(reg::PC)?;
         let code = layout::va(layout::CODE_CACHE)..layout::va(layout::CODE_CACHE_END);
@@ -1376,6 +1391,7 @@ impl Jit {
         self.set_root(cpu);
         self.state().irq = bus.intr() as u32;
         let mut at_dispatch = true;
+        let mut canceled = 0u32;
         loop {
             let expected = if self.verify && at_dispatch { self.expect_block(cpu, bus) } else { None };
             if self.verify && expected.is_none() {
@@ -1392,6 +1408,9 @@ impl Jit {
             }
             let t0 = self.timing.then(std::time::Instant::now);
             let exit = self.vcpu.run()?;
+            if !matches!(exit, Exit::Canceled) {
+                canceled = 0;
+            }
             bus.set_apic_tpr(self.state().tpr as u8);
             self.stats.tpr_fast = self.state().tpr_fast;
             self.take_fill_log(cpu, bus);
@@ -1427,6 +1446,10 @@ impl Jit {
                 Exit::Canceled => {
                     if self.interp_profile.is_some() {
                         self.sample_pc()?;
+                    }
+                    canceled += 1;
+                    if canceled == 4000 {
+                        self.report_stuck()?;
                     }
                     // The vCPU may have stopped mid-block with guest state still in
                     // registers; let it run to the next dispatch, which saves it.
