@@ -891,6 +891,7 @@ impl Jit {
         let s = self.state();
         cpu.regs = s.regs;
         cpu.eip = s.eip;
+        cpu.cr0 = s.cr0;
         let (if_flag, df) = (s.if_flag != 0, s.df != 0);
         {
             use x86::cpu::flags::{ARITH, DF, IF};

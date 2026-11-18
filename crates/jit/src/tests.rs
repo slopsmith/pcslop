@@ -334,6 +334,23 @@ fn bulk_rep_movs_and_stos_match_the_interpreter_with_overlaps() {
 }
 
 #[test]
+fn lazy_fpu_switches_of_cr0_ts_stay_translated() {
+    let code = [
+        0x0f, 0x20, 0xc0, // mov eax, cr0
+        0x83, 0xc8, 0x0a, // or eax, 0xa: TS and MP, as XP's context switch sets them
+        0x0f, 0x22, 0xc0, // mov cr0, eax
+        0x0f, 0x20, 0xc3, // mov ebx, cr0
+        0x0f, 0x06, // clts
+        0x0f, 0x20, 0xc1, // mov ecx, cr0
+        0xd9, 0xe8, // fld1
+        0xd9, 0x1d, 0x00, 0x30, 0, 0, // fstp dword [0x3000]
+        0xf4, // hlt
+    ];
+    let stats = compare(&code, |_| {});
+    assert!(stats.interp_exits <= 1, "TS changes or the x87 code after CLTS left translated code: {stats:?}");
+}
+
+#[test]
 fn rep_ret_runs_translated() {
     let code = [
         0xb9, 0x40, 0, 0, 0, // mov ecx, 64

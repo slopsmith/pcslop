@@ -1994,6 +1994,16 @@ impl Emit {
             }
             0x134 => return self.sysenter(eip),
             0x135 => return self.sysexit(eip),
+            0x122 if insn.reg() == 0 && insn.mem.is_none() => {
+                if !self.write_cr0_ts(Some(guest_reg(insn.rm())), eip) {
+                    return Step::Unsupported;
+                }
+            }
+            0x106 => {
+                if !self.write_cr0_ts(None, eip) {
+                    return Step::Unsupported;
+                }
+            }
             0x120 => {
                 if !self.mov_from_cr(insn) {
                     return Step::Unsupported;

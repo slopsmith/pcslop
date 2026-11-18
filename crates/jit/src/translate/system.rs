@@ -166,6 +166,57 @@ impl Emit {
         self.a.str(Width::W, T_A, STATE, sel_at as i32);
     }
 
+    /// MOV CR0, r32 (`src`) changing only TS, MP and EM, or CLTS, at CPL 0: XP
+    /// and Linux switch lazy FPU state with them on thread switches.
+    pub(super) fn write_cr0_ts(&mut self, src: Option<Reg>, eip: u32) -> bool {
+        use x86::cpu::{cr0, cr4};
+        if self.user {
+            return false;
+        }
+        self.leave_x87_fp();
+        let (slow, done) = (self.a.label(), self.a.label());
+        self.a.ldr(Width::W, T_A, STATE, state::CR0 as i32);
+        match src {
+            Some(r) => {
+                let ok = self.a.logic_imm(Logic::Orr, Size::W, T_B, r, cr0::ET as u64);
+                assert!(ok);
+            }
+            None => self.and_imm32(T_B, T_A, !cr0::TS as u64),
+        }
+        self.a.eor(Size::W, T_C, T_A, T_B);
+        self.and_imm32(T_C, T_C, !(cr0::TS | cr0::MP | cr0::EM) as u64);
+        self.a.cbnz(Size::W, T_C, slow);
+        self.a.str(Width::W, T_B, STATE, state::CR0 as i32);
+        // The "may run here" flags, as `Jit::load_state` derives them.
+        let is_zero = |e: &mut Self, r: Reg| {
+            e.a.sub_imm(Size::W, r, r, 1);
+            e.a.lsr_imm(Size::W, r, r, 31);
+        };
+        self.and_imm32(T_E, T_B, (cr0::TS | cr0::EM) as u64);
+        is_zero(self, T_E);
+        self.a.ldr(Width::W, T_C, STATE, state::FSW as i32);
+        self.a.ubfx(Size::W, T_C, T_C, x86::fpu::sw::ES.trailing_zeros(), 1);
+        self.a.bic(Size::W, T_D, T_E, T_C);
+        self.a.str(Width::W, T_D, STATE, state::X87_BASE as i32);
+        self.a.str(Width::W, T_D, STATE, state::MMX_OK as i32);
+        self.a.ldr(Width::W, T_C, STATE, state::FCW as i32);
+        self.and_imm32(T_C, T_C, 0x3f);
+        let ok = self.a.logic_imm(Logic::Eor, Size::W, T_C, T_C, 0x3f);
+        assert!(ok);
+        is_zero(self, T_C);
+        self.a.and(Size::W, T_C, T_C, T_D);
+        self.a.str(Width::W, T_C, STATE, state::X87_OK as i32);
+        self.a.ldr(Width::W, T_C, STATE, (state::CR0 + 12) as i32);
+        self.a.ubfx(Size::W, T_C, T_C, cr4::OSFXSR.trailing_zeros(), 1);
+        self.a.and(Size::W, T_C, T_C, T_E);
+        self.a.str(Width::W, T_C, STATE, state::SSE_OK as i32);
+        self.a.b(done);
+        self.a.bind(slow);
+        self.exit_interp(eip);
+        self.a.bind(done);
+        true
+    }
+
     /// MOV r32, CR0/CR2/CR3/CR4 (0F 20) at CPL 0.
     pub(super) fn mov_from_cr(&mut self, insn: &Insn) -> bool {
         let cr = insn.reg();
