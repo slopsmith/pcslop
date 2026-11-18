@@ -272,6 +272,40 @@ fn calls_and_returns_with_x87_values_in_registers() {
 }
 
 #[test]
+fn folded_addresses_that_wrap_around_4_gib_match_the_interpreter() {
+    let code = [
+        0xbb, 0xf0, 0xff, 0xff, 0xff, // mov ebx, 0xfffffff0
+        0xbe, 0x10, 0x30, 0, 0, // mov esi, 0x3010
+        0x8b, 0x83, 0x10, 0x30, 0, 0, // mov eax, [ebx+0x3010]: 0x3000
+        0x01, 0x83, 0x14, 0x30, 0, 0, // add [ebx+0x3014], eax
+        0x8b, 0x0c, 0x33, // mov ecx, [ebx+esi]: 0x3000
+        0x89, 0x4b, 0x7f, // mov [ebx+0x7f], ecx: 0x6f
+        0xb9, 0xfc, 0xff, 0xff, 0xff, // mov ecx, -4
+        0x8b, 0x14, 0x8e, // mov edx, [esi+ecx*4]: an index counting up to 0
+        0xbf, 0x10, 0x30, 0, 0, // mov edi, 0x3010
+        0x8b, 0x57, 0xf0, // mov edx, [edi-0x10]: no wrap
+        0x8d, 0x47, 0x00, // lea eax, [edi]
+        0x0f, 0xc1, 0x40, 0x04, // xadd [eax+4], eax: the store uses the old EAX
+        0x87, 0x47, 0x08, // xchg [edi+8], eax
+        0xf4, // hlt
+    ];
+    let stats = compare(&code, |_| {});
+    assert!(stats.wrapped_accesses >= 3, "the wrapping accesses never took the folded path: {stats:?}");
+}
+
+#[test]
+fn an_instruction_across_a_page_does_not_reuse_the_folded_operand_before_it() {
+    let mut code = vec![0x90; 0xff9];
+    code.extend([
+        0x8b, 0x44, 0x24, 0x0c, // mov eax, [esp+0xc]
+        0x68, 0xc0, 0x99, 0x8b, 0x08, // push 0x088b99c0, ending on the next page
+        0x5b, // pop ebx
+        0xf4, // hlt
+    ]);
+    compare(&code, |_| {});
+}
+
+#[test]
 fn rep_ret_runs_translated() {
     let code = [
         0xb9, 0x40, 0, 0, 0, // mov ecx, 64

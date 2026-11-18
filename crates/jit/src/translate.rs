@@ -103,7 +103,16 @@ struct Emit {
     x87: x87::X87Block,
     /// Whether a conditional branch may leave through a side exit and go on.
     superblock: bool,
+    /// The memory operand `load` and `store` use instead of T_ADDR, set by `ea_fold`.
+    fold: Option<Fold>,
+    /// Whether `ea_fold` may fold: self-checking blocks need T_ADDR after a store.
+    fold_ok: bool,
 }
+
+/// `[base + disp]`. An index is not folded: x86 code often holds negative
+/// offsets in it, which would pass 4 GiB every time.
+#[derive(Clone, Copy)]
+struct Fold(Reg, i32);
 
 enum Step {
     Next,
@@ -364,8 +373,48 @@ impl Emit {
         }
     }
 
+    /// Like `ea`, but the next `load`/`store` address memory from guest registers.
+    /// Past 4 GiB, where x86 wraps, that faults and the host interprets it.
+    fn ea_fold(&mut self, insn: &Insn, m: &MemOperand) -> bool {
+        if self.fold_ok && insn.addr32 && insn.seg_override.is_none_or(|s| s < 4) {
+            let disp = m.disp as i32;
+            match (m.base, m.index) {
+                (b, NO_REG) if b != NO_REG && (-256..16384).contains(&disp) => {
+                    self.fold = Some(Fold(guest_reg(b as usize), disp));
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        self.ea(insn, m)
+    }
+
+    /// The folded operand for an access of width `w`, or None after putting
+    /// its address in T_ADDR when no A64 form fits.
+    fn folded(&mut self, w: Width) -> Option<Fold> {
+        let f = self.fold?;
+        let size = match w {
+            Width::B => 1,
+            Width::H => 2,
+            Width::W => 4,
+            Width::X => 8,
+        };
+        let Fold(b, d) = f;
+        if (d >= 0 && d % size == 0 && d / size < 4096) || (-256..256).contains(&d) {
+            return Some(f);
+        }
+        self.fold = None;
+        self.add_const(T_ADDR, b, d as u32);
+        None
+    }
+
+    fn ldst_folded(&mut self, load: bool, w: Width, rt: Reg, Fold(b, d): Fold) {
+        self.a.ldst(load, w, false, load && w == Width::X, rt, b, d);
+    }
+
     /// Computes the effective (linear) address of `m` into T_ADDR.
     fn ea(&mut self, insn: &Insn, m: &MemOperand) -> bool {
+        self.fold = None;
         if !insn.addr32 {
             return false;
         }
@@ -394,12 +443,18 @@ impl Emit {
     }
 
     fn load(&mut self, w: Width, dst: Reg) {
-        self.a.ldr(w, dst, T_ADDR, 0);
+        match self.folded(w) {
+            Some(f) => self.ldst_folded(true, w, dst, f),
+            None => self.a.ldr(w, dst, T_ADDR, 0),
+        }
     }
 
     fn store(&mut self, w: Width, src: Reg) {
         self.stored = true;
-        self.a.str(w, src, T_ADDR, 0);
+        match self.folded(w) {
+            Some(f) => self.ldst_folded(false, w, src, f),
+            None => self.a.str(w, src, T_ADDR, 0),
+        }
     }
 
     fn read_r8(&mut self, n: usize, dst: Reg) {
@@ -570,7 +625,7 @@ impl Emit {
     fn rm8(&mut self, insn: &Insn) -> Option<Reg> {
         match insn.mem {
             Some(m) => {
-                if !self.ea(insn, &m) {
+                if !self.ea_fold(insn, &m) {
                     return None;
                 }
                 self.load(Width::B, T_A);
@@ -619,7 +674,7 @@ impl Emit {
     fn rm_w(&mut self, insn: &Insn, w: Ow, probe: bool) -> Option<Reg> {
         match insn.mem {
             Some(m) => {
-                if !self.ea(insn, &m) {
+                if !self.ea_fold(insn, &m) {
                     return None;
                 }
                 self.load(w.mem(), T_A);
@@ -868,6 +923,7 @@ impl Emit {
     }
 
     fn insn(&mut self, insn: &Insn, eip: u32) -> Step {
+        self.fold = None;
         let next = eip.wrapping_add(insn.len as u32);
         let op = insn.op;
         let op32 = insn.op32;
@@ -999,7 +1055,7 @@ impl Emit {
                 let v = self.read_gpr(w, insn.reg(), T_B);
                 match insn.mem {
                     Some(m) => {
-                        if !self.ea(insn, &m) {
+                        if !self.ea_fold(insn, &m) {
                             return Step::Unsupported;
                         }
                         self.store(w.mem(), v);
@@ -1009,7 +1065,7 @@ impl Emit {
             }
             0x8b if op32 && insn.mem.is_some() => {
                 let m = insn.mem.unwrap();
-                if !self.ea(insn, &m) {
+                if !self.ea_fold(insn, &m) {
                     return Step::Unsupported;
                 }
                 self.load(Width::W, guest_reg(insn.reg()));
@@ -1442,8 +1498,14 @@ impl Emit {
                 self.a.mov(Size::W, T_E, a);
                 let b = self.read_gpr(w, insn.reg(), T_B);
                 self.alu(0, w, T_E, b);
-                self.write_gpr(w, insn.reg(), T_E);
-                self.write_rm(insn, w, T_RES);
+                // The destination is written last, but a store must not see a new base.
+                if insn.mem.is_some() {
+                    self.write_rm(insn, w, T_RES);
+                    self.write_gpr(w, insn.reg(), T_E);
+                } else {
+                    self.write_gpr(w, insn.reg(), T_E);
+                    self.write_rm(insn, w, T_RES);
+                }
             }
             0x1b0 | 0x1b1 if op == 0x1b0 || op32 => {
                 let w = Ow::of(op, op32);
@@ -2412,6 +2474,8 @@ pub fn translatable(insn: &Insn, pc: u32, user: bool) -> bool {
         need: flags::ALL,
         x87: x87::X87Block::default(),
         superblock: false,
+        fold: None,
+        fold_ok: false,
     };
     !matches!(e.insn(insn, pc), Step::Unsupported)
 }
@@ -2516,9 +2580,12 @@ pub fn compile(
         need: flags::ALL,
         x87: x87::X87Block::default(),
         superblock: false,
+        fold: None,
+        fold_ok: false,
     };
     let superblock = chain;
     let need = if self_check { Vec::new() } else { flag_needs(eip, &mut byte, user, exact_flags, superblock) };
+    e.fold_ok = !self_check;
     let mut boundaries = Vec::new();
     let mut pc = eip;
     let mut insns = 0;

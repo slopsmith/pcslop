@@ -234,6 +234,8 @@ pub struct Stats {
     pub page_faults: u64,
     pub mmio_exits: u64,
     pub smc_invalidations: u64,
+    /// Folded addresses that passed 4 GiB and ran in the interpreter.
+    pub wrapped_accesses: u64,
     pub stale_blocks: u64,
     pub vcache_bumps: u64,
     /// MISS exits for blocks that exist but had lost their lookup slot.
@@ -1705,7 +1707,13 @@ impl Jit {
         }
         let ec = esr >> 26;
         assert!(ec == 0x25, "unhandled fault in translated code: ESR {esr:#x} FAR {far:#x} ELR {elr:#x}");
-        assert!(far >> 32 == 0, "translated code faulted outside the x86 address space: FAR {far:#x} ELR {elr:#x} ESR {esr:#x}");
+        if far >> 32 != 0 {
+            // A folded address went past 4 GiB, where x86 wraps around.
+            let eip = self.eip_at(elr).unwrap_or_else(|| panic!("translated code faulted outside the x86 address space: FAR {far:#x} ELR {elr:#x} ESR {esr:#x}"));
+            self.stats.wrapped_accesses += 1;
+            self.deopt_at_fault(elr);
+            return self.interpret_at_fault(cpu, bus, eip);
+        }
         let write = esr & (1 << 6) != 0;
         let mut lin = far as u32;
         if self.shadow[self.root].maps(self.mem.as_slice(), lin, write) {
@@ -1736,18 +1744,7 @@ impl Jit {
                     let leaf = self.map_shadow(bus, cpu, lin, phys, write, global);
                     self.note_aperture_leaf(leaf, above_ram, gart.is_some());
                     self.tlbi_page(lin);
-                    self.state().eip = eip;
-                    self.store_state(cpu);
-                    let e = self.step_interp(cpu, bus);
-                    if e != interp::Exit::Continue || cpu.halted || !supported(cpu) {
-                        return Some(e);
-                    }
-                    self.check_shadow(cpu, bus);
-                    self.load_state(cpu);
-                    self.set_root(cpu);
-                    self.state().irq = bus.intr() as u32;
-                    self.state().resume = resume::DISPATCH;
-                    return None;
+                    return self.interpret_at_fault(cpu, bus, eip);
                 }
                 let leaf = self.map_shadow(bus, cpu, lin, phys, write, global);
                 self.note_aperture_leaf(leaf, above_ram, gart.is_some());
@@ -1766,6 +1763,23 @@ impl Jit {
                 self.state().resume = resume::DISPATCH;
             }
         }
+        None
+    }
+
+    /// Runs the instruction at `eip` in the interpreter after a fault, once
+    /// `deopt_at_fault` wrote back the block's x87 state, and resumes at the dispatcher.
+    fn interpret_at_fault<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B, eip: u32) -> Option<interp::Exit> {
+        self.state().eip = eip;
+        self.store_state(cpu);
+        let e = self.step_interp(cpu, bus);
+        if e != interp::Exit::Continue || cpu.halted || !supported(cpu) {
+            return Some(e);
+        }
+        self.check_shadow(cpu, bus);
+        self.load_state(cpu);
+        self.set_root(cpu);
+        self.state().irq = bus.intr() as u32;
+        self.state().resume = resume::DISPATCH;
         None
     }
 
