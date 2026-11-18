@@ -169,6 +169,13 @@ impl<B: Bus> Ctx<'_, B> {
     }
 
     fn deliver(&mut self, e: Exception, source: Source) -> Exit {
+        if source == Source::Fault && trace_faults(e.vector) {
+            let c = &*self.cpu;
+            eprintln!(
+                "fault {:#x} err {:?} at {:04x}:{:08x} cr2 {:08x} eax {:08x} ecx {:08x} edx {:08x} ebx {:08x} esp {:08x} ebp {:08x} esi {:08x} edi {:08x} ss {:04x} ds {:04x} es {:04x}",
+                e.vector, e.error, c.segs[1].selector, self.start_eip, c.cr2, c.regs[0], c.regs[1], c.regs[2], c.regs[3], c.regs[4], c.regs[5], c.regs[6], c.regs[7], c.segs[2].selector, c.segs[3].selector, c.segs[0].selector
+            );
+        }
         let first = match self.raise(e, source) {
             Ok(()) => return Exit::Continue,
             Err(Trap::Unimplemented(what)) => return Exit::Unimplemented { eip: self.cpu.eip, what },
@@ -186,6 +193,17 @@ impl<B: Bus> Ctx<'_, B> {
             Err(Trap::Fault(_)) => Exit::Shutdown,
         }
     }
+}
+
+/// `SLOPPER_TRACE_FAULTS=1` logs every fault but page faults; `=all` logs those too.
+fn trace_faults(vector: u8) -> bool {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| match std::env::var("SLOPPER_TRACE_FAULTS").as_deref() {
+        Ok("all") => 2,
+        Ok(_) => 1,
+        Err(_) => 0,
+    });
+    mode == 2 || (mode == 1 && vector != vector::PF)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
