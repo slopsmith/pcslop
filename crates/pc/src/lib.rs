@@ -269,6 +269,7 @@ impl Board {
             b.pci.push((Bdf::new(0, 1, 0), pci::i440bx_agp_bridge()));
         }
         b.sync_display_bars();
+        b.enable_agp();
         b.uhci.attach(0, Box::new(usb::Tablet::new()));
         b.ide.attach_cdrom(1, 0, None);
         b.setup_cmos(ram_bytes);
@@ -1089,6 +1090,13 @@ impl Board {
         self.set_irq(15, self.ide.irq(1));
     }
 
+    fn enable_agp(&mut self) {
+        if let Display::Radeon(_) = self.display {
+            let (host, rest) = self.pci.split_at_mut(DISPLAY);
+            pci::enable_agp(&mut host[HOST].1, &mut rest[0].1);
+        }
+    }
+
     pub fn reset(&mut self) {
         self.a20 = true;
         self.kbc = i8042::I8042::default();
@@ -1109,6 +1117,7 @@ impl Board {
         if let Display::Radeon(r) = &mut self.display {
             r.reset();
         }
+        self.enable_agp();
         self.uhci.reset();
         if let Some((_, a)) = self.ac97.as_ref() {
             a.shared.with(|a| a.reset());
@@ -2038,6 +2047,17 @@ mod tests {
         config_write(&mut b, 0, 1, 0x18, 0x0002_0200);
         assert_eq!(config_read(&mut b, 2, 0, 0), 0x4e44_1002);
         assert_eq!(config_read(&mut b, 1, 0, 0), u32::MAX);
+    }
+
+    #[test]
+    fn firmware_leaves_agp_enabled_on_the_radeon_after_each_reset() {
+        let mut b = bx_board();
+        config_write(&mut b, 0, 1, 0x18, 0x0001_0100);
+        let cmd = pci::RADEON_AGP as u32 + 8;
+        assert_ne!(config_read(&mut b, 1, 0, cmd) & pci::agp::ENABLE, 0, "AGP must be on at power-on");
+        config_write(&mut b, 1, 0, cmd, 0);
+        b.reset();
+        assert_ne!(config_read(&mut b, 1, 0, cmd) & pci::agp::ENABLE, 0, "a reboot must enable AGP again");
     }
 
     #[test]

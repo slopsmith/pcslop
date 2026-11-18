@@ -269,12 +269,42 @@ pub fn radeon(rom_len: usize) -> ConfigSpace {
     let pm = c.add_capability(0x50, CAP_PM);
     c.set16(pm + 2, 0x0602);
     c.writable[pm + 4] = 0x03;
-    let agp = c.add_capability(0x58, CAP_AGP);
+    let agp = c.add_capability(RADEON_AGP, CAP_AGP);
     c.data[agp + 2] = 0x30;
     // AGP 2.0 signalling on a 440BX: 1x, 2x and 4x, fast writes, sideband.
     c.set32(agp + 4, 0x1f00_0217);
     c.set_mask32(agp + 8, 0x0000_0317);
     c
+}
+
+/// Offset of the Radeon's AGP capability.
+pub const RADEON_AGP: usize = 0x58;
+
+/// AGP status and command bits (AGP 2.0, section 6.1).
+pub mod agp {
+    pub const RATE: u32 = 0x7;
+    pub const FW: u32 = 1 << 4;
+    pub const ENABLE: u32 = 1 << 8;
+    pub const SBA: u32 = 1 << 9;
+    pub const RQ: u32 = 0xff00_0000;
+}
+
+/// Enables AGP on the 440BX and the Radeon at their fastest common rate, with
+/// sideband addressing and fast writes where both support them, as a 440BX
+/// board's firmware does after it enumerates the AGP bus. Vista's agp440 only
+/// programs AGP when the bridge comes back to D0, so its drivers rely on this.
+pub fn enable_agp(host: &mut ConfigSpace, card: &mut ConfigSpace) {
+    let target = host.read(bx::AGPSTAT, 4);
+    let master = card.read(RADEON_AGP + 4, 4);
+    let common = target & master;
+    let rate = match common & agp::RATE {
+        r if r & 4 != 0 => 4,
+        r if r & 2 != 0 => 2,
+        _ => 1,
+    };
+    let cmd = (target & agp::RQ) | (common & (agp::SBA | agp::FW)) | agp::ENABLE | rate;
+    host.write(bx::AGPCMD, 4, cmd);
+    card.write(RADEON_AGP + 8, 4, cmd);
 }
 
 pub fn piix3_isa() -> ConfigSpace {
@@ -411,6 +441,16 @@ mod tests {
         c.write(bx::AGPSTAT, 4, 0);
         assert_eq!(c.read(bx::AGPSTAT, 4), 0x1f00_0203);
         assert_eq!(c.data[bx::DRB + 7], 64);
+    }
+
+    #[test]
+    fn firmware_agp_setup_enables_both_ends_at_their_fastest_common_rate() {
+        let mut host = i440bx_host(256 << 20);
+        let mut card = radeon(53 << 10);
+        enable_agp(&mut host, &mut card);
+        let cmd = agp::ENABLE | agp::SBA | 2;
+        assert_eq!(host.read(bx::AGPCMD, 4), cmd);
+        assert_eq!(card.read(RADEON_AGP + 8, 4), cmd, "the card's command must match the bridge's");
     }
 
     #[test]
