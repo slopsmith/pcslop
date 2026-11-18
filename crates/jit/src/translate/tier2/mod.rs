@@ -1,0 +1,56 @@
+//! The second tier: recompiles hot code through an IR. See docs/jit-tier2.md.
+
+mod back;
+mod front;
+pub mod ir;
+mod opt;
+
+use a64::Asm;
+
+use super::{Compiled, Emit, X87Loop, flags, x87};
+use crate::runtime::Entries;
+
+/// The region starting at `eip` compiled for `block_va`, or None when tier 2
+/// does not handle its first instruction or runs out of registers.
+pub fn compile_region(eip: u32, byte: &mut dyn FnMut(u32) -> Option<u8>, block_va: u64, rt_va: u64, rt: &Entries, user: bool) -> Option<Compiled> {
+    let mut f = front::build(eip, byte)?;
+    opt::run(&mut f);
+    let mut e = Emit {
+        a: Asm::new(),
+        block_va,
+        dispatch_va: rt_va + rt.dispatch as u64,
+        exit_va: rt_va + rt.exit as u64,
+        unstale_va: rt_va + rt.unstale as u64,
+        page: Some(eip & !0xfff),
+        chains: Vec::new(),
+        user,
+        stored: false,
+        need: flags::ALL,
+        x87: x87::X87Block::default(),
+        superblock: false,
+        fold: None,
+        fold_ok: false,
+        at: eip,
+        lp: X87Loop::default(),
+        counters: None,
+        exits: Vec::new(),
+        cold: Vec::new(),
+        starts: Vec::new(),
+    };
+    let lowered = back::lower(&mut e, &f)?;
+    e.emit_cold();
+    let code = e.a.finish();
+    Some(Compiled {
+        code,
+        boundaries: lowered.boundaries,
+        insns: lowered.insns,
+        chains: e.chains,
+        has_rep: false,
+        recent: false,
+        interp_after: None,
+        retry: false,
+        x87: Vec::new(),
+        x87_loop: false,
+        exits: e.exits,
+    })
+}

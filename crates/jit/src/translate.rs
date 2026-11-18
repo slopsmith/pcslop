@@ -14,6 +14,7 @@ use crate::state::{self, reason};
 mod flags;
 mod sse;
 mod system;
+pub mod tier2;
 mod x87;
 
 pub use x87::Snap as X87Snap;

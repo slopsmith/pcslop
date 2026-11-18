@@ -278,6 +278,8 @@ pub struct Stats {
     pub revived_blocks: u64,
     /// Blocks that loop back to their start keeping x87 values in registers.
     pub x87_loops: u64,
+    /// Blocks compiled by tier 2.
+    pub tier2_regions: u64,
     pub flush_pool: u64,
     /// Shadow entries that map the graphics aperture straight to RAM.
     pub aperture_fills: u64,
@@ -318,6 +320,8 @@ pub struct Jit {
     shadow_key: Option<u64>,
     /// Whether new blocks count their entries and exits.
     counting: bool,
+    /// Whether every block goes through tier 2 first (SLOPPER_JIT_TIER2=eager).
+    tier2_eager: bool,
     /// Next free counter in `layout::COUNTERS`.
     counters_next: usize,
     /// Whether the shadow tables were filled with x86 paging enabled.
@@ -480,6 +484,7 @@ impl Jit {
             shadow_key: None,
             counting: std::env::var_os("SLOPPER_JIT_PROFILE").is_some() || std::env::var_os("SLOPPER_JIT_COUNT").is_some(),
             counters_next: 0,
+            tier2_eager: std::env::var("SLOPPER_JIT_TIER2").is_ok_and(|v| v == "eager"),
             shadow_paged: false,
             apic: None,
             code_next: layout::CODE_CACHE,
@@ -1517,32 +1522,40 @@ impl Jit {
         }
         let counter_base = self.counting.then_some(self.counters_next);
         let mut source = Some(Vec::new());
-        let compiled = translate::compile(
-            eip,
-            |a| {
-                if a & !0xfff == lin_page {
-                    let b = bus.read8(page | (a & 0xfff));
-                    if let Some(v) = &mut source {
-                        v.push(((a & 0xfff) as u16, b));
-                    }
-                    return Some(b);
+        let mut byte = |a: u32| {
+            if a & !0xfff == lin_page {
+                let b = bus.read8(page | (a & 0xfff));
+                if let Some(v) = &mut source {
+                    v.push(((a & 0xfff) as u16, b));
                 }
-                if a & !0xfff != next_lin || next_lin == 0 {
-                    return None;
-                }
-                source = None;
-                let p = *next_phys.get_or_insert_with(|| interp::translate(cpu, bus, next_lin, false).ok());
-                p.map(|p| bus.read8(p | (a & 0xfff)))
-            },
-            block_va,
-            rt_va,
-            &entries,
-            !self.verify,
-            user,
-            self_check,
-            self.verify,
-            counter_base.map(|n| layout::va(layout::COUNTERS + 4 * n)),
-        );
+                return Some(b);
+            }
+            if a & !0xfff != next_lin || next_lin == 0 {
+                return None;
+            }
+            source = None;
+            let p = *next_phys.get_or_insert_with(|| interp::translate(cpu, bus, next_lin, false).ok());
+            p.map(|p| bus.read8(p | (a & 0xfff)))
+        };
+        let tier2 = (self.tier2_eager && !self.verify && !self_check && counter_base.is_none())
+            .then(|| translate::tier2::compile_region(eip, &mut byte, block_va, rt_va, &entries, user))
+            .flatten();
+        self.stats.tier2_regions += tier2.is_some() as u64;
+        let compiled = match tier2 {
+            Some(c) => c,
+            None => translate::compile(
+                eip,
+                byte,
+                block_va,
+                rt_va,
+                &entries,
+                !self.verify,
+                user,
+                self_check,
+                self.verify,
+                counter_base.map(|n| layout::va(layout::COUNTERS + 4 * n)),
+            ),
+        };
         assert!(compiled.exits.len() < MAX_COUNTERS, "a block has more exits than counters were set aside for");
         self.stats.x87_loops += compiled.x87_loop as u64;
         let bytes = compiled.code.len() * 4;
