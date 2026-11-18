@@ -949,6 +949,12 @@ impl Asm {
         self.emit(0x1400_0000 | (words as u32 & 0x03ff_ffff))
     }
 
+    /// BL to a target `words` instructions away, for code outside this buffer.
+    pub fn bl_offset(&mut self, words: i32) {
+        assert!((-(1 << 25)..(1 << 25)).contains(&words));
+        self.emit(0x9400_0000 | (words as u32 & 0x03ff_ffff))
+    }
+
     pub fn b_cond(&mut self, c: Cond, l: Label) {
         self.branch_to(0x5400_0000 | c as u32, l, Fix::Imm19)
     }

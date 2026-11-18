@@ -93,6 +93,7 @@ struct Emit {
     block_va: u64,
     dispatch_va: u64,
     exit_va: u64,
+    unstale_va: u64,
     /// Linear page of the block start; jumps within it may be chained.
     page: Option<u32>,
     chains: Vec<(u32, u32)>,
@@ -2426,6 +2427,9 @@ impl Emit {
         self.a.cbz(Size::W, T_B, slow);
         self.a.ldr(Width::W, T_B, STATE, state::FP80_STALE as i32);
         self.a.cbz(Size::W, T_B, ok);
+        let off = self.branch_offset(self.unstale_va);
+        self.a.bl_offset(off);
+        self.a.b(ok);
         self.a.bind(slow);
         self.exit_interp(eip);
         self.a.bind(ok);
@@ -2741,6 +2745,7 @@ pub fn translatable(insn: &Insn, pc: u32, user: bool) -> bool {
         block_va: 0,
         dispatch_va: 0x1000,
         exit_va: 0x2000,
+        unstale_va: 0x3000,
         page: None,
         chains: Vec::new(),
         user,
@@ -2880,6 +2885,7 @@ fn compile_pass(
         block_va,
         dispatch_va: rt_va + rt.dispatch as u64,
         exit_va: rt_va + rt.exit as u64,
+        unstale_va: rt_va + rt.unstale as u64,
         page: chain.then_some(eip & !0xfff),
         chains: Vec::new(),
         user,

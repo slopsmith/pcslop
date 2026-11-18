@@ -29,6 +29,9 @@ pub struct Entries {
     pub dispatch: usize,
     /// Saves guest state and exits with EIP in w0 and the reason in w1.
     pub exit: usize,
+    /// Called with BL: rebuilds the 80-bit form of every x87 register held
+    /// only as a double, as MMX code needs. Uses x10..x15.
+    pub unstale: usize,
 }
 
 fn ctl_maintenance(a: &mut Asm) {
@@ -646,6 +649,44 @@ pub fn build() -> (Vec<u32>, Entries) {
         a.eret();
     }
 
+    let unstale_pos = a.pos();
+    unstale(&mut a);
+
     let code = a.finish();
-    (code, Entries { resume: resume_pos * 4, dispatch: dispatch_pos * 4, exit: exit_pos * 4 })
+    (code, Entries { resume: resume_pos * 4, dispatch: dispatch_pos * 4, exit: exit_pos * 4, unstale: unstale_pos * 4 })
+}
+
+/// Only zeros and normal doubles are ever stale, so the 80-bit form is exact.
+fn unstale(a: &mut Asm) {
+    let (stale, p, d, m, e, t) = (r(10), r(11), r(12), r(13), r(14), r(15));
+    let (top, next, zero, store) = (a.label(), a.label(), a.label(), a.label());
+    a.ldr(Width::W, stale, STATE, state::FP80_STALE as i32);
+    a.movz(Size::W, p, 0, 0);
+    a.bind(top);
+    a.lsrv(Size::W, t, stale, p);
+    a.tbz(t, 0, next);
+    a.add_shift(Size::X, t, STATE, p, Shift::Lsl, 3);
+    a.ldr(Width::X, d, t, state::FP64 as i32);
+    a.ubfx(Size::X, e, d, 52, 11);
+    a.cbz(Size::W, e, zero);
+    a.lsl_imm(Size::X, m, d, 11);
+    let ok = a.logic_imm(Logic::Orr, Size::X, m, m, 1 << 63);
+    assert!(ok);
+    a.add_imm(Size::W, e, e, 0xc00);
+    a.add_imm(Size::W, e, e, 0x3000);
+    a.b(store);
+    a.bind(zero);
+    a.movz(Size::X, m, 0, 0);
+    a.bind(store);
+    a.lsr_imm(Size::X, d, d, 63);
+    a.logic_shift(Logic::Orr, false, Size::W, e, e, d, Shift::Lsl, 15);
+    a.str(Width::X, m, t, state::MM as i32);
+    a.add_shift(Size::X, t, STATE, p, Shift::Lsl, 1);
+    a.str(Width::H, e, t, state::FSE as i32);
+    a.bind(next);
+    a.add_imm(Size::W, p, p, 1);
+    a.sub_imm(Size::W, t, p, 8);
+    a.cbnz(Size::W, t, top);
+    a.str(Width::W, ZR, STATE, state::FP80_STALE as i32);
+    a.ret();
 }
