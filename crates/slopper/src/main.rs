@@ -1114,6 +1114,16 @@ fn format_regs(cpu: &Cpu) -> String {
         r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7],
         cpu.eip, cpu.eflags, s[1].selector, s[2].selector, s[3].selector, s[0].selector, s[4].selector, cpu.cr0, cpu.cr3,
         cpu.fpu.cw, cpu.fpu.sw, cpu.fpu.tags, cpu.mxcsr, cpu.cr4
+    ) + &format!(
+        "\nsegments (base/limit/attr): {} gdt {:08x}/{:x}",
+        ["es", "cs", "ss", "ds", "fs", "gs"]
+            .iter()
+            .zip(s)
+            .map(|(n, g)| format!("{n} {:08x}/{:x}/{:x}", g.base, g.limit, g.attr))
+            .collect::<Vec<_>>()
+            .join(" "),
+        cpu.gdtr.base,
+        cpu.gdtr.limit
     )
 }
 
