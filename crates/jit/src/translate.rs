@@ -2027,6 +2027,11 @@ impl Emit {
                     return Step::Unsupported;
                 }
             }
+            0x122 if insn.reg() == 3 && insn.mem.is_none() => {
+                if !self.write_cr3(guest_reg(insn.rm()), eip) {
+                    return Step::Unsupported;
+                }
+            }
             0x106 => {
                 if !self.write_cr0_ts(None, eip) {
                     return Step::Unsupported;

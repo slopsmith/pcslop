@@ -245,6 +245,8 @@ pub struct Stats {
     pub flushes: u64,
     pub flush_tlb_gen: u64,
     pub nonglobal_flushes: u64,
+    /// MOV CR3 done in the VM.
+    pub vm_cr3_switches: u64,
     pub flushes_avoided: u64,
     pub flush_single_all: u64,
     pub flush_multi: u64,
@@ -305,7 +307,6 @@ pub struct Jit {
     /// Chain sites patched to jump straight into the block at a physical address.
     chain_in: HashMap<u64, Vec<usize>>,
     /// Shadow leaf entries for non-global x86 mappings, cleared on CR3 loads.
-    nonglobal: [Vec<usize>; 2],
     /// Linear pages mapped writable in the shadow tables, by physical page.
     writable: [HashMap<u32, Vec<u32>>; 2],
     /// Shadow leaf entries for physical addresses above RAM (the aperture
@@ -444,7 +445,6 @@ impl Jit {
             smc_counts: HashMap::default(),
             self_check: Default::default(),
             writable: [HashMap::default(), HashMap::default()],
-            nonglobal: [Vec::new(), Vec::new()],
             aperture_leaves: [HashSet::default(), HashSet::default()],
             aperture_epoch: 0,
             pt_watch: PtWatch::default(),
@@ -517,7 +517,7 @@ impl Jit {
         let pge = cpu.cr4 & x86::cpu::cr4::PGE != 0;
         let mut reported = 0;
         for r in 0..2 {
-            let tracked: HashSet<usize> = self.nonglobal[r].iter().copied().collect();
+            let tracked: HashSet<usize> = self.nonglobal_leaves(r).into_iter().collect();
             for (lin, phys, writable, off) in self.shadow[r].leaves(self.mem.as_slice()) {
                 let pde = bus.read32((cpu.cr3 & !0xfff) + (lin >> 22) * 4);
                 let want = if pde & 1 == 0 {
@@ -945,6 +945,15 @@ impl Jit {
             let s = self.state();
             (s.user, s.cs_sel, s.fs_sel, s.gs_sel, s.fs_base, s.gs_base)
         };
+        let switches = std::mem::take(&mut self.state().cr3_switched);
+        if switches != 0 {
+            // The VM already cleared the non-global shadow leaves.
+            cpu.cr3 = self.state().cr3;
+            cpu.tlb.flush_nonglobal();
+            self.shadow_key = Some(cpu.tlb.generation);
+            self.pt_watch.forget();
+            self.stats.vm_cr3_switches += switches as u64;
+        }
         if std::mem::take(&mut self.state().ldtr_nulled) != 0 {
             let sel = self.state().ldtr_sel as u16;
             cpu.ldtr = x86::cpu::Segment { selector: sel, ..Default::default() };
@@ -997,6 +1006,24 @@ impl Jit {
         s.vepoch = s.vepoch.wrapping_add(1);
     }
 
+    /// Records a shadow leaf of a non-global x86 page in `layout::NONGLOBAL`.
+    fn track_nonglobal(&mut self, r: usize, leaf: usize) {
+        let n = self.state().ng_count[r] as usize;
+        if n >= layout::NONGLOBAL_ENTRIES {
+            self.state().ng_count[r] = layout::NONGLOBAL_ENTRIES as u32 + 1;
+            return;
+        }
+        let at = layout::NONGLOBAL + (r * layout::NONGLOBAL_ENTRIES + n) * 4;
+        self.mem.as_mut_slice()[at..at + 4].copy_from_slice(&(leaf as u32).to_le_bytes());
+        self.state().ng_count[r] = n as u32 + 1;
+    }
+
+    fn nonglobal_leaves(&mut self, r: usize) -> Vec<usize> {
+        let n = (self.state().ng_count[r] as usize).min(layout::NONGLOBAL_ENTRIES);
+        let base = layout::NONGLOBAL + r * layout::NONGLOBAL_ENTRIES * 4;
+        (0..n).map(|i| u32::from_le_bytes(self.mem.as_slice()[base + 4 * i..base + 4 * i + 4].try_into().unwrap()) as usize).collect()
+    }
+
     fn disarm_apic(&mut self) {
         self.apic = None;
         self.state().apic_va = 0;
@@ -1011,9 +1038,9 @@ impl Jit {
         }
         for r in 0..2 {
             self.writable[r].clear();
-            self.nonglobal[r].clear();
             self.aperture_leaves[r].clear();
         }
+        self.state().ng_count = [0; 2];
         self.state().ctl |= ctl::TLBI_ALL;
         self.stats.flushes += 1;
     }
@@ -1048,12 +1075,17 @@ impl Jit {
                         if self.apic.is_some_and(|(_, global)| !global) {
                             self.disarm_apic();
                         }
+                        if self.state().ng_count.iter().any(|&n| n as usize > layout::NONGLOBAL_ENTRIES) {
+                            self.flush_shadow();
+                            return;
+                        }
                         self.bump_vcache_nonglobal();
                         self.pt_watch.forget();
                         for r in 0..2 {
-                            for off in std::mem::take(&mut self.nonglobal[r]) {
+                            for off in self.nonglobal_leaves(r) {
                                 self.shadow[r].clear_leaf(self.mem.as_mut_slice(), off);
                             }
+                            self.state().ng_count[r] = 0;
                         }
                         self.state().ctl |= ctl::TLBI_ALL;
                         self.stats.nonglobal_flushes += 1;
@@ -1132,7 +1164,7 @@ impl Jit {
             self.writable[r].entry(phys & !0xfff).or_default().push(lin & !0xfff);
         }
         if !global {
-            self.nonglobal[r].push(leaf);
+            self.track_nonglobal(r, leaf);
         }
         self.stats.shadow_fills += 1;
         leaf
@@ -1321,7 +1353,7 @@ impl Jit {
         let (&va, &key) = self.by_va.range(..=elr).next_back()?;
         let b = &self.blocks[&key];
         let word = ((elr - va) / 4) as u32;
-        b.boundaries.iter().rev().find(|(w, _)| *w <= word).map(|(_, e)| *e)
+        b.boundaries.iter().rev().find(|(w, _)| *w <= word).or(b.boundaries.first()).map(|(_, e)| *e)
     }
 
     /// Runs translated code until the CPU needs the interpreter for more than
@@ -1567,12 +1599,9 @@ impl Jit {
         for i in 0..n {
             let off = layout::FILL_LOG + i * 32;
             let word = |j: usize| u32::from_le_bytes(self.mem.as_slice()[off + 4 * j..off + 4 * j + 4].try_into().unwrap());
-            let (leaf, lin, phys_flags, pde, pte) = (word(0) as usize, word(1), word(2), word(3), word(4));
+            let (lin, phys_flags, pde, pte) = (word(1), word(2), word(3), word(4));
             let phys = phys_flags & !0xfff;
             let r = (phys_flags & state::fill::USER != 0) as usize;
-            if phys_flags & state::fill::GLOBAL == 0 {
-                self.nonglobal[r].push(leaf);
-            }
             if phys_flags & state::fill::WRITABLE != 0 {
                 self.writable[r].entry(phys).or_default().push(lin & !0xfff);
             }
@@ -1806,6 +1835,7 @@ impl Jit {
             self.pt_watch.watch(cpu, bus, lin);
         }
         self.apic = Some((phys & !0xfff, global));
+        self.state().apic_global = global as u32;
         self.state().apic_va = u64::from(lin & !0xfff) | 1;
 
         self.stats.mmio_exits += 1;

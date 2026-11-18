@@ -92,6 +92,11 @@ pub struct State {
     pub rs_top: u32,
     /// Like `vepoch`, for entries naming code on x86-global pages.
     pub gepoch: u32,
+    /// Entries used in each tree's part of `layout::NONGLOBAL`; past
+    /// `NONGLOBAL_ENTRIES` some went untracked and only a full flush clears them.
+    pub ng_count: [u32; 2],
+    /// MOV CR3s translated code did since the host last looked.
+    pub cr3_switched: u32,
     /// x86 instructions retired by translated code.
     pub icount: u64,
     /// When non-zero, counts dispatches down and exits with PENDING at zero.
@@ -193,6 +198,8 @@ pub struct State {
     /// The linear page that maps the local APIC, plus 1, or 0. The fault
     /// handler serves 32-bit TPR accesses on it from `tpr` at CPL 0.
     pub apic_va: u64,
+    /// Whether the x86 mapping of `apic_va` is global.
+    pub apic_global: u32,
     pub tpr: u32,
     /// A TPR write below this priority class lets a held-back interrupt
     /// through, so it sets `pending`.
@@ -223,6 +230,9 @@ pub const VLOOKUP: usize = offset_of!(State, vlookup);
 pub const VEPOCH: usize = offset_of!(State, vepoch);
 pub const RS_TOP: usize = offset_of!(State, rs_top);
 pub const GEPOCH: usize = offset_of!(State, gepoch);
+pub const NG_COUNT: usize = offset_of!(State, ng_count);
+pub const CR3_SWITCHED: usize = offset_of!(State, cr3_switched);
+pub const APIC_GLOBAL: usize = offset_of!(State, apic_global);
 pub const ICOUNT: usize = offset_of!(State, icount);
 pub const BUDGET: usize = offset_of!(State, budget);
 pub const INFO: usize = offset_of!(State, info);

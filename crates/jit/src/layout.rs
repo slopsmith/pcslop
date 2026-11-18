@@ -28,6 +28,10 @@ pub const CODE_BITMAP_END: usize = 0x18_0000;
 /// (as in `VLOOKUP`) and the host code that continues there.
 pub const RSTACK: usize = 0x18_0000;
 pub const RSTACK_BYTES: usize = 64 * 16;
+/// Offsets of the shadow leaves of non-global x86 pages, `NONGLOBAL_ENTRIES`
+/// u32 per tree (CPL 0, then CPL 3), so a CR3 switch can clear them in the VM.
+pub const NONGLOBAL: usize = 0x19_0000;
+pub const NONGLOBAL_ENTRIES: usize = 8192;
 pub const SHADOW_POOL: usize = 0x20_0000;
 pub const SHADOW_POOL_END: usize = 0x100_0000;
 /// The dispatcher's cache from (EIP, CPL 3) to block, ahead of the address translation.

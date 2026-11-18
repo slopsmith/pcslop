@@ -1031,6 +1031,49 @@ fn paged(cpu: &mut Cpu, bus: &mut FlatBus, big: bool) {
 }
 
 #[test]
+fn cr3_switches_in_the_vm_drop_the_old_non_global_mappings() {
+    let code = [
+        0xbb, 0x00, 0x00, 0x02, 0x00, // mov ebx, 0x20000
+        0xba, 0x00, 0x00, 0x01, 0x00, // mov edx, 0x10000
+        0xb9, 0x05, 0, 0, 0, // mov ecx, 5
+        0xa1, 0x00, 0x50, 0, 0, // loop: mov eax, [0x5000]
+        0x01, 0xc6, // add esi, eax
+        0x0f, 0x22, 0xdb, // mov cr3, ebx
+        0xa1, 0x00, 0x50, 0, 0, // mov eax, [0x5000]
+        0x01, 0xc7, // add edi, eax
+        0x0f, 0x22, 0xda, // mov cr3, edx
+        0x49, // dec ecx
+        0x75, 0xe9, // jnz loop
+        0xf4, // hlt
+    ];
+    let setup = |cpu: &mut Cpu, bus: &mut FlatBus| {
+        paged(cpu, bus, false);
+        let mem = bus.ram.as_mut_slice();
+        for (dir, table, data) in [(0x10000usize, 0x11000usize, 0x5000u32), (0x20000, 0x21000, 0x6000)] {
+            mem[dir..dir + 4].copy_from_slice(&(table as u32 | 7).to_le_bytes());
+            for i in 0..1024u32 {
+                let pte = if i == 5 { data | 7 } else { i << 12 | 0x107 };
+                mem[table + 4 * i as usize..table + 4 * i as usize + 4].copy_from_slice(&pte.to_le_bytes());
+            }
+        }
+        mem[0x5000..0x5004].copy_from_slice(&0x1111_1111u32.to_le_bytes());
+        mem[0x6000..0x6004].copy_from_slice(&0x2222_2222u32.to_le_bytes());
+        cpu.cr4 |= x86::cpu::cr4::PGE;
+    };
+    let mut a = flat_cpu(0x1000, 0x8000);
+    let mut b = a.clone();
+    let mut bus_a = bus_with(0x1000, &code);
+    let mut bus_b = bus_with(0x1000, &code);
+    setup(&mut a, &mut bus_a);
+    setup(&mut b, &mut bus_b);
+    run_interp(&mut a, &mut bus_a);
+    let stats = run_jit(&mut b, &mut bus_b);
+    assert_eq!(a.regs, b.regs);
+    assert_eq!((a.regs[6], a.regs[7]), (0x5555_5555, 0xaaaa_aaaa));
+    assert!(stats.vm_cr3_switches >= 8, "CR3 writes left translated code: {stats:?}");
+}
+
+#[test]
 fn random_programs_match_the_interpreter_with_paging() {
     let mut rng = Rng(0x5ad0_77);
     let mut fills = 0;

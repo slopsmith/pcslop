@@ -9,6 +9,7 @@ use x86::decode::Insn;
 
 use super::{Emit, Step, T_A, T_ADDR, T_B, T_C, T_D, T_E};
 use crate::runtime::{STATE, guest_reg};
+use crate::layout;
 use crate::state;
 
 const ES: usize = 0;
@@ -210,6 +211,61 @@ impl Emit {
         self.a.ubfx(Size::W, T_C, T_C, cr4::OSFXSR.trailing_zeros(), 1);
         self.a.and(Size::W, T_C, T_C, T_E);
         self.a.str(Width::W, T_C, STATE, state::SSE_OK as i32);
+        self.a.b(done);
+        self.a.bind(slow);
+        self.exit_interp(eip);
+        self.a.bind(done);
+        true
+    }
+
+    /// MOV CR3, r32 at CPL 0 with CR4.PGE set: clears the non-global shadow
+    /// leaves recorded in `layout::NONGLOBAL` instead of exiting.
+    pub(super) fn write_cr3(&mut self, src: Reg, eip: u32) -> bool {
+        use x86::cpu::cr4;
+        if self.user {
+            return false;
+        }
+        let (slow, done, apic_ok) = (self.a.label(), self.a.label(), self.a.label());
+        self.a.ldr(Width::W, T_A, STATE, (state::CR0 + 12) as i32);
+        self.a.tbz(T_A, cr4::PGE.trailing_zeros(), slow);
+        self.a.mov_imm(Size::W, T_D, layout::NONGLOBAL_ENTRIES as u64);
+        for r in 0..2 {
+            self.a.ldr(Width::W, T_B, STATE, (state::NG_COUNT + 4 * r) as i32);
+            self.a.sub(Size::W, T_E, T_D, T_B);
+            self.a.tbnz(T_E, 31, slow);
+        }
+        self.a.ldr(Width::X, T_A, STATE, state::APIC_VA as i32);
+        self.a.cbz(Size::X, T_A, apic_ok);
+        self.a.ldr(Width::W, T_A, STATE, state::APIC_GLOBAL as i32);
+        self.a.cbz(Size::W, T_A, slow);
+        self.a.bind(apic_ok);
+        self.a.str(Width::W, src, STATE, (state::CR0 + 8) as i32);
+        self.and_imm32(T_A, src, 0xffff_f000);
+        self.a.str(Width::W, T_A, STATE, state::WALK_CR3 as i32);
+        self.a.mov_imm(Size::X, T_D, layout::RUNTIME_VA);
+        for r in 0..2 {
+            let (top, empty) = (self.a.label(), self.a.label());
+            self.a.ldr(Width::W, T_B, STATE, (state::NG_COUNT + 4 * r) as i32);
+            self.a.mov_imm(Size::X, T_C, layout::va(layout::NONGLOBAL + r * layout::NONGLOBAL_ENTRIES * 4));
+            self.a.bind(top);
+            self.a.cbz(Size::W, T_B, empty);
+            self.a.sub_imm(Size::W, T_B, T_B, 1);
+            self.a.ldst_reg(true, Width::W, false, false, T_A, T_C, T_B, a64::Extend::Uxtw, true);
+            self.a.ldst_reg(false, Width::X, false, false, ZR, T_D, T_A, a64::Extend::Uxtw, false);
+            self.a.b(top);
+            self.a.bind(empty);
+            self.a.str(Width::W, ZR, STATE, (state::NG_COUNT + 4 * r) as i32);
+        }
+        self.a.dsb(0xb);
+        self.a.tlbi_vmalle1();
+        self.a.dsb(0xb);
+        self.a.isb();
+        self.a.ldr(Width::W, T_A, STATE, state::VEPOCH as i32);
+        self.a.add_imm(Size::W, T_A, T_A, 1);
+        self.a.str(Width::W, T_A, STATE, state::VEPOCH as i32);
+        self.a.ldr(Width::W, T_A, STATE, state::CR3_SWITCHED as i32);
+        self.a.add_imm(Size::W, T_A, T_A, 1);
+        self.a.str(Width::W, T_A, STATE, state::CR3_SWITCHED as i32);
         self.a.b(done);
         self.a.bind(slow);
         self.exit_interp(eip);

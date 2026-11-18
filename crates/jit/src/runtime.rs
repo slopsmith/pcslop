@@ -325,6 +325,27 @@ fn try_fill(a: &mut Asm, fail: Label) {
     a.logic_shift(Logic::Orr, false, Size::X, t7, t7, eff, Shift::Lsl, crate::shadow::LEAF_GLOBAL.trailing_zeros());
     a.str(Width::X, t7, leaf, 0);
 
+    let (global_leaf, overflow, tracked) = (a.label(), a.label(), a.label());
+    let (list, n, at) = (pde_va, pte_va, write);
+    a.tbnz(t6, fill::GLOBAL.trailing_zeros(), global_leaf);
+    a.add_shift(Size::X, at, STATE, user, Shift::Lsl, 2);
+    a.ldr(Width::W, n, at, state::NG_COUNT as i32);
+    a.cmp_imm(Size::W, n, layout::NONGLOBAL_ENTRIES as u32);
+    a.b_cond(Cond::Hs, overflow);
+    a.mov_imm(Size::X, list, layout::va(layout::NONGLOBAL));
+    a.add_shift(Size::X, list, list, user, Shift::Lsl, (layout::NONGLOBAL_ENTRIES * 4).trailing_zeros());
+    a.mov_imm(Size::X, eff, layout::RUNTIME_VA);
+    a.sub(Size::X, eff, leaf, eff);
+    a.add_shift(Size::X, list, list, n, Shift::Lsl, 2);
+    a.str(Width::W, eff, list, 0);
+    a.add_imm(Size::W, n, n, 1);
+    a.b(tracked);
+    a.bind(overflow);
+    a.mov_imm(Size::W, n, layout::NONGLOBAL_ENTRIES as u64 + 1);
+    a.bind(tracked);
+    a.str(Width::W, n, at, state::NG_COUNT as i32);
+    a.bind(global_leaf);
+
     a.mov_imm(Size::X, t7, layout::va(layout::FILL_LOG));
     a.add_shift(Size::X, t7, t7, count, Shift::Lsl, 5);
     a.mov_imm(Size::X, eff, layout::RUNTIME_VA);
