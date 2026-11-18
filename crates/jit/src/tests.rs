@@ -1101,6 +1101,34 @@ fn code_at_an_address_hypervisor_framework_reads_as_an_smccc_query_runs() {
 }
 
 #[test]
+fn invlpg_in_the_vm_drops_the_old_mapping() {
+    let code = [
+        0x8b, 0x35, 0x00, 0x50, 0, 0, // mov esi, [0x5000]
+        0xc7, 0x05, 0x14, 0x10, 0x01, 0x00, 0x07, 0x60, 0, 0, // mov dword [0x11014], 0x6007: PTE of 0x5000
+        0x0f, 0x01, 0x3d, 0x00, 0x50, 0, 0, // invlpg [0x5000]
+        0x8b, 0x3d, 0x00, 0x50, 0, 0, // mov edi, [0x5000]
+        0xf4, // hlt
+    ];
+    let setup = |cpu: &mut Cpu, bus: &mut FlatBus| {
+        paged(cpu, bus, false);
+        let mem = bus.ram.as_mut_slice();
+        mem[0x5000..0x5004].copy_from_slice(&0x1111_1111u32.to_le_bytes());
+        mem[0x6000..0x6004].copy_from_slice(&0x2222_2222u32.to_le_bytes());
+    };
+    let mut a = flat_cpu(0x1000, 0x8000);
+    let mut b = a.clone();
+    let mut bus_a = bus_with(0x1000, &code);
+    let mut bus_b = bus_with(0x1000, &code);
+    setup(&mut a, &mut bus_a);
+    setup(&mut b, &mut bus_b);
+    run_interp(&mut a, &mut bus_a);
+    let stats = run_jit(&mut b, &mut bus_b);
+    assert_eq!(a.regs, b.regs);
+    assert_eq!((b.regs[6], b.regs[7]), (0x1111_1111, 0x2222_2222));
+    assert!(stats.interp_exits <= 1, "INVLPG left translated code: {stats:?}");
+}
+
+#[test]
 fn random_programs_match_the_interpreter_with_paging() {
     let mut rng = Rng(0x5ad0_77);
     let mut fills = 0;

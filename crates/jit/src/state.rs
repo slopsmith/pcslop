@@ -97,6 +97,8 @@ pub struct State {
     pub ng_count: [u32; 2],
     /// MOV CR3s translated code did since the host last looked.
     pub cr3_switched: u32,
+    /// INVLPGs translated code did since the host last looked.
+    pub invlpgs: u32,
     /// x86 instructions retired by translated code.
     pub icount: u64,
     /// When non-zero, counts dispatches down and exits with PENDING at zero.
@@ -232,6 +234,7 @@ pub const RS_TOP: usize = offset_of!(State, rs_top);
 pub const GEPOCH: usize = offset_of!(State, gepoch);
 pub const NG_COUNT: usize = offset_of!(State, ng_count);
 pub const CR3_SWITCHED: usize = offset_of!(State, cr3_switched);
+pub const INVLPGS: usize = offset_of!(State, invlpgs);
 pub const APIC_GLOBAL: usize = offset_of!(State, apic_global);
 pub const ICOUNT: usize = offset_of!(State, icount);
 pub const BUDGET: usize = offset_of!(State, budget);

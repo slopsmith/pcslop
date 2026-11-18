@@ -273,6 +273,57 @@ impl Emit {
         true
     }
 
+    /// INVLPG at CPL 0: drops the page's leaf from both shadow trees, as the
+    /// host's TLB flush would, unless it maps the APIC.
+    pub(super) fn invlpg(&mut self, insn: &Insn, eip: u32) -> bool {
+        let Some(m) = insn.mem else { return false };
+        if self.user || !self.ea(insn, &m) {
+            return false;
+        }
+        let (slow, done, apic_ok) = (self.a.label(), self.a.label(), self.a.label());
+        self.a.ldr(Width::X, T_B, STATE, state::APIC_VA as i32);
+        self.a.cbz(Size::X, T_B, apic_ok);
+        self.and_imm32(T_C, T_ADDR, 0xffff_f000);
+        let ok = self.a.logic_imm(Logic::Orr, Size::W, T_C, T_C, 1);
+        assert!(ok);
+        self.a.eor(Size::X, T_C, T_C, T_B);
+        self.a.cbz(Size::X, T_C, slow);
+        self.a.bind(apic_ok);
+        self.a.mov_imm(Size::X, T_E, layout::RUNTIME_VA.wrapping_sub(layout::RUNTIME_IPA));
+        for r in 0..2 {
+            let absent = self.a.label();
+            self.a.ldr(Width::X, T_B, STATE, (state::ROOTS + 8 * r) as i32);
+            for (shift, bits) in [(30, 2), (21, 9)] {
+                self.a.ubfx(Size::X, T_C, T_ADDR, shift, bits);
+                self.a.add_shift(Size::X, T_B, T_B, T_C, Shift::Lsl, 3);
+                self.a.ldr(Width::X, T_C, T_B, 0);
+                self.a.tbz(T_C, 0, absent);
+                let ok = self.a.logic_imm(Logic::And, Size::X, T_C, T_C, 0x0000_ffff_ffff_f000);
+                assert!(ok);
+                self.a.add(Size::X, T_B, T_C, T_E);
+            }
+            self.a.ubfx(Size::X, T_C, T_ADDR, 12, 9);
+            self.a.add_shift(Size::X, T_B, T_B, T_C, Shift::Lsl, 3);
+            self.a.str(Width::X, ZR, T_B, 0);
+            self.a.bind(absent);
+        }
+        self.a.dsb(0xb);
+        self.a.lsr_imm(Size::W, T_C, T_ADDR, 12);
+        self.a.tlbi_vaae1(T_C);
+        self.a.dsb(0xb);
+        self.a.isb();
+        for at in [state::VEPOCH, state::GEPOCH, state::INVLPGS] {
+            self.a.ldr(Width::W, T_C, STATE, at as i32);
+            self.a.add_imm(Size::W, T_C, T_C, 1);
+            self.a.str(Width::W, T_C, STATE, at as i32);
+        }
+        self.a.b(done);
+        self.a.bind(slow);
+        self.exit_interp(eip);
+        self.a.bind(done);
+        true
+    }
+
     /// MOV r32, CR0/CR2/CR3/CR4 (0F 20) at CPL 0.
     pub(super) fn mov_from_cr(&mut self, insn: &Insn) -> bool {
         let cr = insn.reg();

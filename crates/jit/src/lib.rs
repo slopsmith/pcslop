@@ -960,6 +960,11 @@ impl Jit {
             let s = self.state();
             (s.user, s.cs_sel, s.fs_sel, s.gs_sel, s.fs_base, s.gs_base)
         };
+        if std::mem::take(&mut self.state().invlpgs) != 0 {
+            // The VM already dropped the pages from the shadow trees.
+            cpu.tlb.flush();
+            self.shadow_key = Some(cpu.tlb.generation);
+        }
         let switches = std::mem::take(&mut self.state().cr3_switched);
         if switches != 0 {
             // The VM already cleared the non-global shadow leaves.
