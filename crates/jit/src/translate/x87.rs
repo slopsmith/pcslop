@@ -42,7 +42,7 @@ const SQRT: u32 = 9;
 /// What the translator knows about the x87 state at the current point of a
 /// block. Registers TOP (as it was at the block's first x87 instruction),
 /// TAGS and SW stay loaded from then on; stack slots are numbered relative to
-/// that TOP. Results stay in V8 plus their slot until the block leaves, when
+/// that TOP, and TAGS is rotated to match, its bit r tagging slot r. Results stay in V8 plus their slot until the block leaves, when
 /// `x87_flush` writes them back (see `Snap` for faults in between).
 #[derive(Default, Clone, Copy)]
 pub(super) struct X87Block {
@@ -60,10 +60,13 @@ pub(super) struct X87Block {
     /// FOP of the last instruction are `note`.
     meta: bool,
     note: (u32, u32),
+    /// The FDS selector this block already stored, plus 0x100.
+    fds: u32,
 }
 
 /// What the host needs to write the x87 state back when it abandons a block
-/// at an instruction boundary: TOP, TAGS and SW are in x2, x3 and x4.
+/// at an instruction boundary: TOP, TAGS (rotated by TOP) and SW are in x2,
+/// x3 and x4.
 #[derive(Clone, Copy, Debug)]
 pub struct Snap {
     pub dirty: u8,
@@ -86,7 +89,7 @@ impl X87Block {
     /// full slots stay cached, all of them counted dirty so exits write them.
     pub(super) fn loop_head(&self) -> X87Block {
         let cached = self.cached & self.full;
-        X87Block { entered: true, rc_checked: self.rc_checked, d: 0, cached, dirty: cached, full: self.full, empty: self.empty, meta: false, note: (0, 0) }
+        X87Block { cached, dirty: cached, full: self.full, empty: self.empty, rc_checked: self.rc_checked, entered: true, ..X87Block::default() }
     }
 
     /// Whether this state may continue at a loop head assuming `head`.
@@ -738,6 +741,13 @@ impl Emit {
         assert!(ok);
     }
 
+    /// Tags ST(i) full or empty.
+    fn set_tag(&mut self, i: usize, full: bool) {
+        let bit = 1u64 << self.slot(i);
+        let ok = if full { self.a.logic_imm(Logic::Orr, Size::W, TAGS, TAGS, bit) } else { self.a.logic_imm(Logic::And, Size::W, TAGS, TAGS, !bit & 0xffff_ffff) };
+        assert!(ok);
+    }
+
     fn x87_enter(&mut self, bail: Label) {
         if self.x87.entered {
             return;
@@ -756,6 +766,9 @@ impl Emit {
         self.a.lsr_imm(Size::W, U, U, 31);
         self.a.bfi(Size::W, SW, U, SINGLE, 1);
         self.a.ldr(Width::W, TAGS, STATE, state::FTAGS as i32);
+        self.a.logic_shift(Logic::Orr, false, Size::W, TAGS, TAGS, TAGS, Shift::Lsl, 8);
+        self.a.lsrv(Size::W, TAGS, TAGS, TOP);
+        self.and_imm(Size::W, TAGS, TAGS, 0xff);
         let (tainted, x87_fpcr) = (self.a.label(), self.a.label());
         self.a.ldr(Width::W, U, STATE, state::X87_TAINT as i32);
         self.a.cbnz(Size::W, U, tainted);
@@ -847,13 +860,12 @@ impl Emit {
         if known & bit != 0 {
             return;
         }
-        self.phys(i);
-        self.a.lsrv(Size::W, U, TAGS, P);
+        let slot = self.slot(i) as u32;
         if full {
-            self.a.tbz(U, 0, bail);
+            self.a.tbz(TAGS, slot, bail);
             self.x87.full |= bit;
         } else {
-            self.a.tbnz(U, 0, bail);
+            self.a.tbnz(TAGS, slot, bail);
             self.x87.empty |= bit;
         }
     }
@@ -894,10 +906,7 @@ impl Emit {
     fn fset(&mut self, i: usize, v: V) {
         let bit = 1u8 << self.slot(i);
         if self.x87.full & bit == 0 {
-            self.phys(i);
-            self.a.movz(Size::W, U, 1, 0);
-            self.a.lslv(Size::W, U, U, P);
-            self.a.orr(Size::W, TAGS, TAGS, U);
+            self.set_tag(i, true);
         }
         self.cache_set(i, v);
         self.x87.dirty |= bit;
@@ -1015,7 +1024,11 @@ impl Emit {
     /// since entry (a note always has bit 31 set).
     fn write_meta(&mut self, note: (u32, u32)) {
         self.a.str(Width::W, SW, STATE, state::FSW as i32);
-        self.a.str(Width::W, TAGS, STATE, state::FTAGS as i32);
+        self.a.logic_shift(Logic::Orr, false, Size::W, U, TAGS, TAGS, Shift::Lsl, 8);
+        self.a.lslv(Size::W, U, U, TOP);
+        self.a.lsr_imm(Size::W, U, U, 8);
+        self.and_imm(Size::W, U, U, 0xff);
+        self.a.str(Width::W, U, STATE, state::FTAGS as i32);
         if note.1 == 0 {
             return;
         }
@@ -1168,7 +1181,7 @@ impl Emit {
         self.a.str(Width::H, s, U, state::FSE as i32);
         self.a.movz(Size::W, U, 1, 0);
         self.a.lslv(Size::W, U, U, P);
-        self.a.orr(Size::W, TAGS, TAGS, U);
+        self.set_tag(7, true);
         for at in [state::FP64_VALID, state::FP80_STALE] {
             self.a.ldr(Width::W, T_E, STATE, at as i32);
             self.a.bic(Size::W, T_E, T_E, U);
@@ -1189,10 +1202,8 @@ impl Emit {
     }
 
     fn fpop(&mut self) {
+        self.set_tag(0, false);
         self.a.ubfx(Size::W, P, SW, 11, 3);
-        self.a.movz(Size::W, U, 1, 0);
-        self.a.lslv(Size::W, U, U, P);
-        self.a.bic(Size::W, TAGS, TAGS, U);
         self.a.add_imm(Size::W, P, P, 1);
         self.a.bfi(Size::W, SW, P, 11, 3);
         let bit = 1u8 << self.slot(0);
@@ -1231,8 +1242,11 @@ impl Emit {
         self.x87.note = (eip, 1 << 31 | fop);
         if let Some(seg) = seg {
             self.a.str(Width::W, T_ADDR, STATE, state::FDP as i32);
-            self.a.movz(Size::W, U, 0x100 | seg as u32, 0);
-            self.a.str(Width::W, U, STATE, state::FDSEG as i32);
+            if self.x87.fds != 0x100 | seg as u32 {
+                self.x87.fds = 0x100 | seg as u32;
+                self.a.movz(Size::W, U, self.x87.fds, 0);
+                self.a.str(Width::W, U, STATE, state::FDSEG as i32);
+            }
         }
     }
 

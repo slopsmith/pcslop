@@ -207,6 +207,8 @@ pub struct State {
     /// through, so it sets `pending`.
     pub tpr_threshold: u32,
     pub tpr_fast: u64,
+    /// SYSENTERs translated code ran.
+    pub syscalls: u64,
 }
 
 pub const REGS: usize = offset_of!(State, regs);
@@ -284,6 +286,7 @@ pub const APIC_VA: usize = offset_of!(State, apic_va);
 pub const TPR: usize = offset_of!(State, tpr);
 pub const TPR_THRESHOLD: usize = offset_of!(State, tpr_threshold);
 pub const TPR_FAST: usize = offset_of!(State, tpr_fast);
+pub const SYSCALLS: usize = offset_of!(State, syscalls);
 pub const FSE: usize = offset_of!(State, fse);
 pub const FCW: usize = offset_of!(State, fcw);
 pub const FSW: usize = offset_of!(State, fsw);

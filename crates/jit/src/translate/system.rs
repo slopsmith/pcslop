@@ -30,6 +30,9 @@ impl Emit {
         self.a.str(Width::W, T_B, STATE, state::SS_SEL as i32);
         self.a.ldr(Width::W, guest_reg(4), STATE, state::SYSENTER_ESP as i32);
         self.a.ldr(Width::W, T_C, STATE, state::SYSENTER_EIP as i32);
+        self.a.ldr(Width::X, T_B, STATE, state::SYSCALLS as i32);
+        self.a.add_imm(Size::X, T_B, T_B, 1);
+        self.a.str(Width::X, T_B, STATE, state::SYSCALLS as i32);
         self.switch_tree(false);
         self.goto_reg(T_C);
         self.a.bind(slow);

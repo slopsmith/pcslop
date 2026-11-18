@@ -282,6 +282,8 @@ pub struct Stats {
     pub aperture_flushes: u64,
     /// APIC TPR accesses served inside the VM.
     pub tpr_fast: u64,
+    /// SYSENTERs run in translated code.
+    pub syscalls: u64,
     /// Nanoseconds inside `hv_vcpu_run`, and handling each kind of exit.
     pub vm_ns: u64,
     pub miss_ns: u64,
@@ -726,7 +728,7 @@ impl Jit {
         }
         if snap.meta {
             let s = self.state();
-            s.ftags = xregs[1] as u32;
+            s.ftags = ((xregs[1] as u32 & 0xff) * 0x101 << top >> 8) & 0xff;
             s.fsw = xregs[2] as u32;
             if snap.note.1 != 0 {
                 s.fip = snap.note.0;
@@ -1717,6 +1719,7 @@ impl Jit {
             }
             bus.set_apic_tpr(self.state().tpr as u8);
             self.stats.tpr_fast = self.state().tpr_fast;
+            self.stats.syscalls = self.state().syscalls;
             self.take_fill_log(cpu, bus);
             self.sync_mode(cpu, bus);
             let t1 = self.timing.then(std::time::Instant::now);
