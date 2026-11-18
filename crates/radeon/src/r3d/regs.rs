@@ -106,6 +106,7 @@ pub const ZB_CB_CLEAR: u32 = 1 << 5;
 pub const ZB_DEPTHOFFSET: u32 = 0x4f20;
 pub const ZB_DEPTHPITCH: u32 = 0x4f24;
 pub const ZB_DEPTHCLEARVALUE: u32 = 0x4f28;
+pub const ZB_ZMASK_OFFSET: u32 = 0x4f30;
 pub const ZB_ZMASK_PITCH: u32 = 0x4f34;
 pub const ZB_ZPASS_DATA: u32 = 0x4f58;
 pub const ZB_ZPASS_ADDR: u32 = 0x4f5c;
