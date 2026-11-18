@@ -153,7 +153,9 @@ fn try_fill(a: &mut Asm, fail: Label) {
     a.ubfx(Size::X, t6, far, 12, 9);
     a.add_shift(Size::X, leaf, leaf, t6, Shift::Lsl, 3);
     let leaf_free = a.label();
+    let was_valid = r(30);
     a.ldr(Width::X, t7, leaf, 0);
+    a.ubfx(Size::X, was_valid, t7, 0, 1);
     a.tbz(t7, 0, leaf_free);
     logic(a, Logic::And, Size::W, t6, esr, 0x3f);
     a.cmp_imm(Size::W, t6, 0x07);
@@ -283,11 +285,19 @@ fn try_fill(a: &mut Asm, fail: Label) {
     a.add_imm(Size::W, count, count, 1);
     a.str(Width::W, count, STATE, state::FILL_COUNT as i32);
 
+    // Entries that fault are never in the TLB, so a new leaf needs only the
+    // barrier; the ERET after it synchronises the context.
+    let (stale, done) = (a.label(), a.label());
+    a.cbnz(Size::W, was_valid, stale);
+    a.dsb(0xa);
+    a.b(done);
+    a.bind(stale);
     a.dsb(0xb);
     a.lsr_imm(Size::X, t7, far, 12);
     a.tlbi_vaae1(t7);
     a.dsb(0xb);
     a.isb();
+    a.bind(done);
 }
 
 /// CPL 0 TPR accesses on `State::apic_va` use `State::tpr`; the rest go to
