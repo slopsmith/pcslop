@@ -176,6 +176,17 @@ To install it:
 2. At the 1440x900 desktop, `cdrom ISO` on the control socket, run the installer, choose Custom (display driver and CCC), click Continue Anyway on the logo warning, then Finish with "restart now".
 3. Take a save state before the restart. Killing the guest during the install can break its AGP driver.
 
+## Windows Vista's WDDM driver
+
+Vista SP2 binds its in-box "RADEON 9700 PRO (Microsoft Corporation - WDDM)" driver (atikmdag.sys). It used to stop with Code 43 after reading `CONFIG_MEMSIZE`; it now starts and draws the Vista Basic desktop through the CP and the 2D engine. What it needed:
+
+- **AGP enabled by firmware.** ATI's ASIC library finds the card's AGP capability and drops a capability the driver requires unless the card's AGP command register has AGP_ENABLE set; the adapter then fails to start. Vista's agp440.sys only programs AGP when the bridge returns to D0 (on resume), so it relies on the BIOS having done it. The board now enables AGP on the 440BX and the card at their fastest common rate (2x, with sideband addressing) at power-on and at every reset, as a 440BX board's firmware does.
+- **PAT.** agp440's AddDevice allocates its GATT with `MmAllocateContiguousMemorySpecifyCache(MmWriteCombined)`, which fails when the CPU reports no PAT. The filter then never attaches, dxgkrnl reports no AGP aperture, and atikmdag refuses to start with less than 32 MiB of aperture. CPUID now reports PAT, as a real Northwood does, and IA32_PAT keeps what the guest writes. We give every page the same memory type anyway.
+- **An output protection block at `0x1FC0`-`0x1FDC`**, four channels of a control and a data register. The driver flushes a channel (writes 4, waits for the control to read 0), starts it (writes 0, waits for 8) and reads a nonzero random word, without timeouts. It then starts a key exchange; we never answer it (the control stays 1), its bounded wait times out and the driver goes on without the protected session.
+- **The GUIDMA interrupt.** Every DMA buffer ends with the fence id in `SCRATCH_REG6` and a GUI DMA descriptor written through the CP at `0x720`-`0x728`: no bytes, EOL set, INTDIS clear. Its only job is to raise `GEN_INT_STATUS` bit 30 (GUIDMA), which the driver enables in `GEN_INT_CNTL`; dxgkrnl's scheduler stalls until it arrives. We latch it once the GPU has caught up, and the driver acknowledges it by writing the bit back.
+
+Open: with the Aero colour scheme, DWM composes through the 3D engine (tiled colour buffers, flips between two front buffers at 0 and `0x1DB000`) and the screen stays black but for a white rectangle.
+
 ## 3D engine
 
 `crates/radeon/src/r3d` runs the R300's 3D pipeline. Its CPU path draws while the packet executes and is the reference for the Metal backend, which draws the pixels by default (see [Metal backend](#metal-backend)):
