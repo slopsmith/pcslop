@@ -369,3 +369,31 @@ fn the_idct_engine_reads_idle_for_xps_mode_switch() {
     let mut r = card();
     assert_ne!(r.mmio_read(IDCT_STATUS, 4) & IDCT_IDLE, 0);
 }
+
+#[test]
+fn random_source_flushes_then_hands_out_nonzero_words() {
+    let mut r = card();
+    for cntl in RNG_CNTL {
+        r.mmio_write(cntl, 4, RNG_FLUSH, &mut NoBus);
+        assert_eq!(r.mmio_read(cntl, 4), 0, "a flushed channel at {cntl:#x} must read empty");
+        r.mmio_write(cntl, 4, 0, &mut NoBus);
+        assert_eq!(r.mmio_read(cntl, 4), RNG_READY, "a started channel at {cntl:#x} must have a word ready");
+        let a = r.mmio_read(cntl + 4, 4);
+        let b = r.mmio_read(cntl + 4, 4);
+        assert!(a != 0 && b != 0 && a != b, "the driver rejects zero and expects fresh words: {a:#x} {b:#x}");
+        assert_eq!(r.mmio_read(cntl, 4), RNG_READY);
+    }
+}
+
+#[test]
+fn random_source_never_completes_a_key_exchange() {
+    let mut r = card();
+    let cntl = RNG_CNTL[0];
+    r.mmio_write(cntl, 4, 0, &mut NoBus);
+    r.mmio_write(cntl + 4, 4, 0x1234_5678, &mut NoBus);
+    for _ in 0..3 {
+        assert_eq!(r.mmio_read(cntl, 4), RNG_BUSY, "the driver's bounded wait must time out instead of seeing a reply");
+    }
+    r.mmio_write(cntl, 4, RNG_FLUSH, &mut NoBus);
+    assert_eq!(r.mmio_read(cntl, 4), 0, "a flush must still empty the channel");
+}

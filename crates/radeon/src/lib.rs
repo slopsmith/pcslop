@@ -454,6 +454,12 @@ impl Radeon {
             RBBM_STATUS => RBBM_FIFOCNT_IDLE | (busy as u32 * RBBM_ACTIVE),
             IDCT_STATUS => self.reg(IDCT_STATUS) | IDCT_IDLE,
             MC_STATUS => self.reg(MC_STATUS) | MC_STATUS_IDLE,
+            0x1fc0..=0x1fdc if reg & 4 == 0 => match self.reg(reg) {
+                0 => RNG_READY,
+                v if v & RNG_FLUSH != 0 => 0,
+                _ => RNG_BUSY,
+            },
+            0x1fc0..=0x1fdc => self.random_word(reg),
             0x0f00..=0x0ffc => {
                 let i = (reg - 0x0f00) as usize;
                 u32::from_le_bytes(self.config[i..i + 4].try_into().unwrap())
@@ -511,6 +517,10 @@ impl Radeon {
         }
         self.regs[reg as usize / 4] = new;
         match reg {
+            0x1fc0..=0x1fdc if reg & 4 != 0 => {
+                self.regs[reg as usize / 4 - 1] = RNG_BUSY;
+                return;
+            }
             I2C_CNTL_0 => {
                 let cntl0 = self.i2c.control(new, self.reg(I2C_CNTL_1), self.monitor.edid());
                 self.regs[reg as usize / 4] = cntl0;
@@ -591,6 +601,17 @@ impl Radeon {
             return self.render_extended(out, wait);
         }
         Some(self.vga.render(out))
+    }
+
+    /// The next word of a random source channel's data register, which keeps
+    /// the generator's state. SplitMix64's finalizer (Sebastiano Vigna).
+    fn random_word(&mut self, reg: u32) -> u32 {
+        let mut z = (self.reg(reg) as u64) << 32 ^ self.now_ns ^ 0x9e37_79b9_7f4a_7c15;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        let word = ((z ^ (z >> 31)) as u32).max(1);
+        self.regs[reg as usize / 4] = word;
+        word
     }
 
     /// GEN_INT_STATUS: the latched vertical blank and the software interrupt.

@@ -213,3 +213,13 @@ pub const I2C_DATA: u32 = 0x0098;
 pub const IDCT_STATUS: u32 = 0x1fb4;
 pub const IDCT_IDLE: u32 = 1 << 31;
 pub const IDLE_QUEUE_STATUS: [(u32, u32); 3] = [(0x0790, 0x02), (0x07b0, 0x08), (0x0a10, 0x3333)];
+/// An undocumented output protection block in four channels, each a control
+/// register and a data register after it. Vista's atikmdag flushes a channel
+/// by writing RNG_FLUSH and waits for the control to read 0, then writes 0 and
+/// waits for RNG_READY before it reads a random word, which must not be 0.
+/// It then starts a key exchange by writing data words; we never answer it,
+/// so the channel stays RNG_BUSY and the driver gives up on the session.
+pub const RNG_CNTL: [u32; 4] = [0x1fc0, 0x1fc8, 0x1fd0, 0x1fd8];
+pub const RNG_BUSY: u32 = 1 << 0;
+pub const RNG_FLUSH: u32 = 1 << 2;
+pub const RNG_READY: u32 = 1 << 3;
