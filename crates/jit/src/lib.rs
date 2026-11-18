@@ -334,6 +334,8 @@ pub struct Jit {
     interp_profile: Option<HashMap<u16, u64>>,
     /// Interpreter exits by (opcode key, EIP), when profiling is on.
     interp_sites: HashMap<(u16, u32), u64>,
+    /// Translations by block start, when profiling is on.
+    translated_at: HashMap<u32, u64>,
     /// Where the vCPU was at each kick while profiling: guest EIP of the
     /// translated block, or a runtime offset (negative keys, 64-byte buckets).
     pc_samples: HashMap<i64, u64>,
@@ -453,6 +455,7 @@ impl Jit {
             stats: Stats::default(),
             interp_profile: std::env::var_os("SLOPPER_JIT_PROFILE").map(|_| HashMap::default()),
             interp_sites: HashMap::default(),
+            translated_at: HashMap::default(),
             pc_samples: HashMap::default(),
             block_samples: HashMap::default(),
             host_samples: HashMap::default(),
@@ -571,6 +574,7 @@ impl Jit {
         self.timing = on;
         self.interp_profile = on.then(HashMap::default);
         self.interp_sites.clear();
+        self.translated_at.clear();
         self.pc_samples.clear();
         self.block_samples.clear();
         self.host_samples.clear();
@@ -589,6 +593,10 @@ impl Jit {
         let mut sites: Vec<_> = self.interp_sites.iter().collect();
         sites.sort_by(|a, b| b.1.cmp(a.1));
         let sites: Vec<String> = sites.iter().take(20).map(|((k, eip), n)| format!("{k:04x}@{eip:08x}:{n}")).collect();
+        let mut again: Vec<_> = self.translated_at.iter().filter(|(_, n)| **n > 1).collect();
+        again.sort_by(|a, b| b.1.cmp(a.1));
+        let retranslated: u64 = again.iter().map(|(_, n)| **n - 1).sum();
+        let again: Vec<String> = again.iter().take(12).map(|(eip, n)| format!("{eip:08x}:{n}")).collect();
         let total: u64 = self.pc_samples.values().sum();
         let mut pcs: Vec<_> = self.pc_samples.iter().collect();
         pcs.sort_by(|a, b| b.1.cmp(a.1));
@@ -599,7 +607,7 @@ impl Jit {
             .map(|(k, n)| if **k < 0 { format!("rt+{:#x}:{n}", -**k - 1) } else { format!("{:#x}:{n}", **k) })
             .collect();
         format!(
-            "ms in vm {:.0} miss {:.0} interp {:.0} fault {:.0} mmio {:.0}\ninterpreter exits by opcode: {}\nby site: {}\n{total} samples, {runtime} in the runtime; hottest: {}",
+            "ms in vm {:.0} miss {:.0} interp {:.0} fault {:.0} mmio {:.0}\ninterpreter exits by opcode: {}\nby site: {}\n{} translations, {retranslated} of blocks translated before; most often: {}\n{total} samples, {runtime} in the runtime; hottest: {}",
             ms(s.vm_ns),
             ms(s.miss_ns),
             ms(s.interp_ns),
@@ -607,6 +615,8 @@ impl Jit {
             ms(s.mmio_ns),
             top.join(" "),
             sites.join(" "),
+            self.translated_at.values().sum::<u64>(),
+            again.join(" "),
             hot.join(" ")
         )
     }
@@ -1261,6 +1271,9 @@ impl Jit {
             self.reset_code_cache();
         }
         let key = block_key(phys, eip, user);
+        if self.interp_profile.is_some() {
+            *self.translated_at.entry(eip).or_default() += 1;
+        }
         let page = phys & !0xfff;
         let lin_page = eip & !0xfff;
         let block_va = layout::va(self.code_next);
