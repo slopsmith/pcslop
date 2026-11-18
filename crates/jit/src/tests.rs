@@ -306,6 +306,49 @@ fn fprem_sets_the_quotient_bits_and_remainder_sign() {
 }
 
 #[test]
+fn single_precision_results_past_the_float_range_keep_their_exponent() {
+    let mut code = vec![0xb9, 0x14, 0, 0, 0]; // mov ecx, 20
+    code.extend([
+        0xdd, 0x05, 0x00, 0x30, 0, 0, // loop: fld qword [0x3000]
+        0xdc, 0x0d, 0x08, 0x30, 0, 0, // fmul qword [0x3008]
+        0xdd, 0x1d, 0x10, 0x30, 0, 0, // fstp qword [0x3010]
+        0xdd, 0x05, 0x18, 0x30, 0, 0, // fld qword [0x3018]
+        0xdc, 0x0d, 0x08, 0x30, 0, 0, // fmul qword [0x3008]
+        0xdd, 0x1d, 0x20, 0x30, 0, 0, // fstp qword [0x3020]
+        0xdd, 0x05, 0x00, 0x30, 0, 0, // fld qword [0x3000]
+        0xdc, 0x0d, 0x08, 0x30, 0, 0, // fmul qword [0x3008]
+        0xd9, 0x1d, 0x28, 0x30, 0, 0, // fstp dword [0x3028]
+    ]);
+    // More integer work than an interpreter run takes after an exit.
+    code.extend([0x42; 16]); // inc edx
+    code.extend([0x49, 0x75, (-(54i8 + 16 + 3)) as u8, 0xf4]); // dec ecx; jnz loop; hlt
+    for (rc, big, factor) in [(0, 3e38, 1.0 / 3.0 + 7.0), (0, -1e300, 1.1), (0xc00, 5e38, 3.3), (0x400, 1e39, 1.7), (0x800, -1e39, 1.7)] {
+        let mut a = flat_cpu(0x1000, 0x8000);
+        a.fpu.cw = 0x7f | rc;
+        let mut b = a.clone();
+        let mut bus_a = bus_with(0x1000, &code);
+        let mut bus_b = bus_with(0x1000, &code);
+        for bus in [&mut bus_a, &mut bus_b] {
+            let m = bus.ram.as_mut_slice();
+            m[0x3000..0x3008].copy_from_slice(&f64::to_le_bytes(big));
+            m[0x3008..0x3010].copy_from_slice(&f64::to_le_bytes(factor));
+            m[0x3018..0x3020].copy_from_slice(&f64::to_le_bytes(1e-41 / big));
+        }
+        run_interp(&mut a, &mut bus_a);
+        let stats = run_jit(&mut b, &mut bus_b);
+        let result = |bus: &FlatBus, at: usize| f64::from_le_bytes(bus.ram.as_slice()[at..at + 8].try_into().unwrap());
+        assert!(result(&bus_a, 0x3010).is_finite(), "{big} * {factor} overflowed, though precision control keeps the exponent range");
+        assert_eq!(result(&bus_a, 0x3010).to_bits(), result(&bus_b, 0x3010).to_bits(), "{big} * {factor} under RC {rc:#x}");
+        assert_eq!(result(&bus_a, 0x3020).to_bits(), result(&bus_b, 0x3020).to_bits(), "tiny * {factor} under RC {rc:#x}");
+        assert_eq!(bus_a.ram.as_slice()[0x3028..0x302c], bus_b.ram.as_slice()[0x3028..0x302c], "{big} * {factor} stored as a float under RC {rc:#x}");
+        assert_eq!(a.fpu.sw, b.fpu.sw, "status words differ under RC {rc:#x}");
+        if rc == 0 {
+            assert!(stats.interp_exits <= 1, "results past the float range left translated code: {stats:?}");
+        }
+    }
+}
+
+#[test]
 fn loop_with_memory_and_stack() {
     let code = [
         0xb8, 0x05, 0, 0, 0, // mov eax, 5

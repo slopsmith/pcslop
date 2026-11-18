@@ -200,6 +200,27 @@ impl F80 {
         (b as u32, e)
     }
 
+    /// Rounds the significand to `bits` bits by `rc` and keeps the exponent,
+    /// as x87 precision control does; PE when bits were lost.
+    pub fn round_significand(self, bits: u32, rc: u8) -> (F80, u16) {
+        let exp = self.exp();
+        if exp == 0 || exp == 0x7fff {
+            return (self, 0);
+        }
+        let (kept, lost, half) = split(self.mant as u128, 64 - bits);
+        if !lost {
+            return (self, 0);
+        }
+        let mut m = kept + round_up(rc, self.sign(), half, kept) as u128;
+        let mut exp = exp;
+        if m >> bits != 0 {
+            m >>= 1;
+            exp += 1;
+        }
+        debug_assert!(exp < 0x7fff, "rounding a significand overflowed the exponent, which precision control cannot do to values from f64");
+        (F80 { mant: (m as u64) << (64 - bits), se: (self.se & 0x8000) | exp }, exc::PE)
+    }
+
     pub fn to_f64(self, rc: u8) -> (f64, u16) {
         let (b, e) = self.to_f64_bits(rc);
         (f64::from_bits(b), e)
@@ -508,6 +529,25 @@ mod tests {
         let (big, e) = F80::from_f64(1e300).to_f32_bits(rc::ZERO);
         assert_eq!(f32::from_bits(big), f32::MAX);
         assert!(e & exc::OE != 0);
+    }
+
+    #[test]
+    fn precision_control_rounds_the_significand_but_keeps_the_exponent_range() {
+        let big = F80::from_f64(f32::MAX as f64 * 2.0);
+        let (r, e) = big.round_significand(24, rc::NEAREST);
+        assert_eq!(r, big, "a value with a short significand past f32's range must stay as it is");
+        assert_eq!(e, 0);
+        let (r, e) = F80::from_f64(1e300 / 3.0).round_significand(24, rc::NEAREST);
+        assert_eq!(r.mant & ((1 << 40) - 1), 0, "only 24 significand bits may be left");
+        assert_eq!(e, exc::PE);
+        assert!(r.to_f64(rc::NEAREST).0.is_finite());
+        let tiny = 1e-300f64 / 3.0;
+        let (r, _) = F80::from_f64(tiny).round_significand(24, rc::NEAREST);
+        assert_eq!(r.to_f64(rc::NEAREST).0, f64::from_bits((tiny.to_bits() + (1 << 28)) >> 29 << 29), "values below f32's range keep 24 bits too");
+        let (up, _) = F80::from_f64(1.0 + f64::EPSILON).round_significand(24, rc::UP);
+        assert_eq!(up.to_f64(rc::NEAREST).0, 1.0 + f32::EPSILON as f64);
+        let (all_ones, _) = F80 { mant: u64::MAX, se: 0x3fff }.round_significand(24, rc::NEAREST);
+        assert_eq!(all_ones, F80 { mant: 1 << 63, se: 0x4000 }, "a carry out of the significand bumps the exponent");
     }
 
     #[test]

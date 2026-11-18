@@ -617,9 +617,9 @@ impl<B: Bus> Ctx<'_, B> {
         if self.cpu.fpu.pc() != 0 || r.is_nan() {
             return v;
         }
-        let (b, x) = v.to_f32_bits(self.cpu.fpu.rc());
-        *e |= x & !exc::DE;
-        F80::from_f32_bits(b)
+        let (v, x) = v.round_significand(24, self.cpu.fpu.rc());
+        *e |= x;
+        v
     }
 
     /// FCOM-family compare that sets C3, C2, C0. Returns whether the

@@ -526,14 +526,49 @@ impl<'a> BlockLower<'a> {
         }
     }
 
-    /// Rounds a result to single precision when the control word asks for it
-    /// (SW bit 16, set from FCW on entry as in tier 1).
+    /// Single precision (SW bit 16) rounds the significand to 24 bits and keeps the exponent.
     fn precision(&mut self, r: V) {
-        let done = self.e.a.label();
-        self.e.a.tbz(Reg(4), 16, done);
-        self.e.a.fp1(true, 4, r, r);
-        self.e.a.fp1(false, 5, r, r);
-        self.e.a.bind(done);
+        let (done, wide) = (self.e.a.label(), self.e.a.label());
+        let (bits, t) = (Reg(16), Reg(15));
+        let a = &mut self.e.a;
+        a.tbz(Reg(4), 16, done);
+        a.fmov_xd(bits, r);
+        // NZCV holds guest flags here, so the range check must not set them.
+        a.ubfx(Size::X, t, bits, 52, 11);
+        a.sub_imm(Size::W, t, t, 0x37e);
+        a.lsr_imm(Size::W, SCRATCH, t, 8);
+        a.cbnz(Size::W, SCRATCH, wide);
+        a.sub_imm(Size::W, SCRATCH, t, 3);
+        a.tbnz(SCRATCH, 31, wide);
+        a.fp1(true, 4, r, r);
+        a.fp1(false, 5, r, r);
+        a.b(done);
+        let (nearest, chop, mask) = (a.label(), a.label(), a.label());
+        a.bind(wide);
+        a.ldr(AW::W, t, STATE, state::FCW as i32);
+        a.ubfx(Size::W, t, t, 10, 2);
+        a.cbz(Size::W, t, nearest);
+        a.sub_imm(Size::W, SCRATCH, t, 3);
+        a.cbz(Size::W, SCRATCH, chop);
+        // Down rounds negative magnitudes up, up rounds positive ones up.
+        a.sub_imm(Size::W, t, t, 1);
+        a.lsr_imm(Size::X, SCRATCH, bits, 63);
+        a.eor(Size::W, SCRATCH, SCRATCH, t);
+        a.cbz(Size::W, SCRATCH, chop);
+        a.mov_imm(Size::X, t, 0x1fff_ffff);
+        a.add(Size::X, bits, bits, t);
+        a.b(mask);
+        a.bind(nearest);
+        a.ubfx(Size::X, t, bits, 29, 1);
+        a.add(Size::X, bits, bits, t);
+        a.mov_imm(Size::X, t, 0x0fff_ffff);
+        a.add(Size::X, bits, bits, t);
+        a.bind(chop);
+        a.bind(mask);
+        let ok = a.logic_imm(Logic::And, Size::X, bits, bits, !0x1fff_ffffu64);
+        assert!(ok, "the significand mask is a valid logical immediate");
+        a.fmov_dx(r, bits);
+        a.bind(done);
     }
 
     fn x87(&mut self, v: Val) -> Option<()> {

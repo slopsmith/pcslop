@@ -36,6 +36,7 @@ const C1: u32 = 1 << 9;
 const C2: u32 = 1 << 10;
 const C3: u32 = 1 << 14;
 const PE_SHIFT: u32 = 5;
+const OE_SHIFT: u32 = 3;
 const SINGLE: u32 = 16;
 const SQRT: u32 = 9;
 
@@ -309,10 +310,10 @@ impl Emit {
                     let v = self.st_val(0, bail);
                     self.a.fp1(true, 4, FB, v);
                     self.a.fmov_ws(T_A, FB);
-                    let (normal, zero) = (self.a.label(), self.a.label());
+                    let (normal, zero, wide) = (self.a.label(), self.a.label(), self.a.label());
                     self.a.ubfx(Size::W, T_B, T_A, 23, 8);
                     self.a.add_imm(Size::W, T_C, T_B, 2);
-                    self.a.tbnz(T_C, 8, bail);
+                    self.a.tbnz(T_C, 8, wide);
                     self.a.sub_imm(Size::W, T_C, T_B, 1);
                     self.a.cbz(Size::W, T_C, bail);
                     self.a.cbnz(Size::W, T_B, normal);
@@ -332,6 +333,18 @@ impl Emit {
                     self.a.fmov_xd(T_B, E1);
                     self.a.mvn(Size::X, T_B, T_B);
                     self.flag_nonzero_to_pe(T_B);
+                    self.a.b(exact);
+                    // A finite value that rounds to infinity overflowed, masked.
+                    self.a.bind(wide);
+                    self.a.ldr(Width::W, T_C, STATE, state::FCW as i32);
+                    self.a.ubfx(Size::W, T_C, T_C, 10, 2);
+                    self.a.cbnz(Size::W, T_C, bail);
+                    self.a.sub_imm(Size::W, T_C, T_B, 254);
+                    self.a.cbz(Size::W, T_C, normal);
+                    for bit in [OE_SHIFT, PE_SHIFT] {
+                        let ok = self.a.logic_imm(Logic::Orr, Size::W, SW, SW, 1 << bit);
+                        assert!(ok);
+                    }
                     self.a.bind(exact);
                     self.a.bind(zero);
                     self.store(Width::W, T_A);
@@ -1446,24 +1459,24 @@ impl Emit {
         self.clear_c1();
     }
 
-    /// Single precision rounds to an f32 and takes its range, as the interpreter does.
+    /// Single precision rounds the significand to 24 bits and keeps the exponent range.
     fn apply_precision(&mut self, bail: Label) {
-        let (normal, inexact_known, done) = (self.a.label(), self.a.label(), self.a.label());
+        let (normal, inexact_known, done, wide) = (self.a.label(), self.a.label(), self.a.label(), self.a.label());
         self.a.tbz(SW, SINGLE, done);
         self.a.fp1(true, 4, FS, FR);
         self.a.fmov_ws(T_A, FS);
         self.a.ubfx(Size::W, T_B, T_A, 23, 8);
         self.a.add_imm(Size::W, T_C, T_B, 2);
-        self.a.tbnz(T_C, 8, bail);
+        self.a.tbnz(T_C, 8, wide);
         self.a.sub_imm(Size::W, T_C, T_B, 1);
-        self.a.cbz(Size::W, T_C, bail);
+        self.a.cbz(Size::W, T_C, wide);
         self.a.cbnz(Size::W, T_B, normal);
         self.a.lsl_imm(Size::W, T_B, T_A, 1);
-        self.a.cbnz(Size::W, T_B, bail);
+        self.a.cbnz(Size::W, T_B, wide);
         self.a.fmov_xd(T_B, FR);
         self.a.lsl_imm(Size::X, T_B, T_B, 1);
         self.a.cbz(Size::X, T_B, done);
-        self.a.b(bail);
+        self.a.b(wide);
         self.a.bind(normal);
         self.a.fp1(false, 5, E1, FS);
         self.a.tbnz(SW, PE_SHIFT, inexact_known);
@@ -1473,6 +1486,31 @@ impl Emit {
         self.flag_nonzero_to_pe(T_B);
         self.a.bind(inexact_known);
         self.a.fp1(true, 0, FR, E1);
+        self.a.b(done);
+        // Near or past the ends of f32's range: precision control keeps the
+        // exponent, so round the double's significand to 24 bits, to nearest even.
+        self.a.bind(wide);
+        self.a.ldr(Width::W, T_C, STATE, state::FCW as i32);
+        self.a.ubfx(Size::W, T_C, T_C, 10, 2);
+        self.a.cbnz(Size::W, T_C, bail);
+        self.a.fmov_xd(T_B, FR);
+        self.a.ubfx(Size::X, T_C, T_B, 52, 11);
+        self.a.cbz(Size::W, T_C, bail);
+        self.a.add_imm(Size::W, T_C, T_C, 1);
+        self.a.tbnz(T_C, 11, bail);
+        self.and_imm(Size::X, T_C, T_B, 0x1fff_ffff);
+        self.a.cbz(Size::X, T_C, done);
+        self.a.ubfx(Size::X, T_E, T_B, 29, 1);
+        self.a.add(Size::X, T_B, T_B, T_E);
+        self.a.mov_imm(Size::X, T_E, 0x0fff_ffff);
+        self.a.add(Size::X, T_B, T_B, T_E);
+        self.and_imm(Size::X, T_B, T_B, !0x1fff_ffffu64);
+        self.a.ubfx(Size::X, T_C, T_B, 52, 11);
+        self.a.add_imm(Size::W, T_C, T_C, 1);
+        self.a.tbnz(T_C, 11, bail);
+        let ok = self.a.logic_imm(Logic::Orr, Size::W, SW, SW, 1 << PE_SHIFT);
+        assert!(ok);
+        self.a.fmov_dx(FR, T_B);
         self.a.bind(done);
     }
 
