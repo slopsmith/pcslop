@@ -200,9 +200,9 @@ impl Emit {
             self.a.cbnz(Size::X, tag, miss);
             self.a.ret_to(host);
             self.a.bind(miss);
-            return self.flushed(|e| e.goto_reg(eip));
+            return self.flushed(|e| e.goto_indirect(eip));
         }
-        self.goto_reg(eip);
+        self.goto_indirect(eip);
     }
 
     /// Jumps through the dispatcher even within the page, so it can check for interrupts.
@@ -211,6 +211,43 @@ impl Emit {
         self.a.mov_imm(Size::W, r(0), eip as u64);
         let off = self.branch_offset(self.dispatch_va);
         self.a.b_offset(off);
+    }
+
+    /// Like `goto_reg` for indirect branches that keep the CPL, probing the
+    /// dispatcher's EIP cache here so each site has its own `br` to predict.
+    fn goto_indirect(&mut self, eip: Reg) {
+        if eip != r(0) {
+            self.a.mov(Size::W, r(0), eip);
+        }
+        self.x87_flush();
+        if self.page.is_some() {
+            let slow = self.a.label();
+            let (tag, slot, epoch, base) = (r(6), r(7), r(3), r(2));
+            self.a.ldr(Width::W, CHAIN_TMP, STATE, state::PENDING as i32);
+            self.a.cbnz(Size::W, CHAIN_TMP, slow);
+            // User code is never on global pages; kernel code nearly always is.
+            if self.user {
+                let ok = self.a.logic_imm(Logic::Orr, Size::X, tag, r(0), 1 << 32);
+                assert!(ok);
+                self.a.ldr(Width::W, epoch, STATE, state::VEPOCH as i32);
+            } else {
+                let ok = self.a.logic_imm(Logic::Orr, Size::X, tag, r(0), 1 << 33);
+                assert!(ok);
+                self.a.ldr(Width::W, epoch, STATE, state::GEPOCH as i32);
+            }
+            self.a.logic_shift(Logic::Orr, false, Size::X, tag, tag, epoch, Shift::Lsl, 34);
+            self.a.logic_shift(Logic::Eor, false, Size::W, slot, r(0), r(0), Shift::Lsr, 16);
+            let ok = self.a.logic_imm(Logic::And, Size::W, slot, slot, layout::VLOOKUP_ENTRIES as u64 - 1);
+            assert!(ok);
+            self.a.ldr(Width::X, base, STATE, state::VLOOKUP as i32);
+            self.a.add_shift(Size::X, slot, base, slot, Shift::Lsl, 4);
+            self.a.ldp(Size::X, r(4), r(5), slot, 0);
+            self.a.eor(Size::X, r(4), r(4), tag);
+            self.a.cbnz(Size::X, r(4), slow);
+            self.a.br(r(5));
+            self.a.bind(slow);
+        }
+        self.flushed(|e| e.goto_reg(r(0)));
     }
 
     fn goto_reg(&mut self, eip: Reg) {
@@ -983,7 +1020,7 @@ impl Emit {
                 self.a.eor(Size::W, T_C, T_C, T_B);
                 self.a.cbnz(Size::W, T_C, slow);
                 self.a.add_imm(Size::W, esp, esp, 8);
-                self.goto_reg(T_A);
+                self.goto_indirect(T_A);
                 self.a.bind(slow);
                 self.exit_interp(eip);
                 return Step::End;
@@ -1234,9 +1271,9 @@ impl Emit {
                         self.a.mov_imm(Size::W, T_B, next as u64);
                         self.push(T_B);
                         self.a.mov(Size::W, r(0), T_C);
-                        self.call_predicted(next, |e| e.goto_reg(r(0)));
+                        self.call_predicted(next, |e| e.goto_indirect(r(0)));
                     } else {
-                        self.goto_reg(T_C);
+                        self.goto_indirect(T_C);
                     }
                     return Step::End;
                 }
