@@ -918,7 +918,7 @@ impl Emit {
 
     /// MOVS/STOS/LODS/CMPS/SCAS with optional REP/REPE/REPNE. DF=1 falls
     /// back to the interpreter at run time.
-    fn string_op(&mut self, insn: &Insn, eip: u32) -> bool {
+    fn string_op(&mut self, insn: &Insn, _eip: u32) -> bool {
         let op = insn.op;
         self.need = flags::ALL;
         if !insn.addr32 || matches!(insn.seg_override, Some(4) | Some(5)) {
@@ -930,16 +930,33 @@ impl Emit {
             Ow::H => 2,
             Ow::D => 4,
         };
+        let (back, done) = (self.a.label(), self.a.label());
+        self.a.ldr(Width::W, T_D, STATE, state::DF as i32);
+        self.a.cbnz(Size::W, T_D, back);
+        self.string_loop(insn, w, n, false);
+        self.a.b(done);
+        self.a.bind(back);
+        self.string_loop(insn, w, n, true);
+        self.a.bind(done);
+        true
+    }
+
+    /// One string instruction (with its REP loop) stepping forward, or back for DF = 1.
+    fn string_loop(&mut self, insn: &Insn, w: Ow, n: u32, back: bool) {
+        let op = insn.op;
         let (esi, edi, ecx) = (guest_reg(6), guest_reg(7), guest_reg(1));
         let rep = insn.rep != Rep::None;
         let compares = matches!(op, 0xa6 | 0xa7 | 0xae | 0xaf);
-        let slow = self.a.label();
-        let done = self.a.label();
-        let top = self.a.label();
-        self.a.ldr(Width::W, T_D, STATE, state::DF as i32);
-        self.a.cbnz(Size::W, T_D, slow);
+        let (top, done) = (self.a.label(), self.a.label());
+        let step = |e: &mut Self, r: Reg| {
+            if back {
+                e.a.sub_imm(Size::W, r, r, n);
+            } else {
+                e.a.add_imm(Size::W, r, r, n);
+            }
+        };
         if rep && matches!(op, 0xa4 | 0xa5 | 0xaa | 0xab) {
-            self.bulk_string(op, w, n);
+            self.bulk_string(op, w, n, back);
         }
         self.a.bind(top);
         if rep {
@@ -949,28 +966,28 @@ impl Emit {
             0xa4 | 0xa5 => {
                 self.a.ldr(w.mem(), T_A, esi, 0);
                 self.a.str(w.mem(), T_A, edi, 0);
-                self.a.add_imm(Size::W, esi, esi, n);
-                self.a.add_imm(Size::W, edi, edi, n);
+                step(self, esi);
+                step(self, edi);
             }
             0xaa | 0xab => {
                 let v = self.read_gpr(w, 0, T_A);
                 self.a.str(w.mem(), v, edi, 0);
-                self.a.add_imm(Size::W, edi, edi, n);
+                step(self, edi);
             }
             0xac | 0xad => {
                 self.a.ldr(w.mem(), T_A, esi, 0);
                 self.write_gpr(w, 0, T_A);
-                self.a.add_imm(Size::W, esi, esi, n);
+                step(self, esi);
             }
             0xa6 | 0xa7 => {
                 self.a.ldr(w.mem(), T_A, esi, 0);
                 self.a.ldr(w.mem(), T_B, edi, 0);
-                self.a.add_imm(Size::W, esi, esi, n);
-                self.a.add_imm(Size::W, edi, edi, n);
+                step(self, esi);
+                step(self, edi);
             }
             _ => {
                 self.a.ldr(w.mem(), T_B, edi, 0);
-                self.a.add_imm(Size::W, edi, edi, n);
+                step(self, edi);
             }
         }
         if rep {
@@ -987,22 +1004,23 @@ impl Emit {
         } else if rep {
             self.a.b(top);
         }
-        self.a.b(done);
-        self.a.bind(slow);
-        self.exit_interp(eip);
         self.a.bind(done);
-        true
     }
 
-    /// Forward REP MOVS/STOS 16 bytes at a time while that much is left. Single
+    /// REP MOVS/STOS 16 bytes at a time while that much is left. Single
     /// registers keep MMIO syndromes valid; registers advance after each chunk.
-    fn bulk_string(&mut self, op: u16, w: Ow, n: u32) {
+    fn bulk_string(&mut self, op: u16, w: Ow, n: u32, back: bool) {
         let (esi, edi, ecx) = (guest_reg(6), guest_reg(7), guest_reg(1));
         let per = 16 / n;
         let (top, out) = (self.a.label(), self.a.label());
         if matches!(op, 0xa4 | 0xa5) {
-            // A destination less than 16 bytes ahead must see each element's copy.
-            self.a.sub(Size::W, T_B, edi, esi);
+            // A destination less than 16 bytes past the source, in the direction
+            // of the copy, must see each element's copy.
+            if back {
+                self.a.sub(Size::W, T_B, esi, edi);
+            } else {
+                self.a.sub(Size::W, T_B, edi, esi);
+            }
             self.a.lsr_imm(Size::W, T_B, T_B, 4);
             self.a.cbz(Size::W, T_B, out);
         } else {
@@ -1024,20 +1042,30 @@ impl Emit {
                 }
             }
         }
+        // Backwards, a chunk ends with the element at ESI/EDI.
+        let lo = if back { n as i32 - 16 } else { 0 };
         self.a.bind(top);
         self.a.sub_imm(Size::W, T_C, ecx, per);
         self.a.tbnz(T_C, 31, out);
         if matches!(op, 0xa4 | 0xa5) {
-            self.a.ldr(Width::X, T_A, esi, 0);
-            self.a.ldr(Width::X, T_D, esi, 8);
-            self.a.str(Width::X, T_A, edi, 0);
-            self.a.str(Width::X, T_D, edi, 8);
-            self.a.add_imm(Size::W, esi, esi, 16);
+            self.a.ldr(Width::X, T_A, esi, lo);
+            self.a.ldr(Width::X, T_D, esi, lo + 8);
+            self.a.str(Width::X, T_A, edi, lo);
+            self.a.str(Width::X, T_D, edi, lo + 8);
+            if back {
+                self.a.sub_imm(Size::W, esi, esi, 16);
+            } else {
+                self.a.add_imm(Size::W, esi, esi, 16);
+            }
         } else {
-            self.a.str(Width::X, T_B, edi, 0);
-            self.a.str(Width::X, T_B, edi, 8);
+            self.a.str(Width::X, T_B, edi, lo);
+            self.a.str(Width::X, T_B, edi, lo + 8);
         }
-        self.a.add_imm(Size::W, edi, edi, 16);
+        if back {
+            self.a.sub_imm(Size::W, edi, edi, 16);
+        } else {
+            self.a.add_imm(Size::W, edi, edi, 16);
+        }
         self.a.mov(Size::W, ecx, T_C);
         self.a.b(top);
         self.a.bind(out);
