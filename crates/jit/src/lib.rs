@@ -273,6 +273,8 @@ pub struct Stats {
     pub revalidate_dropped: u64,
     /// Blocks reused for an identical copy of their code page.
     pub revived_blocks: u64,
+    /// Blocks that loop back to their start keeping x87 values in registers.
+    pub x87_loops: u64,
     pub flush_pool: u64,
     /// Shadow entries that map the graphics aperture straight to RAM.
     pub aperture_fills: u64,
@@ -1473,6 +1475,7 @@ impl Jit {
             self_check,
             self.verify,
         );
+        self.stats.x87_loops += compiled.x87_loop as u64;
         let bytes = compiled.code.len() * 4;
         if self.code_next + bytes > layout::CODE_CACHE_END {
             self.reset_code_cache();

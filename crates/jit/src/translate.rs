@@ -84,6 +84,8 @@ pub struct Compiled {
     pub retry: bool,
     /// The x87 state held in registers at instruction boundaries (ARM word index).
     pub x87: Vec<(u32, X87Snap)>,
+    /// Whether a jump back to the start keeps x87 values in registers.
+    pub x87_loop: bool,
 }
 
 struct Emit {
@@ -109,6 +111,19 @@ struct Emit {
     fold_ok: bool,
     /// EIP of the instruction being translated.
     at: u32,
+    lp: X87Loop,
+}
+
+/// A block that jumps back to its own start with x87 values in registers.
+#[derive(Default)]
+struct X87Loop {
+    start: u32,
+    /// Where the body starts and the x87 state it was translated for.
+    head: Option<(a64::Label, x87::X87Block)>,
+    /// The state at the first balanced jump back to `start`.
+    seen: Option<x87::X87Block>,
+    /// ICOUNT adds on jumps to `head`, which skip the block's first one.
+    counts: Vec<usize>,
 }
 
 /// `[base + disp]`. An index is not folded: x86 code often holds negative
@@ -152,6 +167,22 @@ impl Emit {
     }
 
     fn goto(&mut self, eip: u32) {
+        if eip == self.lp.start && self.page.is_some() {
+            if let Some((head, h)) = self.lp.head
+                && self.x87.fits(&h)
+            {
+                let slow = self.a.label();
+                self.a.ldr(Width::W, CHAIN_TMP, STATE, state::PENDING as i32);
+                self.a.cbnz(Size::W, CHAIN_TMP, slow);
+                self.x87_loop_back(&h);
+                self.lp.counts.push(self.a.pos());
+                self.a.nop();
+                self.a.b(head);
+                self.a.bind(slow);
+            } else if self.lp.seen.is_none() && self.x87.balanced() {
+                self.lp.seen = Some(self.x87);
+            }
+        }
         self.x87_flush();
         if self.page == Some(eip & !0xfff) {
             let slow = self.a.label();
@@ -302,6 +333,7 @@ impl Emit {
     fn back_to_sti(&mut self, (start, eip, insns, nb): (usize, u32, usize, usize), pc: &mut u32, n: &mut usize, boundaries: &mut Vec<(u32, u32)>) {
         self.a.truncate(start);
         self.chains.retain(|&(w, _)| (w as usize) < start);
+        self.lp.counts.retain(|&w| w < start);
         boundaries.truncate(nb + 1);
         *pc = eip;
         *n = insns;
@@ -2713,6 +2745,7 @@ pub fn translatable(insn: &Insn, pc: u32, user: bool) -> bool {
         fold: None,
         fold_ok: false,
         at: 0,
+        lp: X87Loop::default(),
     };
     !matches!(e.insn(insn, pc), Step::Unsupported)
 }
@@ -2805,6 +2838,37 @@ pub fn compile(
     self_check: bool,
     exact_flags: bool,
 ) -> Compiled {
+    let superblock = chain;
+    let need = if self_check { Vec::new() } else { flag_needs(eip, &mut byte, user, exact_flags, superblock) };
+    let mut pass = |head| compile_pass(eip, &mut byte, block_va, rt_va, rt, chain, user, self_check, &need, head);
+    let (mut out, mut seen) = pass(None);
+    // A loop of x87 code: translate it again assuming at its start the x87
+    // state its back edge has, until the back edge matches.
+    for _ in 0..3 {
+        let Some(back) = seen.filter(|_| chain && !self_check) else { break };
+        let (code, again) = pass(Some(back.loop_head()));
+        if code.x87_loop {
+            out = code;
+            break;
+        }
+        seen = again;
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_pass(
+    eip: u32,
+    mut byte: impl FnMut(u32) -> Option<u8>,
+    block_va: u64,
+    rt_va: u64,
+    rt: &Entries,
+    chain: bool,
+    user: bool,
+    self_check: bool,
+    need: &[u8],
+    head: Option<x87::X87Block>,
+) -> (Compiled, Option<x87::X87Block>) {
     let mut e = Emit {
         a: Asm::new(),
         block_va,
@@ -2820,10 +2884,11 @@ pub fn compile(
         fold: None,
         fold_ok: false,
         at: 0,
+        lp: X87Loop::default(),
     };
     let superblock = chain;
-    let need = if self_check { Vec::new() } else { flag_needs(eip, &mut byte, user, exact_flags, superblock) };
     e.fold_ok = !self_check;
+    e.lp.start = eip;
     let mut boundaries = Vec::new();
     let mut pc = eip;
     let mut insns = 0;
@@ -2838,6 +2903,12 @@ pub fn compile(
         e.a.b(check);
     }
     e.a.bind(body);
+    if let Some(h) = head {
+        e.x87_loop_prologue(h, eip);
+        let l = e.a.label();
+        e.a.bind(l);
+        e.lp.head = Some((l, h));
+    }
     let mut code_end = eip;
     let mut recent = false;
     let mut interp_after = None;
@@ -2898,6 +2969,7 @@ pub fn compile(
                 Step::Unsupported | Step::Sti => {
                     e.a.truncate(start);
                     e.chains.retain(|&(w, _)| (w as usize) < start);
+                    e.lp.counts.retain(|&w| w < start);
                     e.x87 = x87_before;
                     e.exit_interp(pc);
                     interp_after = Some(insns);
@@ -2976,6 +3048,7 @@ pub fn compile(
                 } else {
                     e.a.truncate(start);
                     e.chains.retain(|&(w, _)| (w as usize) < start);
+                    e.lp.counts.retain(|&w| w < start);
                     e.x87 = x87_before;
                     e.exit_interp(pc);
                     interp_after = Some(insns);
@@ -2997,11 +3070,14 @@ pub fn compile(
         e.exit_with(eip, reason::STALE);
     }
     let mut code = e.a.finish();
-    for (k, &(word, before)) in count_sites.iter().enumerate() {
-        let until = count_sites.get(k + 1).map_or(insns, |&(_, n)| n);
+    let segment = |k: usize| count_sites.get(k + 1).map_or(insns, |&(_, n)| n) - count_sites[k].1;
+    let sites = count_sites.iter().enumerate().map(|(k, &(word, _))| (word, segment(k)));
+    for (word, n) in sites.chain(e.lp.counts.iter().map(|&w| (w, segment(0)))) {
         let mut count = Asm::new();
-        count.add_imm(Size::X, ICOUNT, ICOUNT, (until - before) as u32);
+        count.add_imm(Size::X, ICOUNT, ICOUNT, n as u32);
         code[word] = count.code[0];
     }
-    Compiled { code, boundaries, insns, chains: e.chains, has_rep, recent, interp_after, retry, x87: x87_snaps }
+    let x87_loop = !e.lp.counts.is_empty();
+    let compiled = Compiled { code, boundaries, insns, chains: e.chains, has_rep, recent, interp_after, retry, x87: x87_snaps, x87_loop };
+    (compiled, e.lp.seen)
 }

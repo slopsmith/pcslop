@@ -75,6 +75,28 @@ impl X87Block {
     pub(super) fn snap(&self) -> Option<Snap> {
         (self.entered && (self.dirty != 0 || self.meta)).then_some(Snap { dirty: self.dirty, meta: self.meta, note: self.note })
     }
+
+    /// Whether a jump back to the block's start with this state could keep
+    /// the cached registers: x87 code ran and TOP is back where it started.
+    pub(super) fn balanced(&self) -> bool {
+        self.entered && self.d == 0
+    }
+
+    /// The state a loop head assumes, from the state at its back edge: the
+    /// full slots stay cached, all of them counted dirty so exits write them.
+    pub(super) fn loop_head(&self) -> X87Block {
+        let cached = self.cached & self.full;
+        X87Block { entered: true, rc_checked: self.rc_checked, d: 0, cached, dirty: cached, full: self.full, empty: self.empty, meta: false, note: (0, 0) }
+    }
+
+    /// Whether this state may continue at a loop head assuming `head`.
+    pub(super) fn fits(&self, head: &X87Block) -> bool {
+        self.balanced()
+            && self.cached & head.cached == head.cached
+            && self.full & head.full == head.full
+            && self.empty & head.empty == head.empty
+            && (self.rc_checked || !head.rc_checked)
+    }
 }
 
 fn cv(slot: usize) -> V {
@@ -902,8 +924,6 @@ impl Emit {
         self.a.str(Width::W, T_E, STATE, state::FP80_STALE as i32);
     }
 
-    /// Writes everything newer in registers back to the state, on the path
-    /// being emitted; the translator's view stays as it was.
     /// Emits `f` as if the x87 cache were already flushed.
     pub(super) fn flushed(&mut self, f: impl FnOnce(&mut Self)) {
         let entered = std::mem::replace(&mut self.x87.entered, false);
@@ -911,19 +931,31 @@ impl Emit {
         self.x87.entered = entered;
     }
 
+    /// Writes everything newer in registers back to the state, on the path
+    /// being emitted; the translator's view stays as it was.
     pub(super) fn x87_flush(&mut self) {
         if !self.x87.entered {
             return;
         }
         let saved = self.x87;
-        // Results go back as doubles only; `fget` and the host make the
-        // 80-bit form when something needs it. T_D: valid bits, T_C: stale bits.
-        if saved.cached != 0 {
-            self.a.movz(Size::W, T_D, 0, 0);
-            self.a.movz(Size::W, T_C, 0, 0);
+        self.write_back(saved.cached, saved.dirty);
+        if saved.meta {
+            self.write_meta(saved.note);
         }
+        self.x87 = saved;
+    }
+
+    /// Stores the `cached` slots as doubles, marking the `dirty` ones' 80-bit
+    /// copies stale; `fget` and the host make the 80-bit form when needed.
+    fn write_back(&mut self, cached: u8, dirty: u8) {
+        if cached == 0 {
+            return;
+        }
+        // T_D: valid bits, T_C: stale bits.
+        self.a.movz(Size::W, T_D, 0, 0);
+        self.a.movz(Size::W, T_C, 0, 0);
         for r in 0..8 {
-            if saved.cached & 1 << r == 0 {
+            if cached & 1 << r == 0 {
                 continue;
             }
             if r == 0 {
@@ -937,29 +969,66 @@ impl Emit {
             self.a.movz(Size::W, U, 1, 0);
             self.a.lslv(Size::W, U, U, P);
             self.a.orr(Size::W, T_D, T_D, U);
-            if saved.dirty & 1 << r != 0 {
+            if dirty & 1 << r != 0 {
                 self.a.orr(Size::W, T_C, T_C, U);
             }
         }
-        if saved.cached != 0 {
-            self.a.ldr(Width::W, T_E, STATE, state::FP64_VALID as i32);
-            self.a.orr(Size::W, T_E, T_E, T_D);
-            self.a.str(Width::W, T_E, STATE, state::FP64_VALID as i32);
-        }
-        if saved.dirty != 0 {
+        self.a.ldr(Width::W, T_E, STATE, state::FP64_VALID as i32);
+        self.a.orr(Size::W, T_E, T_E, T_D);
+        self.a.str(Width::W, T_E, STATE, state::FP64_VALID as i32);
+        if dirty & cached != 0 {
             self.a.ldr(Width::W, T_E, STATE, state::FP80_STALE as i32);
             self.a.orr(Size::W, T_E, T_E, T_C);
             self.a.str(Width::W, T_E, STATE, state::FP80_STALE as i32);
         }
-        if saved.meta {
-            self.a.str(Width::W, SW, STATE, state::FSW as i32);
-            self.a.str(Width::W, TAGS, STATE, state::FTAGS as i32);
-            self.a.mov_imm(Size::W, U, saved.note.0 as u64);
-            self.a.str(Width::W, U, STATE, state::FIP as i32);
-            self.a.mov_imm(Size::W, U, saved.note.1 as u64);
-            self.a.str(Width::W, U, STATE, state::FNOTE as i32);
+    }
+
+    fn write_meta(&mut self, note: (u32, u32)) {
+        self.a.str(Width::W, SW, STATE, state::FSW as i32);
+        self.a.str(Width::W, TAGS, STATE, state::FTAGS as i32);
+        self.a.mov_imm(Size::W, U, note.0 as u64);
+        self.a.str(Width::W, U, STATE, state::FIP as i32);
+        self.a.mov_imm(Size::W, U, note.1 as u64);
+        self.a.str(Width::W, U, STATE, state::FNOTE as i32);
+    }
+
+    /// On a back edge that `fits` `head`: writes back what the head does not
+    /// track, so the loop body can run again with its registers as they are.
+    pub(super) fn x87_loop_back(&mut self, head: &X87Block) {
+        let extra = self.x87.dirty & !head.dirty;
+        self.write_back(extra, extra);
+        if self.x87.meta {
+            self.write_meta(self.x87.note);
         }
-        self.x87 = saved;
+    }
+
+    /// Establishes `head` on entry from outside the loop: loads the cached
+    /// slots and checks the tags it relies on, or leaves for the interpreter.
+    pub(super) fn x87_loop_prologue(&mut self, head: X87Block, eip: u32) {
+        let (bail, done) = (self.a.label(), self.a.label());
+        self.x87_enter(bail);
+        let before = self.x87;
+        for i in 0..8 {
+            if head.full & 1 << i != 0 {
+                self.x87_need(i, true, bail);
+            } else if head.empty & 1 << i != 0 {
+                self.x87_need(i, false, bail);
+            }
+        }
+        if head.rc_checked {
+            self.check_rc_nearest(bail);
+        }
+        for i in 0..8 {
+            if head.cached & 1 << i != 0 {
+                self.st_val(i, bail);
+            }
+        }
+        self.a.b(done);
+        self.a.bind(bail);
+        self.x87 = before;
+        self.exit_interp(eip);
+        self.a.bind(done);
+        self.x87 = head;
     }
 
     /// Leaves unless `v` needs no flag but PE: not infinite, NaN or denormal, and a

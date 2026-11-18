@@ -269,6 +269,35 @@ fn a_return_after_its_caller_was_rewritten_runs_the_new_code() {
 }
 
 #[test]
+fn x87_loops_keep_values_in_registers_and_check_the_stack_on_entry() {
+    let mut code = vec![
+        0xd9, 0xe8, // fld1
+        0xd9, 0xee, // fldz
+        0xb9, 50, 0, 0, 0, // mov ecx, 50
+        0xe8, 0xf7, 0, 0, 0, // call 0x1105
+        0xd9, 0x1d, 0x00, 0x30, 0, 0, // fstp dword [0x3000]
+        0xd9, 0x1d, 0x04, 0x30, 0, 0, // fstp dword [0x3004]
+        0xd9, 0xee, // fldz, leaving ST(1) empty for the loop
+        0xb9, 3, 0, 0, 0, // mov ecx, 3
+        0xe8, 0xdf, 0, 0, 0, // call 0x1105
+        0xd9, 0x1d, 0x08, 0x30, 0, 0, // fstp dword [0x3008]
+        0xf4, // hlt
+    ];
+    code.resize(0x105, 0x90);
+    code.extend([
+        0xd8, 0xc1, // fadd st0, st1
+        0xd9, 0xc0, // fld st0
+        0xd8, 0xc8, // fmul st0, st0
+        0xdd, 0xd8, // fstp st0
+        0x49, // dec ecx
+        0x75, 0xf5, // jnz 0x1105
+        0xc3, // ret
+    ]);
+    let stats = compare(&code, |_| {});
+    assert!(stats.x87_loops >= 1, "the loop flushed its x87 registers every iteration: {stats:?}");
+}
+
+#[test]
 fn calls_and_returns_with_x87_values_in_registers() {
     let mut code = vec![
         0xb8, 0x20, 0x10, 0, 0, // mov eax, 0x1020
