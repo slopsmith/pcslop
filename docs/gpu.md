@@ -185,7 +185,12 @@ Vista SP2 binds its in-box "RADEON 9700 PRO (Microsoft Corporation - WDDM)" driv
 - **An output protection block at `0x1FC0`-`0x1FDC`**, four channels of a control and a data register. The driver flushes a channel (writes 4, waits for the control to read 0), starts it (writes 0, waits for 8) and reads a nonzero random word, without timeouts. It then starts a key exchange; we never answer it (the control stays 1), its bounded wait times out and the driver goes on without the protected session.
 - **The GUIDMA interrupt.** Every DMA buffer ends with the fence id in `SCRATCH_REG6` and a GUI DMA descriptor written through the CP at `0x720`-`0x728`: no bytes, EOL set, INTDIS clear. Its only job is to raise `GEN_INT_STATUS` bit 30 (GUIDMA), which the driver enables in `GEN_INT_CNTL`; dxgkrnl's scheduler stalls until it arrives. We latch it once the GPU has caught up, and the driver acknowledges it by writing the bit back.
 
-Open: with the Aero colour scheme, DWM composes through the 3D engine (tiled colour buffers, flips between two front buffers at 0 and `0x1DB000`) and the screen stays black but for a white rectangle.
+**Aero.** With the Windows Aero colour scheme, DWM composes through the 3D engine: textured quads from tiled surfaces into one of two front buffers (at 0 and `0x1DB000`), then a flip. Glass with its blur, dragging windows and Flip3D all draw, on the Metal and the CPU path. It needed:
+
+- **Two undocumented type-3 packets** that set the vertex array's address. AMD's R5xx guide lists neither, and Mesa and Linux never send them, so their meaning comes from what the driver sends. `0x24` is `[slot, address]` and stores a base address; `0x25` is `[slot, ?, offset, register / 4]` and writes the slot's base plus the offset to the register. The driver sends `0x24 [0, 0xF8052000]` once per DMA buffer, then one `0x25 [0, offset << 15, offset, 0x832]` before each draw, which sets `VAP_VTX_AOS_ADDR0` (0x20C8) to its place in a vertex buffer in the GART. The second dword is always the offset shifted left by 15, and we ignore it. The driver writes `VAP_VTX_NUM_ARRAYS` and `VAP_VTX_AOS_ATTR01` as plain registers and never sends `3D_LOAD_VBPNTR`. While these packets were skipped, every draw read its vertices from a stale address and DWM drew nothing.
+- Nothing else. Draws drawing 0 pixels in a trace are normal: DWM sets a scissor around the dirty rectangle and draws whole window parts through it. The output protection handshake can stay unanswered.
+
+The driver also wraps each DMA buffer in `COND_EXEC` (`0x21 [0xF7FFF000, 2, 0x3C]`) and starts it with `PRED_EXEC` (`0x20`); we run what they guard unconditionally.
 
 ## 3D engine
 
