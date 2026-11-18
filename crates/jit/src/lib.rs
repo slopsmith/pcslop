@@ -286,6 +286,8 @@ pub struct Stats {
     pub vm_ns: u64,
     pub miss_ns: u64,
     pub interp_ns: u64,
+    /// Time following the interpreter's TLB flushes, part of the exit times.
+    pub shadow_ns: u64,
     pub fault_ns: u64,
     pub mmio_ns: u64,
 }
@@ -613,7 +615,7 @@ impl Jit {
         self.block_samples.clear();
         self.host_samples.clear();
         let s = &mut self.stats;
-        (s.vm_ns, s.miss_ns, s.interp_ns, s.fault_ns, s.mmio_ns) = (0, 0, 0, 0, 0);
+        (s.vm_ns, s.miss_ns, s.interp_ns, s.fault_ns, s.mmio_ns, s.shadow_ns) = (0, 0, 0, 0, 0, 0);
     }
 
     /// Time per exit kind and the most frequent interpreted opcodes since profiling began.
@@ -644,12 +646,13 @@ impl Jit {
             .map(|(k, n)| if **k < 0 { format!("rt+{:#x}:{n}", -**k - 1) } else { format!("{:#x}:{n}", **k) })
             .collect();
         format!(
-            "ms in vm {:.0} miss {:.0} interp {:.0} fault {:.0} mmio {:.0}\ninterpreter exits by opcode: {}\nby site: {}\nby time in the exiting instruction: {}\n{} translations, {retranslated} of blocks translated before; most often: {}\n{total} samples, {runtime} in the runtime; hottest: {}",
+            "ms in vm {:.0} miss {:.0} interp {:.0} fault {:.0} mmio {:.0} (shadow flushes {:.0})\ninterpreter exits by opcode: {}\nby site: {}\nby time in the exiting instruction: {}\n{} translations, {retranslated} of blocks translated before; most often: {}\n{total} samples, {runtime} in the runtime; hottest: {}",
             ms(s.vm_ns),
             ms(s.miss_ns),
             ms(s.interp_ns),
             ms(s.fault_ns),
             ms(s.mmio_ns),
+            ms(s.shadow_ns),
             top.join(" "),
             by_count.join(" "),
             by_time.join(" "),
@@ -1117,6 +1120,14 @@ impl Jit {
 
     /// Follows the interpreter's TLB: CR3/CR0/CR4 writes and INVLPG flush it.
     fn check_shadow<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B) {
+        let t = self.timing.then(std::time::Instant::now);
+        self.follow_tlb(cpu, bus);
+        if let Some(t) = t {
+            self.stats.shadow_ns += t.elapsed().as_nanos() as u64;
+        }
+    }
+
+    fn follow_tlb<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B) {
         self.check_aperture(bus);
         let key = cpu.tlb.generation;
         let ops = cpu.tlb.take_ops();
