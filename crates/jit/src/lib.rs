@@ -728,8 +728,10 @@ impl Jit {
             let s = self.state();
             s.ftags = xregs[1] as u32;
             s.fsw = xregs[2] as u32;
-            s.fip = snap.note.0;
-            s.fnote = snap.note.1;
+            if snap.note.1 != 0 {
+                s.fip = snap.note.0;
+                s.fnote = snap.note.1;
+            }
         }
         Ok(())
     }

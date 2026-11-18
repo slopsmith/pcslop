@@ -130,6 +130,8 @@ enum K {
     Com { i: usize, pops: u32 },
     ComMem { src: Src, pop: bool },
     Tst,
+    Xam,
+    Clex,
     Comi { i: usize, pop: bool },
     Sqrt,
     Trig(TrigOp),
@@ -187,6 +189,8 @@ fn classify(insn: &Insn) -> Option<K> {
         (1, 0xe0) => K::Chs,
         (1, 0xe1) => K::Abs,
         (1, 0xe4) => K::Tst,
+        (1, 0xe5) => K::Xam,
+        (3, 0xe2) => K::Clex,
         (1, 0xe8) => K::LdConst { mant: 1 << 63 },
         (1, 0xee) => K::LdConst { mant: 0 },
         (1, 0xfa) => K::Sqrt,
@@ -209,7 +213,7 @@ impl Emit {
         if insn.mem.is_some() && (!insn.addr32 || matches!(insn.seg_override, Some(4 | 5))) {
             return false;
         }
-        let control = matches!(k, K::StswAx | K::StswMem | K::StcwMem | K::Ldcw);
+        let control = matches!(k, K::StswAx | K::StswMem | K::StcwMem | K::Ldcw | K::Clex);
         let bail = self.a.label();
         let done = self.a.label();
         let mut seg = None;
@@ -439,6 +443,30 @@ impl Emit {
                 let a = self.st_val(0, bail);
                 self.a.fmov_dx(FB, ZR);
                 self.set_cc(a, FB);
+            }
+            K::Xam => {
+                // `st_val` leaves for anything but a zero or a normal value.
+                self.x87_need(0, true, bail);
+                let a = self.st_val(0, bail);
+                self.a.fmov_xd(T_A, a);
+                self.a.mov_imm(Size::W, T_B, (C0 | C1 | C2 | C3) as u64);
+                self.a.bic(Size::W, SW, SW, T_B);
+                self.a.lsr_imm(Size::X, T_B, T_A, 63);
+                self.a.bfi(Size::W, SW, T_B, 9, 1);
+                self.a.lsl_imm(Size::X, T_A, T_A, 1);
+                self.a.clz(Size::X, T_A, T_A);
+                self.a.lsr_imm(Size::W, T_A, T_A, 6);
+                self.a.bfi(Size::W, SW, T_A, 14, 1);
+                let ok = self.a.logic_imm(Logic::Eor, Size::W, T_A, T_A, 1);
+                assert!(ok);
+                self.a.bfi(Size::W, SW, T_A, 10, 1);
+            }
+            K::Clex => {
+                // A pending unmasked exception asserts FERR#, which the interpreter handles.
+                self.a.tbnz(SW, 7, bail);
+                self.a.mov_imm(Size::W, T_A, 0x80ff);
+                self.a.bic(Size::W, SW, SW, T_A);
+                self.x87.meta = true;
             }
             K::Comi { i, pop } => {
                 self.x87_need(0, true, bail);
@@ -983,9 +1011,14 @@ impl Emit {
         }
     }
 
+    /// Stores SW and TAGS, and FIP and FOP unless no instruction set them
+    /// since entry (a note always has bit 31 set).
     fn write_meta(&mut self, note: (u32, u32)) {
         self.a.str(Width::W, SW, STATE, state::FSW as i32);
         self.a.str(Width::W, TAGS, STATE, state::FTAGS as i32);
+        if note.1 == 0 {
+            return;
+        }
         self.a.mov_imm(Size::W, U, note.0 as u64);
         self.a.str(Width::W, U, STATE, state::FIP as i32);
         self.a.mov_imm(Size::W, U, note.1 as u64);

@@ -1403,7 +1403,7 @@ fn random_x87(rng: &mut Rng, out: &mut Vec<u8>) {
         7 => out.extend([0xd9, 0xc8 | i]),
         8 => out.extend([0xd9, 0xc0 | i]),
         9 => out.extend([0xdd, [0xd0, 0xd8][rng.below(2) as usize] | i]),
-        10 => out.extend([0xd9, [0xe0, 0xe1, 0xee, 0xe8, 0xfa, 0xfc, 0xe4][rng.below(7) as usize]]),
+        10 => out.extend([0xd9, [0xe0, 0xe1, 0xee, 0xe8, 0xfa, 0xfc, 0xe4, 0xe5][rng.below(8) as usize]]),
         11 => out.extend([0xd8, 0xd0 | i]),
         12 => out.extend([0xd8, 0xd8 | i]),
         13 => out.extend([[0xde, 0xd9], [0xda, 0xe9]][rng.below(2) as usize]),
@@ -1418,9 +1418,10 @@ fn random_x87(rng: &mut Rng, out: &mut Vec<u8>) {
         }
         20 => mem_abs(out, 0xd9, 5, 0x3500 + 2 * (k % 6)),
         21 => mem_abs(out, [0xd9, 0xdd][rng.below(2) as usize], 7, 0x3520 + 2 * k),
-        22 => match rng.below(4) {
+        22 => match rng.below(5) {
             0 => out.extend([0x0f, 0x6f, modrm_rr(rng.below(8) as u8, rng.below(8) as u8)]),
             1 => out.extend([0x0f, 0x77]),
+            2 => out.extend([0xdb, 0xe2]),
             _ => out.push(0x9b),
         },
         _ => mem_abs(out, [0xd8, 0xdc][rng.below(2) as usize], [2, 3][rng.below(2) as usize], 0x3100 + 4 * k),
@@ -2421,3 +2422,4 @@ fn dump_runtime_code() {
     std::fs::write(std::env::var("RT_OUT").unwrap(), bytes).unwrap();
     eprintln!("resume {:#x} dispatch {:#x} exit {:#x}", e.resume, e.dispatch, e.exit);
 }
+
