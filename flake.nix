@@ -45,16 +45,20 @@
         };
       };
 
-      devShells.${system}.default = pkgs.mkShellNoCC {
-        packages = [
-          pkgs.acpica-tools
-          pkgs.nasm
-          pkgs.pkg-config
-        ];
-        buildInputs = [
-          pkgs.glib
-          pkgs.libslirp
-        ];
+      devShells.${system} = {
+        xpbench = import ./nix/xpbench.nix { inherit pkgs; };
+
+        default = pkgs.mkShellNoCC {
+          packages = [
+            pkgs.acpica-tools
+            pkgs.nasm
+            pkgs.pkg-config
+          ];
+          buildInputs = [
+            pkgs.glib
+            pkgs.libslirp
+          ];
+        };
       };
     };
 }
