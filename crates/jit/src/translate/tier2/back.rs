@@ -64,13 +64,12 @@ pub fn lower(e: &mut Emit, f: &Func, fallback: Label) -> Option<Lowered> {
 /// it relies on, and loads the slots it reads; any mismatch goes to `fallback`.
 fn x87_prologue(e: &mut Emit, x: &X87Info, fallback: Label) {
     let bail = e.a.label();
-    // Masked exceptions and rounding to nearest; precision is checked per result.
+    // Masked exceptions; FPCR follows RC and precision is checked per result.
     e.a.ldr(AW::W, Reg(15), STATE, state::FCW as i32);
-    e.a.mov_imm(Size::W, SCRATCH, 0xc3f);
-    e.a.and(Size::W, Reg(15), Reg(15), SCRATCH);
-    e.a.mov_imm(Size::W, SCRATCH, 0x3f);
-    e.a.eor(Size::W, SCRATCH, SCRATCH, Reg(15));
-    e.a.cbnz(Size::W, SCRATCH, fallback);
+    e.a.mvn(Size::W, Reg(15), Reg(15));
+    let ok = e.a.logic_imm(Logic::And, Size::W, Reg(15), Reg(15), 0x3f);
+    assert!(ok, "0x3f must encode");
+    e.a.cbnz(Size::W, Reg(15), fallback);
     e.x87_enter(bail);
     for i in 0..8 {
         if x.touched & 1 << i != 0 {
@@ -481,7 +480,8 @@ impl<'a> BlockLower<'a> {
                     FSrc::F64 => self.e.a.fmov_xd(Reg(15), src),
                     _ => {
                         let ok = self.e.a.label();
-                        self.e.a.fp1(true, 8, FA, src);
+                        // FRINTI rounds by FPCR, which x87_enter set from RC.
+                        self.e.a.fp1(true, 15, FA, src);
                         self.e.a.fcvtzs(true, Size::X, Reg(15), FA);
                         if dst == FSrc::I32 {
                             self.e.a.sxtw(Reg(16), Reg(15));

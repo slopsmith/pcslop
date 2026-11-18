@@ -1719,7 +1719,7 @@ fn random_x87_programs_match_the_interpreter_in_tier_2() {
         code.push(0xf4);
         let mem = x87_memory(&mut rng);
         let mut a = flat_cpu(0x1000, 0x8000);
-        a.fpu.cw = [0x37f, 0x27f, 0x07f][round % 3];
+        a.fpu.cw = [0x37f, 0x27f, 0x07f, 0x77f, 0xb7f, 0xf7f, 0x47f][round % 7];
         let mut b = a.clone();
         let mut bus_a = bus_with(0x1000, &code);
         let mut bus_b = bus_with(0x1000, &code);

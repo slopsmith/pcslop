@@ -23,8 +23,8 @@ const MAX_BLOCK_INSNS: u32 = 64;
 pub fn build(entry: u32, byte: &mut dyn FnMut(u32) -> Option<u8>, x87: Option<(u16, u8)>) -> Option<Func> {
     let page = entry & !0xfff;
     let mut f = Func::default();
-    // Exceptions masked and rounding to nearest, as the region's entry checks.
-    let x87 = x87.filter(|&(cw, _)| cw & 0x3f == 0x3f && (cw >> 10) & 3 == 0);
+    // Exceptions masked, as the region's entry checks.
+    let x87 = x87.filter(|&(cw, _)| cw & 0x3f == 0x3f);
     f.x87 = x87.map(|(_, entry_full)| X87Info { entry_full, touched: 0 });
     let mut index: HashMap<u32, Blk> = HashMap::new();
     let mut work = vec![entry];
