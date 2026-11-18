@@ -2201,7 +2201,7 @@ fn aperture_accesses_reach_the_gatt_pages_without_exits() {
     assert_eq!(u32::from_le_bytes(ram[0x30008..0x3000c].try_into().unwrap()), 500_500);
     assert_eq!(&ram[0x30100..0x30200], &ram[0x2000..0x2100]);
     assert_eq!(cpu.regs[2], u32::MAX, "an invalid GATT entry reads all ones");
-    assert!(stats.aperture_fills >= 2, "{stats:?}");
+    assert!(stats.aperture_fills >= 2, "aperture pages exit on every access instead of mapping directly: {stats:?}");
     assert!(stats.mmio_exits <= 2, "only the invalid page may exit: {stats:?}");
 }
 
@@ -2230,7 +2230,7 @@ fn a_gtlb_flush_remaps_the_aperture() {
     assert_eq!(&ram[0x32000..0x32004], &[0xbb; 4]);
     assert_eq!(&ram[0x33000..0x33004], &[0xcc; 4], "a page that was invalid before the flush must map now");
     assert_eq!((cpu.regs[0], cpu.regs[1]), (0xbbbb_bbbb, u32::MAX));
-    assert!(stats.aperture_flushes >= 1 && stats.aperture_fills >= 3, "{stats:?}");
+    assert!(stats.aperture_flushes >= 1 && stats.aperture_fills >= 3, "a GTLB flush left stale aperture mappings in place: {stats:?}");
 }
 
 #[test]
