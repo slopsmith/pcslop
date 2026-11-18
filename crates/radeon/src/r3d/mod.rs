@@ -417,11 +417,12 @@ impl Radeon {
         match self.metal_stats() {
             Some((d, f, w)) => {
                 let t = self.metal.as_ref().map_or(0, |m| m.throttles());
+                let c = self.metal.as_ref().map_or(0, |m| m.committed());
                 let p = self.metal.as_ref().map_or(0, |m| m.pipelines());
                 let ms = self.metal.as_ref().map_or(0, |m| m.gpu_ms());
                 let (tn, tu) = self.metal.as_ref().map_or((0, 0), |m| m.texture_stats());
                 let vd = self.metal.as_ref().map_or(0, |m| m.vertex_draws());
-                s += &format!(" | metal draws {d} gpu vertices {vd} cpu fallbacks {f} waits {w} throttled {t} pipelines {p} gpu ms {ms} metal textures {tn} dxt copies {tu}")
+                s += &format!(" | metal draws {d} gpu vertices {vd} cpu fallbacks {f} waits {w} command buffers {c} throttled {t} pipelines {p} gpu ms {ms} metal textures {tn} dxt copies {tu}")
             }
             None => s += " | cpu",
         }

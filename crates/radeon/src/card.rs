@@ -233,7 +233,7 @@ impl Card {
 
     pub fn describe(&self) -> String {
         let s = self.lock().describe();
-        if self.threaded() { s + " | cp thread" } else { s }
+        if self.threaded() { s + &format!(" | cp thread ring kicks {}", self.st.submitted.load(Relaxed)) } else { s }
     }
 
     /// Commands, 2D operations and 3D draws run so far.

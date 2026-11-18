@@ -50,6 +50,10 @@ impl MetalR3d {
         0
     }
 
+    pub fn committed(&self) -> u64 {
+        0
+    }
+
     pub fn stats(&self) -> (u64, u64, u64) {
         (0, 0, 0)
     }

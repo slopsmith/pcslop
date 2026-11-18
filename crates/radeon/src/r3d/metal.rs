@@ -747,6 +747,10 @@ impl MetalR3d {
         self.throttles
     }
 
+    pub fn committed(&self) -> u64 {
+        self.committed
+    }
+
     pub fn stats(&self) -> (u64, u64, u64) {
         (self.draws, self.fallbacks, self.waits)
     }
