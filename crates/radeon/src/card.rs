@@ -134,7 +134,7 @@ impl Radeon {
 pub struct Card {
     core: Arc<Mutex<Radeon>>,
     st: Arc<Status>,
-    worker: Option<JoinHandle<()>>,
+    pub(crate) worker: Option<JoinHandle<()>>,
     vram: *mut u8,
     rom: Vec<u8>,
     tracing: bool,
@@ -211,6 +211,7 @@ impl Card {
         let handle = thread::Builder::new()
             .name("radeon-cp".into())
             .spawn(move || {
+                interactive_qos();
                 let run = std::panic::AssertUnwindSafe(|| worker(&core, &st, bus, wake));
                 if std::panic::catch_unwind(run).is_err() {
                     std::process::abort();
@@ -531,6 +532,20 @@ fn drains_on_write(reg: u32) -> bool {
         _ => reg >= 0x0400,
     }
 }
+
+pub(crate) const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+
+// The guest waits on this thread, so it belongs on a performance core.
+#[cfg(target_os = "macos")]
+fn interactive_qos() {
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(class: u32, relative_priority: i32) -> i32;
+    }
+    unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
+}
+
+#[cfg(not(target_os = "macos"))]
+fn interactive_qos() {}
 
 fn lock<'a>(core: &'a Mutex<Radeon>, st: &Status) -> MutexGuard<'a, Radeon> {
     let mut g = core.lock().unwrap_or_else(PoisonError::into_inner);

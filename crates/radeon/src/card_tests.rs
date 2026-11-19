@@ -246,3 +246,20 @@ fn a_live_refresh_skips_while_the_worker_holds_the_card_and_waits_briefly_after_
     c.render_live(&mut out);
     assert_eq!(c.skipped, 0, "the refresh after the worker lets go gets the card");
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn the_command_processor_thread_asks_for_performance_cores() {
+    use std::os::unix::thread::JoinHandleExt;
+    unsafe extern "C" {
+        fn pthread_get_qos_class_np(thread: RawPthread, class: *mut u32, relative_priority: *mut i32) -> i32;
+    }
+    use std::os::unix::thread::RawPthread;
+    let mut ram = Ram::new();
+    let (c, _) = threaded_card(&mut ram);
+    let (mut class, mut rel) = (0u32, 0i32);
+    let handle = c.worker.as_ref().expect("threaded_card starts the worker").as_pthread_t();
+    std::thread::sleep(Duration::from_millis(20));
+    unsafe { pthread_get_qos_class_np(handle, &mut class, &mut rel) };
+    assert_eq!(class, crate::card::QOS_CLASS_USER_INTERACTIVE, "the guest stalls when the worker lands on an efficiency core");
+}

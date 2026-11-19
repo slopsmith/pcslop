@@ -479,6 +479,19 @@ impl KeyQueue {
     }
 }
 
+// Guest speed follows this thread's core: keep it off the efficiency cores.
+#[cfg(target_os = "macos")]
+fn interactive_qos() {
+    const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(class: u32, relative_priority: i32) -> i32;
+    }
+    unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
+}
+
+#[cfg(not(target_os = "macos"))]
+fn interactive_qos() {}
+
 fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: Arc<Shared>) -> ExitCode {
     let mut board = Board::new(board_cfg);
     if let Some(path) = args.cdrom.as_ref().filter(|_| args.load.is_none())
@@ -1345,7 +1358,10 @@ fn main() -> ExitCode {
     host_power::poll(HOST_POWER_INTERVAL, tx.clone(), Event::HostPower);
     let capture_mode = args.capture_mode;
     let emu_shared = shared.clone();
-    let emu = std::thread::spawn(move || emulate(args, cfg, rx, emu_shared));
+    let emu = std::thread::spawn(move || {
+        interactive_qos();
+        emulate(args, cfg, rx, emu_shared)
+    });
 
     let stdin_tx = tx.clone();
     std::thread::spawn(move || stdin_commands(stdin_tx));
