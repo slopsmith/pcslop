@@ -446,6 +446,9 @@ impl Radeon {
                     (r as u32) << 22 | (g as u32) << 12 | (b as u32) << 2
                 }
             }
+            // For A11, the first R300 silicon, Catalyst zeroes COLORPITCH0's pitch before
+            // each 2D blit and leaves it there for the 3D draws after it.
+            CONFIG_CNTL => (self.reg(CONFIG_CNTL) & !CFG_ATI_REV_ID_MASK) | CFG_ATI_REV_A13,
             CONFIG_APER_0_BASE => self.bars.fb,
             CONFIG_APER_1_BASE => self.bars.fb.wrapping_add(APER_SIZE),
             CONFIG_APER_SIZE => APER_SIZE,

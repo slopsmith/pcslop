@@ -26,6 +26,14 @@ fn mm_index_reaches_registers_and_vram() {
 }
 
 #[test]
+fn config_cntl_reports_a13_silicon_whatever_is_written() {
+    let mut r = card();
+    assert_eq!(r.mmio_read(CONFIG_CNTL, 4) & CFG_ATI_REV_ID_MASK, CFG_ATI_REV_A13);
+    r.mmio_write(CONFIG_CNTL, 4, 0x0000_0102, &mut NoBus);
+    assert_eq!(r.mmio_read(CONFIG_CNTL, 4), 0x0000_0102 | CFG_ATI_REV_A13);
+}
+
+#[test]
 fn pll_writes_need_pll_wr_en() {
     let mut r = card();
     r.io_write(8, 1, 0x0e, &mut NoBus);
