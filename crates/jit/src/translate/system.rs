@@ -5,7 +5,7 @@
 //! interpreter, which raises the right fault.
 
 use a64::{Label, Logic, Reg, Shift, Size, Width, ZR, sysreg};
-use x86::decode::Insn;
+use x86::decode::{Insn, MemOperand, NO_REG};
 
 use super::{Emit, Step, T_A, T_ADDR, T_B, T_C, T_D, T_E};
 use crate::runtime::{STATE, guest_reg};
@@ -264,6 +264,56 @@ impl Emit {
         self.a.add_imm(Size::W, T_A, T_A, 1);
         self.a.str(Width::W, T_A, STATE, state::CR3_SWITCHED as i32);
         self.cold_exit(slow, eip);
+        self.a.bind(done);
+        true
+    }
+
+    /// A CPL 0 MOV between a 32-bit register and a constant address at page
+    /// offset 0x80 checks for the APIC page and then reads or writes
+    /// `State::tpr` as the in-VM fault handler would, without the fault.
+    pub(super) fn tpr_mov(&mut self, insn: &Insn) -> bool {
+        let (load, reg, disp) = match (insn.op, insn.mem) {
+            (0x8b | 0x89, Some(m)) if m.base == NO_REG && m.index == NO_REG => (insn.op == 0x8b, insn.reg(), m.disp),
+            (0xa1 | 0xa3, _) => (insn.op == 0xa1, 0, insn.imm),
+            _ => return false,
+        };
+        if self.user || !insn.op32 || !insn.addr32 || disp & 0xfff != 0x80 || !matches!(insn.seg_override, None | Some(3)) {
+            return false;
+        }
+        let (normal, done) = (self.a.label(), self.a.label());
+        self.a.ldr(Width::X, T_A, STATE, state::APIC_VA as i32);
+        self.a.mov_imm(Size::X, T_B, u64::from(disp & !0xfff) | 1);
+        self.a.eor(Size::X, T_A, T_A, T_B);
+        self.a.cbnz(Size::X, T_A, normal);
+        let r = guest_reg(reg);
+        if load {
+            self.a.ldr(Width::W, r, STATE, state::TPR as i32);
+        } else {
+            let lowered = self.a.label();
+            self.and_imm32(T_C, r, 0xff);
+            self.a.str(Width::W, T_C, STATE, state::TPR as i32);
+            self.and_imm32(T_C, T_C, 0xf0);
+            self.a.ldr(Width::W, T_D, STATE, state::TPR_THRESHOLD as i32);
+            self.a.sub(Size::W, T_C, T_C, T_D);
+            self.a.tbz(T_C, 31, lowered);
+            self.a.movz(Size::W, T_C, 1, 0);
+            self.a.str(Width::W, T_C, STATE, state::PENDING as i32);
+            self.a.bind(lowered);
+        }
+        self.a.ldr(Width::X, T_C, STATE, state::TPR_FAST as i32);
+        self.a.add_imm(Size::X, T_C, T_C, 1);
+        self.a.str(Width::X, T_C, STATE, state::TPR_FAST as i32);
+        self.a.b(done);
+        self.a.bind(normal);
+        let m = MemOperand { base: NO_REG, index: NO_REG, scale: 0, disp, default_seg: 3 };
+        if !self.ea(insn, &m) {
+            unreachable!("a 32-bit absolute address always translates");
+        }
+        if load {
+            self.load(Width::W, r);
+        } else {
+            self.store(Width::W, r);
+        }
         self.a.bind(done);
         true
     }

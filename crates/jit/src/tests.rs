@@ -2583,6 +2583,63 @@ fn apic_tpr_accesses_stay_in_the_vm() {
 }
 
 #[test]
+fn tpr_movs_with_absolute_addresses_match_the_apic() {
+    let code = [
+        0xb9, 0xe8, 0x03, 0x00, 0x00, // mov ecx, 1000
+        0x89, 0x0d, 0x80, 0x00, 0xe0, 0xfe, // loop: mov [0xfee00080], ecx
+        0x8b, 0x1d, 0x80, 0x00, 0xe0, 0xfe, // mov ebx, [0xfee00080]
+        0x01, 0xda, // add edx, ebx
+        0xa1, 0x80, 0x00, 0xe0, 0xfe, // mov eax, [0xfee00080]
+        0x01, 0xc2, // add edx, eax
+        0x49, // dec ecx
+        0x75, 0xe8, // jnz loop
+        0xb8, 0x20, 0x01, 0x00, 0x00, // mov eax, 0x120
+        0xa3, 0x80, 0x00, 0xe0, 0xfe, // mov [0xfee00080], eax
+        0x8b, 0x35, 0x80, 0x00, 0xe0, 0xfe, // mov esi, [0xfee00080]
+        0xf4,
+    ];
+    let (mut cpu, mut bus) = apic_setup(&code);
+    let (stats, _) = run_apic(&mut cpu, &mut bus);
+    let sum: u32 = (1..=1000u32).map(|i| i & 0xff).sum();
+    assert_eq!(cpu.regs[2], 2 * sum, "XP's IRQL would come back wrong");
+    assert_eq!(bus.tpr, 0x20, "only the low byte of a TPR write counts");
+    assert_eq!(cpu.regs[6], 0x20);
+    assert!(bus.host_tpr_accesses <= 1, "every IRQL change would cost a VM exit: {} host accesses, {stats:?}", bus.host_tpr_accesses);
+}
+
+#[test]
+fn an_absolute_tpr_store_below_a_held_back_interrupt_leaves_the_vm() {
+    let code = [
+        0xb8, 0x30, 0x00, 0x00, 0x00, // mov eax, 0x30
+        0xa3, 0x80, 0x00, 0xe0, 0xfe, // mov [0xfee00080], eax
+        0xb8, 0x50, 0x00, 0x00, 0x00, // mov eax, 0x50
+        0xa3, 0x80, 0x00, 0xe0, 0xfe, // mov [0xfee00080], eax
+        0xb9, 0x20, 0x00, 0x00, 0x00, // mov ecx, 0x20
+        0x89, 0x0d, 0x80, 0x00, 0xe0, 0xfe, // mov [0xfee00080], ecx
+        0xeb, 0xfe, // jmp $
+    ];
+    let (mut cpu, mut bus) = apic_setup(&code);
+    bus.threshold = 0x40;
+    let _vm = VM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut jit = unsafe { Jit::new(bus.flat.ram.as_ptr(), RAM).unwrap() };
+    let kicker = jit.kicker();
+    let watchdog = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        kicker.kick();
+    });
+    let start = std::time::Instant::now();
+    let mut exit = jit.run(&mut cpu, &mut bus).unwrap();
+    while bus.tpr != 0x20 && start.elapsed() < std::time::Duration::from_secs(2) {
+        exit = jit.run(&mut cpu, &mut bus).unwrap();
+    }
+    let took = start.elapsed();
+    watchdog.join().unwrap();
+    assert!(matches!(exit, RunExit::Kicked), "the guest never got to run on after lowering the TPR: {exit:?}");
+    assert!(took < std::time::Duration::from_secs(1), "an interrupt unmasked by a TPR write waited {took:?} for delivery");
+    assert_eq!(bus.tpr, 0x20);
+}
+
+#[test]
 fn lowering_the_tpr_below_a_held_back_interrupt_leaves_the_vm() {
     let code = [
         0xc7, 0x05, 0x80, 0x00, 0xe0, 0xfe, 0x30, 0x00, 0x00, 0x00, // mov dword [0xfee00080], 0x30
@@ -2829,4 +2886,3 @@ fn dump_runtime_code() {
     std::fs::write(std::env::var("RT_OUT").unwrap(), bytes).unwrap();
     eprintln!("resume {:#x} dispatch {:#x} exit {:#x}", e.resume, e.dispatch, e.exit);
 }
-

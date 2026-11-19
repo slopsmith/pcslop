@@ -1389,6 +1389,7 @@ impl Emit {
                 self.write_rm(insn, w, b);
                 self.write_gpr(w, insn.reg(), T_C);
             }
+            0x89 | 0x8b | 0xa1 | 0xa3 if self.tpr_mov(insn) => {}
             0x88 | 0x89 => {
                 let w = Ow::of(op, op32);
                 let v = self.read_gpr(w, insn.reg(), T_B);
