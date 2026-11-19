@@ -1478,7 +1478,13 @@ impl Emit {
                 self.cold_exit(slow, eip);
                 self.a.bind(done);
             }
-            0x131 if !self.user => {
+            0x131 => {
+                if self.user {
+                    let slow = self.a.label();
+                    self.a.ldr(Width::W, T_A, STATE, state::CR4 as i32);
+                    self.a.tbnz(T_A, x86::cpu::cr4::TSD.trailing_zeros(), slow);
+                    self.cold_exit(slow, eip);
+                }
                 self.a.mrs(T_A, a64::sysreg::CNTVCT_EL0);
                 self.a.ldr(Width::X, T_B, STATE, state::TSC_ORIGIN as i32);
                 self.a.sub(Size::X, T_A, T_A, T_B);

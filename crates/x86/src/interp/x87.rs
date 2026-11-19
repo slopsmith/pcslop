@@ -805,6 +805,7 @@ impl<B: Bus> Ctx<'_, B> {
                             y * x.log2()
                         }
                         0xf9 => y * x.ln_1p() * std::f64::consts::LOG2_E,
+                        _ if trig::atan2_fast(y, x) => trig::atan2(y, x),
                         _ => y.atan2(x),
                     };
                     if r.is_nan() {

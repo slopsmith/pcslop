@@ -1331,6 +1331,42 @@ fn user_mode_code_matches_the_interpreter() {
 }
 
 #[test]
+fn user_mode_rdtsc_stays_translated_unless_cr4_tsd_is_set() {
+    let code = [
+        0xb8, 0x05, 0, 0, 0, // mov eax, 5
+        0x0f, 0x31, // rdtsc
+        0x89, 0xc3, // mov ebx, eax
+        0xfa, // cli: #GP at CPL 3 (IOPL 0), handled by the interpreter
+    ];
+    for tsd in [false, true] {
+        let mut cpu = flat_cpu(0x1000, 0x8000);
+        for seg in &mut cpu.segs {
+            seg.selector |= 3;
+            seg.attr |= 3 << 5;
+        }
+        if tsd {
+            cpu.cr4 |= x86::cpu::cr4::TSD;
+        }
+        cpu.start_host_tsc();
+        let mut bus = bus_with(0x1000, &code);
+        let _vm = VM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut jit = unsafe { Jit::new(bus.ram.as_ptr(), RAM).unwrap() };
+        let before = cpu.read_tsc();
+        let exit = jit.run(&mut cpu, &mut bus).unwrap();
+        assert!(matches!(exit, RunExit::Interp(_)));
+        if tsd {
+            assert_eq!(cpu.eip, 0x1005, "with CR4.TSD, RDTSC at CPL 3 must leave for the interpreter's #GP");
+            assert_eq!(cpu.regs[0], 5);
+        } else {
+            assert_eq!(jit.stats.translated_insns, 3, "RDTSC at CPL 3 should run translated up to the CLI");
+            assert_eq!(cpu.regs[3], cpu.regs[0]);
+            let tsc = (cpu.regs[2] as u64) << 32 | cpu.regs[0] as u64;
+            assert!(before <= tsc && tsc <= cpu.read_tsc(), "the guest TSC must follow the host clock");
+        }
+    }
+}
+
+#[test]
 fn instruction_across_a_page_end() {
     let mut code = vec![0x90; 0xffd];
     code.extend([0xb8, 0x78, 0x56, 0x34, 0x12, 0x40, 0xf4]);
@@ -1743,7 +1779,9 @@ fn mem_abs(out: &mut Vec<u8>, op: u8, reg: u8, addr: u32) {
 fn random_x87(rng: &mut Rng, out: &mut Vec<u8>) {
     let i = rng.below(8) as u8;
     let k = rng.below(8);
-    match rng.below(27) {
+    match rng.below(29) {
+        27 => out.extend([0xd9, 0xf3]),
+        28 => out.extend([0xd9, [0xfe, 0xff, 0xf2, 0xfb][rng.below(4) as usize]]),
         24 => mem_abs(out, 0xdb, [5, 7][rng.below(2) as usize], 0x3540 + 10 * k),
         25 => out.extend([0xdd, 0xc0 | i]),
         0 => mem_abs(out, 0xdd, 0, 0x3000 + 8 * k),
@@ -1793,13 +1831,14 @@ fn x87_memory(rng: &mut Rng) -> Vec<u8> {
             2 => 1.0e300,
             3 => 1.0 / 3.0,
             4 => (rng.next() as i32) as f64 * 1.0e-6,
+            5 => (rng.next() as i32) as f64 * 1.0e-19,
             _ => (rng.below(2001) as f64 - 1000.0) / 8.0,
         }
     };
     for k in 0..8 {
         let d = pick(rng);
         mem[8 * k..8 * k + 8].copy_from_slice(&d.to_le_bytes());
-        let f = pick(rng) as f32;
+        let f = if rng.below(5) == 0 { f32::from_bits(rng.below(0x80_0000) | rng.below(2) << 31) } else { pick(rng) as f32 };
         mem[0x100 + 4 * k..0x104 + 4 * k].copy_from_slice(&f.to_le_bytes());
         let n = rng.next() as i32 >> rng.below(31);
         mem[0x200 + 4 * k..0x204 + 4 * k].copy_from_slice(&n.to_le_bytes());
@@ -1871,6 +1910,101 @@ fn x87_sine_cosine_and_tangent_match_the_interpreter() {
         }
     }
     assert!(exits < runs * 2 - 20, "{exits} interpreter exits in {runs} runs: in-range inputs should stay translated");
+}
+
+/// Runs `code` with `data` at 0x3000 in both the interpreter and the JIT and
+/// checks they agree, x87 state included.
+fn compare_x87(code: &[u8], data: &[u8], what: &str) -> Stats {
+    let mut a = flat_cpu(0x1000, 0x8000);
+    let mut b = a.clone();
+    let mut bus_a = bus_with(0x1000, code);
+    let mut bus_b = bus_with(0x1000, code);
+    bus_a.ram.as_mut_slice()[0x3000..0x3000 + data.len()].copy_from_slice(data);
+    bus_b.ram.as_mut_slice()[0x3000..0x3000 + data.len()].copy_from_slice(data);
+    run_interp(&mut a, &mut bus_a);
+    let stats = run_jit(&mut b, &mut bus_b);
+    assert_eq!(a.regs, b.regs, "{what}: registers (FSW in AX)");
+    assert_eq!(a.fpu, b.fpu, "{what}: x87 state");
+    assert!(bus_a.ram.as_slice() == bus_b.ram.as_slice(), "{what}: results in memory differ");
+    stats
+}
+
+#[test]
+fn x87_loads_after_emms_replace_the_mmx_exponent() {
+    let code = [
+        0xdd, 0x05, 0x00, 0x30, 0, 0, // fld qword [0x3000]
+        0x0f, 0x6f, 0xfc, // movq mm7, mm4
+        0x0f, 0x77, // emms
+        0xdf, 0x2d, 0x08, 0x30, 0, 0, // fild qword [0x3008]: into the register MM7 shares
+        0xf4, // hlt
+    ];
+    let mut data = 2.5f64.to_le_bytes().to_vec();
+    data.extend(13i64.to_le_bytes());
+    compare_x87(&code, &data, "FILD after MOVQ MM7 and EMMS");
+}
+
+#[test]
+fn fpatan_matches_the_interpreter_without_leaving_translated_code() {
+    let code = [
+        0xdd, 0x05, 0x00, 0x30, 0, 0, // fld qword [0x3000]
+        0xdd, 0x05, 0x08, 0x30, 0, 0, // fld qword [0x3008]
+        0xd9, 0xf3, // fpatan
+        0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, // inc eax, past the interpreter's tail
+        0xdd, 0x1d, 0x10, 0x30, 0, 0, // fstp qword [0x3010]
+        0xdf, 0xe0, // fnstsw ax
+        0xf4, // hlt
+    ];
+    let normal = [(1.0f64, 2.0f64), (-3.5, 0.25), (0.25, -3.5), (-1.0e-3, -7.0), (5.0, 5.0), (-5.0, 5.0), (5.0, -5.0), (1.0e-12, 3.0), (3.0, -1.0e-12), (0.7, 0.69), (0.3, 0.6), (-0.6, -0.3), (2.0e-9, 1.0e9), (0.8, 1.0), (-1.0, 0.9), (0.45, -0.98), (3.0, 7.0), (0.6, 1.0), (0.52, 1.0), (0.66, 1.0), (0.45, 1.0), (0.613, 1.1)];
+    for (y, x) in normal {
+        let data: Vec<u8> = [y, x].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let stats = compare_x87(&code, &data, &format!("atan2({y:e}, {x:e})"));
+        assert_eq!(stats.interp_exits, 1, "atan2({y:e}, {x:e}) should stay translated: {stats:?}");
+    }
+    for (y, x) in [(0.0f64, 1.0f64), (-0.0, 1.0), (0.0, -2.0), (-0.0, -2.0), (1.0, 0.0), (-1.0, 0.0), (2.0, -0.0), (0.0, -0.0), (-0.0, -0.0), (-0.0, 0.0)] {
+        let data: Vec<u8> = [y, x].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let stats = compare_x87(&code, &data, &format!("atan2({y:e}, {x:e})"));
+        assert_eq!(stats.interp_exits, 1, "atan2({y:e}, {x:e}) with zeros should stay translated: {stats:?}");
+    }
+    for (y, x) in [(1.0e-300f64, 1.0e300f64), (-1.0e300, 1.0e-300)] {
+        let data: Vec<u8> = [y, x].iter().flat_map(|v| v.to_le_bytes()).collect();
+        compare_x87(&code, &data, &format!("atan2({y:e}, {x:e})"));
+    }
+}
+
+#[test]
+fn trig_of_tiny_angles_stays_translated() {
+    for &x in &[1.0e-9f64, -3.0e-15, 7.0e-300, -2.0e-20] {
+        for op in [0xfe, 0xff, 0xf2, 0xfb] {
+            let code = [
+                0xdd, 0x05, 0x00, 0x30, 0, 0, // fld qword [0x3000]
+                0xd9, op, // the instruction under test
+                0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, // inc eax, past the interpreter's tail
+                0xdd, 0x1d, 0x08, 0x30, 0, 0, // fstp qword [0x3008]
+                0xdf, 0xe0, // fnstsw ax
+                0xf4, // hlt
+            ];
+            let stats = compare_x87(&code, &x.to_le_bytes(), &format!("x {x:e} op {op:#x}"));
+            assert_eq!(stats.interp_exits, 1, "x {x:e} op {op:#x} should stay translated: {stats:?}");
+        }
+    }
+}
+
+#[test]
+fn fld_of_a_float_denormal_stays_translated_and_flags_de() {
+    let code = [
+        0xd9, 0x05, 0x00, 0x30, 0, 0, // fld dword [0x3000]
+        0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, // inc eax, past the interpreter's tail
+        0xd8, 0x0d, 0x04, 0x30, 0, 0, // fmul dword [0x3004]
+        0xdd, 0x1d, 0x08, 0x30, 0, 0, // fstp qword [0x3008]
+        0xdf, 0xe0, // fnstsw ax
+        0xf4, // hlt
+    ];
+    for bits in [1u32, 0x8000_0001, 0x7f_ffff, 0x0012_3456, 0x8040_0000] {
+        let mut data = bits.to_le_bytes().to_vec();
+        data.extend(3.0f32.to_le_bytes());
+        let stats = compare_x87(&code, &data, &format!("{bits:#x}"));
+        assert_eq!(stats.interp_exits, 1, "FLD of {bits:#x} should stay translated: {stats:?}");
+    }
 }
 
 #[test]

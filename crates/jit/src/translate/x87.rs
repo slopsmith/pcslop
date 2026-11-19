@@ -152,6 +152,8 @@ pub(super) enum K {
     Comi { i: usize, pop: bool },
     Sqrt,
     Trig(TrigOp),
+    /// FPATAN: ST(1) = atan2(ST(1), ST(0)), popping.
+    Atan,
     Rndint,
     StswAx,
     StswMem,
@@ -217,6 +219,7 @@ pub(super) fn classify(insn: &Insn) -> Option<K> {
         (1, 0xff) => K::Trig(TrigOp::Cos),
         (1, 0xf2) => K::Trig(TrigOp::Tan),
         (1, 0xfb) => K::Trig(TrigOp::SinCos),
+        (1, 0xf3) => K::Atan,
         (1, 0xfc) => K::Rndint,
         (3, 0xe8..=0xf7) => K::Comi { i, pop: false },
         (7, 0xe8..=0xf7) => K::Comi { i, pop: true },
@@ -243,7 +246,7 @@ impl Emit {
             seg = Some(insn.seg_override.unwrap_or(m.default_seg));
         }
         self.x87_enter(bail);
-        if matches!(k, K::Arith { .. } | K::ArithMem { .. } | K::Sqrt | K::Trig(_) | K::Prem | K::StMem { double: false, .. }) {
+        if matches!(k, K::Arith { .. } | K::ArithMem { .. } | K::Sqrt | K::Trig(_) | K::Atan | K::Prem | K::StMem { double: false, .. }) {
             self.x87_fpcr();
         }
         let before = self.x87;
@@ -252,11 +255,16 @@ impl Emit {
             K::LdMem(src) => {
                 self.x87_need(7, false, bail);
                 let special = matches!(src, Src::F32 | Src::F64).then(|| self.a.label());
-                self.load_src_or(src, FB, bail, special);
+                let (denormal, loaded) = (self.a.label(), self.a.label());
+                self.load_src_with(src, FB, bail, special, (src == Src::F32).then_some(denormal));
                 if let Some(special) = special {
                     let insn = *insn;
                     self.defer(move |e| e.fld_special(special, src, bail, &insn, eip, seg));
                 }
+                if src == Src::F32 {
+                    self.defer(move |e| e.fld_denormal(denormal, loaded));
+                }
+                self.a.bind(loaded);
                 self.clear_c1();
                 self.fpush_val(FB);
             }
@@ -655,6 +663,17 @@ impl Emit {
                     self.fpush_val(FS);
                 }
             }
+            K::Atan => {
+                self.x87_need(0, true, bail);
+                self.x87_need(1, true, bail);
+                self.check_rc_nearest(bail);
+                let x = self.st_val(0, bail);
+                let y = self.st_val(1, bail);
+                self.clear_c1();
+                self.atan2(y, x, bail);
+                self.fset(1, FR);
+                self.fpop();
+            }
             K::Rndint => {
                 self.x87_need(0, true, bail);
                 let a = self.st_val(0, bail);
@@ -718,7 +737,14 @@ impl Emit {
         self.a.bind(nonzero);
         self.a.ubfx(Size::X, T_B, T_A, 52, 11);
         self.a.sub_imm(Size::W, T_B, T_B, trig::MIN_EXP as u32);
-        self.a.tbnz(T_B, 31, bail);
+        let (tiny, set_pe) = (self.a.label(), self.a.label());
+        self.a.tbnz(T_B, 31, tiny);
+        self.defer(move |e| {
+            e.a.bind(tiny);
+            e.fconst(FS, 1.0f64.to_bits());
+            e.a.fp1(true, 0, FR, if op == TrigOp::Cos { FS } else { FA });
+            e.a.b(set_pe);
+        });
         self.a.sub_imm(Size::W, T_B, T_B, (trig::MAX_EXP - trig::MIN_EXP) as u32);
         self.a.tbz(T_B, 31, bail);
 
@@ -782,9 +808,142 @@ impl Emit {
         } else {
             self.trig_quadrant(op);
         }
+        self.a.bind(set_pe);
         let ok = self.a.logic_imm(Logic::Orr, Size::W, SW, SW, 1 << PE_SHIFT);
         assert!(ok);
         self.a.bind(out);
+    }
+
+    /// FR = `x86::trig::atan2(y, x)` by the same operations in order, with PE
+    /// set; leaves for quotients that underflow.
+    fn atan2(&mut self, y: V, x: V, bail: Label) {
+        let (swapped, divided, done, tiny) = (self.a.label(), self.a.label(), self.a.label(), self.a.label());
+        let (y_zero, x_zero) = (self.a.label(), self.a.label());
+        self.a.fp1(true, 1, FA, y);
+        self.a.fp1(true, 1, FB, x);
+        self.a.fmov_xd(T_A, FB);
+        self.a.fmov_xd(T_B, FA);
+        self.a.cbz(Size::X, T_B, y_zero);
+        self.a.cbz(Size::X, T_A, x_zero);
+        self.defer(move |e| {
+            let (pi, signed) = (e.a.label(), e.a.label());
+            e.a.bind(y_zero);
+            e.a.fmov_xd(T_A, x);
+            e.a.tbnz(T_A, 63, pi);
+            e.a.fp1(true, 0, FR, y);
+            e.a.b(done);
+            e.a.bind(pi);
+            e.a.mov_imm(Size::X, T_B, trig::PI_HI);
+            e.a.b(signed);
+            e.a.bind(x_zero);
+            e.a.mov_imm(Size::X, T_B, trig::PIO2_HI);
+            e.a.bind(signed);
+            e.a.fmov_xd(T_A, y);
+            e.a.lsr_imm(Size::X, T_A, T_A, 63);
+            e.a.logic_shift(Logic::Orr, false, Size::X, T_B, T_B, T_A, Shift::Lsl, 63);
+            e.a.fmov_dx(FR, T_B);
+            e.a.b(done);
+        });
+        // T_D's sign: |y| > |x|, so t = |x| / |y| and the angle is pi/2 - atan t.
+        self.a.sub(Size::X, T_D, T_A, T_B);
+        self.a.tbnz(T_D, 63, swapped);
+        self.a.fp2(true, 1, FR, FA, FB);
+        self.a.b(divided);
+        self.a.bind(swapped);
+        self.a.fp2(true, 1, FR, FB, FA);
+        self.a.bind(divided);
+
+        self.a.fmov_xd(T_B, FR);
+        self.a.lsr_imm(Size::X, T_C, T_B, 52);
+        self.a.cbz(Size::X, T_C, bail);
+        self.a.sub_imm(Size::W, T_C, T_C, trig::ATAN_TINY as u32);
+        self.a.tbnz(T_C, 31, tiny);
+        let (low, mid, poly) = (self.a.label(), self.a.label(), self.a.label());
+        self.a.mov_imm(Size::X, T_C, trig::ATAN_SPLIT[0]);
+        self.a.sub(Size::X, T_E, T_B, T_C);
+        self.a.tbnz(T_E, 63, low);
+        self.a.mov_imm(Size::X, T_C, trig::ATAN_SPLIT[1]);
+        self.a.sub(Size::X, T_E, T_B, T_C);
+        self.a.tbnz(T_E, 63, mid);
+        self.fconst(E2, 1.0f64.to_bits());
+        self.a.fp2(true, 3, W0, FR, E2);
+        self.a.fp2(true, 2, W1, FR, E2);
+        self.a.fp2(true, 1, FS, W0, W1);
+        self.a.movz(Size::W, T_E, 2, 0);
+        self.a.b(poly);
+        self.a.bind(mid);
+        self.a.fp2(true, 2, W0, FR, FR);
+        self.fconst(E2, 1.0f64.to_bits());
+        self.a.fp2(true, 3, W0, W0, E2);
+        self.fconst(E2, 2.0f64.to_bits());
+        self.a.fp2(true, 2, W1, E2, FR);
+        self.a.fp2(true, 1, FS, W0, W1);
+        self.a.movz(Size::W, T_E, 1, 0);
+        self.a.b(poly);
+        self.a.bind(low);
+        self.a.fp1(true, 0, FS, FR);
+        self.a.movz(Size::W, T_E, 0, 0);
+
+        // FS = x of the reduction, T_E = 0 for none or 1 + the table index.
+        self.a.bind(poly);
+        self.a.fp2(true, 0, W0, FS, FS);
+        self.a.fp2(true, 0, W1, W0, W0);
+        self.fconst(E1, trig::AT[10]);
+        self.fconst(E2, trig::AT[8]);
+        self.a.fmadd_d(false, W2, W1, E1, E2);
+        for c in [trig::AT[6], trig::AT[4], trig::AT[2], trig::AT[0]] {
+            self.fconst(E2, c);
+            self.a.fmadd_d(false, W2, W1, W2, E2);
+        }
+        self.fconst(E1, trig::AT[9]);
+        self.fconst(E2, trig::AT[7]);
+        self.a.fmadd_d(false, W3, W1, E1, E2);
+        for c in [trig::AT[5], trig::AT[3], trig::AT[1]] {
+            self.fconst(E2, c);
+            self.a.fmadd_d(false, W3, W1, W3, E2);
+        }
+        self.a.fp2(true, 0, W3, W1, W3);
+        self.a.fmadd_d(false, W2, W0, W2, W3);
+        let (table, second) = (self.a.label(), self.a.label());
+        self.a.cbnz(Size::W, T_E, table);
+        self.a.fmadd_d(true, FR, FS, W2, FS);
+        self.a.b(tiny);
+        self.a.bind(table);
+        let (hi, lo) = (trig::ATAN_HI, trig::ATAN_LO);
+        self.a.tbnz(T_E, 1, second);
+        self.fconst(E1, hi[0]);
+        self.fconst(E2, lo[0] ^ 1 << 63);
+        let combined = self.a.label();
+        self.a.b(combined);
+        self.a.bind(second);
+        self.fconst(E1, hi[1]);
+        self.fconst(E2, lo[1] ^ 1 << 63);
+        self.a.bind(combined);
+        self.a.fmadd_d(false, W0, FS, W2, E2);
+        self.a.fp2(true, 3, W0, W0, FS);
+        self.a.fp2(true, 3, FR, E1, W0);
+
+        self.a.bind(tiny);
+        let (no_swap, x_pos) = (self.a.label(), self.a.label());
+        self.a.tbz(T_D, 63, no_swap);
+        self.fconst(E2, trig::PIO2_LO);
+        self.a.fp2(true, 3, W0, FR, E2);
+        self.fconst(E2, trig::PIO2_HI);
+        self.a.fp2(true, 3, FR, E2, W0);
+        self.a.bind(no_swap);
+        self.a.fmov_xd(T_A, x);
+        self.a.tbz(T_A, 63, x_pos);
+        self.fconst(E2, trig::PI_LO);
+        self.a.fp2(true, 3, W0, FR, E2);
+        self.fconst(E2, trig::PI_HI);
+        self.a.fp2(true, 3, FR, E2, W0);
+        self.a.bind(x_pos);
+        self.a.fmov_xd(T_A, y);
+        self.a.tbz(T_A, 63, done);
+        self.a.fp1(true, 2, FR, FR);
+        self.a.bind(done);
+        let ok = self.a.logic_imm(Logic::Orr, Size::W, SW, SW, 1 << PE_SHIFT);
+        assert!(ok);
     }
 
     /// FR (and FS for FSINCOS) from W0 = sin r and W1 = cos r for quadrant T_A.
@@ -828,8 +987,16 @@ impl Emit {
         let (no_mmx, done) = (self.a.label(), self.a.label());
         self.a.ldr(Width::W, T_B, STATE, state::MM_USED as i32);
         self.a.tbz(T_B, 8, no_mmx);
-        self.and_imm(Size::W, T_B, T_B, !0x100u32 as u64);
-        self.a.str(Width::W, T_B, STATE, state::MM_USED as i32);
+        // MMX writes set the exponent to all ones; do it now, before x87 code
+        // after this reuses the registers.
+        self.a.mov_imm(Size::W, T_A, 0xffff);
+        for i in 0..8 {
+            let kept = self.a.label();
+            self.a.tbz(T_B, i, kept);
+            self.a.str(Width::H, T_A, STATE, (state::FSE + 2 * i as usize) as i32);
+            self.a.bind(kept);
+        }
+        self.a.str(Width::W, ZR, STATE, state::MM_USED as i32);
         if !init {
             self.a.ldr(Width::W, T_B, STATE, state::FSW as i32);
             self.and_imm(Size::W, T_B, T_B, !0x3800u32 as u64);
@@ -1498,6 +1665,26 @@ impl Emit {
         self.goto_indirect(T_A);
     }
 
+    /// FLD m32 of a denormal, whose bits are in T_A: FB = its exact double,
+    /// built with integer operations (FPCR may flush denormals), and DE set.
+    fn fld_denormal(&mut self, at: Label, back: Label) {
+        self.a.bind(at);
+        self.a.ubfx(Size::W, T_B, T_A, 0, 23);
+        self.a.clz(Size::W, T_C, T_B);
+        self.a.add_imm(Size::W, T_E, T_C, 21);
+        self.a.lslv(Size::X, T_B, T_B, T_E);
+        self.and_imm(Size::X, T_B, T_B, (1 << 52) - 1);
+        self.a.mov_imm(Size::W, T_E, 1023 - 149 + 31);
+        self.a.sub(Size::W, T_E, T_E, T_C);
+        self.a.logic_shift(Logic::Orr, false, Size::X, T_B, T_B, T_E, Shift::Lsl, 52);
+        self.a.lsr_imm(Size::W, T_C, T_A, 31);
+        self.a.logic_shift(Logic::Orr, false, Size::X, T_B, T_B, T_C, Shift::Lsl, 63);
+        self.a.fmov_dx(FB, T_B);
+        let ok = self.a.logic_imm(Logic::Orr, Size::W, SW, SW, x86::fpu::exc::DE as u64);
+        assert!(ok);
+        self.a.b(back);
+    }
+
     /// FST m32 of a quiet NaN or infinity in M and S, which stores without
     /// exceptions; ends the block after it, leaving ST(0) uncached.
     fn fst_special(&mut self, at: Label, pop: bool, bail: Label, insn: &Insn, eip: u32, seg: Option<u8>) {
@@ -1531,6 +1718,11 @@ impl Emit {
     /// As `load_src`, but a float with an all-ones exponent goes to `special`
     /// with its bits in T_A.
     fn load_src_or(&mut self, src: Src, dst: V, bail: Label, special: Option<Label>) {
+        self.load_src_with(src, dst, bail, special, None);
+    }
+
+    /// As `load_src_or`, but an f32 denormal goes to `denormal` with its bits in T_A.
+    fn load_src_with(&mut self, src: Src, dst: V, bail: Label, special: Option<Label>, denormal: Option<Label>) {
         let special = special.unwrap_or(bail);
         match src {
             Src::F32 => {
@@ -1541,7 +1733,7 @@ impl Emit {
                 self.a.tbnz(T_C, 8, special);
                 self.a.cbnz(Size::W, T_B, ok);
                 self.a.lsl_imm(Size::W, T_C, T_A, 1);
-                self.a.cbnz(Size::W, T_C, bail);
+                self.a.cbnz(Size::W, T_C, denormal.unwrap_or(bail));
                 self.a.bind(ok);
                 self.a.fmov_sw(dst, T_A);
                 self.a.fp1(false, 5, dst, dst);

@@ -278,6 +278,7 @@ pub const SYSENTER_CS: usize = offset_of!(State, sysenter_cs);
 pub const SYSENTER_ESP: usize = offset_of!(State, sysenter_esp);
 pub const SYSENTER_EIP: usize = offset_of!(State, sysenter_eip);
 pub const CR0: usize = offset_of!(State, cr0);
+pub const CR4: usize = offset_of!(State, cr4);
 pub const TTBR0: usize = offset_of!(State, ttbr0);
 pub const ROOTS: usize = offset_of!(State, roots);
 pub const TSC_ORIGIN: usize = offset_of!(State, tsc_origin);
