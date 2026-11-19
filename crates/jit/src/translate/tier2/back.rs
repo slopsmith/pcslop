@@ -461,6 +461,7 @@ impl<'a> BlockLower<'a> {
             Op::Bin(op, a, b, c) => self.bin(v, i, op, a, b, c)?,
             Op::Flags { op, a, b, r, shift, bits, .. } => self.flags(v, op, a, b, r, shift, bits),
             Op::IncDecFlags { dec, a, r, .. } => self.inc_dec_flags(v, dec, a, r),
+            Op::ShiftFlags { op, a, n, r, .. } => self.shift_flags(v, op, a, n, r),
             Op::Cond(cc, _) => {
                 if self.fused_cond != Some(v) {
                     let d = self.alloc(v)?;
@@ -851,6 +852,11 @@ impl<'a> BlockLower<'a> {
                     Alu::Shl => e.lslv(Size::W, d, x, y),
                     Alu::Shr => e.lsrv(Size::W, d, x, y),
                     Alu::Sar => e.asrv(Size::W, d, x, y),
+                    Alu::Mul => e.mul(Size::W, d, x, y),
+                    Alu::SMulHi | Alu::UMulHi => {
+                        if op == Alu::SMulHi { e.smull(d, x, y) } else { e.umull(d, x, y) }
+                        e.lsr_imm(Size::X, d, d, 32);
+                    }
                 }
             }
         }
@@ -882,6 +888,24 @@ impl<'a> BlockLower<'a> {
                     e.cfinv();
                 }
                 Alu::Sbb => e.sbcs(Size::W, Reg(31), x, y),
+                Alu::SMulHi | Alu::UMulHi => {
+                    // CF and OF: the product needs its high half. NZ from the low half.
+                    if op == Alu::SMulHi {
+                        e.smull(SCRATCH, x, y);
+                        e.addsub_ext(Size::X, true, true, Reg(31), SCRATCH, SCRATCH, a64::Extend::Sxtw, 0);
+                    } else {
+                        e.umull(SCRATCH, x, y);
+                        e.lsr_imm(Size::X, SCRATCH, SCRATCH, 32);
+                        e.cmp_imm(Size::X, SCRATCH, 0);
+                    }
+                    e.cset(Size::W, SCRATCH2, Cond::Ne);
+                    let rr = self.get(r, SCRATCH);
+                    let e = &mut self.e.a;
+                    e.tst(Size::W, rr, rr);
+                    e.movz(Size::W, SCRATCH, 2, 0);
+                    e.sub(Size::W, SCRATCH, SCRATCH, SCRATCH2);
+                    e.rmif(SCRATCH, 0, 0b0011);
+                }
                 _ => {
                     let rr = self.get(r, SCRATCH);
                     let e = &mut self.e.a;
@@ -901,7 +925,7 @@ impl<'a> BlockLower<'a> {
             }
         }
         if bits & AF != 0 {
-            if op.logic() {
+            if op.logic() || op.mul() {
                 self.e.a.mov(Size::W, AF_AUX, Reg(31));
             } else {
                 let x = self.get(a, SCRATCH);
@@ -941,6 +965,46 @@ impl<'a> BlockLower<'a> {
         }
     }
 
+    /// CF is the last bit shifted out; OF is SHL's CF ^ SF, SHR's old sign, SAR's 0.
+    fn shift_flags(&mut self, v: Val, op: Alu, a: Val, n: u8, r: Val) {
+        let bits = self.demanded(v);
+        if bits & NZCV_BITS != 0 {
+            let n = n as u32;
+            let rr = self.get(r, SCRATCH);
+            self.e.a.tst(Size::W, rr, rr);
+            match op {
+                Alu::Shl => {
+                    self.e.a.lsr_imm(Size::W, SCRATCH, rr, 31);
+                    let x = self.get(a, SCRATCH2);
+                    let e = &mut self.e.a;
+                    e.ubfx(Size::W, SCRATCH2, x, 32 - n, 1);
+                    e.eor(Size::W, SCRATCH, SCRATCH, SCRATCH2);
+                }
+                Alu::Shr => {
+                    let x = self.get(a, SCRATCH);
+                    let e = &mut self.e.a;
+                    e.ubfx(Size::W, SCRATCH2, x, n - 1, 1);
+                    e.lsr_imm(Size::W, SCRATCH, x, 31);
+                }
+                _ => {
+                    let x = self.get(a, SCRATCH);
+                    let e = &mut self.e.a;
+                    e.ubfx(Size::W, SCRATCH2, x, n - 1, 1);
+                    e.mov(Size::W, SCRATCH, Reg(31));
+                }
+            }
+            let e = &mut self.e.a;
+            let ok = e.logic_imm(Logic::Eor, Size::W, SCRATCH2, SCRATCH2, 1);
+            assert!(ok, "eor with 1 must encode");
+            e.logic_shift(Logic::Orr, false, Size::W, SCRATCH, SCRATCH, SCRATCH2, Shift::Lsl, 1);
+            e.rmif(SCRATCH, 0, 0b0011);
+        }
+        if bits & PF != 0 {
+            let rr = self.get(r, SCRATCH);
+            self.e.a.mov(Size::W, PF_RESULT, rr);
+        }
+    }
+
     /// Flags of INC/DEC values carry no `bits`; anything reading them counts.
     fn demanded(&self, v: Val) -> u8 {
         let mut bits = 0;
@@ -951,6 +1015,7 @@ impl<'a> BlockLower<'a> {
                     Op::Bin(_, _, _, Some(c)) if c == v => bits |= CF,
                     Op::Flags { c: Some(c), bits: b, .. } if c == v && b != 0 => bits |= CF,
                     Op::IncDecFlags { old, .. } if old == v => bits |= CF,
+                    Op::ShiftFlags { old, .. } if old == v => bits |= AF,
                     _ => {}
                 }
             }

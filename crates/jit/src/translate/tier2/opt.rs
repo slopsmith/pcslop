@@ -151,6 +151,9 @@ pub fn eval(op: Alu, x: u32, y: u32) -> Option<u32> {
         Alu::Shl => x.checked_shl(y).unwrap_or(0),
         Alu::Shr => x.checked_shr(y).unwrap_or(0),
         Alu::Sar => ((x as i32) >> y.min(31)) as u32,
+        Alu::Mul => x.wrapping_mul(y),
+        Alu::SMulHi => ((x as i32 as i64 * y as i32 as i64) >> 32) as u32,
+        Alu::UMulHi => ((x as u64 * y as u64) >> 32) as u32,
         Alu::Adc | Alu::Sbb => return None,
     })
 }
@@ -183,6 +186,7 @@ fn demand_flags(f: &mut Func) {
                     Op::Bin(_, _, _, Some(c)) => vec![(c, CF)],
                     Op::Flags { c: Some(c), .. } if want[v as usize] != 0 => vec![(c, CF)],
                     Op::IncDecFlags { old, .. } if want[v as usize] & CF != 0 => vec![(old, CF)],
+                    Op::ShiftFlags { old, .. } if want[v as usize] & AF != 0 => vec![(old, AF)],
                     _ => vec![],
                 };
                 for (src, bits) in add {

@@ -76,7 +76,12 @@ pub fn build(entry: u32, byte: &mut dyn FnMut(u32) -> Option<u8>, x87: Option<(u
                         }
                     };
                 }
-                Flow::Unsupported => break Term::Exit(pc),
+                Flow::Unsupported => {
+                    if why() {
+                        eprintln!("tier2: region {eip:#x} stops at {pc:#x}, opcode {:#x} /{}", insn.op, insn.reg());
+                    }
+                    break Term::Exit(pc);
+                }
             }
         };
         let cur = sb.cur;
@@ -94,6 +99,12 @@ pub fn build(entry: u32, byte: &mut dyn FnMut(u32) -> Option<u8>, x87: Option<(u
         }
     }
     Some(f)
+}
+
+/// SLOPPER_TIER2_WHY: report the instructions that end regions.
+fn why() -> bool {
+    static WHY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WHY.get_or_init(|| std::env::var_os("SLOPPER_TIER2_WHY").is_some())
 }
 
 fn empty(f: &mut Func, eip: u32) -> Block {
@@ -435,6 +446,71 @@ impl Builder<'_> {
                 let v = self.read_rm(loc, s, eip);
                 let v = if op >= 0x1be { self.push(Op::Extract { v, lsb: 0, width: 8 * s, signed: true }, eip) } else { v };
                 self.set_reg(insn.reg(), 4, v, eip);
+            }
+            0x1af | 0x69 | 0x6b if insn.op32 => {
+                let loc = self.rm(insn, eip)?;
+                let m = self.read_rm(loc, 4, eip);
+                let (a, b) = match op {
+                    0x1af => (self.cur[insn.reg()], m),
+                    0x6b => (m, self.k(insn.imm as u8 as i8 as i32 as u32, eip)),
+                    _ => (m, self.k(insn.imm, eip)),
+                };
+                let lo = self.push(Op::Bin(Alu::Mul, a, b, None), eip);
+                self.cur[FLAGS] = self.push(Op::Flags { op: Alu::SMulHi, a, b, c: None, r: lo, shift: 0, bits: 0x3f }, eip);
+                self.cur[insn.reg()] = lo;
+            }
+            0xf7 if insn.op32 && matches!(insn.reg(), 4 | 5) => {
+                let loc = self.rm(insn, eip)?;
+                let b = self.read_rm(loc, 4, eip);
+                let a = self.cur[0];
+                let hi_op = if insn.reg() == 5 { Alu::SMulHi } else { Alu::UMulHi };
+                let lo = self.push(Op::Bin(Alu::Mul, a, b, None), eip);
+                let hi = self.push(Op::Bin(hi_op, a, b, None), eip);
+                self.cur[FLAGS] = self.push(Op::Flags { op: hi_op, a, b, c: None, r: lo, shift: 0, bits: 0x3f }, eip);
+                self.cur[0] = lo;
+                self.cur[2] = hi;
+            }
+            0xc1 | 0xd1 if insn.op32 && matches!(insn.reg(), 4..=7) => {
+                let n = if op == 0xd1 { 1 } else { insn.imm & 31 };
+                let loc = self.rm(insn, eip)?;
+                if n != 0 {
+                    let a = self.read_rm(loc, 4, eip);
+                    let alu = [Alu::Shl, Alu::Shr, Alu::Shl, Alu::Sar][insn.reg() - 4];
+                    let k = self.k(n, eip);
+                    let r = self.push(Op::Bin(alu, a, k, None), eip);
+                    self.write_rm(loc, 4, r, eip);
+                    self.cur[FLAGS] = self.push(Op::ShiftFlags { op: alu, a, n: n as u8, r, old: self.cur[FLAGS] }, eip);
+                }
+            }
+            0xf6 if insn.reg() == 0 => {
+                let loc = self.rm(insn, eip)?;
+                let a = self.read_rm(loc, 1, eip);
+                let b = self.k(insn.imm & 0xff, eip);
+                self.alu(Alu::And, a, b, 1, |_, _| {}, eip)?;
+            }
+            0xa0..=0xa3 => {
+                let s = size(op & 1 == 0);
+                let m = MemOperand { base: NO_REG, index: NO_REG, scale: 0, disp: insn.imm, default_seg: 3 };
+                let addr = self.ea(insn, &m, eip)?;
+                if op < 0xa2 {
+                    let v = self.load(s, addr, eip);
+                    self.set_reg(0, s, v, eip);
+                } else {
+                    let v = self.reg(0, s, eip);
+                    self.store(s, addr, v, eip);
+                }
+            }
+            0xc9 if insn.op32 => {
+                let ebp = self.cur[5];
+                let v = self.load(4, ebp, eip);
+                let four = self.k(4, eip);
+                self.cur[4] = self.push(Op::Bin(Alu::Add, ebp, four, None), eip);
+                self.cur[5] = v;
+            }
+            0xff if insn.op32 && insn.reg() == 6 => {
+                let loc = self.rm(insn, eip)?;
+                let v = self.read_rm(loc, 4, eip);
+                self.push_val(v, eip);
             }
             0x99 if insn.op32 => {
                 let sh = self.k(31, eip);

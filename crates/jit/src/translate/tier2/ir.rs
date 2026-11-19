@@ -23,6 +23,12 @@ pub enum Alu {
     Shl,
     Shr,
     Sar,
+    /// The low half of a 32x32 product.
+    Mul,
+    /// The high half of a signed or unsigned product. As a `Flags` op: the
+    /// flags of IMUL or MUL, whose CF and OF say the high half is needed.
+    SMulHi,
+    UMulHi,
 }
 
 impl Alu {
@@ -33,6 +39,10 @@ impl Alu {
 
     pub fn logic(self) -> bool {
         matches!(self, Alu::Or | Alu::And | Alu::Xor)
+    }
+
+    pub fn mul(self) -> bool {
+        matches!(self, Alu::Mul | Alu::SMulHi | Alu::UMulHi)
     }
 }
 
@@ -65,6 +75,9 @@ pub enum Op {
     Flags { op: Alu, a: Val, b: Val, c: Option<Val>, r: Val, shift: u8, bits: u8 },
     /// Flags of INC or DEC: CF stays as in `old`.
     IncDecFlags { dec: bool, a: Val, r: Val, old: Val },
+    /// Flags of a 32-bit SHL, SHR or SAR of `a` by `n` (1 to 31) giving `r`:
+    /// AF stays as in `old`.
+    ShiftFlags { op: Alu, a: Val, n: u8, r: Val, old: Val },
     /// 1 when x86 condition `cc` (the low nibble of a Jcc) holds for the flags.
     Cond(u8, Val),
     /// `v` with bits `lsb..lsb + width` sign- or zero-extended.
@@ -103,7 +116,7 @@ impl Op {
             Op::Const(_) | Op::Param(_) | Op::FsBase => vec![],
             Op::Bin(_, a, b, c) => [Some(a), Some(b), c].into_iter().flatten().collect(),
             Op::Flags { a, b, c, r, .. } => [Some(a), Some(b), c, Some(r)].into_iter().flatten().collect(),
-            Op::IncDecFlags { a, r, old, .. } => vec![a, r, old],
+            Op::IncDecFlags { a, r, old, .. } | Op::ShiftFlags { a, r, old, .. } => vec![a, r, old],
             Op::Cond(_, f) => vec![f],
             Op::Extract { v, .. } => vec![v],
             Op::Insert { dst, src, .. } => vec![dst, src],
@@ -134,7 +147,7 @@ impl Op {
                     *c = f(*c);
                 }
             }
-            Op::IncDecFlags { a, r, old, .. } => {
+            Op::IncDecFlags { a, r, old, .. } | Op::ShiftFlags { a, r, old, .. } => {
                 *a = f(*a);
                 *r = f(*r);
                 *old = f(*old);
@@ -173,7 +186,7 @@ impl Op {
     }
 
     pub fn is_flags(&self) -> bool {
-        matches!(self, Op::Flags { .. } | Op::IncDecFlags { .. } | Op::FComi { .. })
+        matches!(self, Op::Flags { .. } | Op::IncDecFlags { .. } | Op::ShiftFlags { .. } | Op::FComi { .. })
     }
 }
 

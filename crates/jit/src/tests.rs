@@ -164,6 +164,49 @@ fn large_displacements_and_scaled_adds_match_the_interpreter_in_tier_2() {
 }
 
 #[test]
+fn multiplies_and_byte_tests_match_the_interpreter_in_tier_2() {
+    fn test() {
+        let code = [
+            0xb9, 0x05, 0, 0, 0, // mov ecx, 5
+            0x89, 0xd8, // loop: mov eax, ebx
+            0xf7, 0xee, // imul esi
+            0x0f, 0x90, 0xc0, // seto al
+            0x01, 0xc7, // add edi, eax
+            0x01, 0xd7, // add edi, edx
+            0x89, 0xd8, // mov eax, ebx
+            0xf7, 0xe6, // mul esi
+            0x0f, 0x92, 0xc0, // setc al
+            0x01, 0xc7, // add edi, eax
+            0x31, 0xd7, // xor edi, edx
+            0x0f, 0xaf, 0xde, // imul ebx, esi
+            0x0f, 0x92, 0xc0, // setc al
+            0x01, 0xc7, // add edi, eax
+            0x6b, 0xf6, 0xfd, // imul esi, esi, -3
+            0x0f, 0x90, 0xc0, // seto al
+            0x01, 0xc7, // add edi, eax
+            0x69, 0xed, 0x01, 0x00, 0x01, 0x00, // imul ebp, ebp, 0x10001
+            0x0f, 0x98, 0xc0, // sets al
+            0x01, 0xc7, // add edi, eax
+            0xf6, 0xc3, 0x80, // test bl, 0x80
+            0x0f, 0x94, 0xc0, // setz al
+            0x01, 0xc7, // add edi, eax
+            0x49, // dec ecx
+            0x75, 0xc4, // jnz loop
+            0xf4, // hlt
+        ];
+        for (b, s) in [(0x8000_0001u32, 0xffff_fffd), (7, 0x7fff_ffff), (0xffff_ff00, 3)] {
+            let stats = compare(&code, |c| {
+                c.regs[3] = b;
+                c.regs[6] = s;
+                c.regs[5] = 0x1234;
+            });
+            assert!(stats.tier2_regions > 0, "the loop never reached tier 2: {stats:?}");
+        }
+    }
+    in_tier2(test);
+}
+
+#[test]
 fn mixed_code_matches_the_interpreter_in_tier_2() {
     in_tier2(random_mmx_programs_match_the_interpreter);
     in_tier2(random_sse_programs_match_the_interpreter);
@@ -873,7 +916,11 @@ fn random_insn(rng: &mut Rng, out: &mut Vec<u8>) {
             1 => out.extend([0xd1, modrm_rr(rng.below(2) as u8, rng.reg())]),
             2 => out.extend([0xd3, modrm_rr(rng.below(2) as u8, rng.reg())]),
             3 => {
-                if rng.below(2) == 0 {
+                if rng.below(3) == 0 {
+                    out.extend([0xf6, modrm_rr(0, rng.below(8) as u8), rng.next() as u8]);
+                } else if rng.below(3) == 0 {
+                    out.extend([0xff, modrm_rr(6, rng.reg())]);
+                } else if rng.below(2) == 0 {
                     out.extend([0xf6, modrm_rr(2 + rng.below(2) as u8, rng.below(8) as u8)]);
                 } else {
                     out.extend([0x66, 0xf7, modrm_rr(2 + rng.below(2) as u8, rng.reg())]);
@@ -977,8 +1024,9 @@ fn random_insn(rng: &mut Rng, out: &mut Vec<u8>) {
         }
         25 => out.extend([0xd3, modrm_rr([4, 5, 7][rng.below(3) as usize], rng.reg())]),
         26 => out.extend([[0x86, 0x87][rng.below(2) as usize], modrm_rr(rng.reg(), rng.reg())]),
-        27 => match rng.below(3) {
+        27 => match rng.below(4) {
             0 => out.extend([0xf7, modrm_rr(4, rng.reg())]),
+            3 => out.extend([0xf7, modrm_rr(5, rng.reg())]),
             1 => out.extend([0x6b, modrm_rr(rng.reg(), rng.reg()), rng.next() as u8]),
             _ => {
                 out.extend([0x69, modrm_rr(rng.reg(), rng.reg())]);
