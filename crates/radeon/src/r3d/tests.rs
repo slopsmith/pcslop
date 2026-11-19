@@ -518,6 +518,21 @@ fn the_alpha_test_orders_its_functions_as_opengl_does() {
     }
 }
 
+#[test]
+fn the_stencil_test_compares_the_reference_with_the_buffer() {
+    for (func, pass) in [(4, true), (5, true), (1, false), (2, false)] {
+        let mut g = Gpu::new();
+        g.w(ZB_CNTL, 1);
+        g.w(ZB_FORMAT, 2);
+        g.w(ZB_DEPTHOFFSET, VRAM + DEPTH);
+        g.w(ZB_DEPTHPITCH, PITCH as u32);
+        g.w(ZB_ZSTENCILCNTL, func << 3);
+        g.w(ZB_STENCILREFMASK, 0xfe | 0xff << 8 | 0xff << 16);
+        g.draw(13, &quad(0.0, 0.0, 10.0, 10.0, RED));
+        assert_eq!(g.px(5, 5) != 0, pass, "function {func} with reference 0xfe over a cleared stencil");
+    }
+}
+
 /// Catalyst's fast colour clear, as Mesa's r300 driver also does it: the
 /// top half of the colour buffer is the colour buffer and the bottom half
 /// the Z buffer, which writes ZB_DEPTHCLEARVALUE with ZB_CB_CLEAR set.
@@ -936,7 +951,8 @@ mod against_metal {
                 g.w(ZB_ZSTENCILCNTL, 7 << 3 | 2 << 9);
                 g.w(ZB_STENCILREFMASK, 5 | 0xff << 8 | 0xff << 16);
                 g.draw(13, &quad(0.0, 0.0, 20.0, 20.0, RED));
-                g.w(ZB_ZSTENCILCNTL, 3 << 3);
+                g.w(ZB_ZSTENCILCNTL, 1 << 3);
+                g.w(ZB_STENCILREFMASK, 3 | 0xff << 8 | 0xff << 16);
                 g.draw(13, &quad(10.0, 10.0, 40.0, 40.0, BLUE));
                 g.w(ZB_CNTL, 0);
                 g.w(FG_ALPHA_FUNC, 1 << 11 | 4 << 8 | 0x80);

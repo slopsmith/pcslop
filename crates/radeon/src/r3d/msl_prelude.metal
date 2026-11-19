@@ -369,7 +369,7 @@ static bool depth_stencil(constant Uniforms &u, device uchar *vram, uint x, uint
         uint zfail_op = (S_ZS >> (back ? 24 : 12)) & 7;
         uint ref = u.stencil_ref & 0xff, mask = (u.stencil_ref >> 8) & 0xff, wmask = (u.stencil_ref >> 16) & 0xff;
         uint s = old & 0xff;
-        bool s_pass = test(func, s & mask, ref & mask);
+        bool s_pass = test(func, ref & mask, s & mask);
         uint op = !s_pass ? fail_op : !z_pass ? zfail_op : zpass_op;
         uint ns = stencil_op(op, s, ref);
         nv = (nv & ~wmask) | (ns & wmask);

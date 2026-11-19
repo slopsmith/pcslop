@@ -531,7 +531,7 @@ impl Raster {
             let mask = (self.stencil_ref >> 8) & 0xff;
             let wmask = (self.stencil_ref >> 16) & 0xff;
             let s = old & 0xff;
-            let s_pass = test(func, s & mask, reference & mask);
+            let s_pass = test(func, reference & mask, s & mask);
             let op = if !s_pass { fail_op } else if !z_pass { zfail_op } else { zpass_op };
             let ns = stencil_op(op, s, reference);
             new = (new & !wmask) | (ns & wmask);
