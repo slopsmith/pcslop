@@ -349,6 +349,94 @@ fn fprem_sets_the_quotient_bits_and_remainder_sign() {
 }
 
 #[test]
+fn integer_stores_of_nans_infinities_and_huge_values_match_the_interpreter() {
+    let pad = [0x42u8; 16]; // inc edx: more than an interpreter run takes after an exit
+    let mut code = Vec::new();
+    code.extend([0xdb, 0x2d, 0x00, 0x30, 0, 0]); // fld tbyte [0x3000]
+    code.extend([0xdd, 0x15, 0x10, 0x30, 0, 0]); // fst qword [0x3010]
+    code.extend(pad);
+    code.extend([0xdb, 0x1d, 0x20, 0x30, 0, 0]); // fistp dword [0x3020]
+    code.extend(pad);
+    code.extend([0xdb, 0x2d, 0x00, 0x30, 0, 0]); // fld tbyte [0x3000]
+    code.extend([0xdf, 0x1d, 0x24, 0x30, 0, 0]); // fistp word [0x3024]
+    code.extend(pad);
+    code.extend([0xdb, 0x2d, 0x00, 0x30, 0, 0]); // fld tbyte [0x3000]
+    code.extend([0xdf, 0x3d, 0x28, 0x30, 0, 0]); // fistp qword [0x3028]
+    code.extend(pad);
+    code.extend([0xdf, 0xe0, 0xf4]); // fnstsw ax; hlt
+    let qnan = x86::fpu::F80 { mant: 0xc000_0000_0000_1800, se: 0x7fff };
+    let neg_inf = x86::fpu::F80 { mant: 1 << 63, se: 0xffff };
+    let huge = x86::fpu::F80 { mant: 0xffff_ffff_ffff_ffff, se: 0x7ffe };
+    let two_63 = x86::fpu::F80 { mant: 1 << 63, se: 0xc03e };
+    for (name, v) in [("QNaN", qnan), ("-inf", neg_inf), ("1e30", x86::fpu::F80::from_f64(1e30)), ("-70000.5", x86::fpu::F80::from_f64(-70000.5)), ("the largest finite value", huge), ("-2^63", two_63)] {
+        let mut a = flat_cpu(0x1000, 0x8000);
+        let mut b = a.clone();
+        let mut bus_a = bus_with(0x1000, &code);
+        let mut bus_b = bus_with(0x1000, &code);
+        for bus in [&mut bus_a, &mut bus_b] {
+            let m = bus.ram.as_mut_slice();
+            m[0x3000..0x3008].copy_from_slice(&v.mant.to_le_bytes());
+            m[0x3008..0x300a].copy_from_slice(&v.se.to_le_bytes());
+        }
+        run_interp(&mut a, &mut bus_a);
+        let stats = run_jit(&mut b, &mut bus_b);
+        assert_eq!(bus_a.ram.as_slice()[0x3010..0x3030], bus_b.ram.as_slice()[0x3010..0x3030], "stores of {name} differ from the interpreter's");
+        assert_eq!(a.regs[0] & 0xffff, b.regs[0] & 0xffff, "status word after storing {name}");
+        // FST m64 overflows past the double range, and FISTP m64 of -2^63 is exact; the interpreter does both.
+        if !matches!(name, "the largest finite value" | "-2^63") {
+            assert!(stats.interp_exits <= 1, "storing {name} left translated code: {stats:?}");
+        }
+    }
+}
+
+#[test]
+fn loads_of_nans_and_infinities_match_the_interpreter() {
+    let pad = [0x42u8; 16]; // inc edx: more than an interpreter run takes after an exit
+    let mut code = Vec::new();
+    code.extend([0xdd, 0x05, 0x00, 0x30, 0, 0]); // fld qword [0x3000]
+    code.extend([0xd9, 0x05, 0x08, 0x30, 0, 0]); // fld dword [0x3008]
+    code.extend([0xdf, 0xe0, 0x89, 0xc3]); // fnstsw ax; mov ebx, eax
+    code.extend(pad);
+    code.extend([0xd9, 0x15, 0x1c, 0x30, 0, 0]); // fst dword [0x301c]
+    code.extend(pad);
+    code.extend([0xdd, 0x1d, 0x10, 0x30, 0, 0]); // fstp qword [0x3010]
+    code.extend(pad);
+    code.extend([0xd9, 0x1d, 0x18, 0x30, 0, 0]); // fstp dword [0x3018]
+    code.extend(pad);
+    code.extend([0xdd, 0x05, 0x00, 0x30, 0, 0]); // fld qword [0x3000]
+    code.extend([0xdb, 0x1d, 0x20, 0x30, 0, 0]); // fistp dword [0x3020]
+    code.extend(pad);
+    code.extend([0xdf, 0xe0, 0xf4]); // fnstsw ax; hlt
+    let cases: [(&str, u64, u32); 4] = [
+        ("quiet NaNs", 0xfff8_0000_0000_1234, 0x7fc0_0042),
+        ("infinities", 0x7ff0_0000_0000_0000, 0xff80_0000),
+        ("signaling NaNs", 0x7ff0_0000_0000_0001, 0x7f80_0001),
+        ("a NaN and a number", 0x7ff8_0000_0000_0000, 0x4040_0000),
+    ];
+    for (name, double, float) in cases {
+        let mut a = flat_cpu(0x1000, 0x8000);
+        a.fpu.sw |= 0x200;
+        let mut b = a.clone();
+        let mut bus_a = bus_with(0x1000, &code);
+        let mut bus_b = bus_with(0x1000, &code);
+        for bus in [&mut bus_a, &mut bus_b] {
+            let m = bus.ram.as_mut_slice();
+            m[0x3000..0x3008].copy_from_slice(&double.to_le_bytes());
+            m[0x3008..0x300c].copy_from_slice(&float.to_le_bytes());
+        }
+        run_interp(&mut a, &mut bus_a);
+        let stats = run_jit(&mut b, &mut bus_b);
+        assert_eq!(bus_a.ram.as_slice()[0x3010..0x3024], bus_b.ram.as_slice()[0x3010..0x3024], "stores after loading {name} differ from the interpreter's");
+        assert_eq!(a.regs[3] & 0xffff, b.regs[3] & 0xffff, "status word right after loading {name}");
+        assert_eq!(a.regs[0] & 0xffff, b.regs[0] & 0xffff, "status word after storing {name}");
+        assert_eq!((a.fpu.sw, a.fpu.tags), (b.fpu.sw, b.fpu.tags), "x87 stack after loading {name}");
+        if name != "signaling NaNs" {
+            assert!(stats.interp_exits <= 1, "loading {name} left translated code: {stats:?}");
+        }
+    }
+}
+
+#[test]
 fn fldcw_inside_a_block_takes_effect_for_the_x87_code_after_it() {
     let code = [
         0xdd, 0x05, 0x00, 0x30, 0, 0, // fld qword [0x3000]

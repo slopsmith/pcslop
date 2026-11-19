@@ -251,7 +251,12 @@ impl Emit {
         match k {
             K::LdMem(src) => {
                 self.x87_need(7, false, bail);
-                self.load_src(src, FB, bail);
+                let special = matches!(src, Src::F32 | Src::F64).then(|| self.a.label());
+                self.load_src_or(src, FB, bail, special);
+                if let Some(special) = special {
+                    let insn = *insn;
+                    self.defer(move |e| e.fld_special(special, src, bail, &insn, eip, seg));
+                }
                 self.clear_c1();
                 self.fpush_val(FB);
             }
@@ -296,8 +301,26 @@ impl Emit {
                 self.x87_need(0, true, bail);
                 if double && !self.is_cached(0) {
                     // Rounding to a double only depends on RC when the value is not exact.
-                    let (directed, stored) = (self.a.label(), self.a.label());
+                    let (directed, stored, finite) = (self.a.label(), self.a.label(), self.a.label());
                     self.fget(0, M, S);
+                    // Quiet NaNs and infinities store exactly, without exceptions.
+                    self.and_imm(Size::W, T_A, S, 0x7fff);
+                    let ok = self.a.logic_imm(Logic::Eor, Size::W, T_A, T_A, 0x7fff);
+                    assert!(ok);
+                    self.a.cbnz(Size::W, T_A, finite);
+                    self.a.tbz(M, 63, bail);
+                    self.a.lsl_imm(Size::X, T_C, M, 1);
+                    let inf = self.a.label();
+                    self.a.cbz(Size::X, T_C, inf);
+                    self.a.tbz(M, 62, bail);
+                    self.a.bind(inf);
+                    self.a.lsr_imm(Size::X, T_C, T_C, 12);
+                    self.a.mov_imm(Size::X, T_A, 0x7ff << 52);
+                    self.a.orr(Size::X, T_C, T_C, T_A);
+                    self.a.lsr_imm(Size::W, T_A, S, 15);
+                    self.a.logic_shift(Logic::Orr, false, Size::X, T_C, T_C, T_A, Shift::Lsl, 63);
+                    self.a.b(stored);
+                    self.a.bind(finite);
                     self.a.ldr(Width::W, T_A, STATE, state::FCW as i32);
                     self.a.ubfx(Size::W, T_A, T_A, 10, 2);
                     self.a.cbnz(Size::W, T_A, directed);
@@ -313,6 +336,16 @@ impl Emit {
                     self.a.fmov_xd(T_C, cv(self.slot(0)));
                     self.store(Width::X, T_C);
                 } else {
+                    if !self.is_cached(0) {
+                        let special = self.a.label();
+                        self.fget(0, M, S);
+                        self.and_imm(Size::W, T_A, S, 0x7fff);
+                        let ok = self.a.logic_imm(Logic::Eor, Size::W, T_A, T_A, 0x7fff);
+                        assert!(ok);
+                        self.a.cbz(Size::W, T_A, special);
+                        let insn = *insn;
+                        self.defer(move |e| e.fst_special(special, pop, bail, &insn, eip, seg));
+                    }
                     let v = self.st_val(0, bail);
                     self.a.fp1(true, 4, FB, v);
                     self.a.fmov_ws(T_A, FB);
@@ -359,23 +392,28 @@ impl Emit {
                     self.fpop();
                 }
             }
+            // NaNs, infinities and values out of range store the integer
+            // indefinite with IE, masked; C1 stays.
             K::Ist { w, pop } => {
                 self.x87_need(0, true, bail);
+                let (invalid, stored) = (self.a.label(), self.a.label());
+                let checked = pop && !self.is_cached(0);
+                if checked {
+                    // Magnitudes from 2^64 up, NaNs and unsupported encodings.
+                    self.fget(0, M, S);
+                    self.and_imm(Size::W, T_E, S, 0x7fff);
+                    self.a.mov_imm(Size::W, T_D, 0x403f);
+                    self.a.sub(Size::W, T_E, T_E, T_D);
+                    self.a.tbz(T_E, 31, invalid);
+                }
                 let v = self.st_val(0, bail);
                 self.round_by_rc(FB, v);
-                self.a.fcm(Fcm::Eq, true, FR, FB, v);
-                self.a.fmov_xd(T_B, FR);
-                self.a.mvn(Size::X, T_B, T_B);
-                self.flag_nonzero_to_pe(T_B);
-                self.a.fcm(Fcm::Agt, true, FR, FB, v);
-                self.a.fmov_xd(T_B, FR);
-                self.a.bfi(Size::W, SW, T_B, 9, 1);
                 self.a.fcvtzs(true, Size::X, T_A, FB);
                 match w {
                     Width::X => {
                         self.a.mov_imm(Size::X, T_E, i64::MAX as u64);
                         self.a.eor(Size::X, T_E, T_E, T_A);
-                        self.a.cbz(Size::X, T_E, bail);
+                        self.a.cbz(Size::X, T_E, invalid);
                         self.a.mov_imm(Size::X, T_E, i64::MIN as u64);
                         self.a.eor(Size::X, T_E, T_E, T_A);
                         self.a.cbz(Size::X, T_E, bail);
@@ -383,17 +421,39 @@ impl Emit {
                     Width::W => {
                         self.a.sxtw(T_E, T_A);
                         self.a.sub(Size::X, T_E, T_E, T_A);
-                        self.a.cbnz(Size::X, T_E, bail);
+                        self.a.cbnz(Size::X, T_E, invalid);
                     }
                     _ => {
                         self.a.sxth(Size::X, T_E, T_A);
                         self.a.sub(Size::X, T_E, T_E, T_A);
-                        self.a.cbnz(Size::X, T_E, bail);
+                        self.a.cbnz(Size::X, T_E, invalid);
                     }
                 }
+                self.a.fcm(Fcm::Eq, true, FR, FB, v);
+                self.a.fmov_xd(T_B, FR);
+                self.a.mvn(Size::X, T_B, T_B);
+                self.flag_nonzero_to_pe(T_B);
+                self.a.fcm(Fcm::Agt, true, FR, FB, v);
+                self.a.fmov_xd(T_B, FR);
+                self.a.bfi(Size::W, SW, T_B, 9, 1);
                 self.store(w, T_A);
+                self.a.b(stored);
+                self.a.bind(invalid);
+                let indefinite = match w {
+                    Width::X => 1u64 << 63,
+                    Width::W => 1 << 31,
+                    _ => 1 << 15,
+                };
+                self.a.mov_imm(Size::X, T_A, indefinite);
+                self.store(w, T_A);
+                let ok = self.a.logic_imm(Logic::Orr, Size::W, SW, SW, 1);
+                assert!(ok);
+                self.a.bind(stored);
                 if pop {
                     self.fpop();
+                    if checked {
+                        self.x87.cached &= !(1 << self.slot(7));
+                    }
                 }
             }
             // Registers move as their doubles; values that are not an exact
@@ -1414,16 +1474,71 @@ impl Emit {
         self.a.bind(done);
     }
 
+    /// FLD of a quiet NaN or infinity, whose raw bits are in T_A: pushes
+    /// it in the 80-bit form, uncached, and ends the block after it.
+    fn fld_special(&mut self, at: Label, src: Src, bail: Label, insn: &Insn, eip: u32, seg: Option<u8>) {
+        self.a.bind(at);
+        let (frac, quiet, shift, sign) = if src == Src::F32 { (23, 22, 40, 31) } else { (52, 51, 11, 63) };
+        self.a.ubfx(Size::X, M, T_A, 0, frac);
+        let inf = self.a.label();
+        self.a.cbz(Size::X, M, inf);
+        self.a.tbz(M, quiet, bail);
+        self.a.bind(inf);
+        self.a.lsl_imm(Size::X, M, M, shift);
+        let ok = self.a.logic_imm(Logic::Orr, Size::X, M, M, 1 << 63);
+        assert!(ok);
+        self.a.ubfx(Size::X, S, T_A, sign, 1);
+        self.a.lsl_imm(Size::W, S, S, 15);
+        let ok = self.a.logic_imm(Logic::Orr, Size::W, S, S, 0x7fff);
+        assert!(ok);
+        self.clear_c1();
+        self.fpush();
+        self.x87_commit(eip, insn, seg);
+        self.a.mov_imm(Size::W, T_A, eip.wrapping_add(insn.len as u32) as u64);
+        self.goto_indirect(T_A);
+    }
+
+    /// FST m32 of a quiet NaN or infinity in M and S, which stores without
+    /// exceptions; ends the block after it, leaving ST(0) uncached.
+    fn fst_special(&mut self, at: Label, pop: bool, bail: Label, insn: &Insn, eip: u32, seg: Option<u8>) {
+        self.a.bind(at);
+        let inf = self.a.label();
+        self.a.tbz(M, 63, bail);
+        self.a.lsl_imm(Size::X, T_C, M, 1);
+        self.a.cbz(Size::X, T_C, inf);
+        self.a.tbz(M, 62, bail);
+        self.a.bind(inf);
+        self.a.lsr_imm(Size::X, T_C, T_C, 41);
+        self.a.mov_imm(Size::W, T_A, 0xff << 23);
+        self.a.orr(Size::W, T_C, T_C, T_A);
+        self.a.lsr_imm(Size::W, T_A, S, 15);
+        self.a.logic_shift(Logic::Orr, false, Size::W, T_C, T_C, T_A, Shift::Lsl, 31);
+        self.store(Width::W, T_C);
+        if pop {
+            self.fpop();
+        }
+        self.x87_commit(eip, insn, seg);
+        self.a.mov_imm(Size::W, T_A, eip.wrapping_add(insn.len as u32) as u64);
+        self.goto_indirect(T_A);
+    }
+
     /// The memory operand at T_ADDR as f64 in `dst`; leaves for NaNs,
     /// infinities and denormals, which the interpreter flags.
     fn load_src(&mut self, src: Src, dst: V, bail: Label) {
+        self.load_src_or(src, dst, bail, None);
+    }
+
+    /// As `load_src`, but a float with an all-ones exponent goes to `special`
+    /// with its bits in T_A.
+    fn load_src_or(&mut self, src: Src, dst: V, bail: Label, special: Option<Label>) {
+        let special = special.unwrap_or(bail);
         match src {
             Src::F32 => {
                 let ok = self.a.label();
                 self.a.ldr(Width::W, T_A, T_ADDR, 0);
                 self.a.ubfx(Size::W, T_B, T_A, 23, 8);
                 self.a.add_imm(Size::W, T_C, T_B, 1);
-                self.a.tbnz(T_C, 8, bail);
+                self.a.tbnz(T_C, 8, special);
                 self.a.cbnz(Size::W, T_B, ok);
                 self.a.lsl_imm(Size::W, T_C, T_A, 1);
                 self.a.cbnz(Size::W, T_C, bail);
@@ -1436,7 +1551,7 @@ impl Emit {
                 self.a.ldr(Width::X, T_A, T_ADDR, 0);
                 self.a.ubfx(Size::X, T_B, T_A, 52, 11);
                 self.a.add_imm(Size::W, T_C, T_B, 1);
-                self.a.tbnz(T_C, 11, bail);
+                self.a.tbnz(T_C, 11, special);
                 self.a.cbnz(Size::W, T_B, ok);
                 self.a.lsl_imm(Size::X, T_C, T_A, 1);
                 self.a.cbnz(Size::X, T_C, bail);
