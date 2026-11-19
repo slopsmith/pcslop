@@ -185,7 +185,8 @@ static bool wrap(uint mode, int i, uint size, thread uint &out) {
     return true;
 }
 
-static float4 fetch(constant TexDesc &t, const device uchar *d, uint level, int x, int y, int z) {
+// Inlining this at every tap makes each pipeline take over a second to compile.
+__attribute__((noinline)) static float4 fetch(constant TexDesc &t, const device uchar *d, uint level, int x, int y, int z) {
     uint w = max(t.width >> level, 1u), h = max(t.height >> level, 1u);
     uint ux, uy, uz = uint(z);
     bool zin = t.kind != 1 || wrap((t.filter >> 6) & 7, z, max(t.depth >> level, 1u), uz);
