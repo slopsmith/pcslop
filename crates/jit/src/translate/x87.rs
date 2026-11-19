@@ -49,6 +49,8 @@ const SQRT: u32 = 9;
 pub(super) struct X87Block {
     entered: bool,
     rc_checked: bool,
+    /// FPCR holds FCW's rounding mode for x87 arithmetic.
+    fpcr: bool,
     /// How far TOP moved since entry, mod 8 (a push adds 7).
     d: u8,
     /// Slots whose f64 value is in V8 plus the slot number.
@@ -83,7 +85,7 @@ impl X87Block {
     /// The state of a tier-2 region's body: every slot it uses is in its
     /// register and written back on the way out, with SW and TAGS.
     pub(super) fn region_body(touched: u8) -> X87Block {
-        X87Block { entered: true, cached: touched, dirty: touched, meta: true, ..X87Block::default() }
+        X87Block { entered: true, fpcr: true, cached: touched, dirty: touched, meta: true, ..X87Block::default() }
     }
 
     /// Whether a jump back to the block's start with this state could keep
@@ -96,7 +98,7 @@ impl X87Block {
     /// full slots stay cached, all of them counted dirty so exits write them.
     pub(super) fn loop_head(&self) -> X87Block {
         let cached = self.cached & self.full;
-        X87Block { cached, dirty: cached, full: self.full, empty: self.empty, rc_checked: self.rc_checked, entered: true, ..X87Block::default() }
+        X87Block { cached, dirty: cached, full: self.full, empty: self.empty, rc_checked: self.rc_checked, fpcr: self.fpcr, entered: true, ..X87Block::default() }
     }
 
     /// Whether this state may continue at a loop head assuming `head`.
@@ -106,6 +108,7 @@ impl X87Block {
             && self.full & head.full == head.full
             && self.empty & head.empty == head.empty
             && (self.rc_checked || !head.rc_checked)
+            && (self.fpcr || !head.fpcr)
     }
 }
 
@@ -240,6 +243,9 @@ impl Emit {
             seg = Some(insn.seg_override.unwrap_or(m.default_seg));
         }
         self.x87_enter(bail);
+        if matches!(k, K::Arith { .. } | K::ArithMem { .. } | K::Sqrt | K::Trig(_) | K::Prem | K::StMem { double: false, .. }) {
+            self.x87_fpcr();
+        }
         let before = self.x87;
         let mut comi = None;
         match k {
@@ -606,11 +612,7 @@ impl Emit {
                 self.a.ldr(Width::W, T_A, STATE, state::FCW as i32);
                 self.store(Width::H, T_A);
             }
-            K::Ldcw => {
-                self.fldcw(bail);
-                self.x87_flush();
-                self.x87 = X87Block::default();
-            }
+            K::Ldcw => self.fldcw(bail),
         }
         if !control {
             self.x87_commit(eip, insn, seg);
@@ -801,22 +803,22 @@ impl Emit {
         self.a.bind(ok);
     }
 
+    /// Only control words that mask every exception stay here, so X87_OK
+    /// holds and the block keeps its registers.
     fn fldcw(&mut self, bail: Label) {
         self.a.ldr(Width::H, T_A, T_ADDR, 0);
         let ok = self.a.logic_imm(Logic::Orr, Size::W, T_A, T_A, 0x40);
         assert!(ok);
-        self.a.bic(Size::W, T_B, SW, T_A);
+        self.a.mvn(Size::W, T_B, T_A);
         self.and_imm(Size::W, T_B, T_B, 0x3f);
         self.a.cbnz(Size::W, T_B, bail);
-        self.and_imm(Size::W, T_B, T_A, 0x3f);
-        let ok = self.a.logic_imm(Logic::Eor, Size::W, T_B, T_B, 0x3f);
-        assert!(ok);
+        self.a.str(Width::W, T_A, STATE, state::FCW as i32);
+        self.a.ubfx(Size::W, T_B, T_A, 8, 2);
         self.a.sub_imm(Size::W, T_B, T_B, 1);
         self.a.lsr_imm(Size::W, T_B, T_B, 31);
-        self.a.ldr(Width::W, T_C, STATE, state::X87_BASE as i32);
-        self.a.and(Size::W, T_B, T_B, T_C);
-        self.a.str(Width::W, T_B, STATE, state::X87_OK as i32);
-        self.a.str(Width::W, T_A, STATE, state::FCW as i32);
+        self.a.bfi(Size::W, SW, T_B, SINGLE, 1);
+        self.x87.rc_checked = false;
+        self.x87.fpcr = false;
         let sse_fpcr = self.a.label();
         self.a.ldr(Width::W, T_B, STATE, state::FPCR_X87 as i32);
         self.a.cbz(Size::W, T_B, sse_fpcr);
@@ -858,7 +860,7 @@ impl Emit {
         self.a.logic_shift(Logic::Orr, false, Size::W, TAGS, TAGS, TAGS, Shift::Lsl, 8);
         self.a.lsrv(Size::W, TAGS, TAGS, TOP);
         self.and_imm(Size::W, TAGS, TAGS, 0xff);
-        let (tainted, x87_fpcr) = (self.a.label(), self.a.label());
+        let tainted = self.a.label();
         self.a.ldr(Width::W, U, STATE, state::X87_TAINT as i32);
         self.a.cbnz(Size::W, U, tainted);
         self.a.mrs(U, sysreg::FPSR);
@@ -866,13 +868,23 @@ impl Emit {
         self.a.movz(Size::W, U, 1, 0);
         self.a.str(Width::W, U, STATE, state::X87_TAINT as i32);
         self.a.bind(tainted);
+    }
+
+    /// Sets FPCR for x87 arithmetic once per block, as late as possible:
+    /// writing FPCR is slow, and code toggling RC around FISTP never needs it.
+    pub(super) fn x87_fpcr(&mut self) {
+        if self.x87.fpcr {
+            return;
+        }
+        self.x87.fpcr = true;
+        let done = self.a.label();
         self.a.ldr(Width::W, U, STATE, state::FPCR_X87 as i32);
         self.a.sub_imm(Size::W, U, U, 1);
-        self.a.cbz(Size::W, U, x87_fpcr);
+        self.a.cbz(Size::W, U, done);
         self.set_fpcr(true);
         self.a.movz(Size::W, U, 1, 0);
         self.a.str(Width::W, U, STATE, state::FPCR_X87 as i32);
-        self.a.bind(x87_fpcr);
+        self.a.bind(done);
     }
 
     /// Ends the block's x87 work and puts FPSR and FPCR back as SSE code
@@ -912,11 +924,12 @@ impl Emit {
             self.a.ubfx(Size::W, S, T_E, 6, 1);
             self.a.orr(Size::W, M, M, S);
         }
-        self.a.mov_imm(Size::X, T_E, 7 << 22 | 1);
+        self.a.ldr(Width::W, U, STATE, state::FPCR_MODE as i32);
+        self.a.eor(Size::W, U, U, M);
+        self.a.cbz(Size::W, U, same);
+        self.a.str(Width::W, M, STATE, state::FPCR_MODE as i32);
+        self.a.mov_imm(Size::X, T_E, state::FPCR_MODE_MASK);
         self.a.mrs(S, sysreg::FPCR);
-        self.a.and(Size::X, U, S, T_E);
-        self.a.eor(Size::X, U, U, M);
-        self.a.cbz(Size::X, U, same);
         self.a.bic(Size::X, S, S, T_E);
         self.a.orr(Size::X, S, S, M);
         self.a.msr(sysreg::FPCR, S);
@@ -1154,6 +1167,9 @@ impl Emit {
         }
         if head.rc_checked {
             self.check_rc_nearest(bail);
+        }
+        if head.fpcr {
+            self.x87_fpcr();
         }
         for i in 0..8 {
             if head.cached & 1 << i != 0 {

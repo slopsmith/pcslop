@@ -573,6 +573,7 @@ impl Jit {
         if !jit.afp {
             v.set_reg(reg::FPCR, 0)?;
         }
+        jit.state().fpcr_mode = (jit.fpcr & state::FPCR_MODE_MASK) as u32;
         jit.state().lookup = layout::va(layout::LOOKUP);
         jit.state().vlookup = layout::va(layout::VLOOKUP);
         Ok(jit)
@@ -976,6 +977,7 @@ impl Jit {
             if fpcr != self.fpcr {
                 self.fpcr = fpcr;
                 self.vcpu.set_reg(reg::FPCR, fpcr).expect("FPCR write");
+                self.state().fpcr_mode = (fpcr & state::FPCR_MODE_MASK) as u32;
             }
         }
         let s = self.state();

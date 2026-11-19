@@ -306,6 +306,42 @@ fn fprem_sets_the_quotient_bits_and_remainder_sign() {
 }
 
 #[test]
+fn fldcw_inside_a_block_takes_effect_for_the_x87_code_after_it() {
+    let code = [
+        0xdd, 0x05, 0x00, 0x30, 0, 0, // fld qword [0x3000]
+        0xd9, 0xfe, // fsin
+        0xd9, 0x2d, 0x42, 0x30, 0, 0, // fldcw [0x3042]: single precision
+        0xdc, 0x0d, 0x08, 0x30, 0, 0, // fmul qword [0x3008]
+        0xdd, 0x1d, 0x18, 0x30, 0, 0, // fstp qword [0x3018]
+        0xd9, 0x2d, 0x40, 0x30, 0, 0, // fldcw [0x3040]: chop
+        0xdd, 0x05, 0x00, 0x30, 0, 0, // fld qword [0x3000]
+        0xdc, 0x0d, 0x08, 0x30, 0, 0, // fmul qword [0x3008]
+        0xd9, 0xfe, // fsin
+        0xdd, 0x1d, 0x10, 0x30, 0, 0, // fstp qword [0x3010]
+        0xf4, // hlt
+    ];
+    for x in [0.3f64, 0.7, 1.1, 2.9, -0.45, 1.3, 0.123, 2.2] {
+        let mut a = flat_cpu(0x1000, 0x8000);
+        let mut b = a.clone();
+        let mut bus_a = bus_with(0x1000, &code);
+        let mut bus_b = bus_with(0x1000, &code);
+        for bus in [&mut bus_a, &mut bus_b] {
+            let m = bus.ram.as_mut_slice();
+            m[0x3000..0x3008].copy_from_slice(&x.to_le_bytes());
+            m[0x3008..0x3010].copy_from_slice(&(1.0f64 / 3.0).to_le_bytes());
+            m[0x3040..0x3042].copy_from_slice(&0x0f7fu16.to_le_bytes());
+            m[0x3042..0x3044].copy_from_slice(&0x007fu16.to_le_bytes());
+        }
+        run_interp(&mut a, &mut bus_a);
+        run_jit(&mut b, &mut bus_b);
+        let at = |bus: &FlatBus, o: usize| f64::from_le_bytes(bus.ram.as_slice()[o..o + 8].try_into().unwrap());
+        assert_eq!(at(&bus_a, 0x3010).to_bits(), at(&bus_b, 0x3010).to_bits(), "FMUL and FSIN of {x} ignored the chop RC loaded in the same block");
+        assert_eq!(at(&bus_a, 0x3018).to_bits(), at(&bus_b, 0x3018).to_bits(), "FMUL after {x} ignored the single precision loaded in the same block");
+        assert_eq!(a.fpu.sw, b.fpu.sw, "status words differ for {x}");
+    }
+}
+
+#[test]
 fn single_precision_results_past_the_float_range_keep_their_exponent() {
     let mut code = vec![0xb9, 0x14, 0, 0, 0]; // mov ecx, 20
     code.extend([

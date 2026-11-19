@@ -133,6 +133,9 @@ pub struct State {
     /// How FPCR is set up: 0 for SSE code (MXCSR), 1 for x87 code under the
     /// current FCW, 2 for x87 code under an FCW that FLDCW has since replaced.
     pub fpcr_x87: u32,
+    /// FPCR's RMode, FZ and FIZ bits as last written, so code that wants
+    /// them need not read FPCR.
+    pub fpcr_mode: u32,
     pub mmx_ok: u32,
     /// Bit n: MM n was written; bit 8: an MMX instruction ran.
     pub mm_used: u32,
@@ -250,6 +253,9 @@ pub const FP80_STALE: usize = offset_of!(State, fp80_stale);
 pub const X87_TAINT: usize = offset_of!(State, x87_taint);
 pub const FPSR_SAVED: usize = offset_of!(State, fpsr_saved);
 pub const FPCR_X87: usize = offset_of!(State, fpcr_x87);
+pub const FPCR_MODE: usize = offset_of!(State, fpcr_mode);
+/// The FPCR bits `fpcr_mode` tracks.
+pub const FPCR_MODE_MASK: u64 = 7 << 22 | 1;
 pub const MMX_OK: usize = offset_of!(State, mmx_ok);
 pub const MM_USED: usize = offset_of!(State, mm_used);
 pub const SHADOW_ROOT: usize = offset_of!(State, shadow_root);

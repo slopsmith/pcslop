@@ -98,6 +98,7 @@ fn x87_prologue(e: &mut Emit, x: &X87Info, fallback: Label) {
     assert!(ok, "0x3f must encode");
     e.a.cbnz(Size::W, Reg(15), fallback);
     e.x87_enter(bail);
+    e.x87_fpcr();
     for i in 0..8 {
         if x.touched & 1 << i != 0 {
             e.x87_need(i, x.entry_full & 1 << i != 0, bail);
@@ -585,7 +586,7 @@ impl<'a> BlockLower<'a> {
                     FSrc::F64 => self.e.a.fmov_xd(Reg(15), src),
                     _ => {
                         let ok = self.e.a.label();
-                        // FRINTI rounds by FPCR, which x87_enter set from RC.
+                        // FRINTI rounds by FPCR, which x87_fpcr set from RC.
                         self.e.a.fp1(true, 15, FA, src);
                         self.e.a.fcvtzs(true, Size::X, Reg(15), FA);
                         if dst == FSrc::I32 {
