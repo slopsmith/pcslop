@@ -1263,6 +1263,38 @@ mod against_metal {
         );
     }
 
+    fn ram_dword(g: &Gpu, at: usize) -> u32 {
+        u32::from_le_bytes(g.ram.0[at..at + 4].try_into().unwrap())
+    }
+
+    /// Polls until the dword at `at` holds something other than `old`.
+    fn landed(g: &mut Gpu, at: usize, old: u32) -> u32 {
+        let start = std::time::Instant::now();
+        while ram_dword(g, at) == old {
+            assert!(start.elapsed().as_secs() < 5, "nothing landed at {at:#x}");
+            g.r.poll_fences(&mut g.ram);
+        }
+        ram_dword(g, at)
+    }
+
+    /// Two occlusion queries around draws that pass 100 and 200 pixels,
+    /// the second without resetting the count, then a fence in scratch
+    /// register 0 at 0x9000.
+    fn queries(g: &mut Gpu) {
+        depth(g, false);
+        g.ram.0[0x9000..0x9010].fill(0xee);
+        g.w(SCRATCH_ADDR, 0x9000);
+        g.w(SCRATCH_UMSK, 1);
+        g.w(ZB_ZPASS_DATA, 0);
+        g.draw(13, &quad(0.0, 0.0, 10.0, 10.0, RED));
+        g.w(ZB_ZPASS_ADDR, 0x9004);
+        g.draw(13, &quad(20.0, 20.0, 40.0, 30.0, RED));
+        g.w(ZB_ZPASS_ADDR, 0x9008);
+        g.w(ZB_ZPASS_DATA, 0);
+        g.draw(13, &quad(40.0, 40.0, 50.0, 50.0, RED));
+        g.w(SCRATCH_REG0, 7);
+    }
+
     #[test]
     fn occlusion_counts_match() {
         let mut counts = Vec::new();
@@ -1271,18 +1303,44 @@ mod against_metal {
             if metal && !g.r.use_metal() {
                 return;
             }
-            depth(&mut g, false);
-            g.w(ZB_ZPASS_DATA, 0);
-            g.draw(13, &quad(0.0, 0.0, 10.0, 10.0, RED));
-            g.draw(13, &quad(5.0, 5.0, 20.0, 20.0, RED));
-            g.w(ZB_ZPASS_ADDR, 0x9000);
-            counts.push(u32::from_le_bytes(g.ram.0[0x9000..0x9004].try_into().unwrap()));
+            queries(&mut g);
+            landed(&mut g, 0x9000, 0xeeee_eeee);
+            counts.push([ram_dword(&g, 0x9004), ram_dword(&g, 0x9008)]);
         }
+        assert_eq!(counts[0], [100, 300], "the second query counts on from the first");
         assert_eq!(counts[0], counts[1]);
     }
 
+    #[test]
+    fn occlusion_queries_land_once_their_draws_finish_without_waiting_for_the_gpu() {
+        let mut g = Gpu::new();
+        if !g.r.use_metal() {
+            return;
+        }
+        queries(&mut g);
+        let waits = g.r.metal_stats().unwrap().2;
+        assert_eq!(waits, 0, "a query waited for the GPU");
+        assert_eq!(landed(&mut g, 0x9000, 0xeeee_eeee), 7);
+        assert_eq!([ram_dword(&g, 0x9004), ram_dword(&g, 0x9008)], [100, 300], "the fence after the queries landed before them");
+    }
+
+    #[test]
+    fn a_fence_after_a_query_shows_only_once_the_query_landed() {
+        let mut g = Gpu::new();
+        if !g.r.use_metal() {
+            return;
+        }
+        queries(&mut g);
+        g.r.gpu_sync();
+        if g.r.mmio_read(SCRATCH_REG0, 4) == 7 {
+            assert_eq!(ram_dword(&g, 0x9004), 100, "the guest saw the fence before the query's result");
+        }
+        landed(&mut g, 0x9000, 0xeeee_eeee);
+        assert_eq!(g.r.mmio_read(SCRATCH_REG0, 4), 7);
+    }
+
     fn scratch_in_memory(g: &Gpu) -> u32 {
-        u32::from_le_bytes(g.ram.0[0x9000..0x9004].try_into().unwrap())
+        ram_dword(g, 0x9000)
     }
 
     #[test]

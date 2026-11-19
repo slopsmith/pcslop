@@ -327,6 +327,9 @@ impl Card {
         g.reset();
         g.drop_ring_run();
         g.fences = Default::default();
+        if let Some(m) = g.metal.as_mut() {
+            m.zpass_forget();
+        }
         self.st.wptr.store(g.reg(CP_RB_WPTR), Release);
         self.st.publish(&mut g);
     }
@@ -515,6 +518,9 @@ impl snapshot::Snap for Card {
         g.load(r)?;
         g.drop_ring_run();
         g.fences = Default::default();
+        if let Some(m) = g.metal.as_mut() {
+            m.zpass_forget();
+        }
         g.vga().mark_changed();
         self.st.wptr.store(g.reg(CP_RB_WPTR), Release);
         self.st.publish(&mut g);

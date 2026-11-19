@@ -358,9 +358,11 @@ impl Radeon {
         }
     }
 
-    /// Like `gpu_sync`, and also writes back the scratch registers.
+    /// Like `gpu_sync`, and also writes back occlusion queries and the
+    /// scratch registers.
     pub fn gpu_finish(&mut self, mem: &mut dyn BusMemory) {
         self.gpu_sync();
+        self.poll_fences(mem);
         self.flush_writebacks(mem);
     }
 
@@ -378,23 +380,31 @@ impl Radeon {
         true
     }
 
-    /// True while fences wait for Metal or for their writeback.
+    /// True while fences or occlusion queries wait for Metal, or fences for
+    /// their writeback.
     pub fn fences_pending(&self) -> bool {
-        !self.fences.queue.is_empty() || !self.fences.writebacks.is_empty()
+        !self.fences.queue.is_empty() || !self.fences.writebacks.is_empty() || self.metal.as_ref().is_some_and(|m| m.zpass_pending())
     }
 
-    /// Applies the fences whose draws have finished by now, and writes back
-    /// the scratch registers they changed.
+    /// Writes the occlusion queries whose draws have finished by now,
+    /// applies the fences after them, and writes back the scratch registers
+    /// they changed.
     pub fn poll_fences(&mut self, mem: &mut dyn BusMemory) {
-        if self.fences.queue.is_empty() && self.fences.writebacks.is_empty() {
+        if !self.fences_pending() {
             return;
         }
         let done = self.metal.as_mut().map_or(u64::MAX, |m| m.finished());
+        for (addr, v) in self.metal.as_mut().map_or(Vec::new(), |m| m.zpass_done(done)) {
+            self.mc_write_dword(mem, addr, v);
+        }
         self.retire_fences(done);
         self.flush_writebacks(mem);
     }
 
+    /// Applies the fences whose draws have finished by command buffer
+    /// `done`, but none after an occlusion query still to be written.
     pub(crate) fn retire_fences(&mut self, done: u64) {
+        let done = done.min(self.metal.as_ref().and_then(|m| m.zpass_oldest()).map_or(u64::MAX, |s| s - 1));
         while let Some(&(serial, n, v)) = self.fences.queue.front() {
             if serial > done {
                 break;
@@ -477,13 +487,20 @@ impl Radeon {
         true
     }
 
-    /// Writes the occlusion counter to memory when ZB_ZPASS_ADDR is written.
+    /// Writes the occlusion counter to memory when ZB_ZPASS_ADDR is written,
+    /// once the draws before it have finished, as the ZB at the end of the
+    /// card's pipeline does; a write to ZB_ZPASS_DATA sets the count.
     pub(crate) fn zpass_written(&mut self, reg: u32, v: u32, mem: &mut dyn BusMemory) -> bool {
-        if reg != ZB_ZPASS_ADDR {
-            return false;
-        }
         let count = self.reg(ZB_ZPASS_DATA);
-        self.mc_write_dword(mem, v & !3, count);
+        match (reg, self.metal.as_mut()) {
+            (ZB_ZPASS_DATA, Some(m)) => m.zpass_restart(),
+            (ZB_ZPASS_ADDR, Some(m)) => {
+                m.zpass_query(v & !3, count);
+                self.poll_fences(mem);
+            }
+            (ZB_ZPASS_ADDR, None) => self.mc_write_dword(mem, v & !3, count),
+            _ => return false,
+        }
         true
     }
 

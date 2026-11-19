@@ -72,6 +72,24 @@ impl MetalR3d {
 
     pub fn vram_written(&mut self) {}
 
+    pub fn zpass_restart(&mut self) {}
+
+    pub fn zpass_query(&mut self, _addr: u32, _base: u32) {}
+
+    pub fn zpass_done(&mut self, _done: u64) -> Vec<(u32, u32)> {
+        Vec::new()
+    }
+
+    pub fn zpass_pending(&self) -> bool {
+        false
+    }
+
+    pub fn zpass_forget(&mut self) {}
+
+    pub fn zpass_oldest(&self) -> Option<u64> {
+        None
+    }
+
     pub fn draw_vertices(&mut self, _r: &Raster, _slots: &[usize], _vs: &super::vsgen::VsDesc, _job: &super::vsgen::VertexJob) -> bool {
         false
     }

@@ -38,6 +38,9 @@ const SUBMIT_AFTER: std::time::Duration = std::time::Duration::from_micros(50);
 /// megabyte; past this the cache starts over.
 const MAX_PIPELINES: usize = 1024;
 const ALIGN: usize = 256;
+/// Occlusion counters: draws count passed pixels into the current one, and
+/// each ZB_ZPASS_ADDR write starts a new one so later draws stay out of it.
+const ZPASS_SLOTS: usize = 1 << 16;
 /// The render target is attachmentless and covers the whole 4096x4096
 /// coordinate space the scissor allows.
 const TARGET: usize = 4096;
@@ -157,6 +160,15 @@ impl Arena {
     }
 }
 
+/// A ZB_ZPASS_ADDR write that waits for its draws: `base` plus the
+/// counters in `slots` once command buffer `serial` has finished.
+struct Query {
+    serial: u64,
+    addr: u32,
+    base: u32,
+    slots: Vec<usize>,
+}
+
 struct Batch {
     cmd: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     enc: Option<Retained<ProtocolObject<dyn MTLRenderCommandEncoder>>>,
@@ -173,6 +185,12 @@ pub(crate) struct MetalR3d {
     vram: Buffer,
     vram_len: usize,
     counter: Buffer,
+    /// The counter slot draws add to, and every slot since the occlusion
+    /// count was last read or set, plus what earlier slots held.
+    slot: usize,
+    chain: Vec<usize>,
+    carried: u32,
+    queries: std::collections::VecDeque<Query>,
     /// Each command buffer signals its serial number when its work is done,
     /// which shows up well before its status says Completed.
     finished: Retained<ProtocolObject<dyn MTLSharedEvent>>,
@@ -242,7 +260,7 @@ impl MetalR3d {
         let vram_buf = unsafe {
             device.newBufferWithBytesNoCopy_length_options_deallocator(ptr, vram.len(), MTLResourceOptions::StorageModeShared, None)
         }?;
-        let counter = device.newBufferWithLength_options(16, MTLResourceOptions::StorageModeShared)?;
+        let counter = device.newBufferWithLength_options(4 * ZPASS_SLOTS, MTLResourceOptions::StorageModeShared)?;
         let finished = device.newSharedEvent()?;
         let textures = match device.newLibraryWithSource_options_error(&NSString::from_str(msl::TEXTURES), None) {
             Ok(l) => l,
@@ -258,6 +276,10 @@ impl MetalR3d {
             vram: vram_buf,
             vram_len: vram.len(),
             counter,
+            slot: 0,
+            chain: vec![0],
+            carried: 0,
+            queries: Default::default(),
             finished,
             pipelines: HashMap::new(),
             sample_tex,
@@ -469,6 +491,7 @@ impl MetalR3d {
             self.kick();
         }
         let counter = self.counter.clone();
+        let counter_at = 4 * self.slot;
         let vram = self.vram.clone();
         let Some(batch) = self.open() else { return };
         let Some(ub) = batch.arena.put(bytes_of(&u)) else { return };
@@ -492,7 +515,7 @@ impl MetalR3d {
         unsafe {
             enc.setFragmentBuffer_offset_atIndex(Some(&vram), 0, 0);
             enc.setFragmentBuffer_offset_atIndex(Some(&arena), ub, 3);
-            enc.setFragmentBuffer_offset_atIndex(Some(&counter), 0, 4);
+            enc.setFragmentBuffer_offset_atIndex(Some(&counter), counter_at, 4);
             enc.setFragmentBuffer_offset_atIndex(Some(&arena), tb, 5);
             enc.setFragmentBuffer_offset_atIndex(Some(&arena), sb, 6);
             if !images.is_empty() {
@@ -851,18 +874,84 @@ impl MetalR3d {
 
     /// Submits the queued draws, waits for every draw to finish, and returns
     /// how many pixels passed the depth and stencil tests since the last
-    /// call.
+    /// call or `zpass_restart`.
     fn sync_inner(&mut self) -> u32 {
-        if !self.busy() {
-            return 0;
-        }
         self.wait_all();
-        unsafe {
-            let p = self.counter.contents().as_ptr().cast::<u32>();
-            let n = p.read_volatile();
-            p.write_volatile(0);
-            n
+        let n = self.chain_value();
+        if n != 0 || self.chain.len() > 1 {
+            self.zpass_restart();
         }
+        n
+    }
+
+    fn slot_value(&self, slot: usize) -> u32 {
+        unsafe { self.counter.contents().as_ptr().cast::<u32>().add(slot).read_volatile() }
+    }
+
+    fn chain_value(&self) -> u32 {
+        self.chain.iter().fold(self.carried, |n, &s| n.wrapping_add(self.slot_value(s)))
+    }
+
+    /// Moves draws to a fresh counter slot. Slots are reused only after
+    /// everything that counts into them has finished.
+    fn next_slot(&mut self) {
+        self.slot = (self.slot + 1) % ZPASS_SLOTS;
+        if self.slot == 0 {
+            self.wait_all();
+            self.carried = self.chain_value();
+            self.chain.clear();
+            let values: Vec<u32> = self.queries.iter().map(|q| q.slots.iter().fold(q.base, |n, &s| n.wrapping_add(self.slot_value(s)))).collect();
+            for (q, v) in self.queries.iter_mut().zip(values) {
+                q.base = v;
+                q.slots.clear();
+            }
+        }
+        unsafe { self.counter.contents().as_ptr().cast::<u32>().add(self.slot).write_volatile(0) };
+        self.chain.push(self.slot);
+    }
+
+    /// ZB_ZPASS_DATA was written: draws from now on count from its value.
+    pub fn zpass_restart(&mut self) {
+        self.carried = 0;
+        self.chain.clear();
+        self.next_slot();
+    }
+
+    /// ZB_ZPASS_ADDR was written: `base`, the occlusion count register,
+    /// plus what the draws queued so far pass goes to `addr` once they
+    /// have finished.
+    pub fn zpass_query(&mut self, addr: u32, base: u32) {
+        let serial = self.kick();
+        self.queries.push_back(Query { serial, addr, base: base.wrapping_add(self.carried), slots: self.chain.clone() });
+        self.next_slot();
+    }
+
+    /// The address and value of each query whose draws finished by
+    /// command buffer `done`, oldest first.
+    pub fn zpass_done(&mut self, done: u64) -> Vec<(u32, u32)> {
+        let mut out = Vec::new();
+        while let Some(q) = self.queries.front() {
+            if q.serial > done {
+                break;
+            }
+            out.push((q.addr, q.slots.iter().fold(q.base, |n, &s| n.wrapping_add(self.slot_value(s)))));
+            self.queries.pop_front();
+        }
+        out
+    }
+
+    pub fn zpass_pending(&self) -> bool {
+        !self.queries.is_empty()
+    }
+
+    /// The command buffer the oldest query waiting to be written waits for.
+    pub fn zpass_oldest(&self) -> Option<u64> {
+        self.queries.front().map(|q| q.serial)
+    }
+
+    /// Drops the queries waiting for draws, for a reset or a loaded state.
+    pub fn zpass_forget(&mut self) {
+        self.queries.clear();
     }
 
 }

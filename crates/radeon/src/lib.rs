@@ -671,8 +671,7 @@ fn gpio_lines(v: u32) -> (bool, bool) {
 /// own: Metal runs draws in order, and everything else that touches VRAM
 /// waits for Metal first.
 fn fence_written(reg: u32, v: u32) -> bool {
-    matches!(reg, r3d::regs::ZB_ZPASS_DATA | r3d::regs::ZB_ZPASS_ADDR)
-        || (reg == GEN_INT_STATUS && v & SW_INT_FIRE != 0)
+    (reg == GEN_INT_STATUS && v & SW_INT_FIRE != 0)
         || (reg == GUI_DMA_CMD && v & (GUI_DMA_EOL | GUI_DMA_INTDIS) == GUI_DMA_EOL)
 }
 
