@@ -930,7 +930,7 @@ fn random_insn(rng: &mut Rng, out: &mut Vec<u8>) {
     };
     match rng.below(40) {
         38 | 39 => match rng.below(8) {
-            6 => out.push(0x9e),
+            6 => out.push([0x9e, 0x9f][rng.below(2) as usize]),
             0 => out.extend([[0x06, 0x0e, 0x1e][rng.below(3) as usize], 0x58 + rng.reg()]),
             1 => out.extend([0x0f, [0xa0, 0xa8][rng.below(2) as usize], 0x58 + rng.reg()]),
             2 => {
@@ -2106,6 +2106,7 @@ fn random_sse(rng: &mut Rng, out: &mut Vec<u8>) {
         15 => sse_op(out, [0xf3, 0xf2][rng.below(2) as usize], 0x2a, reg, rm.map(|_| rng.reg()), slot + 4 * rng.below(4)),
         16 => sse_op(out, [0xf3, 0xf2][rng.below(2) as usize], [0x2c, 0x2d][rng.below(2) as usize], rng.reg(), rm, slot),
         17 => sse_op(out, [0xf3, 0xf2][rng.below(2) as usize], 0x5a, reg, rm, slot),
+        19 => sse_op(out, 0xf3, [0x52, 0x53][rng.below(2) as usize], reg, rm, slot),
         18 => {
             out.extend([0x0f, 0xae, 2 << 3 | 5]);
             out.extend((0x3100 + 4 * rng.below(6)).to_le_bytes());

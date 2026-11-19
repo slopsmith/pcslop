@@ -46,6 +46,7 @@ pub(super) fn is_sse(insn: &Insn) -> bool {
         0x112 | 0x116 => pfx == NP || (pfx == P66 && mem),
         0x113 | 0x117 => pfx <= P66 && mem,
         0x12a | 0x12c | 0x12d | 0x15a => pfx >= F3,
+        0x152 | 0x153 => pfx == F3,
         0x16f | 0x17f => pfx == P66 || pfx == F3,
         0x16e | 0x1d6 | 0x170 | 0x1db | 0x1df | 0x1eb | 0x1ef => pfx == P66,
         0x17e => pfx == P66 || pfx == F3,
@@ -74,7 +75,7 @@ impl Emit {
         let (op, reg, rm) = (insn.op, insn.reg(), insn.rm());
         let scalar = pfx >= F3;
         let double = pfx == P66 || pfx == F2;
-        let arith = matches!(op, 0x158 | 0x159 | 0x15c | 0x15e | 0x15d | 0x15f | 0x151 | 0x1c2 | 0x12e | 0x12f | 0x12a | 0x12c | 0x12d | 0x15a);
+        let arith = matches!(op, 0x158 | 0x159 | 0x15c | 0x15e | 0x15d | 0x15f | 0x151 | 0x1c2 | 0x12e | 0x12f | 0x12a | 0x12c | 0x12d | 0x15a | 0x152 | 0x153);
         let bail = self.a.label();
         let done = self.a.label();
         if let Some(m) = insn.mem {
@@ -332,6 +333,29 @@ impl Emit {
                 }
                 self.commit_fp(reg, scalar, double);
             }
+            (0x152 | 0x153, _) => {
+                self.a.ldr_q(XA, STATE, xmm(reg));
+                self.a.ldr(Width::W, T_A, STATE, state::MXCSR as i32);
+                let ok = self.a.logic_imm(Logic::And, Size::W, T_A, T_A, 0x6000);
+                assert!(ok);
+                self.a.cbnz(Size::W, T_A, bail);
+                self.fp_src(insn, true, false, bail);
+                self.a.mrs(T_C, a64::sysreg::FPSR);
+                self.a.fmov_ws(T_A, XB);
+                self.flush_single(T_A);
+                self.a.fmov_sw(XB, T_A);
+                if op == 0x152 {
+                    self.a.fp1(false, 3, XB, XB);
+                }
+                self.a.movz(Size::W, T_A, 0x3f80, 1);
+                self.a.fmov_sw(XT, T_A);
+                self.a.fp2(false, 1, XR, XT, XB);
+                self.a.msr(a64::sysreg::FPSR, T_C);
+                self.a.fmov_ws(T_A, XR);
+                self.flush_single(T_A);
+                self.a.fmov_sw(XR, T_A);
+                self.commit_fp(reg, true, false);
+            }
             (0x1c2, _) => {
                 self.a.ldr_q(XA, STATE, xmm(reg));
                 self.fp_src(insn, scalar, double, bail);
@@ -460,6 +484,18 @@ impl Emit {
         let ok = self.a.logic_imm(Logic::And, Size::W, T_B, T_ADDR, 15);
         assert!(ok);
         self.a.cbnz(Size::W, T_B, bail);
+    }
+
+    /// Replaces the single-precision subnormal in `r` with a zero of its
+    /// sign, leaving NZCV (the guest's flags) alone.
+    fn flush_single(&mut self, r: a64::Reg) {
+        let normal = self.a.label();
+        let ok = self.a.logic_imm(Logic::And, Size::W, T_B, r, 0x7f80_0000);
+        assert!(ok);
+        self.a.cbnz(Size::W, T_B, normal);
+        let ok = self.a.logic_imm(Logic::And, Size::W, r, r, 0x8000_0000);
+        assert!(ok);
+        self.a.bind(normal);
     }
 
     fn fp_src(&mut self, insn: &Insn, scalar: bool, double: bool, bail: Label) {

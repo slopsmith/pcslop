@@ -1968,6 +1968,10 @@ impl Emit {
                 let ok = self.a.logic_imm(a64::Logic::And, Size::W, AF_AUX, T_A, x86::cpu::flags::AF as u64);
                 assert!(ok);
             }
+            0x9f => {
+                self.arith_flags(T_A);
+                self.a.bfi(Size::W, guest_reg(0), T_A, 8, 8);
+            }
             0x9c if op32 => self.pushf(),
             0x9d if op32 => return self.popf(eip, next),
             0x1ba if insn.reg() >= 4 => {
@@ -2375,12 +2379,28 @@ impl Emit {
 
     fn pushf(&mut self) {
         use x86::cpu::flags;
-        self.a.ldr(Width::W, T_A, STATE, state::EFLAGS_REST as i32);
-        let ok = self.a.logic_imm(a64::Logic::And, Size::W, T_A, T_A, !(flags::RF as u64) & 0xffff_ffff);
+        self.a.ldr(Width::W, T_C, STATE, state::EFLAGS_REST as i32);
+        let ok = self.a.logic_imm(a64::Logic::And, Size::W, T_C, T_C, !(flags::RF as u64) & 0xffff_ffff);
         assert!(ok);
-        for (c, bit) in [(Cond::Mi, 7), (Cond::Eq, 6), (Cond::Lo, 0), (Cond::Vs, 11)] {
+        self.arith_flags(T_A);
+        self.a.orr(Size::W, T_A, T_A, T_C);
+        self.a.cset(Size::W, T_B, Cond::Vs);
+        self.a.logic_shift(a64::Logic::Orr, false, Size::W, T_A, T_A, T_B, Shift::Lsl, 11);
+        self.a.ldr(Width::W, T_B, STATE, state::IF_FLAG as i32);
+        self.a.logic_shift(a64::Logic::Orr, false, Size::W, T_A, T_A, T_B, Shift::Lsl, 9);
+        self.a.ldr(Width::W, T_B, STATE, state::DF as i32);
+        self.a.logic_shift(a64::Logic::Orr, false, Size::W, T_A, T_A, T_B, Shift::Lsl, 10);
+        self.push(T_A);
+    }
+
+    /// SF, ZF, AF, PF and CF in `rd` where EFLAGS keeps them, with the
+    /// reserved bit 1 set: what LAHF puts in AH. Clobbers T_B.
+    fn arith_flags(&mut self, rd: Reg) {
+        use x86::cpu::flags;
+        self.a.movz(Size::W, rd, 2, 0);
+        for (c, bit) in [(Cond::Mi, 7), (Cond::Eq, 6), (Cond::Lo, 0)] {
             self.a.cset(Size::W, T_B, c);
-            self.a.logic_shift(a64::Logic::Orr, false, Size::W, T_A, T_A, T_B, Shift::Lsl, bit);
+            self.a.logic_shift(a64::Logic::Orr, false, Size::W, rd, rd, T_B, Shift::Lsl, bit);
         }
         self.a.ubfx(Size::W, T_B, PF_RESULT, 0, 8);
         for sh in [4, 2, 1] {
@@ -2390,15 +2410,10 @@ impl Emit {
         assert!(ok);
         let ok = self.a.logic_imm(a64::Logic::Eor, Size::W, T_B, T_B, 1);
         assert!(ok);
-        self.a.logic_shift(a64::Logic::Orr, false, Size::W, T_A, T_A, T_B, Shift::Lsl, 2);
+        self.a.logic_shift(a64::Logic::Orr, false, Size::W, rd, rd, T_B, Shift::Lsl, 2);
         let ok = self.a.logic_imm(a64::Logic::And, Size::W, T_B, AF_AUX, flags::AF as u64);
         assert!(ok);
-        self.a.orr(Size::W, T_A, T_A, T_B);
-        self.a.ldr(Width::W, T_B, STATE, state::IF_FLAG as i32);
-        self.a.logic_shift(a64::Logic::Orr, false, Size::W, T_A, T_A, T_B, Shift::Lsl, 9);
-        self.a.ldr(Width::W, T_B, STATE, state::DF as i32);
-        self.a.logic_shift(a64::Logic::Orr, false, Size::W, T_A, T_A, T_B, Shift::Lsl, 10);
-        self.push(T_A);
+        self.a.orr(Size::W, rd, rd, T_B);
     }
 
     /// POPF that leaves the system flags alone; anything else goes to the
