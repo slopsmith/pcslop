@@ -329,7 +329,7 @@ pub struct Jit {
     tier2_eager: bool,
     /// Whether x87 code stays with tier 1 (SLOPPER_JIT_TIER2_X87=exact).
     tier2_exact_x87: bool,
-    /// Whether blocks that turn out hot are compiled again by tier 2 (SLOPPER_JIT_TIER2=auto).
+    /// Whether blocks that turn out hot are compiled again by tier 2 (on unless SLOPPER_JIT_TIER2=off).
     tier2_auto: bool,
     /// Samples per tier-1 block, from the periodic kicks.
     tier2_samples: HashMap<u64, u32>,
@@ -501,7 +501,7 @@ impl Jit {
             counters_next: 0,
             tier2_eager: std::env::var("SLOPPER_JIT_TIER2").is_ok_and(|v| v == "eager"),
             tier2_exact_x87: std::env::var("SLOPPER_JIT_TIER2_X87").is_ok_and(|v| v == "exact"),
-            tier2_auto: std::env::var("SLOPPER_JIT_TIER2").is_ok_and(|v| v == "auto"),
+            tier2_auto: !std::env::var("SLOPPER_JIT_TIER2").is_ok_and(|v| v == "off" || v == "eager"),
             tier2_samples: HashMap::default(),
             tier2_queue: Vec::new(),
             tier2_tried: HashSet::default(),
