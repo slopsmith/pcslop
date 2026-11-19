@@ -42,6 +42,10 @@ impl MetalR3d {
         0
     }
 
+    pub fn compile_ms(&self) -> u64 {
+        0
+    }
+
     pub fn writes_pending(&mut self, _start: usize, _end: usize) -> bool {
         false
     }

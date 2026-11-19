@@ -1523,3 +1523,17 @@ fn pipeline_key_ignores_instruction_slots_the_program_does_not_run() {
     other.alu[2][1] = 5;
     assert_ne!(pipeline_key(&program(0), &[0], true), pipeline_key(&other, &[0], true));
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn pipeline_sources_leave_texture_types_to_the_linked_texture_library() {
+    use super::msl::{Backend, TEXTURES, shader};
+    use super::us::{Node, Program};
+    let program = Program { nodes: vec![Node { alu: (0, 1), tex: Some((0, 1)) }], tex: vec![1 << 15; 32], alu: vec![PASS_COLOUR; 64], consts: Vec::new() };
+    let src = shader(&program, &[0], true, &Backend::default());
+    assert!(src.contains("sample_tex("), "the program samples a texture");
+    for name in ["texture2d", "sampler "] {
+        assert!(!src.contains(name), "naming {name} costs every pipeline compile about 0.1 s");
+    }
+    assert!(TEXTURES.contains("[[visible]] float4 sample_tex("));
+}

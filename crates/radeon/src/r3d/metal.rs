@@ -17,7 +17,7 @@ use super::zmask::Fill;
 use super::tex::TexMem;
 use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::NSString;
+use objc2_foundation::{NSArray, NSString};
 use objc2_metal::*;
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -177,6 +177,8 @@ pub(crate) struct MetalR3d {
     /// which shows up well before its status says Completed.
     finished: Retained<ProtocolObject<dyn MTLSharedEvent>>,
     pipelines: HashMap<Vec<u32>, Option<Pipeline>>,
+    /// `sample_tex`, linked into every fragment shader.
+    sample_tex: Retained<ProtocolObject<dyn MTLFunction>>,
     /// Built on first use; None inside if it failed.
     fill_pipeline: Option<Option<ComputePipeline>>,
     batch: Option<Batch>,
@@ -192,6 +194,8 @@ pub(crate) struct MetalR3d {
     throttles: u64,
     /// Seconds the GPU spent running finished command buffers.
     gpu_seconds: f64,
+    /// Seconds spent building pipelines.
+    compile_seconds: f64,
     textures: TexCache,
     /// False to decode every texture on the CPU, for comparison.
     native_textures: bool,
@@ -240,6 +244,14 @@ impl MetalR3d {
         }?;
         let counter = device.newBufferWithLength_options(16, MTLResourceOptions::StorageModeShared)?;
         let finished = device.newSharedEvent()?;
+        let textures = match device.newLibraryWithSource_options_error(&NSString::from_str(msl::TEXTURES), None) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("radeon: MSL error in the texture library: {}", e.localizedDescription());
+                return None;
+            }
+        };
+        let sample_tex = textures.newFunctionWithName(&NSString::from_str("sample_tex"))?;
         Some(MetalR3d {
             device,
             queue,
@@ -248,6 +260,7 @@ impl MetalR3d {
             counter,
             finished,
             pipelines: HashMap::new(),
+            sample_tex,
             fill_pipeline: None,
             batch: None,
             inflight: Default::default(),
@@ -259,6 +272,7 @@ impl MetalR3d {
             waits: 0,
             throttles: 0,
             gpu_seconds: 0.0,
+            compile_seconds: 0.0,
             textures: TexCache::new(),
             native_textures: std::env::var("SLOPPER_TEX").as_deref() != Ok("decode"),
             gpu_vertices: std::env::var("SLOPPER_VS").as_deref() != Ok("cpu"),
@@ -311,7 +325,17 @@ impl MetalR3d {
         built
     }
 
-    fn build(&self, src: &str) -> Option<Pipeline> {
+    fn build(&mut self, src: &str) -> Option<Pipeline> {
+        let start = std::time::Instant::now();
+        let p = self.build_inner(src);
+        self.compile_seconds += start.elapsed().as_secs_f64();
+        if let Ok(dir) = std::env::var("SLOPPER_MSL_DUMP") {
+            let _ = std::fs::write(format!("{dir}/{}.metal", self.pipelines.len()), src);
+        }
+        p
+    }
+
+    fn build_inner(&self, src: &str) -> Option<Pipeline> {
         let lib = match self.device.newLibraryWithSource_options_error(&NSString::from_str(src), None) {
             Ok(l) => l,
             Err(e) => {
@@ -324,6 +348,9 @@ impl MetalR3d {
         let desc = MTLRenderPipelineDescriptor::new();
         desc.setVertexFunction(Some(&vs));
         desc.setFragmentFunction(Some(&fs));
+        let linked = MTLLinkedFunctions::new();
+        linked.setPrivateFunctions(Some(&NSArray::from_retained_slice(&[self.sample_tex.clone()])));
+        desc.setFragmentLinkedFunctions(Some(&linked));
         desc.setRasterSampleCount(1);
         match self.device.newRenderPipelineStateWithDescriptor_error(&desc) {
             Ok(p) => Some(p),
@@ -727,6 +754,11 @@ impl MetalR3d {
 
     pub fn pipelines(&self) -> usize {
         self.pipelines.len()
+    }
+
+    /// Milliseconds spent building pipelines.
+    pub fn compile_ms(&self) -> u64 {
+        (self.compile_seconds * 1000.0) as u64
     }
 
     /// Milliseconds the GPU spent on finished work.

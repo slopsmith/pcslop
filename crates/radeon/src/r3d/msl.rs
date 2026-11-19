@@ -7,7 +7,10 @@ use super::us::Program;
 use super::vsgen::VsDesc;
 use std::fmt::Write;
 
-const PRELUDE: &str = include_str!("msl_prelude.metal");
+const PRELUDE: &str = concat!(include_str!("msl_common.metal"), include_str!("msl_prelude.metal"));
+
+/// The library holding `sample_tex`, which every fragment shader links.
+pub(crate) const TEXTURES: &str = concat!(include_str!("msl_common.metal"), include_str!("msl_tex.metal"));
 
 const CAPTURED_VS: &str = r#"
 vertex VOut vs(uint vid [[vertex_id]], const device float4 *vb [[buffer(0)]]) {
@@ -187,7 +190,7 @@ pub(crate) fn shader_gpu(prog: &Program, slots: &[usize], perspective: bool, bac
 /// polygon offset applied here, and the face from Metal.
 fn fragment(prog: &Program, slots: &[usize], flat: &[u32], gpu_vertices: bool) -> String {
     let mut f = String::from(
-        "fragment void fs(VOut in [[stage_in]],\n    device uchar *vram [[buffer(0), raster_order_group(0)]],\n    constant Uniforms &u [[buffer(3)]],\n    device atomic_uint *counter [[buffer(4)]],\n    const device TexSlot *images [[buffer(5)]],\n    const device SamplerSlot *samplers [[buffer(6)]],\n    bool front_facing [[front_facing]]) {\n    TexTables tb = {images, samplers};\n    float4 t[32];\n    for (uint i = 0; i < 32; i++) t[i] = float4(0);\n",
+        "fragment void fs(VOut in [[stage_in]],\n    device uchar *vram [[buffer(0), raster_order_group(0)]],\n    constant Uniforms &u [[buffer(3)]],\n    device atomic_uint *counter [[buffer(4)]],\n    const device uchar *images [[buffer(5)]],\n    const device uchar *samplers [[buffer(6)]],\n    bool front_facing [[front_facing]]) {\n    float4 t[32];\n    for (uint i = 0; i < 32; i++) t[i] = float4(0);\n",
     );
     for (i, s) in slots.iter().enumerate() {
         match flat.get(i).copied().unwrap_or(0) {
@@ -233,7 +236,7 @@ fn tex_inst(f: &mut String, inst: u32) {
     if op == 2 {
         let _ = writeln!(f, "    killed = killed || any(t[{src}] < 0.0);");
     } else {
-        let _ = writeln!(f, "    t[{dst}] = sample_tex(u.tex[{id}], tb, t[{src}], {op});");
+        let _ = writeln!(f, "    t[{dst}] = sample_tex(u.tex[{id}], images, samplers, t[{src}], {op});");
     }
 }
 
