@@ -1,20 +1,14 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// Texture fetch and filtering, the alpha test, depth and stencil, blending,
+// Texture filtering, the alpha test, depth and stencil, blending,
 // the ROP and colour packing, ported from tex.rs and raster.rs so both
-// backends draw the same pixels. Everything reads and writes the VRAM buffer.
+// backends draw the same pixels. The back end reads and writes the VRAM buffer.
 // The S_ macros are the draw's back end state, which msl.rs bakes in.
 
 struct TexDesc {
-    uint enabled, stage, base, limit, width, height, format, nlevels, filter, border;
-    uint sel[4];
-    uint signed_comps;
-    uint kind, depth;
-    uint off[12];
-    uint pitch[12];
-    uint slice[12];
-    uint native, first, layers, map, sampler;
+    uint enabled, width, height, nlevels, filter, border, kind, depth;
+    uint first, layers, map, sampler, manual;
     uint pad[3];
 };
 
@@ -47,128 +41,6 @@ struct Uniforms {
     float poly[4];
 };
 
-static uint rd8(const device uchar *d, uint a, uint limit) {
-    return d[a < limit ? a : a % limit];
-}
-
-static uint rd16(const device uchar *d, uint a, uint limit) {
-    if ((a & 1) == 0 && a + 2 <= limit) return *(const device ushort *)(d + a);
-    return rd8(d, a, limit) | rd8(d, a + 1, limit) << 8;
-}
-
-static uint rd32(const device uchar *d, uint a, uint limit) {
-    if ((a & 3) == 0 && a + 4 <= limit) return *(const device uint *)(d + a);
-    return rd16(d, a, limit) | rd16(d, a + 2, limit) << 16;
-}
-
-static float un(uint v, uint bits, bool sgn) {
-    v &= (1u << bits) - 1u;
-    if (sgn && bits > 1) return max(float(int(v << (32 - bits)) >> (32 - bits)) / float((1u << (bits - 1)) - 1u), -1.0);
-    return float(v) / float((1u << bits) - 1u);
-}
-
-static float4 fields(uint v, uint w0, uint w1, uint w2, uint w3, uint sg) {
-    float4 out = float4(0, 0, 0, 1);
-    uint shift = 0;
-    out.x = un(v, w0, sg & 1);
-    shift += w0;
-    if (w1) { out.y = un(v >> shift, w1, sg & 2); shift += w1; }
-    if (w2) { out.z = un(v >> shift, w2, sg & 4); shift += w2; }
-    if (w3) { out.w = un(v >> shift, w3, sg & 8); }
-    return out;
-}
-
-static float hf(uint h) {
-    return float(as_type<half>(ushort(h)));
-}
-
-static uint2 block(uint format) {
-    switch (format) {
-    case 0: case 2: case 5: case 0x12: return uint2(1, 1);
-    case 1: case 3: case 6: case 7: case 10: case 11: case 0x14: case 0x15: case 0x18: return uint2(2, 1);
-    case 14: case 0x1a: case 0x1c: return uint2(8, 1);
-    case 0x1d: return uint2(16, 1);
-    case 0xf: return uint2(8, 4);
-    case 0x10: case 0x11: return uint2(16, 4);
-    default: return uint2(4, 1);
-    }
-}
-
-static float3 rgb565(uint c) {
-    return float3(float((c >> 11) & 31) / 31.0, float((c >> 5) & 63) / 63.0, float(c & 31) / 31.0);
-}
-
-static float4 dxt(uint format, const device uchar *d, uint a, uint limit, uint x, uint y) {
-    uint colour_at = format == 0xf ? 0 : 8;
-    uint c0 = rd16(d, a + colour_at, limit), c1 = rd16(d, a + colour_at + 2, limit);
-    float3 ca = rgb565(c0), cb = rgb565(c1);
-    uint bits = (rd8(d, a + colour_at + 4 + y, limit) >> (2 * x)) & 3;
-    float3 rgb;
-    float alpha = 1.0;
-    if (c0 > c1 || format != 0xf) {
-        rgb = bits == 0 ? ca : bits == 1 ? cb : bits == 2 ? ca * (2.0 / 3.0) + cb * (1.0 / 3.0) : ca * (1.0 / 3.0) + cb * (2.0 / 3.0);
-    } else {
-        rgb = bits == 0 ? ca : bits == 1 ? cb : bits == 2 ? ca * 0.5 + cb * 0.5 : float3(0);
-        if (bits == 3) alpha = 0.0;
-    }
-    uint i = y * 4 + x;
-    if (format == 0x10) {
-        alpha = float((rd8(d, a + i / 2, limit) >> (4 * (i % 2))) & 15) / 15.0;
-    } else if (format == 0x11) {
-        float a0 = float(rd8(d, a, limit)), a1 = float(rd8(d, a + 1, limit));
-        uint bit = 3 * i;
-        uint idx = 0;
-        for (uint k = 0; k < 3; k++) {
-            uint b = bit + k;
-            idx |= ((rd8(d, a + 2 + b / 8, limit) >> (b % 8)) & 1) << k;
-        }
-        float v;
-        if (idx == 0) v = a0;
-        else if (idx == 1) v = a1;
-        else if (a0 > a1) v = (float(8 - idx) * a0 + float(idx - 1) * a1) / 7.0;
-        else if (idx == 6) v = 0.0;
-        else if (idx == 7) v = 255.0;
-        else v = (float(6 - idx) * a0 + float(idx - 1) * a1) / 5.0;
-        alpha = v / 255.0;
-    }
-    return float4(rgb.z, rgb.y, rgb.x, alpha);
-}
-
-static float4 texel(constant TexDesc &t, const device uchar *d, uint level, uint x, uint y, uint z) {
-    uint2 b = block(t.format);
-    uint a = t.base + t.off[level] + z * t.slice[level] + (y / b.y) * t.pitch[level] + (x / b.y) * b.x;
-    uint l = t.limit;
-    switch (t.format) {
-    case 0: return fields(rd8(d, a, l), 8, 0, 0, 0, t.signed_comps);
-    case 1: return fields(rd16(d, a, l), 16, 0, 0, 0, t.signed_comps);
-    case 2: return fields(rd8(d, a, l), 4, 4, 0, 0, t.signed_comps);
-    case 3: return fields(rd16(d, a, l), 8, 8, 0, 0, t.signed_comps);
-    case 4: return fields(rd32(d, a, l), 16, 16, 0, 0, t.signed_comps);
-    case 5: return fields(rd8(d, a, l), 2, 3, 3, 0, t.signed_comps);
-    case 6: return fields(rd16(d, a, l), 5, 6, 5, 0, t.signed_comps);
-    case 7: return fields(rd16(d, a, l), 5, 5, 6, 0, t.signed_comps);
-    case 8: return fields(rd32(d, a, l), 10, 11, 11, 0, t.signed_comps);
-    case 9: return fields(rd32(d, a, l), 11, 11, 10, 0, t.signed_comps);
-    case 10: return fields(rd16(d, a, l), 4, 4, 4, 4, t.signed_comps);
-    case 11: return fields(rd16(d, a, l), 5, 5, 5, 1, t.signed_comps);
-    case 12: return fields(rd32(d, a, l), 8, 8, 8, 8, t.signed_comps);
-    case 13: return fields(rd32(d, a, l), 10, 10, 10, 2, t.signed_comps);
-    case 14: return float4(un(rd16(d, a, l), 16, t.signed_comps & 1), un(rd16(d, a + 2, l), 16, t.signed_comps & 2), un(rd16(d, a + 4, l), 16, t.signed_comps & 4), un(rd16(d, a + 6, l), 16, t.signed_comps & 8));
-    case 0xf: case 0x10: case 0x11: return dxt(t.format, d, a, l, x % 4, y % 4);
-    case 0x18: return float4(hf(rd16(d, a, l)), 0, 0, 1);
-    case 0x19: return float4(hf(rd16(d, a, l)), hf(rd16(d, a + 2, l)), 0, 1);
-    case 0x1a: return float4(hf(rd16(d, a, l)), hf(rd16(d, a + 2, l)), hf(rd16(d, a + 4, l)), hf(rd16(d, a + 6, l)));
-    case 0x1b: return float4(as_type<float>(rd32(d, a, l)), 0, 0, 1);
-    case 0x1c: return float4(as_type<float>(rd32(d, a, l)), as_type<float>(rd32(d, a + 4, l)), 0, 1);
-    case 0x1d: return float4(as_type<float>(rd32(d, a, l)), as_type<float>(rd32(d, a + 4, l)), as_type<float>(rd32(d, a + 8, l)), as_type<float>(rd32(d, a + 12, l)));
-    default: return fields(rd32(d, a, l), 8, 8, 8, 8, t.signed_comps);
-    }
-}
-
-static float pick(float4 c, uint s) {
-    return s <= 3 ? c[s] : s == 5 ? 1.0 : 0.0;
-}
-
 static bool wrap(uint mode, int i, uint size, thread uint &out) {
     int n = int(size);
     int m;
@@ -183,19 +55,6 @@ static bool wrap(uint mode, int i, uint size, thread uint &out) {
     }
     out = uint(m);
     return true;
-}
-
-// Inlining this at every tap makes each pipeline take over a second to compile.
-__attribute__((noinline)) static float4 fetch(constant TexDesc &t, const device uchar *d, uint level, int x, int y, int z) {
-    uint w = max(t.width >> level, 1u), h = max(t.height >> level, 1u);
-    uint ux, uy, uz = uint(z);
-    bool zin = t.kind != 1 || wrap((t.filter >> 6) & 7, z, max(t.depth >> level, 1u), uz);
-    if (wrap(t.filter & 7, x, w, ux) && wrap((t.filter >> 3) & 7, y, h, uy) && zin) {
-        float4 c = texel(t, d, level, ux, uy, t.kind == 0 ? 0 : uz);
-        return float4(pick(c, t.sel[1]), pick(c, t.sel[2]), pick(c, t.sel[3]), pick(c, t.sel[0]));
-    }
-    uint b = t.border;
-    return float4(float((b >> 16) & 0xff), float((b >> 8) & 0xff), float(b & 0xff), float(b >> 24)) / 255.0;
 }
 
 // As Texture::coords in tex.rs: (s, t, r), or for a cube map the face's
@@ -220,29 +79,47 @@ static float3 tex_coords(constant TexDesc &t, float4 c, bool projected) {
     return (projected && c.w != 0.0) ? c.xyz / c.w : c.xyz;
 }
 
-static float4 bilinear(constant TexDesc &t, const device uchar *d, uint level, float2 uv, int z) {
-    uv -= 0.5;
-    float2 f0 = floor(uv);
-    float2 f = uv - f0;
-    int x0 = int(f0.x), y0 = int(f0.y);
-    float4 t00 = fetch(t, d, level, x0, y0, z), t10 = fetch(t, d, level, x0 + 1, y0, z);
-    float4 t01 = fetch(t, d, level, x0, y0 + 1, z), t11 = fetch(t, d, level, x0 + 1, y0 + 1, z);
-    float4 top = t00 + (t10 - t00) * f.x, bottom = t01 + (t11 - t01) * f.x;
-    return top + (bottom - top) * f.y;
-}
-
 static float channel(float4 c, uint m) {
     return m <= 3 ? c[m] : m == 5 ? 1.0 : 0.0;
 }
 
-// Samples one image of a texture with Metal, as `fetch` and `bilinear` would.
-static float4 native_tap(constant TexDesc &t, TexTables tb, uint level, uint face, float2 st, bool linear) {
-    texture2d<float> img = tb.images[t.first + level * t.layers + face].t;
-    float4 c = img.sample(tb.samplers[t.sampler + (linear ? 1 : 0)].s, st, metal::level(0));
+static float4 mapped(constant TexDesc &t, float4 c) {
     return float4(channel(c, t.map & 7), channel(c, (t.map >> 3) & 7), channel(c, (t.map >> 6) & 7), channel(c, (t.map >> 9) & 7));
 }
 
-static float4 sample_tex(constant TexDesc &t, const device uchar *vram, const device uchar *stage, TexTables tb, float4 coords, uint op) {
+// One texel after the wrap modes, as Texture::fetch in tex.rs. Inlining it
+// at every tap slows pipeline compiles down.
+__attribute__((noinline)) static float4 fetch(constant TexDesc &t, TexTables tb, uint level, int x, int y, int z) {
+    uint w = max(t.width >> level, 1u), h = max(t.height >> level, 1u);
+    uint ux, uy, uz = uint(z);
+    bool zin = t.kind != 1 || wrap((t.filter >> 6) & 7, z, max(t.depth >> level, 1u), uz);
+    if (wrap(t.filter & 7, x, w, ux) && wrap((t.filter >> 3) & 7, y, h, uy) && zin) {
+        texture2d<float> img = tb.images[t.first + level * t.layers + (t.kind == 0 ? 0 : uz)].t;
+        return mapped(t, img.read(uint2(ux, uy)));
+    }
+    uint b = t.border;
+    return float4(float((b >> 16) & 0xff), float((b >> 8) & 0xff), float(b & 0xff), float(b >> 24)) / 255.0;
+}
+
+static float4 bilinear(constant TexDesc &t, TexTables tb, uint level, float2 uv, int z) {
+    uv -= 0.5;
+    float2 f0 = floor(uv);
+    float2 f = uv - f0;
+    int x0 = int(f0.x), y0 = int(f0.y);
+    float4 t00 = fetch(t, tb, level, x0, y0, z), t10 = fetch(t, tb, level, x0 + 1, y0, z);
+    float4 t01 = fetch(t, tb, level, x0, y0 + 1, z), t11 = fetch(t, tb, level, x0 + 1, y0 + 1, z);
+    float4 top = t00 + (t10 - t00) * f.x, bottom = t01 + (t11 - t01) * f.x;
+    return top + (bottom - top) * f.y;
+}
+
+// Samples one image of a texture with a Metal sampler, as `fetch` and
+// `bilinear` would.
+static float4 native_tap(constant TexDesc &t, TexTables tb, uint level, uint face, float2 st, bool linear) {
+    texture2d<float> img = tb.images[t.first + level * t.layers + face].t;
+    return mapped(t, img.sample(tb.samplers[t.sampler + (linear ? 1 : 0)].s, st, metal::level(0)));
+}
+
+static float4 sample_tex(constant TexDesc &t, TexTables tb, float4 coords, uint op) {
     float3 str = tex_coords(t, coords, op == 3);
     float2 st = str.xy;
     float2 size = float2(t.width, t.height);
@@ -251,13 +128,12 @@ static float4 sample_tex(constant TexDesc &t, const device uchar *vram, const de
     float lod = rho > 0.0 ? 0.5 * log2(rho) : 0.0;
     if (op == 4) lod += coords.w;
     if (!t.enabled) return float4(0, 0, 0, 1);
-    const device uchar *d = t.stage ? stage : vram;
     bool minify = lod > 0.0;
     uint mip = (t.filter >> 13) & 3;
     uint level = 0;
     if (minify && mip != 0) level = min(uint(round(lod)) + ((t.filter >> 17) & 0xf), t.nlevels - 1);
     bool linear = minify ? ((t.filter >> 11) & 3) == 2 : ((t.filter >> 9) & 3) == 2;
-    if (t.native) return native_tap(t, tb, level, t.kind == 2 ? uint(str.z) : 0, st, linear);
+    if (!t.manual) return native_tap(t, tb, level, t.kind == 2 ? uint(str.z) : 0, st, linear);
     float2 wh = float2(max(t.width >> level, 1u), max(t.height >> level, 1u));
     float2 uv = st * wh;
     int z0 = 0;
@@ -270,10 +146,10 @@ static float4 sample_tex(constant TexDesc &t, const device uchar *vram, const de
         z0 = int(floor(wz));
         fz = linear ? wz - floor(wz) : 0.0;
     }
-    if (!linear) return fetch(t, d, level, int(floor(uv.x)), int(floor(uv.y)), z0);
-    float4 a = bilinear(t, d, level, uv, z0);
+    if (!linear) return fetch(t, tb, level, int(floor(uv.x)), int(floor(uv.y)), z0);
+    float4 a = bilinear(t, tb, level, uv, z0);
     if (fz == 0.0) return a;
-    return a + (bilinear(t, d, level, uv, z0 + 1) - a) * fz;
+    return a + (bilinear(t, tb, level, uv, z0 + 1) - a) * fz;
 }
 
 static float presub(uint op, float a, float b) {

@@ -11,8 +11,9 @@ use super::V4;
 pub(crate) enum TexMem {
     /// Byte offset into VRAM.
     Vram(usize),
-    /// A copy of the texture's bytes from system memory.
-    Copy(Vec<u8>),
+    /// A copy of the texture's bytes from system memory, read at this
+    /// address in the memory controller's space.
+    Copy { bytes: Vec<u8>, addr: u32 },
 }
 
 #[derive(Clone)]
@@ -126,7 +127,7 @@ impl Texture {
     fn bytes<'a>(&'a self, vram: &'a [u8]) -> (&'a [u8], usize) {
         match &self.mem {
             TexMem::Vram(o) => (vram, *o),
-            TexMem::Copy(v) => (v, 0),
+            TexMem::Copy { bytes, .. } => (bytes, 0),
         }
     }
 
@@ -186,6 +187,13 @@ impl Texture {
             0x1d => [0, 1, 2, 3].map(|c| f32::from_bits(d32(4 * c))),
             _ => fields(d32(0), &[8, 8, 8, 8]),
         }
+    }
+
+    /// The raw components of every texel of one image: `layer` is the cube
+    /// face or volume slice. Row by row, C0 first.
+    pub fn decode(&self, vram: &[u8], level: usize, layer: u32) -> Vec<V4> {
+        let (w, h) = ((self.width >> level).max(1), (self.height >> level).max(1));
+        (0..h).flat_map(|y| (0..w).map(move |x| (x, y))).map(|(x, y)| self.texel(vram, level, x, y, layer)).collect()
     }
 
     fn swizzle(&self, c: V4) -> V4 {

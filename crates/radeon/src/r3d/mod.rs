@@ -423,9 +423,9 @@ impl Radeon {
                 let c = self.metal.as_ref().map_or(0, |m| m.committed());
                 let p = self.metal.as_ref().map_or(0, |m| m.pipelines());
                 let ms = self.metal.as_ref().map_or(0, |m| m.gpu_ms());
-                let (tn, tu) = self.metal.as_ref().map_or((0, 0), |m| m.texture_stats());
+                let (tn, td, tm, tu) = self.metal.as_ref().map_or((0, 0, 0, 0), |m| m.texture_stats());
                 let vd = self.metal.as_ref().map_or(0, |m| m.vertex_draws());
-                s += &format!(" | metal draws {d} gpu vertices {vd} cpu fallbacks {f} waits {w} command buffers {c} throttled {t} pipelines {p} gpu ms {ms} metal textures {tn} dxt copies {tu}")
+                s += &format!(" | metal draws {d} gpu vertices {vd} cpu fallbacks {f} waits {w} command buffers {c} throttled {t} pipelines {p} gpu ms {ms} metal textures {tn} decoded {td} manual {tm} uploads {tu}")
             }
             None => s += " | cpu",
         }
@@ -688,7 +688,7 @@ impl Radeon {
             None => {
                 let mut buf = vec![0; t.span().min(64 << 20)];
                 self.mc_read(mem, base, &mut buf);
-                TexMem::Copy(buf)
+                TexMem::Copy { bytes: buf, addr: base }
             }
         };
         t.sel = [bits(f1, 9, 3), bits(f1, 12, 3), bits(f1, 15, 3), bits(f1, 18, 3)];

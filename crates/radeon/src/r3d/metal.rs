@@ -14,7 +14,7 @@ use super::vsgen::{ArraySrc, VertexJob, VsDesc};
 use super::{msl, us};
 use super::raster::{Captured, Raster};
 use super::zmask::Fill;
-use super::tex::{TexMem, Texture};
+use super::tex::TexMem;
 use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
@@ -38,9 +38,6 @@ const SUBMIT_AFTER: std::time::Duration = std::time::Duration::from_micros(50);
 /// megabyte; past this the cache starts over.
 const MAX_PIPELINES: usize = 1024;
 const ALIGN: usize = 256;
-/// Bytes of a draw's texture and sampler tables at most: 16 maps of 12
-/// levels of 6 faces, and two samplers each.
-const TABLES: usize = 8 * (16 * 12 * 6 + 32);
 /// The render target is attachmentless and covers the whole 4096x4096
 /// coordinate space the scissor allows.
 const TARGET: usize = 4096;
@@ -49,27 +46,18 @@ const TARGET: usize = 4096;
 #[derive(Clone, Copy, Default)]
 struct TexDesc {
     enabled: u32,
-    stage: u32,
-    base: u32,
-    limit: u32,
     width: u32,
     height: u32,
-    format: u32,
     nlevels: u32,
     filter: u32,
     border: u32,
-    sel: [u32; 4],
-    signed: u32,
     kind: u32,
     depth: u32,
-    off: [u32; 12],
-    pitch: [u32; 12],
-    slice: [u32; 12],
-    native: u32,
     first: u32,
     layers: u32,
     map: u32,
     sampler: u32,
+    manual: u32,
     pad: [u32; 3],
 }
 
@@ -205,7 +193,7 @@ pub(crate) struct MetalR3d {
     /// Seconds the GPU spent running finished command buffers.
     gpu_seconds: f64,
     textures: TexCache,
-    /// False to sample every texture in software, for comparison.
+    /// False to decode every texture on the CPU, for comparison.
     native_textures: bool,
     /// False to run every vertex program on the CPU, for comparison.
     gpu_vertices: bool,
@@ -272,7 +260,7 @@ impl MetalR3d {
             throttles: 0,
             gpu_seconds: 0.0,
             textures: TexCache::new(),
-            native_textures: std::env::var("SLOPPER_TEX").as_deref() != Ok("software"),
+            native_textures: std::env::var("SLOPPER_TEX").as_deref() != Ok("decode"),
             gpu_vertices: std::env::var("SLOPPER_VS").as_deref() != Ok("cpu"),
             vertex_draws: 0,
         })
@@ -377,11 +365,7 @@ impl MetalR3d {
 
     /// The pipeline for a draw, or None if the CPU must draw it.
     fn prepare_inner(&mut self, r: &Raster, cap: &Captured) -> Option<Pipeline> {
-        let copies: usize = r.textures.iter().map(|t| match t {
-            Some(Texture { mem: TexMem::Copy(v), .. }) => v.len() + ALIGN,
-            _ => 0,
-        }).sum();
-        if cap.slots.len() > MAX_SLOTS || copies + size_of::<Uniforms>() + (1 << 20) > ARENA_SIZE {
+        if cap.slots.len() > MAX_SLOTS || !self.textures_fit(r) {
             self.fallbacks += 1;
             return None;
         }
@@ -452,26 +436,14 @@ impl MetalR3d {
                 (d.offset + y0 as usize * d.pitch * bpp, d.offset + (y1 as usize + 1) * d.pitch * bpp)
             }))
             .collect();
-        let mut copies: Vec<(usize, &[u8])> = Vec::new();
-        for (i, t) in r.textures.iter().enumerate() {
-            if let Some(Texture { mem: TexMem::Copy(v), .. }) = t {
-                copies.push((i, v));
-            }
-        }
-        let need = vertex_bytes + copies.iter().map(|c| c.1.len() + ALIGN).sum::<usize>() + size_of::<Uniforms>() + TABLES + 6 * ALIGN;
+        let (images, samplers) = self.texture_images(r, &mut u);
+        let need = vertex_bytes + size_of::<Uniforms>() + 8 * (images.len() + samplers.len()) + 6 * ALIGN;
         if self.batch.as_ref().is_some_and(|b| b.arena.used + need > ARENA_SIZE) {
             self.kick();
         }
-        let (images, samplers) = self.native_textures(r, &mut u);
         let counter = self.counter.clone();
         let vram = self.vram.clone();
         let Some(batch) = self.open() else { return };
-        for (i, data) in copies {
-            let Some(at) = batch.arena.put(data) else { return };
-            u.tex[i].stage = 1;
-            u.tex[i].base = at as u32;
-            u.tex[i].limit = ARENA_SIZE as u32;
-        }
         let Some(ub) = batch.arena.put(bytes_of(&u)) else { return };
         let ids: Vec<u64> = images.iter().map(|t| resource_id(t.gpuResourceID())).collect();
         let Some(tb) = batch.arena.put(slice_bytes(&ids)) else { return };
@@ -492,8 +464,6 @@ impl MetalR3d {
         enc.setRenderPipelineState(pipeline);
         unsafe {
             enc.setFragmentBuffer_offset_atIndex(Some(&vram), 0, 0);
-            enc.setFragmentBuffer_offset_atIndex(Some(&vram), 0, 1);
-            enc.setFragmentBuffer_offset_atIndex(Some(&arena), 0, 2);
             enc.setFragmentBuffer_offset_atIndex(Some(&arena), ub, 3);
             enc.setFragmentBuffer_offset_atIndex(Some(&counter), 0, 4);
             enc.setFragmentBuffer_offset_atIndex(Some(&arena), tb, 5);
@@ -526,6 +496,9 @@ impl MetalR3d {
         }).sum::<usize>();
         let bytes = 4 * words + size_of::<super::vsgen::VsUniforms>() + (job.arrays.len() + 4) * ALIGN;
         if slots.len() > MAX_SLOTS || bytes > ARENA_SIZE / 2 {
+            return false;
+        }
+        if !self.textures_fit(r) {
             return false;
         }
         let Some(pipeline) = self.vs_pipeline(r, slots, vs) else { return false };
@@ -587,25 +560,37 @@ impl MetalR3d {
         self.vertex_draws
     }
 
-    /// Points the descriptors of the textures Metal can sample at their
-    /// images and samplers, and returns the images and sampler handles the
-    /// draw's tables list.
-    fn native_textures(&mut self, r: &Raster, u: &mut Uniforms) -> (Vec<MetalTexture>, Vec<u64>) {
+    /// Whether every texture of `r` fits in a draw's tables.
+    fn textures_fit(&self, r: &Raster) -> bool {
+        r.textures.iter().flatten().all(|t| metal_tex::plan(t, self.vram_len, self.native_textures).is_some())
+    }
+
+    /// Points the descriptors of `r`'s textures at their images and
+    /// samplers, and returns the images and sampler handles the draw's
+    /// tables list. Copies of VRAM that queued draws still write wait for
+    /// them first.
+    fn texture_images(&mut self, r: &Raster, u: &mut Uniforms) -> (Vec<MetalTexture>, Vec<u64>) {
         let (mut images, mut samplers) = (Vec::new(), Vec::new());
-        if !self.native_textures {
-            return (images, samplers);
-        }
-        let vram = unsafe { std::slice::from_raw_parts(self.vram.contents().as_ptr().cast::<u8>(), self.vram_len) };
         for (i, t) in r.textures.iter().enumerate() {
-            let Some(plan) = t.as_ref().and_then(|t| metal_tex::plan(t, self.vram_len)) else { continue };
+            let Some(t) = t else { continue };
+            let Some(plan) = metal_tex::plan(t, self.vram_len, self.native_textures) else { continue };
+            if let metal_tex::Origin::Vram(base) = plan.key.origin
+                && plan.key.image != metal_tex::Image::Alias
+                && self.writes_pending(base, base + plan.key.span)
+            {
+                self.wait_all();
+                self.textures.invalidate();
+            }
             let pair = [false, true].map(|linear| self.textures.sampler(&self.device, plan.sampler, linear));
             let [Some(near), Some(lin)] = pair else { continue };
-            let Some(imgs) = self.textures.images(&self.device, &self.vram, vram, &plan) else { continue };
+            let vram = unsafe { std::slice::from_raw_parts(self.vram.contents().as_ptr().cast::<u8>(), self.vram_len) };
+            self.textures.manual += plan.manual as u64;
+            let Some(imgs) = self.textures.images(&self.device, &self.vram, vram, t, &plan.key) else { continue };
             let d = &mut u.tex[i];
-            d.native = 1;
             d.first = images.len() as u32;
-            d.layers = plan.layers;
+            d.layers = plan.key.layers;
             d.map = plan.map;
+            d.manual = plan.manual as u32;
             d.sampler = samplers.len() as u32;
             images.extend(imgs.iter().cloned());
             samplers.push(resource_id(near.gpuResourceID()));
@@ -619,15 +604,18 @@ impl MetalR3d {
         self.textures.invalidate();
     }
 
-    /// Samples every texture in software when false.
+    /// Decodes every texture on the CPU when false.
     #[cfg(test)]
     pub fn set_native_textures(&mut self, on: bool) {
         self.native_textures = on;
     }
 
-    /// Texture binds sampled by Metal, and DXT textures copied.
-    pub fn texture_stats(&self) -> (u64, u64) {
-        (self.textures.native, self.textures.uploads)
+    /// Texture binds sampled from native formats and from CPU-decoded
+    /// images, binds the shader filtered itself, and copies and decodes
+    /// made.
+    pub fn texture_stats(&self) -> (u64, u64, u64, u64) {
+        let t = &self.textures;
+        (t.native, t.decoded, t.manual, t.uploads)
     }
 
     fn uniforms(&self, r: &Raster) -> Uniforms {
@@ -676,28 +664,13 @@ impl MetalR3d {
             let Some(t) = t else { continue };
             let d = &mut u.tex[i];
             d.enabled = 1;
-            d.base = match t.mem {
-                TexMem::Vram(o) => o as u32,
-                TexMem::Copy(_) => 0,
-            };
-            d.limit = self.vram_len as u32;
             d.width = t.width;
             d.height = t.height;
-            d.format = t.format;
             d.nlevels = t.levels.len().min(12) as u32;
             d.filter = t.filter;
             d.border = t.border;
-            d.sel = t.sel;
-            d.signed = t.signed;
             d.kind = t.kind;
             d.depth = t.depth;
-            for (l, &n) in t.slices.iter().take(12).enumerate() {
-                d.slice[l] = n as u32;
-            }
-            for (l, &(off, pitch)) in t.levels.iter().take(12).enumerate() {
-                d.off[l] = off as u32;
-                d.pitch[l] = pitch as u32;
-            }
         }
         u
     }
@@ -831,19 +804,27 @@ impl MetalR3d {
         self.completed
     }
 
-    /// Submits the queued draws, waits for every draw to finish, and returns
-    /// how many pixels passed the depth and stencil tests since the last
-    /// call.
-    fn sync_inner(&mut self) -> u32 {
+    /// Submits the queued draws and waits for every draw to finish.
+    fn wait_all(&mut self) {
         self.kick();
         if self.inflight.is_empty() {
-            return 0;
+            return;
         }
         self.waits += 1;
         while let Some((cmd, arena, serial)) = self.inflight.pop_front() {
             cmd.waitUntilCompleted();
             self.retire(&cmd, arena, serial);
         }
+    }
+
+    /// Submits the queued draws, waits for every draw to finish, and returns
+    /// how many pixels passed the depth and stencil tests since the last
+    /// call.
+    fn sync_inner(&mut self) -> u32 {
+        if !self.busy() {
+            return 0;
+        }
+        self.wait_all();
         unsafe {
             let p = self.counter.contents().as_ptr().cast::<u32>();
             let n = p.read_volatile();

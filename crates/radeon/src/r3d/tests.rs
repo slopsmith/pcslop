@@ -756,19 +756,29 @@ mod against_metal {
     /// returns how many draws the GPU's vertex stage took.
     fn same(scene: impl Fn(&mut Gpu), tolerance: u32, edges: usize) -> u64 {
         compare(&scene, tolerance, edges, true, false);
-        compare(&scene, tolerance, edges, true, true).1
+        compare(&scene, tolerance, edges, true, true).vertex_draws
     }
 
-    /// Like `same`, with Metal's texture sampling and vertex stage on or
-    /// off, and returns how many texture binds Metal sampled and how many
-    /// draws its vertex stage took.
-    fn compare(scene: impl Fn(&mut Gpu), tolerance: u32, edges: usize, native: bool, gpu_vertices: bool) -> (u64, u64) {
+    /// What Metal did in a `compare`: texture binds it sampled from native
+    /// formats and from CPU-decoded images, binds the shader filtered
+    /// itself, and draws its vertex stage took.
+    #[derive(Default)]
+    struct Seen {
+        native: u64,
+        decoded: u64,
+        manual: u64,
+        vertex_draws: u64,
+    }
+
+    /// Like `same`, with Metal's native texture formats and vertex stage on
+    /// or off.
+    fn compare(scene: impl Fn(&mut Gpu), tolerance: u32, edges: usize, native: bool, gpu_vertices: bool) -> Seen {
         let mut cpu = Gpu::new();
         scene(&mut cpu);
         let mut gpu = Gpu::new();
         if !gpu.r.use_metal() {
             eprintln!("no Metal device; skipping");
-            return (1, 1);
+            return Seen { native: 1, decoded: 1, manual: 0, vertex_draws: 1 };
         }
         gpu.r.metal.as_mut().unwrap().set_native_textures(native);
         gpu.r.metal.as_mut().unwrap().set_gpu_vertices(gpu_vertices);
@@ -792,14 +802,18 @@ mod against_metal {
         assert!(differ <= edges, "{differ} pixels differ");
         assert!(cpu.count(0) < 64 * 64, "the scene drew nothing");
         let m = gpu.r.metal.as_ref().unwrap();
-        (m.texture_stats().0, m.vertex_draws())
+        let (native, decoded, manual, _) = m.texture_stats();
+        Seen { native, decoded, manual, vertex_draws: m.vertex_draws() }
     }
 
-    /// Compares `scene` with Metal sampling its textures and with the shader
-    /// sampling them in software, and returns whether Metal sampled any.
+    /// Compares `scene` with Metal sampling its textures in their native
+    /// formats and decoded on the CPU, and returns whether Metal's samplers
+    /// sampled native formats only.
     fn both_samplers(scene: impl Fn(&mut Gpu), tolerance: u32) -> bool {
-        compare(&scene, tolerance, 0, false, true);
-        compare(&scene, tolerance, 0, true, true).0 > 0
+        let off = compare(&scene, tolerance, 0, false, true);
+        assert!(off.native == 0 && off.decoded > 0, "with native formats off every texture is decoded");
+        let on = compare(&scene, tolerance, 0, true, true);
+        on.native > 0 && on.decoded == 0 && on.manual == 0
     }
 
     #[test]
@@ -1094,13 +1108,15 @@ mod against_metal {
             (14, tex64),
             (0x1a, half),
         ];
-        for (format, data) in cases {
+        let decoded = [(2, checker(8, 1, &[0x2d], &[0xf0], 0)), (5, checker(8, 1, &[0x6b], &[0xd4], 0)), (7, checker(8, 2, &[0x1f, 0xf8], &[0xe0, 0x07], 0)), (8, checker(8, 4, &[0x10, 0x80, 0xf0, 0xff], &[0xf0, 0x20, 0x40, 0x80], 0))];
+        let cases = cases.into_iter().map(|c| (c, true)).chain(decoded.into_iter().map(|c| (c, false)));
+        for ((format, data), native) in cases {
             for filter in [0, 2 << 9 | 2 << 11] {
                 let scene = |g: &mut Gpu| {
                     texture(g, format, 8, 0, filter, &data);
                     draw_uv(g, [(0.0, 0.0, 0.0, 0.0), (64.0, 0.0, 1.0, 0.0), (64.0, 64.0, 1.0, 1.0), (0.0, 64.0, 0.0, 1.0)]);
                 };
-                assert!(both_samplers(scene, 2), "format {format:#x} sampled in software");
+                assert_eq!(both_samplers(scene, 2), native, "format {format:#x}");
             }
         }
     }
@@ -1142,6 +1158,51 @@ mod against_metal {
                 };
                 assert_eq!(both_samplers(scene, 2), native, "wrap {wrap:#x} border {border:#x}");
             }
+        }
+    }
+
+    #[test]
+    fn volume_textures_match() {
+        for linear in [0, 2 << 9 | 2 << 11] {
+            let scene = |g: &mut Gpu| {
+                layered_texture(g, 1, 2, &[0xff11_2233, 0xff44_5566, 0x8077_8899, 0x00aa_bbcc], 0);
+                g.w(TX_FILTER0_0, 2 | 2 << 3 | 2 << 6 | linear);
+                for (k, r) in [0.1f32, 0.3, 0.6, 0.9].iter().enumerate() {
+                    let x = 16.0 * k as f32;
+                    g.draw(13, &quad(x, 0.0, x + 16.0, 16.0, [0.5, 0.5, *r, 1.0]));
+                }
+                let ramp = |x: f32, y: f32, r: f32| v(x, y, [0.5, 0.5, r, 1.0]);
+                g.draw(13, &[ramp(0.0, 20.0, -0.2), ramp(64.0, 20.0, 1.2), ramp(64.0, 40.0, 1.2), ramp(0.0, 40.0, -0.2)]);
+            };
+            let seen = compare(scene, 1, 0, true, true);
+            assert!(seen.manual > 0, "volumes are read texel by texel");
+        }
+    }
+
+    /// Points texture unit 0 at system memory through the AGP aperture and
+    /// puts `texels` there.
+    fn in_system_memory(g: &mut Gpu, texels: &[u8]) {
+        g.ram.0[0x8_0000..][..texels.len()].copy_from_slice(texels);
+        g.w(MC_AGP_LOCATION, 0xe0ff_e000);
+        g.w(AGP_BASE, 0x8_0000);
+        g.w(TX_OFFSET_0, 0xe000_0000);
+    }
+
+    #[test]
+    fn textures_in_system_memory_match_and_follow_rewrites() {
+        let first = checker(8, 4, &[0x10, 0x80, 0xf0, 0xff], &[0xf0, 0x20, 0x40, 0x80], 0);
+        let second = checker(8, 4, &[0x90, 0x10, 0x30, 0xff], &[0x00, 0xe0, 0x60, 0x40], 0);
+        for (format, signed) in [(12, 0), (12, 0b0110)] {
+            let scene = |g: &mut Gpu| {
+                texture(g, format, 8, 0, 2 << 9 | 2 << 11, &[]);
+                g.w(TX_FORMAT1_0, format | 0xa60 << 4 | signed << 5);
+                g.w(GA_ROUND_MODE, 1 << 4);
+                in_system_memory(g, &first);
+                draw_uv(g, [(0.0, 0.0, 0.0, 0.0), (32.0, 0.0, 1.0, 0.0), (32.0, 64.0, 1.0, 1.0), (0.0, 64.0, 0.0, 1.0)]);
+                in_system_memory(g, &second);
+                draw_uv(g, [(32.0, 0.0, 0.0, 0.0), (64.0, 0.0, 1.0, 0.0), (64.0, 64.0, 1.0, 1.0), (32.0, 64.0, 0.0, 1.0)]);
+            };
+            assert_eq!(both_samplers(scene, 2), signed == 0, "signed {signed:#b}");
         }
     }
 
