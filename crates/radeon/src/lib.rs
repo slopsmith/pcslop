@@ -486,6 +486,9 @@ impl Radeon {
         }
         let new = (old & !mask) | (v & mask);
         match reg {
+            // Vista's driver parks the pitch at 0 before mid-buffer 2D blits and
+            // draws again without restoring it, so a zero pitch keeps the old state.
+            r3d::regs::RB3D_COLORPITCH0 if new & 0x3ffe == 0 => return,
             CRTC_STATUS => {
                 if new & CRTC_VBLANK_SAVE != 0 {
                     self.vblank_acked[0] = self.frame();

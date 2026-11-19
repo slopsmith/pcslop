@@ -155,6 +155,16 @@ fn a_quad_fills_exactly_the_pixels_whose_centres_it_covers() {
 }
 
 #[test]
+fn a_zero_colour_pitch_leaves_the_bound_colour_buffer_in_place() {
+    let mut g = Gpu::new();
+    g.w(RB3D_COLORPITCH0, 6 << 21);
+    g.w(RB3D_COLOR_CHANNEL_MASK, 0x68f);
+    g.draw(13, &quad(2.0, 3.0, 10.0, 7.0, RED));
+    assert_eq!(g.count(0xffff_0000), 8 * 4);
+    assert_eq!(g.px(9, 6), 0xffff_0000);
+}
+
+#[test]
 fn triangles_sharing_an_edge_touch_each_pixel_once() {
     let mut g = Gpu::new();
     g.w(RB3D_BLENDCNTL, 1 | 33 << 16 | 33 << 24);
