@@ -30,6 +30,10 @@ impl MetalR3d {
         0
     }
 
+    pub fn finished(&self) -> u64 {
+        0
+    }
+
     pub fn busy(&self) -> bool {
         false
     }

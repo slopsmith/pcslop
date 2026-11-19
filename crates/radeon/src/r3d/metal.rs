@@ -185,6 +185,9 @@ pub(crate) struct MetalR3d {
     vram: Buffer,
     vram_len: usize,
     counter: Buffer,
+    /// Each command buffer signals its serial number when its work is done,
+    /// which shows up well before its status says Completed.
+    finished: Retained<ProtocolObject<dyn MTLSharedEvent>>,
     pipelines: HashMap<Vec<u32>, Option<Pipeline>>,
     /// Built on first use; None inside if it failed.
     fill_pipeline: Option<Option<ComputePipeline>>,
@@ -248,12 +251,14 @@ impl MetalR3d {
             device.newBufferWithBytesNoCopy_length_options_deallocator(ptr, vram.len(), MTLResourceOptions::StorageModeShared, None)
         }?;
         let counter = device.newBufferWithLength_options(16, MTLResourceOptions::StorageModeShared)?;
+        let finished = device.newSharedEvent()?;
         Some(MetalR3d {
             device,
             queue,
             vram: vram_buf,
             vram_len: vram.len(),
             counter,
+            finished,
             pipelines: HashMap::new(),
             fill_pipeline: None,
             batch: None,
@@ -764,6 +769,13 @@ impl MetalR3d {
         self.committed
     }
 
+    /// The serial number of the last command buffer whose work has finished,
+    /// though Metal may not have retired it yet. Cheap enough for every
+    /// register write: it autoreleases nothing.
+    pub fn finished(&self) -> u64 {
+        self.completed.max(self.finished.signaledValue())
+    }
+
     pub fn stats(&self) -> (u64, u64, u64) {
         (self.draws, self.fallbacks, self.waits)
     }
@@ -775,6 +787,7 @@ impl MetalR3d {
             if let Some(enc) = b.enc.take() {
                 enc.endEncoding();
             }
+            b.cmd.encodeSignalEvent_value(ProtocolObject::from_ref(&*self.finished), self.committed + 1);
             b.cmd.commit();
             self.committed += 1;
             self.inflight.push_back((b.cmd, b.arena, self.committed));

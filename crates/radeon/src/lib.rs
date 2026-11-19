@@ -394,7 +394,7 @@ impl Radeon {
         if idle_polled(reg) && (!self.defer_ring || idle_polled_blind(reg)) {
             self.gpu_sync();
         } else if (SCRATCH_REG0..=SCRATCH_REG7).contains(&reg) && !self.fences.is_empty() {
-            let done = self.metal.as_mut().map_or(u64::MAX, |m| m.completed());
+            let done = self.metal.as_mut().map_or(u64::MAX, |m| m.finished());
             self.retire_fences(done);
         }
         match reg {
@@ -472,7 +472,7 @@ impl Radeon {
         if fence_written(reg, v & mask) {
             self.gpu_sync();
         }
-        self.poll_fences_sometimes(mem);
+        self.poll_fences(mem);
         let old = self.reg(reg);
         let scratch = match reg {
             SCRATCH_REG0..=SCRATCH_REG7 => Some((reg - SCRATCH_REG0) / 4),

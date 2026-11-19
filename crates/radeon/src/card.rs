@@ -26,6 +26,9 @@ const SLICE: u32 = 32;
 const SPIN: Duration = Duration::from_micros(50);
 /// How often the worker looks for finished Metal command buffers.
 const GPU_POLL: Duration = Duration::from_micros(50);
+/// How long after the last fence landed the worker spins instead while fences
+/// wait: about a Metal round trip, so a GPU-bound guest does not keep a core busy.
+const FENCE_SPIN: Duration = Duration::from_micros(500);
 
 /// What both threads share without the lock.
 #[derive(Default)]
@@ -272,7 +275,7 @@ impl Card {
     pub fn poll(&mut self, mem: &mut dyn BusMemory) {
         if !self.threaded() && self.st.fences.load(Acquire) {
             let mut g = self.lock();
-            g.poll_fences(mem);
+            g.gpu_poll(mem);
             self.st.publish(&mut g);
         }
     }
@@ -522,6 +525,8 @@ fn worker(core: &Mutex<Radeon>, st: &Status, mut bus: Box<dyn BusMemory + Send>,
         }
     };
     let mut idle_since: Option<Instant> = None;
+    let mut fence_since: Option<Instant> = None;
+    let mut retired = 0;
     while !st.stop.load(Acquire) {
         let target = st.submitted.load(SeqCst);
         if target != st.done.load(Relaxed) {
@@ -560,9 +565,23 @@ fn worker(core: &Mutex<Radeon>, st: &Status, mut bus: Box<dyn BusMemory + Send>,
             let mut g = lock(core, st);
             g.gpu_poll(bus);
             publish(&mut g);
+            let fenced = st.fences.load(Acquire);
+            if !fenced || g.fences.retired != retired {
+                retired = g.fences.retired;
+                fence_since = None;
+            }
             drop(g);
-            if st.gpu_busy.load(Acquire) {
-                thread::park_timeout(GPU_POLL);
+            if fenced && fence_since.get_or_insert_with(Instant::now).elapsed() < FENCE_SPIN {
+                while st.want_lock.load(Relaxed) > 0 {
+                    thread::yield_now();
+                }
+                std::hint::spin_loop();
+            } else {
+                st.sleeping.store(true, SeqCst);
+                if !st.ring_pending() && st.gpu_busy.load(SeqCst) && !st.stop.load(SeqCst) {
+                    thread::park_timeout(GPU_POLL);
+                }
+                st.sleeping.store(false, SeqCst);
             }
             continue;
         }

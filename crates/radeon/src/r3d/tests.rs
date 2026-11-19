@@ -1229,6 +1229,25 @@ mod against_metal {
     }
 
     #[test]
+    fn a_fence_lands_as_soon_as_metal_signals_its_draws_finished() {
+        let mut g = Gpu::new();
+        if !g.r.use_metal() {
+            return;
+        }
+        g.w(SCRATCH_ADDR, 0x9000);
+        g.w(SCRATCH_UMSK, 1);
+        g.draw(13, &quad(0.0, 0.0, 64.0, 64.0, RED));
+        g.w(SCRATCH_REG0, 7);
+        let serial = g.r.metal.as_mut().unwrap().kick();
+        let start = std::time::Instant::now();
+        while g.r.metal.as_mut().unwrap().finished() < serial {
+            assert!(start.elapsed().as_secs() < 5, "Metal never finished");
+        }
+        g.r.poll_fences(&mut g.ram);
+        assert_eq!(scratch_in_memory(&g), 7);
+    }
+
+    #[test]
     fn a_fence_with_nothing_queued_lands_at_once() {
         let mut g = Gpu::new();
         if !g.r.use_metal() {
