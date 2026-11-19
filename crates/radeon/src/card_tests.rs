@@ -223,7 +223,7 @@ fn stopping_the_thread_runs_the_ring_on_the_callers_thread_again() {
 }
 
 #[test]
-fn a_live_refresh_skips_while_the_worker_holds_the_card_and_waits_after_six_skips() {
+fn a_live_refresh_skips_while_the_worker_holds_the_card_and_waits_briefly_after_six_skips() {
     let mut ram = Ram::new();
     let (mut c, _) = threaded_card(&mut ram);
     let mut out = Vec::new();
@@ -238,7 +238,11 @@ fn a_live_refresh_skips_while_the_worker_holds_the_card_and_waits_after_six_skip
     }
     ram.open_later();
     let start = Instant::now();
-    c.render_live(&mut out);
-    assert!(start.elapsed() >= Duration::from_millis(20), "the seventh refresh waits for the card");
+    assert!(c.render_live(&mut out).is_none(), "the card is still held, so the seventh refresh skips too");
+    let waited = start.elapsed();
+    assert!(waited >= crate::card::REFRESH_LOCK_WAIT, "the seventh refresh gives the worker time to yield");
+    assert!(waited < Duration::from_millis(40), "a long hold, like a shader compile, must not stall the guest");
     wait_idle(&mut c);
+    c.render_live(&mut out);
+    assert_eq!(c.skipped, 0, "the refresh after the worker lets go gets the card");
 }

@@ -139,12 +139,16 @@ pub struct Card {
     rom: Vec<u8>,
     tracing: bool,
     /// Live display refreshes skipped in a row because the card was busy.
-    skipped: u32,
+    pub(crate) skipped: u32,
 }
 
 /// Live refreshes that may be skipped in a row, about 100 ms at 60 Hz,
 /// before one waits for the card.
 const MAX_SKIPPED_REFRESHES: u32 = 6;
+
+/// How long a refresh that has waited `MAX_SKIPPED_REFRESHES` blocks the
+/// emulation thread before it skips this frame too.
+pub(crate) const REFRESH_LOCK_WAIT: Duration = Duration::from_millis(4);
 
 // `vram` points into the VRAM `core` owns, which never moves.
 unsafe impl Send for Card {}
@@ -161,6 +165,32 @@ impl Card {
     fn lock(&self) -> MutexGuard<'_, Radeon> {
         self.st.want_lock.fetch_add(1, SeqCst);
         let g = lock(&self.core, &self.st);
+        self.st.want_lock.fetch_sub(1, SeqCst);
+        g
+    }
+
+    fn try_lock(&self) -> Option<MutexGuard<'_, Radeon>> {
+        match self.core.try_lock() {
+            Ok(g) => Some(g),
+            Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
+            Err(TryLockError::WouldBlock) => None,
+        }
+    }
+
+    // The worker yields between slices but holds the lock through a Metal
+    // shader compile, which can take a large fraction of a second.
+    fn lock_within(&self, limit: Duration) -> Option<MutexGuard<'_, Radeon>> {
+        self.st.want_lock.fetch_add(1, SeqCst);
+        let deadline = Instant::now() + limit;
+        let g = loop {
+            if let Some(g) = self.try_lock() {
+                break Some(g);
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+            thread::yield_now();
+        };
         self.st.want_lock.fetch_sub(1, SeqCst);
         g
     }
@@ -342,15 +372,7 @@ impl Card {
         let written = self.st.fb_written.swap(false, Relaxed);
         let wait = self.skipped >= MAX_SKIPPED_REFRESHES;
         let (frame, skipped) = {
-            let guard = if wait {
-                Some(self.lock())
-            } else {
-                match self.core.try_lock() {
-                    Ok(g) => Some(g),
-                    Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
-                    Err(TryLockError::WouldBlock) => None,
-                }
-            };
+            let guard = if wait { self.lock_within(REFRESH_LOCK_WAIT) } else { self.try_lock() };
             match guard {
                 None => {
                     self.st.fb_written.fetch_or(written, Relaxed);
