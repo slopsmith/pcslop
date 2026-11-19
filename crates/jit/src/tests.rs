@@ -748,6 +748,78 @@ fn lazy_fpu_switches_of_cr0_ts_stay_translated() {
 }
 
 #[test]
+fn setting_cr0_ts_between_sse_instructions_of_one_block_faults_the_second() {
+    let mut code = vec![0u8; 0x100];
+    code[..20].copy_from_slice(&[
+        0x0f, 0x28, 0xc1, // movaps xmm0, xmm1
+        0x0f, 0x20, 0xc0, // mov eax, cr0
+        0x83, 0xc8, 0x08, // or eax, 8: TS
+        0x0f, 0x22, 0xc0, // mov cr0, eax
+        0x0f, 0x29, 0x05, 0x00, 0x30, 0, 0, // movaps [0x3000], xmm0: #NM now
+        0xf4, // hlt
+    ]);
+    code[0x40] = 0xf4;
+    code[0x88..0x98].copy_from_slice(&[0xff, 0xff, 0, 0, 0, 0x9a, 0xcf, 0, 0xff, 0xff, 0, 0, 0, 0x92, 0xcf, 0]);
+    code[0xf8..0x100].copy_from_slice(&[0x40, 0x10, 0x08, 0, 0, 0x8e, 0, 0]);
+    compare(&code, |c| {
+        c.cr4 |= x86::cpu::cr4::OSFXSR;
+        c.xmm[1] = 0x1234_5678_9abc_def0_0fed_cba9_8765_4321;
+        c.gdtr.base = 0x1080;
+        c.gdtr.limit = 0x17;
+        c.idtr.base = 0x10c0;
+        c.idtr.limit = 0x3f;
+    });
+}
+
+#[test]
+fn a_run_of_sse_instructions_checks_once_and_keeps_xmm_in_registers() {
+    let mut code = Vec::new();
+    for i in 0..8 {
+        code.extend([0x0f, 0x58, 0xc1]); // addps xmm0, xmm1
+        if i == 3 {
+            code.extend([0xf3, 0x0f, 0x11, 0x05, 0x00, 0x30, 0, 0]); // movss [0x3000], xmm0
+        }
+    }
+    code.push(0xf4);
+    let (_, entries) = runtime::build();
+    let c = translate::compile(0x1000, |a| code.get(a.wrapping_sub(0x1000) as usize).copied(), 0x4010_0000, 0x4000_0000, &entries, true, true, false, false, None);
+    let (first, last) = (c.boundaries[0].0 as usize, c.boundaries[8].0 as usize);
+    let words = &c.code[first..last];
+    let ldr_state = |off: usize| 0xb940_0000 | ((off / 4) as u32) << 10 | 28 << 5;
+    let sse_checks = words.iter().filter(|&&w| w & !0x1f == ldr_state(state::SSE_FP_OK)).count();
+    let fpcr_reads = words.iter().filter(|&&w| w & !0x1f == 0xd53b_4400).count();
+    let xmm_stores = words
+        .iter()
+        .filter(|&&w| w & 0xffc0_03e0 == 0x3d80_0000 | 28 << 5 && (state::XMM..state::XMM + 128).contains(&((((w >> 10) & 0xfff) * 16) as usize)))
+        .count();
+    assert!(sse_checks <= 1, "{sse_checks} SSE_FP_OK checks: each SSE instruction must not check the state again");
+    assert!(fpcr_reads <= 1, "{fpcr_reads} FPCR reads: leaving x87 mode must happen once per run of SSE code");
+    assert_eq!(xmm_stores, 0, "XMM results must stay in registers between SSE instructions");
+}
+
+#[test]
+fn sse_code_between_x87_instructions_keeps_the_x87_state_in_registers() {
+    let code = [
+        0xd9, 0x05, 0x00, 0x30, 0, 0, // fld dword [0x3000]
+        0x0f, 0x58, 0xc1, // addps xmm0, xmm1
+        0xd9, 0x05, 0x04, 0x30, 0, 0, // fld dword [0x3004]
+        0x0f, 0x59, 0xc1, // mulps xmm0, xmm1
+        0xde, 0xc1, // faddp
+        0xd9, 0x1d, 0x08, 0x30, 0, 0, // fstp dword [0x3008]
+        0xf4, // hlt
+    ];
+    let (_, entries) = runtime::build();
+    let c = translate::compile(0x1000, |a| code.get(a.wrapping_sub(0x1000) as usize).copied(), 0x4010_0000, 0x4000_0000, &entries, true, true, false, false, None);
+    let (first, last) = (c.boundaries[0].0 as usize, c.boundaries[6].0 as usize);
+    let x87_entries = c.code[first..last].iter().filter(|&&w| w & !0x1f == 0xb940_0000 | ((state::X87_OK / 4) as u32) << 10 | 28 << 5).count();
+    assert_eq!(x87_entries, 1, "SSE instructions must not make the x87 code after them enter x87 mode again");
+    compare(&code, |c| {
+        c.cr4 |= x86::cpu::cr4::OSFXSR;
+        c.xmm[1] = 0x3f80_0000_4000_0000_4040_0000_4080_0000;
+    });
+}
+
+#[test]
 fn rep_ret_runs_translated() {
     let code = [
         0xb9, 0x40, 0, 0, 0, // mov ecx, 64
@@ -1689,6 +1761,69 @@ fn random_programs_match_the_interpreter_with_paging() {
 }
 
 #[test]
+fn a_page_fault_after_sse_code_in_the_same_block_keeps_the_xmm_results() {
+    let mut code = vec![0u8; 0x140];
+    code[..22].copy_from_slice(&[
+        0x0f, 0x28, 0xc1, // movaps xmm0, xmm1
+        0x0f, 0x58, 0xc2, // addps xmm0, xmm2
+        0x0f, 0x59, 0xdb, // mulps xmm3, xmm3
+        0x66, 0x0f, 0xfe, 0xe5, // paddd xmm4, xmm5
+        0xa1, 0x00, 0x50, 0, 0, // mov eax, [0x5000]: not present
+        0x0f, 0x28, 0xf0, // movaps xmm6, xmm0
+        0xf4, // hlt
+    ]);
+    code[0x40] = 0xf4;
+    code[0x88..0x98].copy_from_slice(&[0xff, 0xff, 0, 0, 0, 0x9a, 0xcf, 0, 0xff, 0xff, 0, 0, 0, 0x92, 0xcf, 0]);
+    code[0x130..0x138].copy_from_slice(&[0x40, 0x10, 0x08, 0, 0, 0x8e, 0, 0]);
+    let mut a = flat_cpu(0x1000, 0x8000);
+    a.gdtr.base = 0x1080;
+    a.gdtr.limit = 0x17;
+    a.idtr.base = 0x10c0;
+    a.idtr.limit = 0x7f;
+    for i in 0..8 {
+        a.xmm[i] = 0x3f80_0000_4000_0000_4040_0000_4080_0000u128.rotate_left(8 * i as u32) ^ (i as u128 * 0x1111);
+    }
+    let mut b = a.clone();
+    let mut bus_a = bus_with(0x1000, &code);
+    let mut bus_b = bus_with(0x1000, &code);
+    for (cpu, bus) in [(&mut a, &mut bus_a), (&mut b, &mut bus_b)] {
+        paged(cpu, bus, false);
+        bus.ram.as_mut_slice()[0x11014..0x11018].copy_from_slice(&0u32.to_le_bytes());
+    }
+    run_interp(&mut a, &mut bus_a);
+    run_jit(&mut b, &mut bus_b);
+    assert_eq!(a.eip, b.eip, "both must stop in the #PF handler");
+    assert_eq!(a.cr2, 0x5000, "the load must fault");
+    for i in 0..8 {
+        assert_eq!(a.xmm[i], b.xmm[i], "xmm{i} lost what the SSE code before the fault computed");
+    }
+}
+
+#[test]
+fn sse_results_survive_the_back_edge_of_an_x87_loop() {
+    let code = [
+        0xd9, 0xe8, // fld1
+        0xd9, 0xee, // fldz
+        0xb9, 0x08, 0, 0, 0, // mov ecx, 8
+        0xeb, 0x00, // jmp loop: the loop starts its own block
+        0x0f, 0x58, 0xc1, // loop: addps xmm0, xmm1
+        0xd8, 0xc1, // fadd st0, st1
+        0x49, // dec ecx
+        0x75, 0xf8, // jnz loop
+        0xd9, 0x1d, 0x00, 0x30, 0, 0, // fstp dword [0x3000]
+        0xd9, 0x1d, 0x04, 0x30, 0, 0, // fstp dword [0x3004]
+        0x0f, 0x29, 0x05, 0x10, 0x30, 0, 0, // movaps [0x3010], xmm0
+        0xf4, // hlt
+    ];
+    let stats = compare(&code, |c| {
+        c.cr4 |= x86::cpu::cr4::OSFXSR;
+        c.xmm[0] = 0x3f80_0000_3f80_0000_3f80_0000_3f80_0000;
+        c.xmm[1] = 0x4000_0000_4000_0000_4000_0000_4000_0000;
+    });
+    assert!(stats.x87_loops > 0, "the loop must run as an x87 loop block for this to test its back edge: {stats:?}");
+}
+
+#[test]
 fn untranslatable_instruction_across_a_page_end() {
     let mut code = vec![0x90; 0xfff];
     code.extend([0x0f, 0xa2, 0x40, 0xf4]);
@@ -1714,7 +1849,8 @@ fn random_mmx(rng: &mut Rng, out: &mut Vec<u8>) {
             out.extend([0x0f, op, mm << 3 | 5]);
             out.extend((0x3000 + rng.below(8) * 8).to_le_bytes());
         }
-        3 => match rng.below(4) {
+        3 => match rng.below(5) {
+            4 => out.extend([0x0f, 0x77]),
             0 => out.extend([0x0f, 0x6e, modrm_rr(mm, rng.reg())]),
             1 => out.extend([0x0f, 0x7e, modrm_rr(mm, rng.reg())]),
             2 => {
@@ -2240,10 +2376,15 @@ fn random_sse(rng: &mut Rng, out: &mut Vec<u8>) {
         15 => sse_op(out, [0xf3, 0xf2][rng.below(2) as usize], 0x2a, reg, rm.map(|_| rng.reg()), slot + 4 * rng.below(4)),
         16 => sse_op(out, [0xf3, 0xf2][rng.below(2) as usize], [0x2c, 0x2d][rng.below(2) as usize], rng.reg(), rm, slot),
         17 => sse_op(out, [0xf3, 0xf2][rng.below(2) as usize], 0x5a, reg, rm, slot),
-        19 => sse_op(out, 0xf3, [0x52, 0x53][rng.below(2) as usize], reg, rm, slot),
+        19 => match rng.below(4) {
+            0 => sse_op(out, [0xf3, 0][rng.below(2) as usize], [0x52, 0x53][rng.below(2) as usize], reg, rm, slot),
+            1 => sse_op(out, [0, 0xf3][rng.below(2) as usize], 0x5b, reg, rm, slot),
+            2 => sse_op(out, 0xf3, 0xe6, reg, rm, slot),
+            _ => sse_op(out, 0, [0x52, 0x53][rng.below(2) as usize], reg, rm, slot),
+        },
         18 => {
             out.extend([0x0f, 0xae, 2 << 3 | 5]);
-            out.extend((0x3100 + 4 * rng.below(6)).to_le_bytes());
+            out.extend((0x3100 + 4 * rng.below(8)).to_le_bytes());
         }
         _ => sse_op(out, any_pfx, [0x58, 0x59][rng.below(2) as usize], reg, rm, slot),
     }
@@ -2283,7 +2424,7 @@ fn random_sse_programs_match_the_interpreter() {
             };
             mem[4 * k..4 * k + 4].copy_from_slice(&(v as u32).to_le_bytes());
         }
-        for (j, csr) in [0x1f80u32, 0x3f80, 0x5f80, 0x7f80, 0x9f80, 0x1fc0].iter().enumerate() {
+        for (j, csr) in [0x1f80u32, 0x3f80, 0x5f80, 0x7f80, 0x9f80, 0x1fc0, 0x1fbf, 0x1fbe].iter().enumerate() {
             mem[0x100 + 4 * j..0x104 + 4 * j].copy_from_slice(&csr.to_le_bytes());
         }
         let mut a = flat_cpu(0x1000, 0x8000);
@@ -2338,7 +2479,7 @@ fn mixed_x87_and_sse_keep_their_own_flags_and_rounding() {
         }
         code.push(0xf4);
         let mut mem = x87_memory(&mut rng);
-        for (j, csr) in [0x1f80u32, 0x3f80, 0x5f80, 0x7f80, 0x9f80, 0x1fc0].iter().enumerate() {
+        for (j, csr) in [0x1f80u32, 0x3f80, 0x5f80, 0x7f80, 0x9f80, 0x1fc0, 0x1fbf, 0x1fbe].iter().enumerate() {
             mem[0x100 + 4 * j..0x104 + 4 * j].copy_from_slice(&csr.to_le_bytes());
         }
         let mut a = flat_cpu(0x1000, 0x8000);

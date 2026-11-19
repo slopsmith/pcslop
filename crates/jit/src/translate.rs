@@ -121,6 +121,14 @@ struct Emit {
     /// The `flags` bits the current instruction must produce.
     need: u8,
     x87: x87::X87Block,
+    // An earlier `leave_x87_fp` on the straight-line path, no x87 code since.
+    sse_clean: bool,
+    // SSE_OK (1) and SSE_FP_OK (2) as proven on the straight-line path.
+    sse_checked: u8,
+    // Since an MMX instruction with no x87 code after it: MM_USED bits set so
+    // far, bit 15 once FP64_VALID is clear.
+    mmx_known: Option<u16>,
+    xmm: XmmCache,
     /// Whether a conditional branch may leave through a side exit and go on.
     superblock: bool,
     /// The memory operand `load` and `store` use instead of T_ADDR, set by `ea_fold`.
@@ -136,12 +144,20 @@ struct Emit {
     exits: Vec<u32>,
     /// Rarely run code to emit after the block's hot path, with the code
     /// position and x87 state when it was deferred (see `defer`).
-    cold: Vec<(usize, x87::X87Block, Cold)>,
+    cold: Vec<(usize, x87::X87Block, XmmCache, Cold)>,
     /// Each instruction's first code word and how much cold code preceded it.
     starts: Vec<(usize, usize)>,
 }
 
 type Cold = Box<dyn FnOnce(&mut Emit)>;
+
+/// XMM registers held in V0..V7 on the straight-line path, and which of
+/// them are newer than the state.
+#[derive(Clone, Copy, Default)]
+pub(super) struct XmmCache {
+    pub cached: u8,
+    pub dirty: u8,
+}
 
 /// A block that jumps back to its own start with x87 values in registers.
 #[derive(Default)]
@@ -220,6 +236,7 @@ impl Emit {
                 self.a.ldr(Width::W, CHAIN_TMP, STATE, state::PENDING as i32);
                 self.a.cbnz(Size::W, CHAIN_TMP, slow);
                 self.x87_loop_back(&h);
+                self.xmm_flush();
                 self.bump(0);
                 self.lp.counts.push(self.a.pos());
                 self.a.nop();
@@ -390,17 +407,27 @@ impl Emit {
 
     /// Emits `f` after the block's hot path, with the x87 state as it is now.
     fn defer(&mut self, f: impl FnOnce(&mut Emit) + 'static) {
-        self.cold.push((self.a.pos(), self.x87, Box::new(f)));
+        self.defer_with(self.xmm, f);
+    }
+
+    /// `defer` for a path that leaves with the XMM registers as `xmm` says.
+    fn defer_with(&mut self, xmm: XmmCache, f: impl FnOnce(&mut Emit) + 'static) {
+        self.cold.push((self.a.pos(), self.x87, xmm, Box::new(f)));
     }
 
     fn emit_cold(&mut self) {
         let mut i = 0;
         while i < self.cold.len() {
-            let (_, x87, f) = std::mem::replace(&mut self.cold[i], (0, Default::default(), Box::new(|_| {})));
+            let (_, x87, xmm, f) = std::mem::replace(&mut self.cold[i], (0, Default::default(), Default::default(), Box::new(|_| {})));
             let saved = std::mem::replace(&mut self.x87, x87);
+            let saved_xmm = std::mem::replace(&mut self.xmm, xmm);
+            let sse = (self.sse_clean, self.sse_checked, self.mmx_known);
+            (self.sse_clean, self.sse_checked, self.mmx_known) = (false, 0, None);
             self.fold = None;
             f(self);
             self.x87 = saved;
+            self.xmm = saved_xmm;
+            (self.sse_clean, self.sse_checked, self.mmx_known) = sse;
             i += 1;
         }
         self.cold.clear();
@@ -2279,6 +2306,7 @@ impl Emit {
                 let ok = self.a.logic_imm(a64::Logic::And, Size::W, T_B, T_ADDR, 15);
                 assert!(ok);
                 self.a.cbnz(Size::W, T_B, slow);
+                self.xsync(insn.reg());
                 let x = (state::XMM + 16 * insn.reg()) as i32;
                 self.a.ldr(Width::X, T_B, STATE, x);
                 self.a.ldr(Width::X, T_C, STATE, x + 8);
@@ -2506,7 +2534,7 @@ impl Emit {
     /// MMX instructions; at run time they leave faulting cases (CR0.EM/TS, a
     /// pending x87 exception) to the interpreter.
     fn mmx(&mut self, insn: &Insn, eip: u32) -> bool {
-        self.x87_flush();
+        self.x87_state_flush();
         self.x87 = x87::X87Block::default();
         const VA: V = V(16);
         const VB: V = V(17);
@@ -2520,15 +2548,18 @@ impl Emit {
         if !supported {
             return false;
         }
-        let (ok, slow) = (self.a.label(), self.a.label());
-        self.a.ldr(Width::W, T_B, STATE, state::MMX_OK as i32);
-        self.a.cbz(Size::W, T_B, slow);
-        self.a.ldr(Width::W, T_B, STATE, state::FP80_STALE as i32);
-        self.a.cbz(Size::W, T_B, ok);
-        let off = self.branch_offset(self.unstale_va);
-        self.a.bl_offset(off);
-        self.cold_exit(slow, eip);
-        self.a.bind(ok);
+        let known = self.mmx_known.unwrap_or(0);
+        if self.mmx_known.is_none() {
+            let (ok, slow) = (self.a.label(), self.a.label());
+            self.a.ldr(Width::W, T_B, STATE, state::MMX_OK as i32);
+            self.a.cbz(Size::W, T_B, slow);
+            self.a.ldr(Width::W, T_B, STATE, state::FP80_STALE as i32);
+            self.a.cbz(Size::W, T_B, ok);
+            let off = self.branch_offset(self.unstale_va);
+            self.a.bl_offset(off);
+            self.cold_exit(slow, eip);
+            self.a.bind(ok);
+        }
         let mut written = None;
         match op {
             0x16e => {
@@ -2661,14 +2692,19 @@ impl Emit {
                 written = Some(reg);
             }
         }
-        let bits = 1u64 << 8 | written.map_or(0, |n| 1u64 << n);
-        self.a.ldr(Width::W, T_B, STATE, state::MM_USED as i32);
-        self.a.mov_imm(Size::W, T_C, bits);
-        self.a.orr(Size::W, T_B, T_B, T_C);
-        self.a.str(Width::W, T_B, STATE, state::MM_USED as i32);
-        if written.is_some() {
-            self.a.str(Width::W, ZR, STATE, state::FP64_VALID as i32);
+        let bits = 1u16 << 8 | written.map_or(0, |n| 1u16 << n);
+        if bits & !known != 0 {
+            self.a.ldr(Width::W, T_B, STATE, state::MM_USED as i32);
+            self.a.mov_imm(Size::W, T_C, bits as u64);
+            self.a.orr(Size::W, T_B, T_B, T_C);
+            self.a.str(Width::W, T_B, STATE, state::MM_USED as i32);
         }
+        let mut now = known | bits;
+        if written.is_some() && known & 1 << 15 == 0 {
+            self.a.str(Width::W, ZR, STATE, state::FP64_VALID as i32);
+            now |= 1 << 15;
+        }
+        self.mmx_known = Some(now);
         true
     }
 
@@ -2848,6 +2884,10 @@ pub fn translatable(insn: &Insn, pc: u32, user: bool) -> bool {
         stored: false,
         need: flags::ALL,
         x87: x87::X87Block::default(),
+        sse_clean: false,
+        sse_checked: 0,
+        mmx_known: None,
+        xmm: XmmCache::default(),
         superblock: false,
         fold: None,
         fold_ok: false,
@@ -2994,6 +3034,10 @@ fn compile_pass(
         stored: false,
         need: flags::ALL,
         x87: x87::X87Block::default(),
+        sse_clean: false,
+        sse_checked: 0,
+        mmx_known: None,
+        xmm: XmmCache::default(),
         superblock: false,
         fold: None,
         fold_ok: false,
@@ -3058,7 +3102,7 @@ fn compile_pass(
             break;
         };
         boundaries.push((e.a.pos() as u32, pc));
-        if let Some(snap) = e.x87.snap() {
+        if let Some(snap) = e.boundary_snap() {
             x87_snaps.push((e.a.pos() as u32, snap));
         }
         let x87_before = e.x87;

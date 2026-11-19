@@ -55,7 +55,7 @@ pub fn lower(e: &mut Emit, f: &Func, fallback: Label) -> Option<Lowered> {
         insns += f.blocks[b].insns as usize;
     }
     let x87 = match f.x87 {
-        Some(x) => boundaries.iter().map(|&(w, _)| (w, Snap { dirty: x.touched, meta: true, note: (0, 0) })).collect(),
+        Some(x) => boundaries.iter().map(|&(w, _)| (w, Snap { dirty: x.touched, xmm: 0, meta: true, note: (0, 0) })).collect(),
         None => Vec::new(),
     };
     Some(Lowered { boundaries, insns, x87 })

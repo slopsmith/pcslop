@@ -65,6 +65,8 @@ pub(super) struct X87Block {
     note: (u32, u32),
     /// The FDS selector this block already stored, plus 0x100.
     fds: u32,
+    /// SSE code ran since entry: FPSR must be saved again before more x87 code.
+    resave: bool,
 }
 
 /// What the host needs to write the x87 state back when it abandons a block
@@ -73,13 +75,15 @@ pub(super) struct X87Block {
 #[derive(Clone, Copy, Debug)]
 pub struct Snap {
     pub dirty: u8,
+    /// XMM registers whose V0..V7 copy is newer than the state.
+    pub xmm: u8,
     pub meta: bool,
     pub note: (u32, u32),
 }
 
 impl X87Block {
     pub(super) fn snap(&self) -> Option<Snap> {
-        (self.entered && (self.dirty != 0 || self.meta)).then_some(Snap { dirty: self.dirty, meta: self.meta, note: self.note })
+        (self.entered && (self.dirty != 0 || self.meta)).then_some(Snap { dirty: self.dirty, xmm: 0, meta: self.meta, note: self.note })
     }
 
     /// The state of a tier-2 region's body: every slot it uses is in its
@@ -109,6 +113,7 @@ impl X87Block {
             && self.empty & head.empty == head.empty
             && (self.rc_checked || !head.rc_checked)
             && (self.fpcr || !head.fpcr)
+            && !self.resave
     }
 }
 
@@ -976,6 +981,8 @@ impl Emit {
     /// FNINIT (`init`) or EMMS. Both empty every tag; FNINIT also resets FCW,
     /// FSW and the instruction and operand pointers.
     pub(super) fn fpu_reset(&mut self, eip: u32, init: bool) {
+        self.sse_clean = false;
+        self.mmx_known = None;
         self.x87_flush();
         self.x87 = X87Block::default();
         let ok = self.a.label();
@@ -1033,6 +1040,8 @@ impl Emit {
     /// Only control words that mask every exception stay here, so X87_OK
     /// holds and the block keeps its registers.
     fn fldcw(&mut self, bail: Label) {
+        self.sse_clean = false;
+        self.mmx_known = None;
         self.a.ldr(Width::H, T_A, T_ADDR, 0);
         let ok = self.a.logic_imm(Logic::Orr, Size::W, T_A, T_A, 0x40);
         assert!(ok);
@@ -1067,7 +1076,13 @@ impl Emit {
     }
 
     pub(super) fn x87_enter(&mut self, bail: Label) {
+        self.sse_clean = false;
+        self.mmx_known = None;
         if self.x87.entered {
+            if self.x87.resave {
+                self.save_sse_fpsr();
+                self.x87.resave = false;
+            }
             return;
         }
         self.x87 = X87Block { entered: true, ..X87Block::default() };
@@ -1087,9 +1102,17 @@ impl Emit {
         self.a.logic_shift(Logic::Orr, false, Size::W, TAGS, TAGS, TAGS, Shift::Lsl, 8);
         self.a.lsrv(Size::W, TAGS, TAGS, TOP);
         self.and_imm(Size::W, TAGS, TAGS, 0xff);
+        self.save_sse_fpsr();
+    }
+
+    /// Keeps the SSE flags in FPSR_SAVED before x87 code changes FPSR.
+    fn save_sse_fpsr(&mut self) {
         let tainted = self.a.label();
         self.a.ldr(Width::W, U, STATE, state::X87_TAINT as i32);
         self.a.cbnz(Size::W, U, tainted);
+        // With every MXCSR flag already set, x87 code cannot change what the
+        // guest sees there, and FPSR traffic serialises the pipeline.
+        self.mxcsr_flags_all_set(U, tainted);
         self.a.mrs(U, sysreg::FPSR);
         self.a.str(Width::W, U, STATE, state::FPSR_SAVED as i32);
         self.a.movz(Size::W, U, 1, 0);
@@ -1097,9 +1120,26 @@ impl Emit {
         self.a.bind(tainted);
     }
 
+    /// Sets FPSR and FPCR up for SSE code, keeping the x87 state in
+    /// registers for x87 code later in the block.
+    pub(super) fn enter_sse(&mut self) {
+        if self.sse_clean {
+            return;
+        }
+        if !self.x87.entered {
+            return self.leave_x87_fp();
+        }
+        self.restore_sse_fp();
+        self.x87.fpcr = false;
+        self.x87.resave = true;
+        self.sse_clean = true;
+    }
+
     /// Sets FPCR for x87 arithmetic once per block, as late as possible:
     /// writing FPCR is slow, and code toggling RC around FISTP never needs it.
     pub(super) fn x87_fpcr(&mut self) {
+        self.sse_clean = false;
+        self.mmx_known = None;
         if self.x87.fpcr {
             return;
         }
@@ -1114,11 +1154,28 @@ impl Emit {
         self.a.bind(done);
     }
 
+    /// Branches to `yes` when all six MXCSR exception flags are set; clobbers
+    /// `t` and leaves NZCV alone.
+    pub(super) fn mxcsr_flags_all_set(&mut self, t: Reg, yes: Label) {
+        self.a.ldr(Width::W, t, STATE, state::MXCSR as i32);
+        self.a.mvn(Size::W, t, t);
+        self.and_imm(Size::W, t, t, 0x3f);
+        self.a.cbz(Size::W, t, yes);
+    }
+
     /// Ends the block's x87 work and puts FPSR and FPCR back as SSE code
     /// needs them, if x87 code changed them.
     pub(super) fn leave_x87_fp(&mut self) {
-        self.x87_flush();
+        if self.sse_clean {
+            return;
+        }
+        self.x87_state_flush();
         self.x87 = X87Block::default();
+        self.restore_sse_fp();
+        self.sse_clean = true;
+    }
+
+    fn restore_sse_fp(&mut self) {
         let (clean, sse_fpcr) = (self.a.label(), self.a.label());
         self.a.ldr(Width::W, T_E, STATE, state::X87_TAINT as i32);
         self.a.cbz(Size::W, T_E, clean);
@@ -1136,6 +1193,8 @@ impl Emit {
     /// Sets FPCR's rounding mode and flush bits for x87 code (FCW's RC, no
     /// flushing) or for SSE code (MXCSR's RC, FTZ and DAZ, as `fpcr_for`).
     fn set_fpcr(&mut self, x87: bool) {
+        self.sse_clean = false;
+        self.mmx_known = None;
         let same = self.a.label();
         let (at, rc) = if x87 { (state::FCW, 10) } else { (state::MXCSR, 13) };
         self.a.ldr(Width::W, T_E, STATE, at as i32);
@@ -1295,13 +1354,29 @@ impl Emit {
     /// Emits `f` as if the x87 cache were already flushed.
     pub(super) fn flushed(&mut self, f: impl FnOnce(&mut Self)) {
         let entered = std::mem::replace(&mut self.x87.entered, false);
+        let dirty = std::mem::replace(&mut self.xmm.dirty, 0);
         f(self);
         self.x87.entered = entered;
+        self.xmm.dirty = dirty;
+    }
+
+    /// What the host must recover from registers at this instruction boundary.
+    pub(super) fn boundary_snap(&self) -> Option<Snap> {
+        match self.x87.snap() {
+            Some(s) => Some(Snap { xmm: self.xmm.dirty, ..s }),
+            None => (self.xmm.dirty != 0).then_some(Snap { dirty: 0, xmm: self.xmm.dirty, meta: false, note: (0, 0) }),
+        }
     }
 
     /// Writes everything newer in registers back to the state, on the path
     /// being emitted; the translator's view stays as it was.
     pub(super) fn x87_flush(&mut self) {
+        self.xmm_flush();
+        self.x87_state_flush();
+    }
+
+    /// `x87_flush` without the XMM registers, for code that stays in the block.
+    pub(super) fn x87_state_flush(&mut self) {
         if !self.x87.entered {
             return;
         }

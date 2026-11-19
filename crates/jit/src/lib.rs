@@ -785,6 +785,12 @@ impl Jit {
         let word = ((pc - va) / 4) as u32;
         let Some(&(start, _)) = b.boundaries.iter().rev().find(|(w, _)| *w <= word) else { return Ok(()) };
         let Some(&(_, snap)) = b.x87.iter().find(|(w, _)| *w == start) else { return Ok(()) };
+        for n in 0..8 {
+            if snap.xmm & 1 << n != 0 {
+                let v = self.vcpu.simd_reg(n as u32)?;
+                self.state().xmm[n] = v;
+            }
+        }
         let top = xregs[0] as usize & 7;
         for r in 0..8 {
             if snap.dirty & 1 << r != 0 {

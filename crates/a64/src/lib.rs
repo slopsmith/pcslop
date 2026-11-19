@@ -1179,6 +1179,31 @@ impl Asm {
         self.emit(0x6e20_5800 | (rn.0 as u32) << 5 | rd.0 as u32);
     }
 
+    /// DUP of a W register into all four 32-bit lanes.
+    pub fn dup_4s(&mut self, rd: V, rn: Reg) {
+        self.emit(0x4e04_0c00 | (rn.0 as u32) << 5 | rd.0 as u32);
+    }
+
+    /// CMEQ against zero on four 32-bit lanes.
+    pub fn cmeq0_4s(&mut self, rd: V, rn: V) {
+        self.emit(0x4ea0_9800 | (rn.0 as u32) << 5 | rd.0 as u32);
+    }
+
+    /// SCVTF on four 32-bit or two 64-bit signed integers.
+    pub fn scvtf_v(&mut self, double: bool, rd: V, rn: V) {
+        self.emit(0x4e21_d800 | (double as u32) << 22 | (rn.0 as u32) << 5 | rd.0 as u32);
+    }
+
+    /// FCVTZS on four singles.
+    pub fn fcvtzs_4s(&mut self, rd: V, rn: V) {
+        self.emit(0x4ea1_b800 | (rn.0 as u32) << 5 | rd.0 as u32);
+    }
+
+    /// SSHLL #0: sign-extends the low two 32-bit lanes to 64 bits.
+    pub fn sxtl_2d(&mut self, rd: V, rn: V) {
+        self.emit(0x0f20_a400 | (rn.0 as u32) << 5 | rd.0 as u32);
+    }
+
     /// FSQRT on four singles or two doubles.
     pub fn fsqrt_v(&mut self, double: bool, rd: V, rn: V) {
         self.emit(0x6ea1_f800 | (double as u32) << 22 | (rn.0 as u32) << 5 | rd.0 as u32);

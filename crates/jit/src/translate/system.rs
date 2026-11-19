@@ -210,6 +210,8 @@ impl Emit {
         self.a.ubfx(Size::W, T_C, T_C, cr4::OSFXSR.trailing_zeros(), 1);
         self.a.and(Size::W, T_C, T_C, T_E);
         self.a.str(Width::W, T_C, STATE, state::SSE_OK as i32);
+        self.sse_checked = 0;
+        self.mmx_known = None;
         self.cold_exit(slow, eip);
         self.a.bind(done);
         true

@@ -46,7 +46,9 @@ pub(super) fn is_sse(insn: &Insn) -> bool {
         0x112 | 0x116 => pfx == NP || (pfx == P66 && mem),
         0x113 | 0x117 => pfx <= P66 && mem,
         0x12a | 0x12c | 0x12d | 0x15a => pfx >= F3,
-        0x152 | 0x153 => pfx == F3,
+        0x152 | 0x153 => pfx == F3 || pfx == NP,
+        0x15b => pfx == NP || pfx == F3,
+        0x1e6 => pfx == F3,
         0x16f | 0x17f => pfx == P66 || pfx == F3,
         0x16e | 0x1d6 | 0x170 | 0x1db | 0x1df | 0x1eb | 0x1ef => pfx == P66,
         0x17e => pfx == P66 || pfx == F3,
@@ -70,12 +72,13 @@ impl Emit {
         if insn.mem.is_some() && !insn.addr32 {
             return false;
         }
-        self.leave_x87_fp();
+        self.enter_sse();
+        let before = self.xmm;
         let pfx = prefix(insn);
         let (op, reg, rm) = (insn.op, insn.reg(), insn.rm());
         let scalar = pfx >= F3;
         let double = pfx == P66 || pfx == F2;
-        let arith = matches!(op, 0x158 | 0x159 | 0x15c | 0x15e | 0x15d | 0x15f | 0x151 | 0x1c2 | 0x12e | 0x12f | 0x12a | 0x12c | 0x12d | 0x15a | 0x152 | 0x153);
+        let arith = matches!(op, 0x158 | 0x159 | 0x15c | 0x15e | 0x15d | 0x15f | 0x151 | 0x1c2 | 0x12e | 0x12f | 0x12a | 0x12c | 0x12d | 0x15a | 0x152 | 0x153 | 0x15b);
         let bail = self.a.label();
         let done = self.a.label();
         if let Some(m) = insn.mem {
@@ -83,11 +86,16 @@ impl Emit {
                 return false;
             }
         }
-        self.a.ldr(Width::W, T_A, STATE, if arith { state::SSE_FP_OK } else { state::SSE_OK } as i32);
-        self.a.cbz(Size::W, T_A, bail);
+        let need = if arith { 2 } else { 1 };
+        if self.sse_checked & need == 0 {
+            self.a.ldr(Width::W, T_A, STATE, if arith { state::SSE_FP_OK } else { state::SSE_OK } as i32);
+            self.a.cbz(Size::W, T_A, bail);
+            self.sse_checked |= if arith { 3 } else { 1 };
+        }
         match (op, pfx) {
             (0x150, _) => {
                 let d = guest_reg(reg);
+                self.xsync(rm);
                 self.a.ldr(Width::X, T_A, STATE, xmm(rm));
                 self.a.ldr(Width::X, T_B, STATE, xmm(rm) + 8);
                 if pfx == P66 {
@@ -104,10 +112,10 @@ impl Emit {
             }
             (0x110, NP | P66) | (0x128, _) | (0x16f, _) => {
                 self.src(insn, 16, op != 0x110 && !(op == 0x16f && pfx == F3), XB, bail);
-                self.a.str_q(XB, STATE, xmm(reg));
+                self.xst(XB, reg);
             }
             (0x111, NP | P66) | (0x129, _) | (0x12b, _) | (0x17f, _) | (0x1e7, _) => {
-                self.a.ldr_q(XA, STATE, xmm(reg));
+                self.xld(XA, reg);
                 let aligned = !(op == 0x111 || (op == 0x17f && pfx == F3));
                 self.dst16(insn, XA, aligned, bail);
             }
@@ -115,50 +123,52 @@ impl Emit {
                 let n = if pfx == F3 { 4 } else { 8 };
                 if insn.mem.is_some() {
                     self.load_mem(n, XB);
-                    self.a.str_q(XB, STATE, xmm(reg));
+                    self.xst(XB, reg);
                 } else {
-                    self.a.ldr_q(XA, STATE, xmm(reg));
-                    self.a.ldr_q(XB, STATE, xmm(rm));
+                    self.xld(XA, reg);
+                    self.xld(XB, rm);
                     self.a.ins(if n == 4 { 2 } else { 3 }, XA, 0, XB, 0);
-                    self.a.str_q(XA, STATE, xmm(reg));
+                    self.xst(XA, reg);
                 }
             }
             (0x111, _) => {
                 let n = if pfx == F3 { 4 } else { 8 };
                 if insn.mem.is_some() {
-                    self.a.ldr(if n == 4 { Width::W } else { Width::X }, T_A, STATE, xmm(reg));
+                    let r = self.xreg(reg);
+                    if n == 4 { self.a.fmov_ws(T_A, r) } else { self.a.fmov_xd(T_A, r) }
                     self.store(if n == 4 { Width::W } else { Width::X }, T_A);
                 } else {
-                    self.a.ldr_q(XA, STATE, xmm(rm));
-                    self.a.ldr_q(XB, STATE, xmm(reg));
+                    self.xld(XA, rm);
+                    self.xld(XB, reg);
                     self.a.ins(if n == 4 { 2 } else { 3 }, XA, 0, XB, 0);
-                    self.a.str_q(XA, STATE, xmm(rm));
+                    self.xst(XA, rm);
                 }
             }
             (0x112 | 0x116, _) => {
-                self.a.ldr_q(XA, STATE, xmm(reg));
+                self.xld(XA, reg);
                 let lane = (op == 0x116) as u32;
                 if insn.mem.is_some() {
                     self.load_mem(8, XB);
                     self.a.ins(3, XA, lane, XB, 0);
                 } else {
-                    self.a.ldr_q(XB, STATE, xmm(rm));
+                    self.xld(XB, rm);
                     self.a.ins(3, XA, lane, XB, 1 - lane);
                 }
-                self.a.str_q(XA, STATE, xmm(reg));
+                self.xst(XA, reg);
             }
             (0x113 | 0x117, _) => {
+                self.xsync(reg);
                 self.a.ldr(Width::X, T_A, STATE, xmm(reg) + 8 * (op == 0x117) as i32);
                 self.store(Width::X, T_A);
             }
             (0x114 | 0x115, _) => {
-                self.a.ldr_q(XA, STATE, xmm(reg));
+                self.xld(XA, reg);
                 self.src(insn, 16, true, XB, bail);
                 self.a.zip(true, if double { 3 } else { 2 }, op == 0x115, XR, XA, XB);
-                self.a.str_q(XR, STATE, xmm(reg));
+                self.xst(XR, reg);
             }
             (0x154..=0x157, _) | (0x1db | 0x1df | 0x1eb | 0x1ef, _) => {
-                self.a.ldr_q(XA, STATE, xmm(reg));
+                self.xld(XA, reg);
                 self.src(insn, 16, true, XB, bail);
                 match op {
                     0x154 | 0x1db => self.a.vec3(true, false, 0, 0b00011, XR, XA, XB),
@@ -166,10 +176,10 @@ impl Emit {
                     0x156 | 0x1eb => self.a.vec3(true, false, 2, 0b00011, XR, XA, XB),
                     _ => self.a.vec3(true, true, 0, 0b00011, XR, XA, XB),
                 }
-                self.a.str_q(XR, STATE, xmm(reg));
+                self.xst(XR, reg);
             }
             (0x1c6, _) => {
-                self.a.ldr_q(XA, STATE, xmm(reg));
+                self.xld(XA, reg);
                 self.src(insn, 16, true, XB, bail);
                 let imm = insn.imm;
                 if double {
@@ -180,17 +190,17 @@ impl Emit {
                         self.a.ins(2, XR, i, if i < 2 { XA } else { XB }, (imm >> (2 * i)) & 3);
                     }
                 }
-                self.a.str_q(XR, STATE, xmm(reg));
+                self.xst(XR, reg);
             }
             (0x170, _) => {
                 self.src(insn, 16, true, XB, bail);
                 for i in 0..4 {
                     self.a.ins(2, XR, i, XB, (insn.imm >> (2 * i)) & 3);
                 }
-                self.a.str_q(XR, STATE, xmm(reg));
+                self.xst(XR, reg);
             }
             (0x171..=0x173, _) => {
-                self.a.ldr_q(XA, STATE, xmm(rm));
+                self.xld(XA, rm);
                 let n = insn.imm & 0xff;
                 let esize = match op {
                     0x171 => 16,
@@ -209,7 +219,7 @@ impl Emit {
                     (_, 4) if n > 0 => self.a.shr_v(true, true, esize, XA, XA, n.min(esize)),
                     _ => {}
                 }
-                self.a.str_q(XA, STATE, xmm(rm));
+                self.xst(XA, rm);
             }
             (0x1d1..=0x1d3 | 0x1e1 | 0x1e2 | 0x1f1..=0x1f3, _) => {
                 let (esize, log) = match op & 3 {
@@ -238,27 +248,27 @@ impl Emit {
                 }
                 self.a.fmov_dx(XT, T_C);
                 self.a.ins(3, XT, 1, XT, 0);
-                self.a.ldr_q(XA, STATE, xmm(reg));
+                self.xld(XA, reg);
                 self.a.vec3(true, !arith, log - 3, 0b01000, XA, XA, XT);
-                self.a.str_q(XA, STATE, xmm(reg));
+                self.xst(XA, reg);
             }
             (0x1c4, _) => {
-                self.a.ldr_q(XA, STATE, xmm(reg));
+                self.xld(XA, reg);
                 match insn.mem {
                     Some(_) => self.a.ldr(Width::H, T_A, T_ADDR, 0),
                     None => self.a.mov(Size::W, T_A, guest_reg(rm)),
                 }
                 self.a.ins_h(XA, insn.imm & 7, T_A);
-                self.a.str_q(XA, STATE, xmm(reg));
+                self.xst(XA, reg);
             }
             (0x1c5, _) => {
-                self.a.ldr_q(XB, STATE, xmm(rm));
+                self.xld(XB, rm);
                 self.a.umov_h(guest_reg(reg), XB, insn.imm & 7);
             }
             (0x1d7, _) => {
                 // The shift-and-accumulate mask gathering of sse2neon's
                 // _mm_movemask_epi8 (sse2neon contributors, MIT licence).
-                self.a.ldr_q(XB, STATE, xmm(rm));
+                self.xld(XB, rm);
                 self.a.shr_v(true, false, 8, XR, XB, 7);
                 self.a.usra(true, 16, XR, XR, 7);
                 self.a.usra(true, 32, XR, XR, 14);
@@ -269,20 +279,21 @@ impl Emit {
                 self.a.mov(Size::W, guest_reg(reg), T_A);
             }
             (_, P66) if matches!(op, 0x160..=0x16d | 0x1d4 | 0x1fb | 0x1e4 | 0x1e5 | 0x1f4..=0x1f6) || simd_three(op).is_some() => {
-                self.a.ldr_q(XA, STATE, xmm(reg));
+                self.xld(XA, reg);
                 self.src(insn, 16, true, XB, bail);
                 self.sse_int(op);
-                self.a.str_q(XR, STATE, xmm(reg));
+                self.xst(XR, reg);
             }
             (0x16e, _) => {
                 match insn.mem {
                     Some(_) => self.a.ldr_s(XR, T_ADDR, 0),
                     None => self.a.fmov_sw(XR, guest_reg(rm)),
                 }
-                self.a.str_q(XR, STATE, xmm(reg));
+                self.xst(XR, reg);
             }
             (0x17e, P66) => {
-                self.a.ldr(Width::W, T_A, STATE, xmm(reg));
+                let r = self.xreg(reg);
+                self.a.fmov_ws(T_A, r);
                 match insn.mem {
                     Some(_) => self.store(Width::W, T_A),
                     None => self.a.mov(Size::W, guest_reg(rm), T_A),
@@ -291,22 +302,29 @@ impl Emit {
             (0x17e, _) => {
                 match insn.mem {
                     Some(_) => self.a.ldr_d(XR, T_ADDR, 0),
-                    None => self.a.ldr_d(XR, STATE, xmm(rm)),
+                    None => {
+                        let r = self.xreg(rm);
+                        self.a.fmov_xd(T_A, r);
+                        self.a.fmov_dx(XR, T_A);
+                    }
                 }
-                self.a.str_q(XR, STATE, xmm(reg));
+                self.xst(XR, reg);
             }
             (0x1d6, _) => match insn.mem {
                 Some(_) => {
-                    self.a.ldr(Width::X, T_A, STATE, xmm(reg));
+                    let r = self.xreg(reg);
+                    self.a.fmov_xd(T_A, r);
                     self.store(Width::X, T_A);
                 }
                 None => {
-                    self.a.ldr_d(XR, STATE, xmm(reg));
-                    self.a.str_q(XR, STATE, xmm(rm));
+                    let r = self.xreg(reg);
+                    self.a.fmov_xd(T_A, r);
+                    self.a.fmov_dx(XR, T_A);
+                    self.xst(XR, rm);
                 }
             },
             (0x158 | 0x159 | 0x15c | 0x15e | 0x15d | 0x15f, _) => {
-                self.a.ldr_q(XA, STATE, xmm(reg));
+                self.xld(XA, reg);
                 self.fp_src(insn, scalar, double, bail);
                 let (u, size, opc, sop) = match op {
                     0x158 => (false, 0, 0b11010, 2),
@@ -324,7 +342,7 @@ impl Emit {
                 self.commit_fp(reg, scalar, double);
             }
             (0x151, _) => {
-                self.a.ldr_q(XA, STATE, xmm(reg));
+                self.xld(XA, reg);
                 self.fp_src(insn, scalar, double, bail);
                 if scalar {
                     self.a.fp1(double, 3, XR, XB);
@@ -333,14 +351,73 @@ impl Emit {
                 }
                 self.commit_fp(reg, scalar, double);
             }
+            (0x152 | 0x153, NP) => {
+                self.a.ldr(Width::W, T_A, STATE, state::MXCSR as i32);
+                let ok = self.a.logic_imm(Logic::And, Size::W, T_A, T_A, 0x6000);
+                assert!(ok);
+                self.a.cbnz(Size::W, T_A, bail);
+                self.src(insn, 16, true, XB, bail);
+                let saturated = self.a.label();
+                self.a.movz(Size::W, T_D, 0, 0);
+                self.mxcsr_flags_all_set(T_C, saturated);
+                self.a.movz(Size::W, T_D, 1, 0);
+                self.a.mrs(T_C, a64::sysreg::FPSR);
+                self.a.bind(saturated);
+                self.flush_singles(XB);
+                if op == 0x152 {
+                    self.a.fsqrt_v(false, XB, XB);
+                }
+                self.a.movz(Size::W, T_A, 0x3f80, 1);
+                self.a.dup_4s(XT, T_A);
+                self.a.vec3(true, true, 0, 0b11111, XR, XT, XB);
+                let kept = self.a.label();
+                self.a.cbz(Size::W, T_D, kept);
+                self.a.msr(a64::sysreg::FPSR, T_C);
+                self.a.bind(kept);
+                self.flush_singles(XR);
+                self.xst(XR, reg);
+            }
+            (0x15b, NP) => {
+                self.src(insn, 16, true, XB, bail);
+                self.a.scvtf_v(false, XR, XB);
+                self.xst(XR, reg);
+            }
+            (0x15b, _) => {
+                self.src(insn, 16, true, XB, bail);
+                self.a.fcvtzs_4s(XR, XB);
+                self.a.mov_imm(Size::W, T_A, 0x7fff_ffff);
+                self.a.dup_4s(XT, T_A);
+                self.a.vec3(true, true, 2, 0b10001, XT, XR, XT);
+                self.a.fcm_v(Fcm::Eq, false, XA, XB, XB);
+                self.a.not_v(XA, XA);
+                self.a.vec3(true, false, 2, 0b00011, XT, XT, XA);
+                self.a.movz(Size::W, T_A, 0x8000, 1);
+                self.a.dup_4s(XA, T_A);
+                self.a.vec3(true, true, 2, 0b00011, XR, XA, XT);
+                self.xst(XR, reg);
+            }
+            (0x1e6, _) => {
+                match insn.mem {
+                    Some(_) => self.load_mem(8, XB),
+                    None => self.xld(XB, rm),
+                }
+                self.a.sxtl_2d(XB, XB);
+                self.a.scvtf_v(true, XR, XB);
+                self.xst(XR, reg);
+            }
             (0x152 | 0x153, _) => {
-                self.a.ldr_q(XA, STATE, xmm(reg));
+                self.xld(XA, reg);
                 self.a.ldr(Width::W, T_A, STATE, state::MXCSR as i32);
                 let ok = self.a.logic_imm(Logic::And, Size::W, T_A, T_A, 0x6000);
                 assert!(ok);
                 self.a.cbnz(Size::W, T_A, bail);
                 self.fp_src(insn, true, false, bail);
+                let saturated = self.a.label();
+                self.a.movz(Size::W, T_D, 0, 0);
+                self.mxcsr_flags_all_set(T_C, saturated);
+                self.a.movz(Size::W, T_D, 1, 0);
                 self.a.mrs(T_C, a64::sysreg::FPSR);
+                self.a.bind(saturated);
                 self.a.fmov_ws(T_A, XB);
                 self.flush_single(T_A);
                 self.a.fmov_sw(XB, T_A);
@@ -350,20 +427,23 @@ impl Emit {
                 self.a.movz(Size::W, T_A, 0x3f80, 1);
                 self.a.fmov_sw(XT, T_A);
                 self.a.fp2(false, 1, XR, XT, XB);
+                let kept = self.a.label();
+                self.a.cbz(Size::W, T_D, kept);
                 self.a.msr(a64::sysreg::FPSR, T_C);
+                self.a.bind(kept);
                 self.a.fmov_ws(T_A, XR);
                 self.flush_single(T_A);
                 self.a.fmov_sw(XR, T_A);
                 self.commit_fp(reg, true, false);
             }
             (0x1c2, _) => {
-                self.a.ldr_q(XA, STATE, xmm(reg));
+                self.xld(XA, reg);
                 self.fp_src(insn, scalar, double, bail);
                 self.cmp_pred(insn.imm as u8 & 7, scalar, double);
                 self.commit_fp(reg, scalar, double);
             }
             (0x12e | 0x12f, _) => {
-                self.a.ldr_q(XA, STATE, xmm(reg));
+                self.xld(XA, reg);
                 self.fp_src(insn, true, double, bail);
                 self.a.fcmp(double, op == 0x12f, XA, XB);
                 self.a.cset(Size::W, PF_RESULT, a64::Cond::Vc);
@@ -371,7 +451,7 @@ impl Emit {
                 self.a.movz(Size::W, AF_AUX, 0, 0);
             }
             (0x12a, _) => {
-                self.a.ldr_q(XA, STATE, xmm(reg));
+                self.xld(XA, reg);
                 match insn.mem {
                     Some(_) => self.a.ldr(Width::W, T_A, T_ADDR, 0),
                     None => self.a.mov(Size::W, T_A, guest_reg(rm)),
@@ -386,16 +466,59 @@ impl Emit {
                 self.a.mov(Size::W, guest_reg(reg), T_A);
             }
             (0x15a, _) => {
-                self.a.ldr_q(XA, STATE, xmm(reg));
+                self.xld(XA, reg);
                 self.fp_src(insn, true, pfx == F2, bail);
                 self.a.fp1(pfx == F2, if pfx == F3 { 5 } else { 4 }, XR, XB);
                 self.commit_fp(reg, true, pfx == F3);
             }
             _ => unreachable!("is_sse accepted {op:#x} with prefix {pfx}"),
         }
-        self.cold_exit(bail, eip);
+        self.defer_with(before, move |e| {
+            e.a.bind(bail);
+            e.exit_interp(eip);
+        });
         self.a.bind(done);
         true
+    }
+
+    /// The host register caching XMM `n` for the rest of the straight-line path.
+    fn xreg(&mut self, n: usize) -> V {
+        let r = V(n as u8);
+        if self.xmm.cached & 1 << n == 0 {
+            self.a.ldr_q(r, STATE, xmm(n));
+            self.xmm.cached |= 1 << n;
+        }
+        r
+    }
+
+    fn xld(&mut self, v: V, n: usize) {
+        let r = self.xreg(n);
+        self.a.vec3(true, false, 2, 0b00011, v, r, r);
+    }
+
+    fn xst(&mut self, v: V, n: usize) {
+        let r = V(n as u8);
+        self.a.vec3(true, false, 2, 0b00011, r, v, v);
+        self.xmm.cached |= 1 << n;
+        self.xmm.dirty |= 1 << n;
+    }
+
+    /// Writes XMM `n` back to the state if its register is newer, for code
+    /// that reads the state directly.
+    pub(super) fn xsync(&mut self, n: usize) {
+        if self.xmm.dirty & 1 << n != 0 {
+            self.a.str_q(V(n as u8), STATE, xmm(n));
+            self.xmm.dirty &= !(1 << n);
+        }
+    }
+
+    /// Writes every newer XMM register back, on the path being emitted.
+    pub(super) fn xmm_flush(&mut self) {
+        for n in 0..8 {
+            if self.xmm.dirty & 1 << n != 0 {
+                self.a.str_q(V(n as u8), STATE, xmm(n));
+            }
+        }
     }
 
     /// A 128-bit integer operation on XA and XB into XR.
@@ -455,7 +578,7 @@ impl Emit {
                 }
                 self.load_mem(n, dst);
             }
-            None => self.a.ldr_q(dst, STATE, xmm(insn.rm())),
+            None => self.xld(dst, insn.rm()),
         }
     }
 
@@ -476,7 +599,7 @@ impl Emit {
                 self.stored = true;
                 self.a.str_q(v, T_ADDR, 0);
             }
-            None => self.a.str_q(v, STATE, xmm(insn.rm())),
+            None => self.xst(v, insn.rm()),
         }
     }
 
@@ -484,6 +607,18 @@ impl Emit {
         let ok = self.a.logic_imm(Logic::And, Size::W, T_B, T_ADDR, 15);
         assert!(ok);
         self.a.cbnz(Size::W, T_B, bail);
+    }
+
+    /// `flush_single` on each lane of `v`; clobbers XA, XT and T_A.
+    fn flush_singles(&mut self, v: V) {
+        self.a.mov_imm(Size::W, T_A, 0x7f80_0000);
+        self.a.dup_4s(XT, T_A);
+        self.a.vec3(true, false, 0, 0b00011, XA, v, XT);
+        self.a.cmeq0_4s(XA, XA);
+        self.a.movz(Size::W, T_A, 0x8000, 1);
+        self.a.dup_4s(XT, T_A);
+        self.a.vec3(true, false, 0, 0b00011, XT, v, XT);
+        self.a.vec3(true, true, 2, 0b00011, v, XT, XA);
     }
 
     /// Replaces the single-precision subnormal in `r` with a zero of its
@@ -508,9 +643,9 @@ impl Emit {
     fn commit_fp(&mut self, reg: usize, scalar: bool, double: bool) {
         if scalar {
             self.a.ins(if double { 3 } else { 2 }, XA, 0, XR, 0);
-            self.a.str_q(XA, STATE, xmm(reg));
+            self.xst(XA, reg);
         } else {
-            self.a.str_q(XR, STATE, xmm(reg));
+            self.xst(XR, reg);
         }
     }
 
