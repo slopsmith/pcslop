@@ -32,6 +32,7 @@ struct Args {
     gpu_thread: bool,
     cdrom: Option<String>,
     hda: Option<String>,
+    hdb: Option<String>,
     serial: Option<String>,
     ram_mb: u32,
     max_instructions: Option<u64>,
@@ -135,6 +136,9 @@ struct Cli {
     /// Raw disk image on the primary master.
     #[arg(long, value_name = "IMG")]
     hda: Option<String>,
+    /// Raw disk image on the primary slave.
+    #[arg(long, value_name = "IMG", conflicts_with = "load")]
+    hdb: Option<String>,
     /// Write COM1 to FILE, or to stderr with `-`.
     #[arg(long, value_name = "FILE|-")]
     serial: Option<String>,
@@ -242,6 +246,7 @@ fn parse_args() -> Result<Args, String> {
         gpu_thread: !matches!(cli.gpu_thread.or_else(|| std::env::var("SLOPPER_GPU_THREAD").ok()).as_deref(), Some("off" | "0")),
         cdrom: cli.cdrom,
         hda: cli.hda,
+        hdb: cli.hdb,
         serial: cli.serial,
         ram_mb,
         max_instructions: cli.max_instructions,
@@ -510,11 +515,13 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
             Err(e) => eprintln!("no sound card: {e}"),
         }
     }
-    if let Some(path) = &args.hda
-        && let Err(e) = board.attach_disk(path)
-    {
-        eprintln!("cannot open {path}: {e}");
-        return ExitCode::FAILURE;
+    for (slot, disk) in [&args.hda, &args.hdb].into_iter().enumerate() {
+        if let Some(path) = disk
+            && let Err(e) = board.attach_disk_at(path, slot)
+        {
+            eprintln!("cannot open {path}: {e}");
+            return ExitCode::FAILURE;
+        }
     }
     if let Some(path) = &args.serial {
         let out: Box<dyn std::io::Write + Send> = if path == "-" {

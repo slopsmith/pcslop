@@ -1001,8 +1001,13 @@ impl Board {
 
     /// Attaches a raw disk image as the primary master.
     pub fn attach_disk(&mut self, path: &str) -> std::io::Result<()> {
+        self.attach_disk_at(path, 0)
+    }
+
+    /// Attaches a raw disk image as the primary master (`slot` 0) or slave (1).
+    pub fn attach_disk_at(&mut self, path: &str, slot: usize) -> std::io::Result<()> {
         let b = ide::FileBackend::open(path, false)?;
-        self.ide.attach_disk(0, 0, Box::new(b));
+        self.ide.attach_disk(0, slot, Box::new(b));
         Ok(())
     }
 
@@ -1734,6 +1739,19 @@ mod tests {
 
     fn board() -> Board {
         Board::new(Config { ram_bytes: 1 << 20, bios: vec![0; 0x2_0000], vgabios: None, apic: true, chipset: Chipset::I440fx, gpu: Gpu::StdVga, power: battery::Power::default() })
+    }
+
+    #[test]
+    fn a_disk_attached_as_the_primary_slave_answers_identify() {
+        let path = std::env::temp_dir().join(format!("slopper-hdb-{}.img", std::process::id()));
+        std::fs::write(&path, vec![0u8; 1 << 20]).unwrap();
+        let mut b = board();
+        b.attach_disk_at(path.to_str().unwrap(), 1).unwrap();
+        b.io_write(0x1f6, 1, 0xb0);
+        b.io_write(0x1f7, 1, 0xec);
+        let status = b.io_read(0x1f7, 1);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(status & 0x09, 0x08, "the slave must hand over IDENTIFY data, or the guest never sees the second disk: status {status:#x}");
     }
 
     #[test]
