@@ -82,20 +82,23 @@ impl Texture {
         let mut slices = Vec::new();
         let mut off = 0usize;
         for l in 0..=num_levels.min(11) {
-            let w = (width >> l).max(1);
+            let w = (width >> l).max(1).div_ceil(bw);
             let h = (height >> l).max(1);
-            let macro_tiled = tiling & 4 != 0 && macro_tile.is_some_and(|(tw, th)| w > tw && h > th);
-            let align = if bw == 1 { tile_size(bytes, macro_tiled, micro).or(tile_size(bytes, false, 0)) } else { None };
-            let blocks_x = w.div_ceil(bw) as usize;
+            let macro_tiled = tiling & 4 != 0 && macro_tile.is_some_and(|(tw, th)| w > tw && h.div_ceil(bw) > th);
+            let align = match bw {
+                1 => tile_size(bytes, macro_tiled, micro).or(tile_size(bytes, false, 0)),
+                _ if tiling & 0xc != 0 => tile_size(bytes, macro_tiled, micro),
+                _ => None,
+            };
             let pitch = match (l, pitch_texels, align) {
                 (0, Some(p), _) => p.div_ceil(bw) as usize * bytes,
                 (_, _, Some((tw, _))) => w.next_multiple_of(tw) as usize * bytes,
-                _ => (blocks_x * bytes).next_multiple_of(32),
+                _ => (w as usize * bytes).next_multiple_of(32),
             };
-            let rows = if num_levels > 0 { h.next_power_of_two() } else { h };
+            let rows = if num_levels > 0 { h.next_power_of_two() } else { h }.div_ceil(bw);
             let rows = match align {
                 Some((_, th)) => rows.next_multiple_of(th) as usize,
-                None => rows.div_ceil(bw) as usize,
+                None => rows as usize,
             };
             let layers = match kind {
                 1 => (depth >> l).max(1) as usize,
@@ -418,6 +421,20 @@ mod tests {
         let pitches: Vec<usize> = t.levels.iter().map(|l| l.1).collect();
         assert_eq!(offsets, [0, 0x40000, 0x50000, 0x54000, 0x55000, 0x55400, 0x55500, 0x55540, 0x55560], "ARGB8888 256x256 level offsets as Catalyst uploads them");
         assert_eq!(pitches[6..], [16, 16, 16], "microtiled 4x4, 2x2 and 1x1 levels are four texels wide");
+    }
+
+    #[test]
+    fn tiled_dxt_levels_align_to_tiles_of_blocks() {
+        let t = Texture::new(TexMem::Vram(0), 256, 256, 0xf, 8, None, 0, 1, 0xc);
+        let offsets: Vec<usize> = t.levels.iter().map(|l| l.0).collect();
+        assert_eq!(offsets, [0, 0x8000, 0xa000, 0xa800, 0xaa00, 0xaa80, 0xaaa0, 0xaac0, 0xaae0], "DXT1 256x256 level offsets as Catalyst uploads them");
+    }
+
+    #[test]
+    fn linear_dxt_levels_keep_32_byte_pitches() {
+        let t = Texture::new(TexMem::Vram(0), 16, 16, 0xf, 4, None, 0, 1, 0);
+        let pitches: Vec<usize> = t.levels.iter().map(|l| l.1).collect();
+        assert_eq!(pitches, [32, 32, 32, 32, 32]);
     }
 
     #[test]
