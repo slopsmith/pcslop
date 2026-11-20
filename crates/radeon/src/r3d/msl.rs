@@ -79,7 +79,7 @@ impl Backend {
             ncb: ncb as u32,
             formats,
             cmask: r.channel_mask & 0xf,
-            out_fmt: r.out_fmt & 0xff00,
+            out_fmt: r.out_fmt & 0xff00 | (r.out_fmt & 0x1f == 2) as u32,
             clip_all: (r.clip_rule == 0xffff) as u32,
             poly: r.poly_offset.0 & 3,
             ..Default::default()

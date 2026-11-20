@@ -26,6 +26,9 @@ pub(crate) struct Texture {
     pub sel: [u32; 4],
     /// TX_FORMAT1's SIGNED_COMP0..3: components read as two's complement.
     pub signed: u32,
+    /// TX_FORMAT1's GAMMA (R300_TX_FORMAT_GAMMA in Mesa's r300_reg.h): RGB is
+    /// sRGB-encoded and sampled as linear.
+    pub gamma: bool,
     pub filter: u32,
     pub border: u32,
     /// Byte offset and row pitch of each mipmap level.
@@ -109,7 +112,7 @@ impl Texture {
             slices.push(pitch * rows);
             off = (off + pitch * rows * layers).next_multiple_of(32);
         }
-        Texture { mem, width, height, format, sel: [0, 1, 2, 3], signed: 0, filter: 0, border: 0, levels, kind, depth, slices }
+        Texture { mem, width, height, format, sel: [0, 1, 2, 3], signed: 0, gamma: false, filter: 0, border: 0, levels, kind, depth, slices }
     }
 
     /// Bytes the texture spans from its base.
@@ -294,7 +297,12 @@ impl Texture {
 
     /// Samples at (s, t, r) from `coords` with level-of-detail `lod` (log2
     /// of texels per pixel) and returns RGBA.
-    pub fn sample(&self, vram: &[u8], [s, t, r]: [f32; 3], lod: f32) -> V4 {
+    pub fn sample(&self, vram: &[u8], str: [f32; 3], lod: f32) -> V4 {
+        let c = self.filtered(vram, str, lod);
+        if self.gamma { [srgb_to_linear(c[0]), srgb_to_linear(c[1]), srgb_to_linear(c[2]), c[3]] } else { c }
+    }
+
+    fn filtered(&self, vram: &[u8], [s, t, r]: [f32; 3], lod: f32) -> V4 {
         let minify = lod > 0.0;
         let mip = (self.filter >> 13) & 3;
         let max_level = self.levels.len() - 1;
@@ -342,6 +350,15 @@ impl Texture {
         let b = slice(z1);
         [0, 1, 2, 3].map(|c| a[c] + (b[c] - a[c]) * fz)
     }
+}
+
+pub(crate) fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+}
+
+pub(crate) fn linear_to_srgb(c: f32) -> f32 {
+    let c = c.clamp(0.0, 1.0);
+    if c <= 0.0031308 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 }
 }
 
 fn half(h: u32) -> f32 {

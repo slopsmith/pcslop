@@ -61,7 +61,8 @@ struct TexDesc {
     map: u32,
     sampler: u32,
     manual: u32,
-    pad: [u32; 3],
+    gamma: u32,
+    pad: [u32; 2],
 }
 
 #[repr(C)]
@@ -641,6 +642,7 @@ impl MetalR3d {
             d.layers = plan.key.layers;
             d.map = plan.map;
             d.manual = plan.manual as u32;
+            d.gamma = t.gamma as u32;
             d.sampler = samplers.len() as u32;
             images.extend(imgs.iter().cloned());
             samplers.push(resource_id(near.gpuResourceID()));

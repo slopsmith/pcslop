@@ -764,6 +764,7 @@ impl Radeon {
         };
         t.sel = [bits(f1, 9, 3), bits(f1, 12, 3), bits(f1, 15, 3), bits(f1, 18, 3)];
         t.signed = bits(f1, 5, 4);
+        t.gamma = f1 & (1 << 21) != 0;
         t.filter = filter;
         t.border = border;
         Some(t)

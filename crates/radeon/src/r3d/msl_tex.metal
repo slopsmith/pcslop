@@ -123,5 +123,10 @@ static float4 sample(constant TexDesc &t, TexTables tb, float4 coords, uint op) 
 
 [[visible]] float4 sample_tex(constant TexDesc &t, const device uchar *images, const device uchar *samplers, float4 coords, uint op) {
     TexTables tb = {(const device TexSlot *)images, (const device SamplerSlot *)samplers};
-    return sample(t, tb, coords, op);
+    float4 c = sample(t, tb, coords, op);
+    if (t.gamma) {
+        float3 lo = c.xyz / 12.92, hi = pow((c.xyz + 0.055) / 1.055, 2.4);
+        c.xyz = select(hi, lo, c.xyz <= 0.04045);
+    }
+    return c;
 }

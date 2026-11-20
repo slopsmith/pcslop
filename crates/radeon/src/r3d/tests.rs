@@ -497,8 +497,12 @@ fn the_guard_band_clips_vertices_far_off_screen() {
 }
 
 fn textured_sprite(g: &mut Gpu, unit: u32, logical_id: u32) {
+    sprite_of(g, unit, logical_id, 0xff00_ff00, 0xa60c);
+}
+
+fn sprite_of(g: &mut Gpu, unit: u32, logical_id: u32, texel: u32, format1: u32) {
     for i in 0..16 {
-        g.put(TEXTURE as usize + i * 4, 0xff00_ff00);
+        g.put(TEXTURE as usize + i * 4, texel);
     }
     g.w(GB_ENABLE, 1 | 1 << 16);
     g.w(GA_POINT_SIZE, 32 << 16 | 32);
@@ -508,7 +512,7 @@ fn textured_sprite(g: &mut Gpu, unit: u32, logical_id: u32) {
     let u = 4 * unit;
     g.w(TX_FILTER0_0 + u, logical_id << 28);
     g.w(TX_FORMAT0_0 + u, 3 | 3 << 11);
-    g.w(TX_FORMAT1_0 + u, 0xa60c);
+    g.w(TX_FORMAT1_0 + u, format1);
     g.w(TX_OFFSET_0 + u, VRAM + TEXTURE);
     g.w(TX_ENABLE, 1 << unit);
     g.w(US_TEX_INST_0, 1 << 15);
@@ -521,6 +525,21 @@ fn the_fragment_program_finds_a_texture_map_by_its_logical_id() {
     let mut g = Gpu::new();
     textured_sprite(&mut g, 3, 0);
     assert_eq!(g.px(4, 4), 0xff00_ff00);
+}
+
+#[test]
+fn a_gamma_texture_reads_its_colour_as_linear_and_keeps_alpha() {
+    let mut g = Gpu::new();
+    sprite_of(&mut g, 0, 0, 0x80bc_bc37, 0xa60c | 1 << 21);
+    assert_eq!(g.px(4, 4), 0x8080_800a, "sRGB 0xbc is linear 0.5 and 0x37 is 0.038; alpha 0x80 stays");
+}
+
+#[test]
+fn the_gamma_output_format_writes_colour_as_srgb() {
+    let mut g = Gpu::new();
+    g.w(US_OUT_FMT_0, 0x1b02);
+    g.draw(13, &quad(0.0, 0.0, 10.0, 10.0, [0.5, 0.5, 0.5, 0.5]));
+    assert_eq!(g.px(5, 5), 0x80bc_bcbc, "linear 0.5 is sRGB 0xbc; alpha 0x80 stays");
 }
 
 #[test]
@@ -871,6 +890,14 @@ mod against_metal {
                 g.draw(13, &quad(0.0, 0.0, 4.0, 4.0, RED));
             },
             0,
+            0,
+        );
+        same(
+            |g| {
+                g.w(US_OUT_FMT_0, 0x1b02);
+                sprite_of(g, 0, 0, 0x80bc_6a37, 0xa60c | 1 << 21);
+            },
+            1,
             0,
         );
         same(wrapped_program, 0, 0);

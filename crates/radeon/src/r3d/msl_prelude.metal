@@ -210,6 +210,10 @@ static void backend(constant Uniforms &u, device uchar *vram, device atomic_uint
     }
     if (!depth_stencil(u, vram, x, y, z, front)) return;
     atomic_fetch_add_explicit(counter, 1, memory_order_relaxed);
+    if (S_OUT_FMT & 1) {
+        float3 c = clamp(colour.xyz, 0.0, 1.0);
+        colour.xyz = select(1.055 * pow(c, 1.0 / 2.4) - 0.055, c * 12.92, c <= 0.0031308);
+    }
     uint sel[4];
     for (uint k = 0; k < 4; k++) {
         uint s = (S_OUT_FMT >> (8 + 2 * k)) & 3;

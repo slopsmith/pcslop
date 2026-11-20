@@ -4,7 +4,7 @@
 //! register reference.
 
 use super::V4;
-use super::tex::Texture;
+use super::tex::{self, Texture};
 use super::us::{self, Quad, TEMPS};
 use crate::engine::rop3;
 
@@ -583,6 +583,13 @@ impl Raster {
             return;
         }
         self.zpass = self.zpass.wrapping_add(1);
+        // C4_10_GAMMA, as Mesa's r300_reg.h names US_OUT_FMT format 2.
+        let colour = if self.out_fmt & 0x1f == 2 {
+            let g = tex::linear_to_srgb;
+            [g(colour[0]), g(colour[1]), g(colour[2]), colour[3]]
+        } else {
+            colour
+        };
         let sel = [0, 1, 2, 3].map(|k| match (self.out_fmt >> (8 + 2 * k)) & 3 {
             0 => 3,
             s => s as usize - 1,
