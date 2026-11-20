@@ -29,7 +29,7 @@ mod tests;
 
 use std::io::Write;
 
-pub use card::Card;
+pub use card::{Card, Presenter};
 pub use crtc::Mode;
 pub use mem::{BusMemory, NoBus};
 use regs::*;
@@ -488,6 +488,9 @@ impl Radeon {
             return;
         }
         let new = (old & !mask) | (v & mask);
+        if reg == CRTC_OFFSET {
+            self.defer_flip(old, new);
+        }
         match reg {
             // Vista's driver parks the pitch at 0 before mid-buffer 2D blits and
             // draws again without restoring it, so a zero pitch keeps the old state.

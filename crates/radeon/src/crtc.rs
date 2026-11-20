@@ -47,7 +47,7 @@ impl Radeon {
         }
         let bytes = bits.div_ceil(8);
         let pitch = (self.reg(CRTC_PITCH) & 0x7ff) * 8 * bytes;
-        let mut offset = self.vram_offset(self.reg(CRTC_OFFSET));
+        let mut offset = self.vram_offset(self.shown_offset());
         if self.reg(CRTC_OFFSET_CNTL) & R300_CRTC_X_Y_MODE_EN != 0 {
             let xy = self.reg(R300_CRTC_TILE_X0_Y0);
             let (x, y) = (xy & 0xfff, (xy >> 16) & 0xfff);

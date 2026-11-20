@@ -58,7 +58,15 @@ pub(crate) struct Status {
     idle: Condvar,
     /// The guest wrote VRAM through its mapping.
     fb_written: AtomicBool,
+    /// A live refresh found the shown picture still being drawn by Metal;
+    /// the worker presents it once the GPU is done.
+    present_wanted: AtomicBool,
+    presenter: Mutex<Option<Presenter>>,
 }
+
+/// Receives finished pictures from the worker as 0x00RRGGBB pixels, width and
+/// height; it may swap the buffer for another.
+pub type Presenter = Box<dyn FnMut(&mut Vec<u32>, u32, u32) + Send>;
 
 impl Status {
     pub(crate) fn ring_pending(&self) -> bool {
@@ -372,9 +380,16 @@ impl Card {
     /// the emulation thread: while the command processor holds the card or
     /// Metal draws into the visible buffer it skips the refresh and returns
     /// None, so the guest does not wait for the GPU, and catches up later.
+    /// Lets the worker thread hand pictures it finishes to `f` instead of
+    /// making live refreshes wait for the GPU.
+    pub fn set_presenter(&mut self, f: Presenter) {
+        *self.st.presenter.lock().unwrap_or_else(PoisonError::into_inner) = Some(f);
+    }
+
     pub fn render_live(&mut self, out: &mut Vec<u32>) -> Option<(u32, u32)> {
         let written = self.st.fb_written.swap(false, Relaxed);
-        let wait = self.skipped >= MAX_SKIPPED_REFRESHES;
+        let deferred = self.threaded() && self.st.presenter.lock().unwrap_or_else(PoisonError::into_inner).is_some();
+        let wait = self.skipped >= MAX_SKIPPED_REFRESHES && !deferred;
         let (frame, skipped) = {
             let guard = if wait { self.lock_within(REFRESH_LOCK_WAIT) } else { self.try_lock() };
             match guard {
@@ -389,6 +404,11 @@ impl Card {
                     } else {
                         match g.render_unless_drawing(out, wait) {
                             Some(frame) => (frame, false),
+                            None if deferred => {
+                                self.st.present_wanted.store(true, Release);
+                                self.st.wake_worker();
+                                (None, false)
+                            }
                             None => (None, true),
                         }
                     }
@@ -553,6 +573,23 @@ fn interactive_qos() {
 #[cfg(not(target_os = "macos"))]
 fn interactive_qos() {}
 
+/// Hands the shown picture to the presenter once no Metal work still writes it.
+fn present(g: &mut Radeon, st: &Status, picture: &mut Vec<u32>) {
+    if g.take_flip_landed() {
+        st.present_wanted.store(true, Release);
+    }
+    if !st.present_wanted.load(Acquire) {
+        return;
+    }
+    let Some(frame) = g.render_unless_drawing(picture, false) else { return };
+    st.present_wanted.store(false, Release);
+    if let Some((w, h)) = frame
+        && let Some(p) = st.presenter.lock().unwrap_or_else(PoisonError::into_inner).as_mut()
+    {
+        p(picture, w, h);
+    }
+}
+
 fn lock<'a>(core: &'a Mutex<Radeon>, st: &Status) -> MutexGuard<'a, Radeon> {
     let mut g = core.lock().unwrap_or_else(PoisonError::into_inner);
     g.now_ns = st.now_ns.load(Relaxed);
@@ -569,6 +606,7 @@ fn worker(core: &Mutex<Radeon>, st: &Status, mut bus: Box<dyn BusMemory + Send>,
     };
     let mut idle_since: Option<Instant> = None;
     let mut fence_since: Option<Instant> = None;
+    let mut picture = Vec::new();
     let mut retired = 0;
     while !st.stop.load(Acquire) {
         let target = st.submitted.load(SeqCst);
@@ -608,6 +646,7 @@ fn worker(core: &Mutex<Radeon>, st: &Status, mut bus: Box<dyn BusMemory + Send>,
             let mut g = lock(core, st);
             g.gpu_poll(bus);
             publish(&mut g);
+            present(&mut g, st, &mut picture);
             let fenced = st.fences.load(Acquire);
             if !fenced || g.fences.retired != retired {
                 retired = g.fences.retired;
@@ -627,6 +666,9 @@ fn worker(core: &Mutex<Radeon>, st: &Status, mut bus: Box<dyn BusMemory + Send>,
                 st.sleeping.store(false, SeqCst);
             }
             continue;
+        }
+        if st.present_wanted.load(Acquire) {
+            present(&mut lock(core, st), st, &mut picture);
         }
         let since = *idle_since.get_or_insert_with(Instant::now);
         if since.elapsed() < SPIN {

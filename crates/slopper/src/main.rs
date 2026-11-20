@@ -585,6 +585,16 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                 k.kick();
             }
         }));
+        let sink = shared.clone();
+        board.set_frame_sink(Box::new(move |pixels, w, h| {
+            let mut f = sink.frame.lock().unwrap();
+            std::mem::swap(&mut f.pixels, pixels);
+            f.width = w;
+            f.height = h;
+            f.seq += 1;
+            drop(f);
+            sink.wake();
+        }));
     }
     if let Some(cfg) = &args.net {
         match start_net(cfg) {

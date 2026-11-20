@@ -193,6 +193,13 @@ pub(crate) struct Fences {
     writebacks: Vec<u32>,
     /// Fences applied so far.
     pub retired: u64,
+    /// CRTC_OFFSET writes waiting for the draws before them: (command buffer
+    /// serial, offset). The card flips only once those draws are done.
+    flips: std::collections::VecDeque<(u64, u32)>,
+    /// The offset scanned out while flips wait, instead of CRTC_OFFSET.
+    shown: Option<u32>,
+    /// A flip landed since the worker last looked.
+    landed: bool,
 }
 
 impl Fences {
@@ -383,7 +390,7 @@ impl Radeon {
     /// True while fences or occlusion queries wait for Metal, or fences for
     /// their writeback.
     pub fn fences_pending(&self) -> bool {
-        !self.fences.queue.is_empty() || !self.fences.writebacks.is_empty() || self.metal.as_ref().is_some_and(|m| m.zpass_pending())
+        !self.fences.queue.is_empty() || !self.fences.flips.is_empty() || !self.fences.writebacks.is_empty() || self.metal.as_ref().is_some_and(|m| m.zpass_pending())
     }
 
     /// Writes the occlusion queries whose draws have finished by now,
@@ -394,11 +401,48 @@ impl Radeon {
             return;
         }
         let done = self.metal.as_mut().map_or(u64::MAX, |m| m.finished());
+        self.land_flips(done);
         for (addr, v) in self.metal.as_mut().map_or(Vec::new(), |m| m.zpass_done(done)) {
             self.mc_write_dword(mem, addr, v);
         }
         self.retire_fences(done);
         self.flush_writebacks(mem);
+    }
+
+    /// Keeps scanning out `old` until the draws queued before this CRTC_OFFSET
+    /// write are done, as the card's in-order command processor would.
+    pub(crate) fn defer_flip(&mut self, old: u32, new: u32) {
+        let Some(m) = self.metal.as_mut() else { return };
+        if !m.busy() && self.fences.flips.is_empty() {
+            return;
+        }
+        let serial = m.kick();
+        self.fences.shown.get_or_insert(old);
+        self.fences.flips.push_back((serial, new));
+    }
+
+    fn land_flips(&mut self, done: u64) {
+        while let Some(&(serial, v)) = self.fences.flips.front() {
+            if serial > done {
+                break;
+            }
+            self.fences.flips.pop_front();
+            self.fences.shown = Some(v);
+            self.fences.landed = true;
+        }
+        if self.fences.flips.is_empty() && self.fences.shown == Some(self.reg(crate::regs::CRTC_OFFSET)) {
+            self.fences.shown = None;
+        }
+    }
+
+    /// The CRTC_OFFSET the display scans out: the newest one whose draws are done.
+    pub(crate) fn shown_offset(&self) -> u32 {
+        self.fences.shown.unwrap_or(self.reg(crate::regs::CRTC_OFFSET))
+    }
+
+    /// Whether a flip landed since the last call.
+    pub(crate) fn take_flip_landed(&mut self) -> bool {
+        std::mem::take(&mut self.fences.landed)
     }
 
     /// Applies the fences whose draws have finished by command buffer

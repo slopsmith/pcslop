@@ -1034,6 +1034,13 @@ impl Board {
         self.gpu_bus = Some(st);
     }
 
+    /// Sends pictures the Radeon's thread finishes to `f`; see `radeon::Card::set_presenter`.
+    pub fn set_frame_sink(&mut self, f: radeon::Presenter) {
+        if let Display::Radeon(r) = &mut self.display {
+            r.set_presenter(f);
+        }
+    }
+
     /// Level of the INTx line of `self.pci[function]`.
     fn intx(&self, function: usize) -> bool {
         if function == DISPLAY

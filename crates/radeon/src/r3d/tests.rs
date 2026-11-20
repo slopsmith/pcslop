@@ -1383,6 +1383,36 @@ mod against_metal {
     }
 
     #[test]
+    fn a_flip_after_draws_scans_out_only_once_their_pixels_are_done() {
+        let mut g = Gpu::new();
+        if !g.r.use_metal() {
+            return;
+        }
+        let before = g.r.shown_offset();
+        g.draw(13, &quad(0.0, 0.0, 64.0, 64.0, RED));
+        g.w(CRTC_OFFSET, 0x10_0000);
+        assert_eq!(g.r.shown_offset(), before, "the display must keep the old buffer while the draws before the flip run");
+        assert_eq!(g.r.mmio_read(CRTC_OFFSET, 4), 0x10_0000, "the guest reads back the offset it wrote");
+        let start = std::time::Instant::now();
+        while g.r.shown_offset() != 0x10_0000 {
+            assert!(start.elapsed().as_secs() < 5, "the flip never landed");
+            g.r.poll_fences(&mut g.ram);
+        }
+        assert!(g.r.take_flip_landed(), "the worker presents when a flip lands");
+        assert_eq!(g.px(63, 63), 0xffff_0000);
+    }
+
+    #[test]
+    fn a_flip_with_nothing_queued_scans_out_at_once() {
+        let mut g = Gpu::new();
+        if !g.r.use_metal() {
+            return;
+        }
+        g.w(CRTC_OFFSET, 0x10_0000);
+        assert_eq!(g.r.shown_offset(), 0x10_0000);
+    }
+
+    #[test]
     fn a_fence_with_nothing_queued_lands_at_once() {
         let mut g = Gpu::new();
         if !g.r.use_metal() {

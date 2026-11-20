@@ -263,3 +263,25 @@ fn the_command_processor_thread_asks_for_performance_cores() {
     unsafe { pthread_get_qos_class_np(handle, &mut class, &mut rel) };
     assert_eq!(class, crate::card::QOS_CLASS_USER_INTERACTIVE, "the guest stalls when the worker lands on an efficiency core");
 }
+
+#[test]
+fn with_a_presenter_live_refreshes_never_wait_for_a_busy_card() {
+    let mut ram = Ram::new();
+    let (mut c, _) = threaded_card(&mut ram);
+    c.set_presenter(Box::new(|_, _, _| {}));
+    let mut out = Vec::new();
+    c.mark_changed();
+    ram.shut();
+    submit(&mut c, &mut ram, &[pkt0(SCRATCH_REG0, 1), 1]);
+    std::thread::sleep(Duration::from_millis(20));
+    let start = Instant::now();
+    for _ in 0..12 {
+        assert!(c.render_live(&mut out).is_none());
+    }
+    assert!(
+        start.elapsed() < crate::card::REFRESH_LOCK_WAIT * 2,
+        "refreshes must leave the frame to the worker's presenter instead of stalling the guest"
+    );
+    ram.open();
+    wait_idle(&mut c);
+}
