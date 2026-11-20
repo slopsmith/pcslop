@@ -5,7 +5,10 @@ pub const VAP_CNTL_STATUS: u32 = 0x2140;
 pub const VAP_CNTL: u32 = 0x2080;
 pub const DX_CLIP_SPACE_DEF: u32 = 1 << 22;
 pub const VAP_CLIP_CNTL: u32 = 0x221c;
+pub const UCP_ENABLE: u32 = 0x3f;
 pub const CLIP_DISABLE: u32 = 1 << 16;
+/// The PVS vector the six user clip planes start at.
+pub const PVS_UCP_START: usize = 1024;
 pub const VAP_GB_VERT_CLIP_ADJ: u32 = 0x2220;
 pub const VAP_GB_HORZ_CLIP_ADJ: u32 = 0x2228;
 pub const PVS_BYPASS: u32 = 1 << 8;

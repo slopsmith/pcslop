@@ -39,7 +39,7 @@ fn outputs(slots: &[usize], perspective: bool, flat: &[u32]) -> String {
     }
     let fields = format!("    float4 position [[position]];\n    float z [[center_no_perspective]];\n    float front [[flat]];\n{varyings}");
     format!(
-        "#define PERSPECTIVE {perspective}\nstruct VOut {{\n{fields}}};\nstruct VOutV {{\n{fields}    float clip [[clip_distance]] [2];\n}};\n"
+        "#define PERSPECTIVE {perspective}\nstruct VOut {{\n{fields}}};\nstruct VOutV {{\n{fields}    float clip [[clip_distance]] [8];\n}};\n"
     )
 }
 

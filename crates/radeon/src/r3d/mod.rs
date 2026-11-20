@@ -113,14 +113,16 @@ type Plane = ([f32; 4], f32);
 /// The planes the VAP clips triangles against, in clip space. With
 /// VAP_CLIP_CNTL's CLIP_DISABLE only w > 0 is kept. Otherwise the near
 /// plane is z = 0 under VAP_CNTL's DX_CLIP_SPACE_DEF and z = -w without,
-/// the far plane z = w, and x and y are clipped to the guard band the
-/// VAP_GB_*_CLIP_ADJ registers give in multiples of w. Register meanings
+/// the far plane z = w, x and y are clipped to the guard band the
+/// VAP_GB_*_CLIP_ADJ registers give in multiples of w, and the user clip
+/// planes in `user` keep `dot(plane, pos) >= 0`. Register meanings
 /// follow Mesa's r300 driver (r300_reg.h, r300_emit.c's guard band and
 /// VAP_CNTL state; MIT license, Jerome Glisse, Corbin Simpson, Marek Olšák
 /// and others).
-fn clip_planes(enabled: bool, dx: bool, horz: f32, vert: f32) -> Vec<Plane> {
+fn clip_planes(enabled: bool, dx: bool, horz: f32, vert: f32, user: &[[f32; 4]]) -> Vec<Plane> {
     let mut planes = vec![([0.0, 0.0, 0.0, 1.0], NEAR_W)];
     if enabled {
+        planes.extend(user.iter().map(|&n| (n, 0.0)));
         planes.push(([0.0, 0.0, 1.0, if dx { 0.0 } else { 1.0 }], 0.0));
         planes.push(([0.0, 0.0, -1.0, 1.0], 0.0));
         for (axis, adj) in [(0, horz), (1, vert)] {
@@ -677,6 +679,13 @@ impl Radeon {
         }
     }
 
+    /// The user clip planes VAP_CLIP_CNTL's UCP_ENABLE bits turn on, from
+    /// the PVS vector memory at PVS_UCP_START.
+    fn user_clip_planes(&self) -> Vec<[f32; 4]> {
+        let on = self.reg(VAP_CLIP_CNTL) & UCP_ENABLE;
+        (0..6).filter(|i| on & (1 << i) != 0).map(|i| std::array::from_fn(|c| f32::from_bits(self.r3d.vecmem[(PVS_UCP_START + i) * 4 + c]))).collect()
+    }
+
     /// The PSC's registers, which split a vertex's dwords into input vectors.
     fn psc(&self) -> Psc {
         Psc {
@@ -968,6 +977,9 @@ impl Radeon {
         job.uniforms.scale = [vp.scale[0], vp.scale[1], vp.scale[2], 0.0];
         job.uniforms.offset = [vp.offset[0], vp.offset[1], vp.offset[2], 0.0];
         job.uniforms.ga_fog = [vp.ga.0, vp.ga.1, vp.fog.1, vp.fog.2];
+        for (i, plane) in job.uniforms.ucp.iter_mut().enumerate() {
+            *plane = std::array::from_fn(|c| f32::from_bits(self.r3d.vecmem[(PVS_UCP_START + i) * 4 + c]));
+        }
         let psc = self.psc();
         let mut r = self.raster_state(mem);
         job.uniforms.solid = r.solid;
@@ -978,6 +990,7 @@ impl Radeon {
             fmt: [self.reg(VAP_OUT_VTX_FMT_0), self.reg(VAP_OUT_VTX_FMT_1)],
             vte: vp.vte,
             clip: self.reg(VAP_CLIP_CNTL) & CLIP_DISABLE == 0,
+            ucp: self.reg(VAP_CLIP_CNTL) & UCP_ENABLE,
             dx: self.reg(VAP_CNTL) & DX_CLIP_SPACE_DEF != 0,
             fog_select: vp.fog.0,
             colour_control,
@@ -1062,6 +1075,7 @@ impl Radeon {
             self.reg(VAP_CNTL) & DX_CLIP_SPACE_DEF != 0,
             f32::from_bits(self.reg(VAP_GB_HORZ_CLIP_ADJ)),
             f32::from_bits(self.reg(VAP_GB_VERT_CLIP_ADJ)),
+            &self.user_clip_planes(),
         );
         let outside = |v: &Vertex| planes.iter().any(|p| distance(p, v) < 0.0);
         let vram = self.vga.vram_mut();
@@ -1144,9 +1158,10 @@ impl Radeon {
             }
             return;
         }
+        let passed = r.zpass.wrapping_sub(self.reg(ZB_ZPASS_DATA));
         self.regs[ZB_ZPASS_DATA as usize / 4] = r.zpass;
         if self.trace.is_some() {
-            self.note(&format!("3d: {} pixels", r.pixels));
+            self.note(&format!("3d: {} pixels, {passed} passed", r.pixels));
         }
         if r.pixels > 0 {
             self.vga.touch();

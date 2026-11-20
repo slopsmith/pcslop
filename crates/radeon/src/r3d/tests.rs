@@ -99,6 +99,13 @@ impl Gpu {
         }
     }
 
+    fn user_clip_plane(&mut self, index: u32, plane: [f32; 4]) {
+        self.w(VAP_PVS_VECTOR_INDX_REG, PVS_UCP_START as u32 + index);
+        for c in plane {
+            self.w(VAP_PVS_VECTOR_DATA_REG, f(c));
+        }
+    }
+
     fn fragment(&mut self, alu: &[[u32; 4]], tex: usize) {
         for (i, a) in alu.iter().enumerate() {
             let i = 4 * i as u32;
@@ -441,6 +448,24 @@ fn triangles_are_clipped_to_the_direct3d_near_plane() {
     g.w(VAP_CLIP_CNTL, CLIP_DISABLE);
     g.draw(4, &[at(-1.0, -1.0, 0.5), at(1.0, -1.0, 0.5), at(0.0, 1.0, -0.5)]);
     assert_eq!(g.px(32, 40), 0xffff_0000);
+}
+
+/// Direct3D user clip planes, which Portal uses to cut away what lies
+/// behind the portal it looks out of, keep `dot(plane, pos) >= 0`.
+#[test]
+fn enabled_user_clip_planes_cut_triangles_and_disabled_ones_do_not() {
+    let mut g = Gpu::new();
+    clip_space(&mut g);
+    g.w(VAP_CNTL, DX_CLIP_SPACE_DEF);
+    g.user_clip_plane(0, [0.0, 0.0, 0.0, -1.0]);
+    g.user_clip_plane(3, [1.0, 0.0, 0.0, 0.0]);
+    g.w(VAP_CLIP_CNTL, 1 << 3);
+    g.draw(13, &quad(-1.0, -1.0, 1.0, 1.0, RED));
+    assert_eq!(g.px(40, 32), 0xffff_0000, "the half where x >= 0 stays");
+    assert_eq!(g.px(20, 32), 0, "the half where x < 0 is clipped");
+    g.w(VAP_CLIP_CNTL, 1 << 3 | CLIP_DISABLE);
+    g.draw(13, &quad(-1.0, -1.0, 1.0, 1.0, BLUE));
+    assert_eq!(g.px(20, 32), 0xff00_00ff, "CLIP_DISABLE turns user planes off too");
 }
 
 #[test]
@@ -1426,6 +1451,22 @@ mod against_metal {
 
     fn at(x: f32, y: f32, z: f32, w: f32, c: [f32; 4]) -> [f32; 8] {
         [x, y, z, w, c[0], c[1], c[2], c[3]]
+    }
+
+    #[test]
+    fn user_clip_planes_match() {
+        same(
+            |g| {
+                clip_space(g);
+                g.w(VAP_CNTL, DX_CLIP_SPACE_DEF);
+                g.user_clip_plane(1, [0.0, 0.0, 0.0, -1.0]);
+                g.user_clip_plane(4, [1.0, 0.5, 0.0, 0.25]);
+                g.w(VAP_CLIP_CNTL, 1 << 4);
+                g.draw(4, &[at(-1.0, -1.0, 0.5, 1.0, RED), at(1.0, -1.0, 0.5, 1.0, BLUE), at(0.0, 1.0, 0.5, 1.0, RED)]);
+            },
+            2,
+            40,
+        );
     }
 
     #[test]

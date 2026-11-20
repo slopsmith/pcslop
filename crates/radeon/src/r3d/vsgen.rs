@@ -29,6 +29,8 @@ pub(crate) struct VsDesc {
     pub vte: u32,
     /// Clipping is on (not CLIP_DISABLE) and in Direct3D clip space.
     pub clip: bool,
+    /// VAP_CLIP_CNTL's UCP_ENABLE bits.
+    pub ucp: u32,
     pub dx: bool,
     pub fog_select: u32,
     pub colour_control: u32,
@@ -52,6 +54,8 @@ pub(crate) struct VsUniforms {
     /// GA_OFFSET's x and y, then GA_FOG_SCALE and GA_FOG_OFFSET.
     pub ga_fog: [f32; 4],
     pub solid: [f32; 4],
+    /// The user clip planes, in clip space.
+    pub ucp: [[f32; 4]; 6],
 }
 
 pub(crate) enum ArraySrc {
@@ -87,7 +91,13 @@ impl VsDesc {
             }
         }
         k.extend(self.fmt);
-        k.extend([self.vte, self.clip as u32 | (self.dx as u32) << 1, self.fog_select, self.colour_control, self.clamp_colours as u32]);
+        k.extend([
+            self.vte,
+            self.clip as u32 | (self.dx as u32) << 1 | self.ucp << 2,
+            self.fog_select,
+            self.colour_control,
+            self.clamp_colours as u32,
+        ]);
         k.push(self.rs_inst.len() as u32);
         k.extend(&self.rs_inst);
         k.extend(self.rs_ip);
@@ -267,13 +277,17 @@ impl VsDesc {
             if self.clip {
                 let near = if self.dx { "p.z" } else { "p.z + w" };
                 let _ = writeln!(f, "    out.clip[0] = {near};\n    out.clip[1] = w - p.z;");
+                for i in 0..6 {
+                    let d = if self.ucp & (1 << i) != 0 { format!("dot(vu.ucp[{i}], p)") } else { "1.0".into() };
+                    let _ = writeln!(f, "    out.clip[{}] = {d};", 2 + i);
+                }
             } else {
-                f.push_str("    out.clip[0] = 1.0;\n    out.clip[1] = 1.0;\n");
+                f.push_str(NO_CLIP);
             }
         } else {
             f.push_str("    float W = (PERSPECTIVE && rcp > 0.0) ? 1.0 / rcp : 1.0;\n");
             f.push_str("    out.position = float4((round(xw * 16.0) / 16.0 / 2048.0 - 1.0) * W, (1.0 - round(yw * 16.0) / 16.0 / 2048.0) * W, z * W, W);\n");
-            f.push_str("    out.clip[0] = 1.0;\n    out.clip[1] = 1.0;\n");
+            f.push_str(NO_CLIP);
         }
         if self.clamp_colours {
             for c in 0..4 {
@@ -339,12 +353,15 @@ impl VsDesc {
     }
 }
 
+const NO_CLIP: &str = "    for (int i = 0; i < 8; i++) out.clip[i] = 1.0;\n";
+
 const VS_HELPERS: &str = r#"
 struct VsUniforms {
     int4 arrays[16];
     uint imm_base, nconsts;
     uint pad[2];
     float4 scale, offset, ga_fog, solid;
+    float4 ucp[6];
 };
 
 static uint dw(const device uint *vram, const device uint *arena, int4 a, uint vid, uint k) {
