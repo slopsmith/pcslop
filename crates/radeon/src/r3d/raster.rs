@@ -73,6 +73,12 @@ pub(crate) struct Raster {
     pub textures: [Option<Texture>; 16],
     pub zpass: u32,
     pub pixels: u64,
+    /// SLOPPER_R3D_PROBE=x,y
+    pub probe: Option<(i32, i32)>,
+    pub probe_hits: Vec<String>,
+    pub probe_tri: String,
+    pub probe_verts: [usize; 3],
+    pub probe_hit_verts: Option<[usize; 3]>,
     /// When set, triangles are set up and appended here instead of drawn.
     pub capture: Option<Captured>,
 }
@@ -341,6 +347,9 @@ impl Raster {
         if area == 0 || v.iter().any(|v| v.pos.iter().any(|c| !c.is_finite())) {
             return;
         }
+        if self.probe.is_some() {
+            self.probe_tri = format!("{:?}", v.map(|v| [v.pos[0], v.pos[1], v.pos[2]]));
+        }
         let visually_ccw = area < 0;
         let front = visually_ccw != (self.cull & 4 != 0);
         if is_poly && ((front && self.cull & 1 != 0) || (!front && self.cull & 2 != 0)) {
@@ -484,10 +493,15 @@ impl Raster {
             fog[l] = a[FOG];
             depth[l] = b[0] * z[0] + b[1] * z[1] + b[2] * z[2];
         }
+        let lane = (0..4).find(|&l| cover[l] && self.probe == Some((x + (l & 1) as i32, y + (l >> 1) as i32)));
+        let mut log = Vec::new();
         let out = {
             let mut quad = Quad { temps, textures: &self.textures, vram };
-            self.us.run(&mut quad, false)
+            self.us.run(&mut quad, false, lane.map(|l| (l, &mut log)))
         };
+        if lane.is_some() {
+            self.probe_hits.extend(log.into_iter().map(|l| format!("  {l}")));
+        }
         for l in 0..4 {
             if !cover[l] || out.killed[l] {
                 continue;
@@ -495,6 +509,17 @@ impl Raster {
             let (px, py) = (x + (l & 1) as i32, y + (l >> 1) as i32);
             let z = out.depth[l].unwrap_or(depth[l]);
             let colour = blend_fog(self.fog, self.fog_colour, self.fog_factor, out.colour[l], fog[l]);
+            if self.probe == Some((px, py)) {
+                let before = self.zpass;
+                self.backend(vram, px, py, colour, z, front);
+                if self.zpass != before {
+                    self.probe_hit_verts = Some(self.probe_verts);
+                }
+                let used: Vec<String> =
+                    temps[l].iter().enumerate().filter(|(_, t)| t.iter().any(|&c| c != 0.0)).map(|(i, t)| format!("t{i}={t:?}")).collect();
+                self.probe_hits.push(format!("colour {colour:?} z {z} passed {} in {} tri {}", self.zpass != before, used.join(" "), self.probe_tri));
+                continue;
+            }
             self.backend(vram, px, py, colour, z, front);
         }
     }

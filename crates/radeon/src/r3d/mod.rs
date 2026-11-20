@@ -892,6 +892,11 @@ impl Radeon {
             textures,
             zpass: self.reg(ZB_ZPASS_DATA),
             pixels: 0,
+            probe: probe_pixel(),
+            probe_hits: Vec::new(),
+            probe_tri: String::new(),
+            probe_verts: [0; 3],
+            probe_hit_verts: None,
             capture: None,
         }
     }
@@ -1081,6 +1086,7 @@ impl Radeon {
         let vram = self.vga.vram_mut();
         let n = vertices.len();
         let tri = |r: &mut Raster, vram: &mut [u8], a: usize, b: usize, c: usize| {
+            r.probe_verts = [a, b, c];
             let t = [vertices[a], vertices[b], vertices[c]];
             if vp.clips() && t.iter().any(outside) {
                 let poly = clip(&t, &planes);
@@ -1162,9 +1168,66 @@ impl Radeon {
         self.regs[ZB_ZPASS_DATA as usize / 4] = r.zpass;
         if self.trace.is_some() {
             self.note(&format!("3d: {} pixels, {passed} passed", r.pixels));
+            let hits = std::mem::take(&mut r.probe_hits);
+            if !hits.is_empty() {
+                dump_textures(&r.textures, self.vga.vram_mut());
+            }
+            for hit in hits {
+                self.note(&format!("3d: probe {hit}"));
+            }
+            if let (Some(vs), false) = (r.probe_hit_verts, bypass) {
+                for k in vs {
+                    let d = &dwords[remap.as_ref().map_or(k, |m| m[k] as usize)];
+                    let mut log = Vec::new();
+                    program.run_logged(&psc.inputs(d), &mut log);
+                    self.note(&format!("3d: probe vertex {k} dwords {:x?}", d));
+                    for l in log {
+                        self.note(&format!("3d: probe   vs {l}"));
+                    }
+                }
+            }
         }
         if r.pixels > 0 {
             self.vga.touch();
         }
+    }
+}
+
+fn probe_pixel() -> Option<(i32, i32)> {
+    static PROBE: std::sync::OnceLock<Option<(i32, i32)>> = std::sync::OnceLock::new();
+    *PROBE.get_or_init(|| {
+        let v = std::env::var("SLOPPER_R3D_PROBE").ok()?;
+        let (x, y) = v.split_once(',')?;
+        Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+    })
+}
+
+/// SLOPPER_R3D_PROBE_DUMP=dir: base levels as .ppm (C2 C1 C0) and .pgm (C3).
+fn dump_textures(textures: &[Option<tex::Texture>; 16], vram: &[u8]) {
+    static DONE: std::sync::Mutex<Vec<(usize, u32)>> = std::sync::Mutex::new(Vec::new());
+    let Ok(dir) = std::env::var("SLOPPER_R3D_PROBE_DUMP") else { return };
+    for (unit, t) in textures.iter().enumerate() {
+        let Some(t) = t else { continue };
+        let key = (match t.mem {
+            tex::TexMem::Vram(o) => o,
+            tex::TexMem::Copy { addr, .. } => addr as usize,
+        }, t.format);
+        let mut done = DONE.lock().unwrap();
+        if done.contains(&key) {
+            continue;
+        }
+        done.push(key);
+        let (w, h) = (t.width, t.height);
+        let px = t.decode(vram, 0, 0);
+        let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let mut rgb = format!("P6 {w} {h} 255\n").into_bytes();
+        let mut a = format!("P5 {w} {h} 255\n").into_bytes();
+        for c in &px {
+            rgb.extend([q(c[2]), q(c[1]), q(c[0])]);
+            a.push(q(c[3]));
+        }
+        let base = format!("{dir}/unit{unit}-{:x}-fmt{:x}", key.0, t.format);
+        let _ = std::fs::write(format!("{base}.ppm"), rgb);
+        let _ = std::fs::write(format!("{base}.pgm"), a);
     }
 }

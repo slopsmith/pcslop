@@ -75,7 +75,7 @@ pub(crate) struct Quad<'a> {
 }
 
 impl Quad<'_> {
-    fn sample(&mut self, inst: u32, lod_bias_all: bool) {
+    fn sample(&mut self, inst: u32, lod_bias_all: bool, log: Option<(usize, &mut Vec<String>)>) {
         let src = (inst & 31) as usize;
         let dst = ((inst >> 6) & 31) as usize;
         let id = ((inst >> 11) & 15) as usize;
@@ -95,6 +95,9 @@ impl Quad<'_> {
         let mut lod = if rho > 0.0 { 0.5 * rho.log2() } else { 0.0 };
         if op == 4 || lod_bias_all {
             lod += coords[0][3];
+        }
+        if let Some((l, log)) = log {
+            log.push(format!("    {}", tex.describe(self.vram, stc[l], lod)));
         }
         for l in 0..4 {
             self.temps[l][dst] = tex.sample(self.vram, stc[l], lod);
@@ -217,7 +220,8 @@ fn alu(word: &[u32; 4], read: impl Fn(u32) -> V4) -> AluResult {
 
 impl Program {
     /// Runs the program on a quad and returns its colour, depth and kills.
-    pub fn run(&self, q: &mut Quad<'_>, tex_lod_bias: bool) -> Output {
+    /// With `log`, also describes what each instruction did to one lane.
+    pub fn run(&self, q: &mut Quad<'_>, tex_lod_bias: bool, mut log: Option<(usize, &mut Vec<String>)>) -> Output {
         let mut out = Output { colour: [[0.0; 4]; 4], depth: [None; 4], killed: [false; 4] };
         for node in &self.nodes {
             if let Some((start, len)) = node.tex {
@@ -232,7 +236,12 @@ impl Program {
                         }
                         continue;
                     }
-                    q.sample(inst, tex_lod_bias);
+                    let (src, dst) = ((inst & 31) as usize, ((inst >> 6) & 31) as usize);
+                    let coords = log.as_ref().map(|(l, _)| q.temps[*l][src]);
+                    q.sample(inst, tex_lod_bias, log.as_mut().map(|(l, v)| (*l, &mut **v)));
+                    if let (Some((l, log)), Some(c)) = (log.as_mut(), coords) {
+                        log.push(format!("tex {inst:08x} id {} t{dst} = {:?} from t{src} {c:?}", (inst >> 11) & 15, q.temps[*l][dst]));
+                    }
                 }
             }
             let (start, len) = node.alu;
@@ -268,6 +277,12 @@ impl Program {
                     }
                     if a_addr & (1 << 27) != 0 {
                         out.depth[l] = Some(r.alpha);
+                    }
+                    if let Some((ll, log)) = log.as_mut()
+                        && *ll == l
+                    {
+                        let w = word.map(|v| format!("{v:08x}")).join(" ");
+                        log.push(format!("alu {i} [{w}] rgb t{dst}.{wmask:o}/o{omask:o} = {:?} a t{adst} = {}", r.rgb, r.alpha));
                     }
                 }
             }

@@ -275,6 +275,20 @@ impl Texture {
         }
     }
 
+    /// The level `sample` picks for `lod`, its layout and the block at (s, t).
+    pub fn describe(&self, vram: &[u8], [s, t, _]: [f32; 3], lod: f32) -> String {
+        let mip = (self.filter >> 13) & 3;
+        let level = if lod > 0.0 && mip != 0 { ((lod.round() as usize) + ((self.filter >> 17) & 0xf) as usize).min(self.levels.len() - 1) } else { 0 };
+        let (w, h) = ((self.width >> level).max(1), (self.height >> level).max(1));
+        let (x, y) = ((s * w as f32).floor().rem_euclid(w as f32) as u32, (t * h as f32).floor().rem_euclid(h as f32) as u32);
+        let (data, base) = self.bytes(vram);
+        let (off, pitch) = self.levels[level];
+        let (bytes, bw) = block(self.format);
+        let a = base + off + (y / bw) as usize * pitch + (x / bw) as usize * bytes;
+        let raw: Vec<String> = (0..bytes).map(|i| format!("{:02x}", data.get(a + i).copied().unwrap_or(0))).collect();
+        format!("lod {lod:.2} level {level}/{} {w}x{h} off {off:#x} pitch {pitch} texel ({x},{y}) bytes {}", self.levels.len() - 1, raw.join(""))
+    }
+
     /// Samples at (s, t, r) from `coords` with level-of-detail `lod` (log2
     /// of texels per pixel) and returns RGBA.
     pub fn sample(&self, vram: &[u8], [s, t, r]: [f32; 3], lod: f32) -> V4 {

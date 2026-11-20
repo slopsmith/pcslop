@@ -354,4 +354,38 @@ impl Decoded {
         }
         m.out
     }
+
+    /// Like `run`, also describing what each instruction wrote.
+    pub fn run_logged(&self, inputs: &[V4; INPUTS], log: &mut Vec<String>) -> [V4; OUTPUTS] {
+        let mut m = Machine {
+            prog: self,
+            temps: [[0.0; 4]; TEMPS],
+            alt: [[0.0; 4]; TEMPS],
+            inputs: *inputs,
+            out: [[0.0, 0.0, 0.0, 1.0]; OUTPUTS],
+            a0: [0; 4],
+        };
+        for (i, inst) in self.insts.iter().enumerate() {
+            let srcs: Vec<String> = inst
+                .src
+                .iter()
+                .map(|s| format!("{}{}{}={:?}", ["t", "in", "c", "alt"][s.class as usize], s.base, s.rel.map_or(String::new(), |c| format!("+a0.{c}")), m.read(s)))
+                .collect();
+            m.step(inst);
+            let d = &inst.dst;
+            let now = match d.kind {
+                0 => m.temps.get(m.index(d.base, d.rel)).copied(),
+                2 | 3 => m.out.get(m.index(d.base, d.rel)).copied(),
+                4 => m.alt.get(m.index(d.base, d.rel)).copied(),
+                _ => None,
+            };
+            let engine = match inst.engine {
+                Engine::Vector(o) => format!("vec{o}"),
+                Engine::Math(o) => format!("math{o}"),
+                Engine::Macro(o) => format!("macro{o}"),
+            };
+            log.push(format!("{i} {engine} dst kind{} {}.{:04b} = {now:?} a0 {:?} <- {}", d.kind, d.base, d.mask, m.a0, srcs.join(" ")));
+        }
+        m.out
+    }
 }
