@@ -1517,6 +1517,15 @@ impl Emit {
                 self.a.sub(Size::X, T_A, T_A, T_B);
                 self.a.ldr(Width::X, T_B, STATE, state::TSC_MUL as i32);
                 self.a.mul(Size::X, T_A, T_A, T_B);
+                // max(now, last + 1) without a compare, since NZCV holds guest flags.
+                let (g0, g2) = (guest_reg(0), guest_reg(2));
+                self.a.ldr(Width::X, T_B, STATE, state::TSC_LAST as i32);
+                self.a.add_imm(Size::X, T_B, T_B, 1);
+                self.a.sub(Size::X, g2, T_A, T_B);
+                self.a.asr_imm(Size::X, g0, g2, 63);
+                self.a.and(Size::X, g2, g2, g0);
+                self.a.sub(Size::X, T_A, T_A, g2);
+                self.a.str(Width::X, T_A, STATE, state::TSC_LAST as i32);
                 self.a.mov(Size::W, guest_reg(0), T_A);
                 self.a.lsr_imm(Size::X, guest_reg(2), T_A, 32);
             }

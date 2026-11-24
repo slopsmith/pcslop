@@ -701,6 +701,33 @@ fn misc_enable_reads_fast_strings_and_ignores_writes() {
 }
 
 #[test]
+fn back_to_back_rdtsc_reads_always_advance() {
+    use crate::cpu::{EAX, EDX};
+    let mut mc = Machine::new();
+    mc.cpu.start_host_tsc();
+    let mut last = None;
+    for _ in 0..1000 {
+        mc.run(&[0x0f, 0x31]).unwrap();
+        let t = (mc.cpu.regs[EDX] as u64) << 32 | mc.cpu.regs[EAX] as u64;
+        assert!(last.is_none_or(|l| t > l), "Windows 7 divides by the TSC delta of two reads a few instructions apart: {last:?} then {t}");
+        last = Some(t);
+    }
+}
+
+#[test]
+fn machine_check_msrs_report_no_banks_and_no_error() {
+    use crate::cpu::{EAX, ECX, EDX};
+    let mut mc = Machine::new();
+    for msr in [0x179, 0x17a] {
+        mc.cpu.regs[ECX] = msr;
+        mc.cpu.regs[EAX] = 1;
+        mc.cpu.regs[EDX] = 1;
+        mc.run(&[0x0f, 0x32]).unwrap();
+        assert_eq!((mc.cpu.regs[EAX], mc.cpu.regs[EDX]), (0, 0), "Windows 7's HAL reads MSR {msr:#x} without checking CPUID");
+    }
+}
+
+#[test]
 fn cpuid_reports_pat() {
     assert_ne!(crate::cpuid::cpuid(1, 0)[3] & crate::cpuid::edx::PAT, 0, "Vista maps RAM write-combined only through PAT");
 }

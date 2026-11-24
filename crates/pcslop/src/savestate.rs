@@ -162,7 +162,7 @@ pub fn save(dir: &Path, cpu: &Cpu, board: &mut Board, media: &Media) -> Result<S
     }
     let mut cpu_state = Writer::new();
     cpu_state.put(cpu);
-    cpu_state.u64(cpu.read_tsc());
+    cpu_state.u64(cpu.peek_tsc());
     let mut mach = Writer::new();
     mach.put(&board.machine());
     let mut disk = Writer::new();

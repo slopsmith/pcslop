@@ -187,9 +187,11 @@ pub struct State {
     /// SYSENTER and SYSEXIT switch trees without an exit.
     pub ttbr0: [u64; 2],
     pub roots: [u64; 2],
-    /// The TSC is (CNTVCT_EL0 - tsc_origin) * tsc_mul, as in `Cpu::read_tsc`.
+    /// The TSC is (CNTVCT_EL0 - tsc_origin) * tsc_mul, but at least
+    /// tsc_last + 1, as in `Cpu::read_tsc`.
     pub tsc_origin: u64,
     pub tsc_mul: u64,
+    pub tsc_last: u64,
     /// The ACPI PM timer, as `Board::pm_timer`: the count is
     /// umulh(CNTVCT_EL0, pm_mul) + pm_add, read at port `pm_port`
     /// (u32::MAX when there is none).
@@ -283,6 +285,7 @@ pub const TTBR0: usize = offset_of!(State, ttbr0);
 pub const ROOTS: usize = offset_of!(State, roots);
 pub const TSC_ORIGIN: usize = offset_of!(State, tsc_origin);
 pub const TSC_MUL: usize = offset_of!(State, tsc_mul);
+pub const TSC_LAST: usize = offset_of!(State, tsc_last);
 pub const PM_MUL: usize = offset_of!(State, pm_mul);
 pub const PM_ADD: usize = offset_of!(State, pm_add);
 pub const PM_PORT: usize = offset_of!(State, pm_port);

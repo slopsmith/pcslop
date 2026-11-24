@@ -1059,6 +1059,7 @@ impl Jit {
         s.roots = roots;
         s.tsc_origin = cpu.tsc_origin;
         s.tsc_mul = cpu.tsc_mul;
+        s.tsc_last = cpu.tsc;
         let (port, mul, add) = pm_timer.map_or((u32::MAX, 0, 0), |(p, m, a)| (p as u32, m, a));
         (s.pm_port, s.pm_mul, s.pm_add) = (port, mul, add);
         s.dr = cpu.dr;
@@ -1080,6 +1081,7 @@ impl Jit {
         cpu.set_flag(x86::cpu::flags::DF, df);
         cpu.xmm = s.xmm;
         cpu.dr = s.dr;
+        cpu.tsc = s.tsc_last;
         cpu.mxcsr = s.mxcsr | state::mxcsr_flags(s.fpsr);
         s.fpsr = 0;
         let f = &mut cpu.fpu;

@@ -1267,7 +1267,7 @@ impl<B: Bus> Ctx<'_, B> {
     fn rdmsr(&mut self, msr: u32) -> Res<u64> {
         Ok(match msr {
             0x10 => self.cpu.read_tsc(),
-            0x17 | 0x8b => 0,
+            0x17 | 0x8b | 0x179 | 0x17a => 0,
             0x2c => crate::cpuid::EBC_FREQUENCY_ID,
             0x1a0 => crate::cpuid::MISC_ENABLE,
             0x174 => self.cpu.sysenter_cs as u64,

@@ -258,7 +258,8 @@ pub struct Cpu {
     pub dr: [u32; 8],
     pub tsc: u64,
     /// With `tsc_mul` set, the TSC counts host clock ticks since `tsc_origin`,
-    /// times `tsc_mul`; `tsc` is then unused.
+    /// times `tsc_mul`, and `tsc` is the last value read: each read returns at
+    /// least one more, since the host clock ticks only every ~117 guest cycles.
     pub tsc_origin: u64,
     pub tsc_mul: u64,
     pub sysenter_cs: u32,
@@ -369,11 +370,19 @@ impl Cpu {
         self.write_tsc(0);
     }
 
-    pub fn read_tsc(&self) -> u64 {
+    pub fn read_tsc(&mut self) -> u64 {
+        if self.tsc_mul != 0 {
+            self.tsc = self.peek_tsc().max(self.tsc + 1);
+        }
+        self.tsc
+    }
+
+    /// The TSC without advancing it, for snapshots.
+    pub fn peek_tsc(&self) -> u64 {
         if self.tsc_mul == 0 {
             return self.tsc;
         }
-        host_ticks().wrapping_sub(self.tsc_origin).wrapping_mul(self.tsc_mul)
+        host_ticks().wrapping_sub(self.tsc_origin).wrapping_mul(self.tsc_mul).max(self.tsc)
     }
 
     pub fn write_tsc(&mut self, v: u64) {
