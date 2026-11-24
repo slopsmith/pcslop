@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Saves preview screenshots of the manager with a few sample machines into DIR
+# (default: target/manager-screenshots). It opens the app's window, so the
+# screen must be unlocked, or the captures fall back to drawing without Liquid Glass.
+# Usage: apps/macos/Tools/screenshots [DIR]
+set -euo pipefail
+
+pkg=$(cd "$(dirname "$0")/.." && pwd)
+dir=${1:-$pkg/../../target/manager-screenshots}
+mkdir -p "$dir"
+out=$(cd "$dir" && pwd)
+swift() { env -u SDKROOT -u DEVELOPER_DIR /usr/bin/xcrun swift "$@"; }
+
+swift build --package-path "$pkg"
+bin=$(swift build --package-path "$pkg" --show-bin-path)/pcslop-manager
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+machine() {
+	mkdir -p "$tmp/store/$1" "$tmp/empty"
+	cat >"$tmp/store/$1/machine.json" <<JSON
+{"id": "$1", "name": "$2", "os": "$3", "created": "2026-01-01T00:00:00Z", "config": $4}
+JSON
+}
+machine 11111111-1111-1111-1111-111111111111 "Windows XP" windows-xp \
+	'{"board": "bx", "gpu": "radeon", "vgaROM": "/roms/r300.rom", "ramMiB": 512, "hda": "/disks/xp.img", "captureMouse": "auto"}'
+machine 22222222-2222-2222-2222-222222222222 "Ubuntu 8.04" linux \
+	'{"ramMiB": 1024, "cdrom": "/isos/ubuntu-8.04-desktop-i386.iso", "hostForwards": ["tcp::2222-:22"]}'
+machine 33333333-3333-3333-3333-333333333333 "FreeDOS" other '{"ramMiB": 64, "audio": false, "network": false}'
+
+app=$tmp/Manager.app
+mkdir -p "$app/Contents/MacOS"
+cp "$bin" "$app/Contents/MacOS/pcslop-manager"
+cat >"$app/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+	<key>CFBundleExecutable</key><string>pcslop-manager</string>
+	<key>CFBundleIdentifier</key><string>dev.pcslop.manager.screenshots</string>
+	<key>CFBundlePackageType</key><string>APPL</string>
+</dict></plist>
+PLIST
+codesign -s - -f "$app" 2>/dev/null
+
+shot() {
+	local name=$1
+	shift
+	echo "== $name"
+	open -n -W "$app" --args --window 1280x800 --snapshot "$out/$name.png" "$@"
+}
+shot library-light --store "$tmp/store" --appearance light -showInspector NO
+shot library-dark --store "$tmp/store" --appearance dark -showInspector NO
+shot inspector-light --store "$tmp/store" --appearance light --select "Windows XP" -showInspector YES
+shot inspector-dark --store "$tmp/store" --appearance dark --select "Windows XP" -showInspector YES
+shot empty-light --store "$tmp/empty" --appearance light -showInspector NO
+echo "screenshots in $out"
