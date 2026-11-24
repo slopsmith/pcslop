@@ -15,7 +15,8 @@ Nightly builds of the Mac app (macOS 26, Apple Silicon) are at https://github.co
 scripts/fetch-references.sh   # reference source trees -> references/src (gitignored)
 scripts/fetch-docs.sh         # spec PDFs -> references/docs (gitignored)
 experiments/hvf-probe/run.sh  # checks HVF, TSO, exit and exception costs on this Mac
-nix build .#seabios --out-link references/seabios
+nix build .#packages.x86_64-linux.seabios --out-link references/seabios
+nix build .#packages.x86_64-linux.seavgabios --out-link references/seavgabios
 ```
 
 ## Running

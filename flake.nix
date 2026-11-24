@@ -13,9 +13,9 @@
       x86pkgs = nixpkgs.legacyPackages.x86_64-linux;
     in
     {
-      packages.${system} = {
-        slop-app = slopsmith-ci.packages.${system}.slop-app;
+      packages.${system}.slop-app = slopsmith-ci.packages.${system}.slop-app;
 
+      packages.x86_64-linux = {
         seabios = (x86pkgs.seabios.override { ___build-type = "qemu"; }).overrideAttrs (old: {
           patches = (old.patches or [ ]) ++ [ ./nix/seabios-i440bx.patch ];
           postConfigure = ''

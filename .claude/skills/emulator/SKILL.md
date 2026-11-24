@@ -78,7 +78,7 @@ scripts/vm stop xp
   - The 3D engine draws with Metal; `--gpu-3d cpu` (or `PCSLOP_R3D=cpu`) uses the CPU reference path. `status` prints a `radeon:` line with 3D draws, `flips` (CRTC_OFFSET writes, so two samples give a page-flipping app's frame rate), Metal draws, CPU fallbacks and waits.
   - The command processor runs on its own thread (`cp thread` at the end of the `radeon:` line). `--gpu-thread off` (or `PCSLOP_GPU_THREAD=off`) runs it on the emulation thread again, to rule the thread out when chasing a GPU bug.
   - XP's first boot with the card installs the ATI driver and asks to restart: answer with a `tablet` click and let it reboot. Killing the run mid-install left agp440 broken (Code 39) and XP on VgaSave at 1280x1024; the ATI desktop is 1440x900. Save a state at that desktop and load it instead of booting.
-- **Firmware:** `references/seabios` and `references/seavgabios` are Nix out-links. After changing the SeaBIOS part of `flake.nix`, run `nix build .#seabios --out-link references/seabios`. That needs the flake changes committed in jj (`jj new` first).
+- **Firmware:** `references/seabios` and `references/seavgabios` are Nix out-links. After changing the SeaBIOS part of `flake.nix`, run `nix build .#packages.x86_64-linux.seabios --out-link references/seabios` (or `seavgabios`). That needs the flake changes committed in jj (`jj new` first).
 
 ## Measure and debug
 

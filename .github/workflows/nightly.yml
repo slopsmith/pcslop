@@ -26,7 +26,7 @@ jobs:
       linux-build: |
         for p in seabios seavgabios; do
           mkdir -p "references/$p/share/seabios"
-          cp "$(nix build --no-link --print-out-paths ".#packages.aarch64-darwin.$p")"/share/seabios/*.bin "references/$p/share/seabios/"
+          cp "$(nix build --no-link --print-out-paths ".#packages.x86_64-linux.$p")"/share/seabios/*.bin "references/$p/share/seabios/"
         done
       linux-out: references
       # Hosted runners cannot make Hypervisor.framework VMs.

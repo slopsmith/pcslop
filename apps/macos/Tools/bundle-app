@@ -15,7 +15,7 @@ swift() { env -u SDKROOT -u DEVELOPER_DIR /usr/bin/xcrun swift "$@"; }
 bios=references/seabios/share/seabios/bios.bin
 vgabios=references/seavgabios/share/seabios/vgabios.bin
 for f in "$bios" "$vgabios"; do
-	[ -e "$f" ] || { echo "error: $f is missing; see README.md for nix build .#seabios" >&2; exit 1; }
+	[ -e "$f" ] || { echo "error: $f is missing; see the Setup section of README.md" >&2; exit 1; }
 done
 
 slop=$(nix build --no-link --print-out-paths .#slop-app)/bin/slop-app
