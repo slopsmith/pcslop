@@ -52,7 +52,7 @@ pub enum Gpu {
     /// QEMU's stdvga at 00:02, running `vgabios`.
     #[default]
     StdVga,
-    /// An ATI Radeon 9700 on the AGP bus, running the card's own ROM, with
+    /// An ATI Radeon 9700 Pro on the AGP bus, running the card's own ROM, with
     /// its 3D engine drawing through Metal when `metal` is set and the Mac
     /// supports it, and on the CPU otherwise.
     Radeon { rom: Vec<u8>, trace: Option<Box<dyn Write + Send>>, metal: bool },

@@ -138,7 +138,7 @@ impl Radeon {
     }
 }
 
-/// An ATI Radeon 9700, as the board sees it.
+/// An ATI Radeon 9700 Pro, as the board sees it.
 pub struct Card {
     core: Arc<Mutex<Radeon>>,
     st: Arc<Status>,

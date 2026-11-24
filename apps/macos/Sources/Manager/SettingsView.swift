@@ -14,12 +14,12 @@ struct SettingsView: View {
             Section {
                 FileField(
                     title: "Video BIOS", path: $radeonROM.optional, placeholder: "None",
-                    message: "Choose a ROM image of a Radeon 9700's video BIOS.", detail: fileSize(radeonROM))
+                    message: "Choose a ROM image of a Radeon 9700 Pro's video BIOS.", detail: fileSize(radeonROM))
             } header: {
-                Text("ATI Radeon 9700")
+                Text("ATI Radeon 9700 Pro")
             } footer: {
                 Text(
-                    "Machines can use an emulated Radeon 9700 for 2D and 3D acceleration. It needs a ROM image of a real card's video BIOS, which pcslop can't include. Until you choose one, machines use standard VGA."
+                    "Machines can use an emulated Radeon 9700 Pro for 2D and 3D acceleration. It needs a ROM image of a real 9700 Pro's video BIOS, which pcslop can't include. A plain Radeon 9700's video BIOS does not work: the machine never shows a picture. Until you choose one, machines use standard VGA."
                 )
             }
             Section {

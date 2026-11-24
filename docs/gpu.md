@@ -2,7 +2,7 @@
 
 Plan for 2D and 3D acceleration. Built so far: the 440BX board with AGP, the card's PCI function, the real video BIOS's POST, VGA and VBE modes, DDC with our EDID, the primary CRTC with its cursor, the command processor, the 2D engine, and the 3D engine drawing with Metal or on the CPU (see [3D engine](#3d-engine)). Run it with `--gpu radeon --vga-rom ROM`, and add `--gpu-trace PATH` to log every register access.
 
-## Target: ATI Radeon 9700 (R300)
+## Target: ATI Radeon 9700 Pro (R300)
 
 We emulate a real ATI card so that guests run their stock drivers: the open-source radeon stack on Linux and Catalyst on Windows XP. We emulate the card's interface (MMIO registers, the command processor, the GART) at a low level, and draw everything it is asked to draw with Metal. We do not emulate the GPU's rendering on the CPU.
 
@@ -33,7 +33,7 @@ Rejected:
 
 ## Bus: AGP on a 440BX
 
-The 9700 is an AGP card: its ROM's build string reads `R300AGP`. We put it on AGP, behind an Intel 440BX, because Catalyst on XP is likely to refuse an R300 without AGP, and AGP costs little:
+The 9700 Pro is an AGP card: its ROM's build string reads `R300AGP`. We put it on AGP, behind an Intel 440BX, because Catalyst on XP is likely to refuse an R300 without AGP, and AGP costs little:
 
 - `--board bx` swaps the 82441FX for the 82443BX host bridge (8086:7190) with its AGP capability and the GART aperture registers (APBASE, APSIZE, AGPCTRL, ATTBASE). Its PCI-to-PCI bridge (8086:7191) at 00:01.0 leads to AGP bus 1, where the card sits with AGP 3.0 and power management capabilities. The PIIX3 moves to 00:07, as on real 440BX boards. `--gpu radeon` implies `--board bx`; the 440FX stays the default, so existing XP installs see no new hardware.
 - Like a 440BX board's firmware, the board sets APSIZE to 64 MiB before SeaBIOS sizes APBASE.
@@ -51,13 +51,13 @@ Windows XP on `--board bx` with the stdvga reaches the desktop, then reports new
 In the order we need them:
 
 1. **PCI device.**
-   - Vendor `1002`, device `4E44`. The supplied ROM's PCI data structure names `4E44` (Radeon 9700 Pro), though its file name says non-Pro (`4E45`). The driver reads config space, so we pick the ID that matches the ROM.
+   - Vendor `1002`, device `4E44`, a Radeon 9700 Pro. The ROM's PCI data structure names `4E44`, and the driver reads config space, so we pick the ID that matches the ROM.
    - BAR0: VRAM aperture, prefetchable, 128 MiB.
    - BAR1: 256 bytes of I/O ports, which index into the MMIO registers.
    - BAR2: 64 KiB of MMIO registers.
    - An expansion ROM.
 2. **Video BIOS.** The card uses ATI's legacy COMBIOS (it has no AtomBIOS tables).
-   - First choice: run the real ROM. It is ATI's copyrighted firmware, so the user supplies it; it is never committed, shipped or put in a published Nix store path. Its POST programs the PLLs and memory controller and sets VGA modes through ATI's extended VGA registers, so we emulate enough for it to finish.
+   - First choice: run the real ROM. It must be a 9700 Pro's (`4E44`). The Pro and the plain 9700 (`4E45`) video BIOSes are not interchangeable: with a plain 9700's, the machine never shows a picture. The ROM is ATI's copyrighted firmware, so the user supplies it; it is never committed, shipped or put in a published Nix store path. Its POST programs the PLLs and memory controller and sets VGA modes through ATI's extended VGA registers, so we emulate enough for it to finish.
    - Fallback: SeaVGABIOS for VGA and VBE, plus our own COMBIOS tables (connectors, PLL limits, memory setup) for the drivers to read. `radeon_combios.c` in Linux describes these tables.
 3. **Core registers:**
    - indexed PLL registers (`CLOCK_CNTL_INDEX`/`CLOCK_CNTL_DATA`);

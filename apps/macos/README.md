@@ -72,8 +72,9 @@ check. Settings turns the launch check off.
   also looks for `target/release/pcslop`, `target/vm/pcslop` and the
   `references/` SeaBIOS out-links above the current folder; a packaged app
   never looks outside itself.
-- **Radeon 9700 video BIOS**: chosen once in Settings, for every machine. pcslop
-  cannot ship it. Without it, the Radeon is unavailable and presets use standard VGA.
+- **Radeon 9700 Pro video BIOS**: chosen once in Settings, for every machine. pcslop
+  cannot ship it. It must come from a 9700 Pro; a plain Radeon 9700's video BIOS
+  does not work, and the machine never shows a picture. Without it, the Radeon is unavailable and presets use standard VGA.
 - **Machines**: `~/Library/Application Support/pcslop/machines/UUID/`, with
   `machine.json`, `thumbnail.png` (taken when the machine stops), save states
   in `states/` and any disk made for the machine. `--store DIR` uses another folder.

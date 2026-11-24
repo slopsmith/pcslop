@@ -61,7 +61,7 @@ Nothing listed here is committed. Run `scripts/fetch-references.sh` (add `--test
 | Video | [FreeVGA](http://www.osdever.net/FreeVGA/home.htm) | VGA registers; no free IBM VGA technical reference exists |
 | GPU | AMD R3xx 3D Registers, R5xx Acceleration v1.5 ([X.org](https://www.x.org/docs/AMD/old/)) | Released by AMD in 2008. 3D registers and shader formats; CP, PM4 packets and 2D engine |
 | GPU | ATI R3xx databook (`ati-r300/r3xx_databook.pdf`) | Shared privately; no public source found yet, so it stays local |
-| GPU | Radeon 9700 video BIOS (`ati-r300/ATI.9700NP.128.Infineon.021216.rom`) | ATI's copyrighted firmware, COMBIOS, PCI ID `1002:4E44`. Never committed or shipped |
+| GPU | Radeon 9700 Pro video BIOS (`ati-r300/ATI.9700NP.128.Infineon.021216.rom`) | ATI's copyrighted firmware, COMBIOS, PCI ID `1002:4E44`. Never committed or shipped |
 | GPU | OpenGL `ARB_vertex_program`, `ARB_fragment_program` specs ([Khronos registry](https://registry.khronos.org/OpenGL/index_gl.php)) | The semantics R300's shader units were designed around |
 | Host | Arm Architecture Reference Manual, A-profile (DDI 0487 M.d) | 129 MB |
 | General | [OSDev wiki](https://wiki.osdev.org/) | Pages on PIC, PIT, CMOS, PS/2, APIC, PCI, ATA, ATAPI, VGA |

@@ -175,7 +175,7 @@ These are the starting decisions for phase 3.
 3. **HVF runtime:** EL1 runtime, shadow paging, block translator for 32-bit flat code; the interpreter covers everything else.
 4. Finish the XP install. **Benchmark** boot time against QEMU TCG.
 5. Optimise: traces, flag liveness, in-VM device fast paths, ACPI HAL. Then SMP with TSO.
-6. **GPU:** an emulated ATI Radeon 9700 that draws with Metal, running the stock radeon drivers on Linux and Catalyst on XP. See [gpu.md](gpu.md).
+6. **GPU:** an emulated ATI Radeon 9700 Pro that draws with Metal, running the stock radeon drivers on Linux and Catalyst on XP. See [gpu.md](gpu.md).
 
 ## Open questions
 

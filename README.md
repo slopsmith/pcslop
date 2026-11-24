@@ -34,7 +34,7 @@ The board always has a CD-ROM drive, empty unless `--cdrom ISO` is given. Swap d
 
 By default the guest runs translated code in the VM and gets an AC'97 sound card, an RTL8139 network card and a battery that mirrors the Mac's. Turn them off with `--no-jit`, `--no-audio`, `--no-net` and `--no-battery`. Sound plays on the Mac's default output device; `--audio-wav out.wav` also records it and `--audio-silent` plays nothing.
 
-`--gpu radeon --vga-rom ROM` swaps the stdvga for an ATI Radeon 9700 on a 440BX board's AGP bus, running the card's own video BIOS, which you supply. `--gpu-trace PATH` logs the card's register accesses, and `--gpu-3d cpu` draws its 3D engine on the CPU instead of with Metal. See [docs/gpu.md](docs/gpu.md).
+`--gpu radeon --vga-rom ROM` swaps the stdvga for an ATI Radeon 9700 Pro on a 440BX board's AGP bus, running the card's own video BIOS, which you supply. It must come from a 9700 Pro (PCI device `4E44`): with a plain Radeon 9700's video BIOS (`4E45`) the machine never shows a picture. `--gpu-trace PATH` logs the card's register accesses, and `--gpu-3d cpu` draws its 3D engine on the CPU instead of with Metal. See [docs/gpu.md](docs/gpu.md).
 
 The network card sits on a user-mode network (no host privileges needed), with QEMU's addresses: the guest is 10.0.2.15 and the gateway 10.0.2.2. `--net user,hostfwd=tcp::2222-:22` forwards a host port into the guest. It needs libslirp, so build inside `nix develop`, which provides it through pkg-config. A plain `cargo build` still works, but leaves the network card out.
 

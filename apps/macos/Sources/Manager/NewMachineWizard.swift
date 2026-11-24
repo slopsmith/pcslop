@@ -12,8 +12,8 @@ extension Preset {
 
     func blurb(radeon: Bool) -> String {
         switch self {
-        case .windowsXPRadeon: radeon ? "Install or run Windows XP, with 3D on the Radeon 9700." : "Install or run Windows XP."
-        case .ubuntuRadeon: radeon ? "Install Ubuntu to a hard disk, with 3D on the Radeon 9700." : "Install Ubuntu to a hard disk."
+        case .windowsXPRadeon: radeon ? "Install or run Windows XP, with 3D on the Radeon 9700 Pro." : "Install or run Windows XP."
+        case .ubuntuRadeon: radeon ? "Install Ubuntu to a hard disk, with 3D on the Radeon 9700 Pro." : "Install Ubuntu to a hard disk."
         case .custom: "Start from plain defaults and set up every device yourself."
         }
     }
@@ -127,7 +127,7 @@ struct NewMachineWizard: View {
             if !hasRadeon {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     Image(systemName: "info.circle")
-                    Text("Windows XP and Ubuntu get 3D acceleration once you choose a Radeon 9700 video BIOS in Settings.")
+                    Text("Windows XP and Ubuntu get 3D acceleration once you choose a Radeon 9700 Pro video BIOS in Settings.")
                     Spacer(minLength: 8)
                     SettingsLink { Text("Open Settings…") }
                 }

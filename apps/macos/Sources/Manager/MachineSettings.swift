@@ -165,7 +165,7 @@ struct MachineSettings: View {
                 .disabled(machine.config.gpu == .radeon)
             } footer: {
                 if machine.config.gpu == .radeon {
-                    Text("The Radeon 9700 sits on the 440BX's AGP bus, so the board follows the display.")
+                    Text("The Radeon 9700 Pro sits on the 440BX's AGP bus, so the board follows the display.")
                 }
             }
             Section {
@@ -186,14 +186,14 @@ struct MachineSettings: View {
             Section {
                 Picker("Graphics card", selection: $machine.config.gpu) {
                     Text("Standard VGA").tag(GPU.stdvga)
-                    Text("ATI Radeon 9700, with 3D").tag(GPU.radeon)
+                    Text("ATI Radeon 9700 Pro, with 3D").tag(GPU.radeon)
                         .disabled(radeonROM.isEmpty && machine.config.gpu != .radeon)
                 }
                 .pickerStyle(.radioGroup)
             } footer: {
                 if radeonROM.isEmpty {
                     VStack(alignment: .leading, spacing: 6) {
-                        Text("The Radeon 9700 needs a copy of the real card's video BIOS. Choose one in Settings to use it.")
+                        Text("The Radeon 9700 Pro needs a copy of a real 9700 Pro's video BIOS. Choose one in Settings to use it.")
                         SettingsLink { Text("Open Settings…") }
                     }
                 }

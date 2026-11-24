@@ -1,4 +1,4 @@
-//! ATI Radeon 9700 (R300): the PCI function's registers and its legacy VGA.
+//! ATI Radeon 9700 Pro (R300): the PCI function's registers and its legacy VGA.
 //!
 //! The register file is reached three ways, all ending in [`Radeon::access`]:
 //! BAR2 (64 KiB of MMIO), BAR1 (256 I/O ports that mirror the first 256 bytes

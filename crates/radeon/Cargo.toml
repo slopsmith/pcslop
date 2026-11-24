@@ -1,6 +1,6 @@
 [package]
 name = "radeon"
-description = "ATI Radeon 9700 (R300) display adapter"
+description = "ATI Radeon 9700 Pro (R300) display adapter"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

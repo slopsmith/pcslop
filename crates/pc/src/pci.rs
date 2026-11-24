@@ -252,7 +252,7 @@ pub const BRIDGE_CONTROL: usize = 0x3e;
 /// Bridge control: forward the legacy VGA ranges to the secondary bus.
 pub const BRIDGE_VGA: u8 = 0x08;
 
-/// The Radeon 9700's function: VRAM, I/O and MMIO BARs, the expansion ROM,
+/// The Radeon 9700 Pro's function: VRAM, I/O and MMIO BARs, the expansion ROM,
 /// and power management and AGP 3.0 capabilities at 0x50 and 0x58, where
 /// R300 cards have them.
 pub fn radeon(rom_len: usize) -> ConfigSpace {

@@ -155,12 +155,12 @@ struct OSIcon: View {
 extension MachineConfig {
     var summary: String {
         let board = gpu == .radeon || board == .bx ? "440BX" : "440FX"
-        let display = gpu == .radeon ? "Radeon 9700" : "Standard VGA"
+        let display = gpu == .radeon ? "Radeon 9700 Pro" : "Standard VGA"
         return [board, display, Self.memory(ramMiB)].joined(separator: " · ")
     }
 
     var shortSummary: String {
-        [gpu == .radeon ? "Radeon 9700" : "VGA", Self.memory(ramMiB)].joined(separator: " · ")
+        [gpu == .radeon ? "Radeon 9700 Pro" : "VGA", Self.memory(ramMiB)].joined(separator: " · ")
     }
 
     static func memory(_ mib: Int) -> String {

@@ -142,7 +142,7 @@ struct MachineDetail: View {
                 InfoRow("memorychip", "Memory", MachineConfig.memory(c.ramMiB))
                 InfoRow(
                     "display", "Display",
-                    c.gpu == .radeon ? "ATI Radeon 9700, \(c.renderer == .metal ? "Metal" : "CPU") 3D" : "Standard VGA")
+                    c.gpu == .radeon ? "ATI Radeon 9700 Pro, \(c.renderer == .metal ? "Metal" : "CPU") 3D" : "Standard VGA")
                 InfoRow("internaldrive", "Primary disk", diskText(c.hda))
                 if c.hdb?.isEmpty == false { InfoRow("internaldrive", "Secondary disk", diskText(c.hdb)) }
                 InfoRow("opticaldisc", "CD-ROM", fileName(session?.cdrom ?? c.cdrom) ?? "Empty")

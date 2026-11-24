@@ -115,10 +115,10 @@ struct Cli {
     /// Chipset: fx (440FX) or bx (440BX with AGP).
     #[arg(long, value_name = "fx|bx", value_parser = parse_board)]
     board: Option<pc::Chipset>,
-    /// Display card: stdvga or radeon (a Radeon 9700 on the 440BX's AGP bus).
+    /// Display card: stdvga or radeon (a Radeon 9700 Pro on the 440BX's AGP bus).
     #[arg(long, value_name = "stdvga|radeon", default_value = "stdvga", value_parser = ["stdvga", "radeon"])]
     gpu: String,
-    /// The Radeon's video BIOS, which you supply.
+    /// A Radeon 9700 Pro's video BIOS, which you supply.
     #[arg(long, value_name = "FILE")]
     vga_rom: Option<String>,
     /// Log the Radeon's register accesses to FILE.

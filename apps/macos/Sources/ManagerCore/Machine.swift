@@ -105,7 +105,7 @@ public struct MachineConfig: Sendable, Hashable, Codable {
     ) -> [String] {
         var out: [String] = []
         if gpu == .radeon, radeonROM?.isEmpty ?? true {
-            out.append("The Radeon 9700 needs its video BIOS. Choose it in Settings, or switch to standard VGA.")
+            out.append("The Radeon 9700 Pro needs its video BIOS. Choose it in Settings, or switch to standard VGA.")
         }
         if ramMiB < 4 { out.append("The machine needs at least 4 MiB of RAM.") }
         let files: [(String, String?)] = [
