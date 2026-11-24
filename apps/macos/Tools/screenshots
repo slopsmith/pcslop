@@ -65,7 +65,7 @@ shot network --store "$tmp/store" --appearance dark --select "Ubuntu 8.04" --ope
 root=$(cd "$pkg/../.." && pwd)
 refs=$("$root/scripts/main-checkout")/references
 if [ -x "$root/target/vm/pcslop" ]; then
-	shot running --store "$tmp/store" --appearance dark --select FreeDOS --open start --delay 6 \
+	shot running --store "$tmp/store" --appearance dark --select FreeDOS --open start --delay 13 \
 		-pcslopBinary "$root/target/vm/pcslop" -biosPath "$refs/seabios/share/seabios/bios.bin" \
 		-vgaBIOSPath "$refs/seavgabios/share/seabios/vgabios.bin"
 fi

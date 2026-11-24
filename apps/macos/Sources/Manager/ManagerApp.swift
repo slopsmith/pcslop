@@ -21,6 +21,7 @@ struct ManagerApp: App {
                     delegate.sessions = sessions
                     Snapshot.sessions = sessions
                     sessions.onExit = { _ in library.thumbnailsChanged() }
+                    sessions.onThumbnail = { _ in library.thumbnailsChanged() }
                 }
         }
         .defaultSize(width: 1080, height: 720)

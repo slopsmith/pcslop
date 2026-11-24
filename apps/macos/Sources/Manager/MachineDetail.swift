@@ -63,14 +63,6 @@ struct MachineDetail: View {
             ToolbarSpacer(.fixed, placement: .primaryAction)
             ToolbarItemGroup(placement: .primaryAction) {
                 let idle = session.busy == nil
-                Button("Update Screenshot", systemImage: "camera") {
-                    Task {
-                        await session.screenshot(to: store.thumbnail(of: machine.id))
-                        library.thumbnailsChanged()
-                    }
-                }
-                .disabled(!idle)
-                .help("Take a screenshot for the library")
                 Button("Save State", systemImage: "square.and.arrow.down") {
                     Task {
                         if await session.saveState(into: store.newStateFolder(of: machine.id)) {
@@ -196,12 +188,12 @@ struct ScreenPreview: View {
 
     var body: some View {
         let _ = library.thumbnailVersion
+        let picture = ThumbnailCache.image(library.store.thumbnail(of: machine.id))
         ZStack {
-            if let picture = ThumbnailCache.image(library.store.thumbnail(of: machine.id)) {
+            if let picture {
                 Image(nsImage: picture)
                     .resizable()
                     .interpolation(.high)
-                    .aspectRatio(contentMode: .fill)
             } else {
                 Rectangle().fill(machine.os.tint.gradient.opacity(0.22))
                 OSIcon(os: machine.os, size: 44)
@@ -223,8 +215,8 @@ struct ScreenPreview: View {
                 .accessibilityLabel("Start")
             }
         }
-        .aspectRatio(4 / 3, contentMode: .fit)
-        .frame(maxWidth: 520)
+        .aspectRatio(screenAspect(picture), contentMode: .fit)
+        .frame(maxWidth: 560, maxHeight: 420)
         .clipShape(.rect(cornerRadius: 16, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 16, style: .continuous)

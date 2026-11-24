@@ -26,13 +26,17 @@ final class MachineSession {
     private let pending = OSAllocatedUnfairLock(initialState: Data())
     private var drainTask: Task<Void, Never>?
     private var pollTask: Task<Void, Never>?
+    private var thumbnailTask: Task<Void, Never>?
     var onExit: (() -> Void)?
+    var onThumbnail: (() -> Void)?
+
+    static let thumbnailInterval = Duration.seconds(10)
 
     init(machineID: Machine.ID) {
         self.machineID = machineID
     }
 
-    func launch(_ machine: Machine, settings: LaunchSettings, folder: URL, load: SavedState?) throws {
+    func launch(_ machine: Machine, settings: LaunchSettings, folder: URL, thumbnail: URL, load: SavedState?) throws {
         guard process == nil else { return }
         let control = LaunchCommand.socketPath(id: UUID().uuidString)
         let args = try LaunchCommand.arguments(
@@ -89,6 +93,15 @@ final class MachineSession {
                 try? await Task.sleep(for: .seconds(2))
             }
         }
+        thumbnailTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: Self.thumbnailInterval)
+                guard let self, !Task.isCancelled else { return }
+                if !isPaused, busy == nil, case .success = await send("shot \(thumbnail.path)", timeout: 5) {
+                    onThumbnail?()
+                }
+            }
+        }
     }
 
     @discardableResult
@@ -118,10 +131,6 @@ final class MachineSession {
         await refreshCD()
     }
 
-    func screenshot(to url: URL) async {
-        await perform("shot \(url.path)")
-    }
-
     func saveState(into folder: URL) async -> Bool {
         busy = "Saving state"
         defer { busy = nil }
@@ -130,7 +139,7 @@ final class MachineSession {
         case .success(let reply):
             log.appendLine(reply)
             guard reply.hasPrefix("saved ") else { return false }
-            await screenshot(to: folder.appendingPathComponent("thumbnail.png"))
+            await send("shot \(folder.appendingPathComponent(MachineStore.thumbnailFile).path)", timeout: 5)
             return true
         case .failure(let error):
             log.appendLine("control: \(error.message)")
@@ -214,6 +223,8 @@ final class MachineSession {
         drainTask = nil
         pollTask?.cancel()
         pollTask = nil
+        thumbnailTask?.cancel()
+        thumbnailTask = nil
         drain()
         let how = reason == .uncaughtSignal ? "killed by signal \(code)" : "exited with status \(code)"
         Task { [weak self] in
@@ -244,6 +255,7 @@ final class Sessions {
     private(set) var all: [Machine.ID: MachineSession] = [:]
     var lastError: String?
     var onExit: ((Machine.ID) -> Void)?
+    var onThumbnail: ((Machine.ID) -> Void)?
 
     var runningCount: Int { all.values.filter(\.isRunning).count }
 
@@ -266,10 +278,13 @@ final class Sessions {
         let session = all[machine.id] ?? MachineSession(machineID: machine.id)
         let id = machine.id
         session.onExit = { [weak self] in self?.onExit?(id) }
+        session.onThumbnail = { [weak self] in self?.onThumbnail?(id) }
         all[machine.id] = session
         do {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-            try session.launch(machine, settings: settings, folder: folder, load: load)
+            try session.launch(
+                machine, settings: settings, folder: folder,
+                thumbnail: folder.appendingPathComponent(MachineStore.thumbnailFile), load: load)
         } catch let error as ShellWordsError {
             lastError = "Extra arguments: \(error.message)"
         } catch {

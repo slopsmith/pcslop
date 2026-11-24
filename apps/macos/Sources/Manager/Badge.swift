@@ -87,12 +87,12 @@ struct MachineScreen: View {
 
     var body: some View {
         let _ = library.thumbnailVersion
+        let picture = ThumbnailCache.image(image)
         Group {
-            if let picture = ThumbnailCache.image(image) {
+            if let picture {
                 Image(nsImage: picture)
                     .resizable()
                     .interpolation(.high)
-                    .aspectRatio(contentMode: .fill)
             } else {
                 ZStack {
                     Rectangle().fill(os.tint.gradient.opacity(0.25))
@@ -102,7 +102,7 @@ struct MachineScreen: View {
                 }
             }
         }
-        .frame(width: width, height: width * 0.75)
+        .frame(width: width, height: width / screenAspect(picture))
         .clipShape(.rect(cornerRadius: max(6, width * 0.05), style: .continuous))
         .accessibilityHidden(true)
     }
@@ -120,7 +120,7 @@ enum ThumbnailCache {
             return nil
         }
         if let hit = cache[url], hit.date == date { return hit.image }
-        guard let image = NSImage(contentsOf: url) else { return nil }
+        guard let image = NSImage(contentsOf: url), image.isValid else { return cache[url]?.image }
         cache[url] = (date, image)
         return image
     }
@@ -179,4 +179,10 @@ func fileSize(_ path: String?) -> String? {
         let size = (try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? NSNumber
     else { return nil }
     return ByteCountFormatter.string(fromByteCount: size.int64Value, countStyle: .file)
+}
+
+// The guest's own screen shape once there is a screenshot, 4:3 until then.
+func screenAspect(_ picture: NSImage?) -> CGFloat {
+    guard let size = picture?.size, size.width > 0, size.height > 0 else { return 4 / 3 }
+    return size.width / size.height
 }

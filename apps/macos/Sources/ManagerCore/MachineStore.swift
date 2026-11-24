@@ -12,7 +12,7 @@ public struct SavedState: Sendable, Hashable, Identifiable {
 public struct MachineStore: Sendable {
     public let root: URL
     static let machineFile = "machine.json"
-    static let thumbnailFile = "thumbnail.png"
+    public static let thumbnailFile = "thumbnail.png"
     static let stateFile = "state.bin"
 
     public init(root: URL) {
