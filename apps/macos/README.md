@@ -28,23 +28,16 @@ few sample machines.
 
 ## Where things are found
 
-- **pcslop**: the Settings value, the copy in the app bundle, `PCSLOP_BIN`,
-  then `target/release/pcslop` or `target/vm/pcslop` above the current folder
-  or the app. It needs the Hypervisor entitlement, which `cargo run` and
-  `scripts/vm build` sign in.
-- **BIOS and VGA BIOS**: the Settings values, the bundle's copies, then
-  `references/seabios/share/seabios/bios.bin` and
-  `references/seavgabios/share/seabios/vgabios.bin` above the current folder.
+- **pcslop, SeaBIOS and SeaVGABIOS** come inside the app bundle. Settings can
+  point at other builds instead. Run from a checkout (`swift run`), the app
+  also looks for `target/release/pcslop`, `target/vm/pcslop` and the
+  `references/` SeaBIOS out-links above the current folder; a packaged app
+  never looks outside itself.
+- **Radeon 9700 video BIOS**: chosen once in Settings, for every machine. pcslop
+  cannot ship it. Without it, the Radeon is unavailable and presets use standard VGA.
 - **Machines**: `~/Library/Application Support/pcslop/machines/UUID/`, with
-  `machine.json`, `thumbnail.png` (taken when the machine stops) and save
-  states in `states/`. `--store DIR` uses another folder.
-
-## Save states
-
-A save state is a folder made by the control socket's `save DIR`. It holds a
-copy of the primary disk, so a machine started from a state runs on that
-copy, and the machine's own disk image stays as it was. pcslop refuses
-`--hdb` with `--load`, so a state starts without the secondary disk.
+  `machine.json`, `thumbnail.png` (taken when the machine stops), save states
+  in `states/` and any disk made for the machine. `--store DIR` uses another folder.
 
 ## Logos
 

@@ -4,7 +4,7 @@ import Testing
 @testable import ManagerCore
 
 struct LaunchCommandTests {
-    private let firmware = Firmware(bios: "/fw/bios.bin", vgaBIOS: "/fw/vgabios.bin")
+    private let firmware = Firmware(bios: "/fw/bios.bin", vgaBIOS: "/fw/vgabios.bin", radeonROM: "/roms/r300.rom")
 
     private func args(_ config: MachineConfig, load: URL? = nil) throws -> [String] {
         try LaunchCommand.arguments(for: config, firmware: firmware, control: "/tmp/c.sock", load: load)
@@ -22,7 +22,6 @@ struct LaunchCommandTests {
         var config = MachineConfig()
         config.board = .fx
         config.gpu = .radeon
-        config.vgaROM = "/roms/r300.rom"
         config.renderer = .cpu
         let argv = try args(config)
         #expect(!argv.contains("--vgabios"))

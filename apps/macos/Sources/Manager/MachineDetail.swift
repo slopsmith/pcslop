@@ -8,6 +8,7 @@ struct MachineDetail: View {
     @Environment(Sessions.self) private var sessions
     @Environment(EditorRequest.self) private var editor
     @State private var showsOutput = false
+    @AppStorage(Defaults.radeonROM) private var radeonROM = ""
 
     private var session: MachineSession? { sessions.session(for: machine.id) }
     private var running: Bool { session?.isRunning ?? false }
@@ -71,7 +72,7 @@ struct MachineDetail: View {
     }
 
     @ViewBuilder private var problems: some View {
-        let problems = machine.config.problems()
+        let problems = machine.config.problems(radeonROM: radeonROM.isEmpty ? nil : radeonROM)
         if !problems.isEmpty {
             DetailSection("Needs Attention") {
                 ForEach(problems, id: \.self) { problem in

@@ -66,7 +66,6 @@ public enum BatteryMode: Sendable, Hashable, Codable {
 public struct MachineConfig: Sendable, Hashable, Codable {
     public var board: Board = .fx
     public var gpu: GPU = .stdvga
-    public var vgaROM: String?
     public var renderer: Renderer = .metal
     public var ramMiB: Int = 256
     public var hda: String?
@@ -87,7 +86,6 @@ public struct MachineConfig: Sendable, Hashable, Codable {
         let d = MachineConfig()
         board = try c.decodeIfPresent(Board.self, forKey: .board) ?? d.board
         gpu = try c.decodeIfPresent(GPU.self, forKey: .gpu) ?? d.gpu
-        vgaROM = try c.decodeIfPresent(String.self, forKey: .vgaROM)
         renderer = try c.decodeIfPresent(Renderer.self, forKey: .renderer) ?? d.renderer
         ramMiB = try c.decodeIfPresent(Int.self, forKey: .ramMiB) ?? d.ramMiB
         hda = try c.decodeIfPresent(String.self, forKey: .hda)
@@ -102,15 +100,16 @@ public struct MachineConfig: Sendable, Hashable, Codable {
         extraArgs = try c.decodeIfPresent(String.self, forKey: .extraArgs) ?? d.extraArgs
     }
 
-    public func problems(fileExists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }) -> [String] {
+    public func problems(
+        radeonROM: String?, fileExists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }
+    ) -> [String] {
         var out: [String] = []
-        if gpu == .radeon {
-            if board == .fx { out.append("The Radeon needs the BX board's AGP bus.") }
-            if vgaROM?.isEmpty ?? true { out.append("The Radeon needs its video BIOS.") }
+        if gpu == .radeon, radeonROM?.isEmpty ?? true {
+            out.append("The Radeon 9700 needs its video BIOS. Choose it in Settings, or switch to standard VGA.")
         }
         if ramMiB < 4 { out.append("The machine needs at least 4 MiB of RAM.") }
         let files: [(String, String?)] = [
-            ("video BIOS", gpu == .radeon ? vgaROM : nil), ("primary disk", hda),
+            ("Radeon video BIOS", gpu == .radeon ? radeonROM : nil), ("primary disk", hda),
             ("secondary disk", hdb), ("CD-ROM image", cdrom),
         ]
         for (what, path) in files {

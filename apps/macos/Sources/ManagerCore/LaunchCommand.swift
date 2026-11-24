@@ -3,10 +3,12 @@ import Foundation
 public struct Firmware: Sendable, Hashable {
     public var bios: String
     public var vgaBIOS: String?
+    public var radeonROM: String?
 
-    public init(bios: String, vgaBIOS: String? = nil) {
+    public init(bios: String, vgaBIOS: String? = nil, radeonROM: String? = nil) {
         self.bios = bios
         self.vgaBIOS = vgaBIOS
+        self.radeonROM = radeonROM
     }
 }
 
@@ -22,7 +24,7 @@ public enum LaunchCommand {
             if let vga = firmware.vgaBIOS, !vga.isEmpty { args += ["--vgabios", vga] }
         case .radeon:
             args += ["--board", Board.bx.rawValue, "--gpu", "radeon"]
-            if let rom = config.vgaROM, !rom.isEmpty { args += ["--vga-rom", rom] }
+            if let rom = firmware.radeonROM, !rom.isEmpty { args += ["--vga-rom", rom] }
             args += ["--gpu-3d", config.renderer.rawValue]
         }
         args += ["--ram", String(config.ramMiB)]

@@ -15,7 +15,7 @@ public enum Preset: String, Sendable, Hashable, CaseIterable, Identifiable {
         }
     }
 
-    public var needsVideoBIOS: Bool { self != .custom }
+    public var wantsRadeon: Bool { self != .custom }
 
     public var diskGiB: UInt64 {
         switch self {
@@ -25,25 +25,23 @@ public enum Preset: String, Sendable, Hashable, CaseIterable, Identifiable {
         }
     }
 
-    public func machine(name: String, disk: String?, cdrom: String?, vgaROM: String?) -> Machine {
+    public func machine(name: String, disk: String?, cdrom: String?, radeon: Bool) -> Machine {
         var config = MachineConfig()
         config.hda = disk
         config.cdrom = cdrom
         switch self {
         case .windowsXPRadeon:
-            config.board = .bx
-            config.gpu = .radeon
-            config.vgaROM = vgaROM
             config.ramMiB = 512
             config.captureMouse = .auto
         case .ubuntuRadeon:
-            config.board = .bx
-            config.gpu = .radeon
-            config.vgaROM = vgaROM
             config.ramMiB = 512
             config.captureMouse = .click
         case .custom:
             break
+        }
+        if wantsRadeon && radeon {
+            config.board = .bx
+            config.gpu = .radeon
         }
         return Machine(name: name, os: os, config: config)
     }

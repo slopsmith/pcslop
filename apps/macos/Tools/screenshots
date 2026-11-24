@@ -59,5 +59,8 @@ shot settings-light --store "$tmp/store" --appearance light --select "Ubuntu 8.0
 shot new-machine --store "$tmp/store" --appearance dark --open new
 shot new-machine-drives --store "$tmp/store" --appearance dark --open new-drives
 shot settings-system --store "$tmp/store" --appearance dark --select "Windows XP" --open settings --page system
+shot preferences --store "$tmp/store" --appearance dark --open preferences
+shot display-no-rom --store "$tmp/store" --appearance dark --select "Windows XP" --open settings --page display
+shot network --store "$tmp/store" --appearance dark --select "Ubuntu 8.04" --open settings --page network
 shot settings-drives --store "$tmp/store" --appearance light --select "Windows XP" --open settings --page drives
 echo "screenshots in $out"

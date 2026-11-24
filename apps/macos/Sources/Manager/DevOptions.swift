@@ -14,8 +14,13 @@ enum Snapshot {
             window?.setContentSize(NSSize(width: size[0], height: size[1]))
             window?.center()
         }
-        guard let path = ManagerApp.argument("--snapshot"), let window else { return }
+        guard let path = ManagerApp.argument("--snapshot"), var window else { return }
         try? await Task.sleep(for: .seconds(2))
+        if ManagerApp.argument("--open") == "preferences",
+            let settings = NSApp.windows.first(where: { $0.isVisible && $0 !== window })
+        {
+            window = settings
+        }
         let url = URL(fileURLWithPath: path)
         do {
             try await capture(window, to: url)

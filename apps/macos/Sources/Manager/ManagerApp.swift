@@ -106,10 +106,17 @@ func launchSettings() -> LaunchSettings? {
     guard let bios = biosPath.isEmpty ? BinaryLocator.bios()?.path : biosPath else { return nil }
     let vgaPath = defaults.string(forKey: Defaults.vgaBIOS) ?? ""
     let vga = vgaPath.isEmpty ? BinaryLocator.vgaBIOS()?.path : vgaPath
-    return LaunchSettings(binary: binary, firmware: Firmware(bios: bios, vgaBIOS: vga))
+    return LaunchSettings(binary: binary, firmware: Firmware(bios: bios, vgaBIOS: vga, radeonROM: appRadeonROM()))
+}
+
+@MainActor
+func appRadeonROM() -> String? {
+    let path = UserDefaults.standard.string(forKey: Defaults.radeonROM) ?? ""
+    return path.isEmpty ? nil : path
 }
 
 enum Defaults {
+    static let radeonROM = "radeonROM"
     static let binary = "pcslopBinary"
     static let bios = "biosPath"
     static let vgaBIOS = "vgaBIOSPath"

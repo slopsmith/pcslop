@@ -8,7 +8,6 @@ struct MachineTests {
         var config = MachineConfig()
         config.board = .bx
         config.gpu = .radeon
-        config.vgaROM = "/r.rom"
         config.renderer = .cpu
         config.ramMiB = 768
         config.hda = "/a.img"
@@ -42,23 +41,39 @@ struct MachineTests {
         #expect(try MachineStore.decoder.decode(Machine.self, from: Data(json.utf8)).os == .other)
     }
 
-    @Test func radeonOnTheFXBoardWithoutARomHasTwoProblems() {
+    @Test func theRadeonWithoutAVideoBIOSIsAProblem() {
         var config = MachineConfig()
         config.gpu = .radeon
-        config.board = .fx
-        #expect(config.problems(fileExists: { _ in true }).count == 2)
+        #expect(config.problems(radeonROM: nil, fileExists: { _ in true }).count == 1)
+        #expect(config.problems(radeonROM: "", fileExists: { _ in true }).count == 1)
+    }
+
+    @Test func theRadeonWithAVideoBIOSHasNoProblems() {
+        var config = MachineConfig()
+        config.gpu = .radeon
+        #expect(config.problems(radeonROM: "/r.rom", fileExists: { _ in true }).isEmpty)
+    }
+
+    @Test func aMissingVideoBIOSFileIsAProblem() {
+        var config = MachineConfig()
+        config.gpu = .radeon
+        #expect(config.problems(radeonROM: "/gone.rom", fileExists: { _ in false }).count == 1)
+    }
+
+    @Test func standardVGAIgnoresTheRadeonVideoBIOS() {
+        #expect(MachineConfig().problems(radeonROM: "/gone.rom", fileExists: { _ in false }).isEmpty)
     }
 
     @Test func missingDriveFilesAreProblems() {
         var config = MachineConfig()
         config.hda = "/gone.img"
         config.cdrom = "/here.iso"
-        let problems = config.problems(fileExists: { $0 == "/here.iso" })
+        let problems = config.problems(radeonROM: nil, fileExists: { $0 == "/here.iso" })
         #expect(problems.count == 1)
     }
 
     @Test func aDefaultMachineHasNoProblems() {
-        #expect(MachineConfig().problems(fileExists: { _ in false }).isEmpty)
+        #expect(MachineConfig().problems(radeonROM: nil, fileExists: { _ in false }).isEmpty)
     }
 }
 

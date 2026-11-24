@@ -10,16 +10,16 @@ extension Preset {
         }
     }
 
-    var blurb: String {
+    func blurb(radeon: Bool) -> String {
         switch self {
-        case .windowsXPRadeon: "Install or run Windows XP with Radeon 9700 3D acceleration."
-        case .ubuntuRadeon: "Install Ubuntu to a hard disk, with the Radeon 9700."
+        case .windowsXPRadeon: radeon ? "Install or run Windows XP, with 3D on the Radeon 9700." : "Install or run Windows XP."
+        case .ubuntuRadeon: radeon ? "Install Ubuntu to a hard disk, with 3D on the Radeon 9700." : "Install Ubuntu to a hard disk."
         case .custom: "Start from plain defaults and set up every device yourself."
         }
     }
 
-    var hardware: String {
-        machine(name: "", disk: nil, cdrom: nil, vgaROM: nil).config.summary
+    func hardware(radeon: Bool) -> String {
+        machine(name: "", disk: nil, cdrom: nil, radeon: radeon).config.summary
     }
 }
 
@@ -29,7 +29,7 @@ private enum WizardStep: Int, CaseIterable {
     var title: String {
         switch self {
         case .preset: "Choose a Starting Point"
-        case .drives: "Disks and Firmware"
+        case .drives: "Disks"
         case .finish: "Name Your Machine"
         }
     }
@@ -49,7 +49,7 @@ struct NewMachineWizard: View {
     @State private var diskGiB: UInt64
     @State private var existingDisk: String?
     @State private var cdrom: String?
-    @State private var vgaROM: String?
+    @AppStorage(Defaults.radeonROM) private var radeonROM = ""
     @State private var name: String
     @State private var error: String?
 
@@ -61,7 +61,6 @@ struct NewMachineWizard: View {
         _diskGiB = State(initialValue: preset.diskGiB)
         _existingDisk = State(initialValue: request.disk)
         _cdrom = State(initialValue: request.cdrom)
-        _vgaROM = State(initialValue: BinaryLocator.radeonROM()?.path)
         let fromFile = (request.disk ?? request.cdrom).map { URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent }
         _name = State(initialValue: fromFile ?? preset.title)
         if request.preset != nil { _step = State(initialValue: .drives) }
@@ -117,7 +116,7 @@ struct NewMachineWizard: View {
     private var presets: some View {
         VStack(spacing: 12) {
             ForEach(Preset.allCases) { p in
-                PresetCard(preset: p, selected: p == preset)
+                PresetCard(preset: p, selected: p == preset, radeon: hasRadeon)
                     .onTapGesture(count: 2) {
                         choose(p)
                         advance()
@@ -125,6 +124,16 @@ struct NewMachineWizard: View {
                     .onTapGesture { choose(p) }
             }
             Spacer(minLength: 0)
+            if !hasRadeon {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Image(systemName: "info.circle")
+                    Text("Windows XP and Ubuntu get 3D acceleration once you choose a Radeon 9700 video BIOS in Settings.")
+                    Spacer(minLength: 8)
+                    SettingsLink { Text("Open Settings…") }
+                }
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            }
         }
         .padding(22)
     }
@@ -167,13 +176,6 @@ struct NewMachineWizard: View {
                      ? "The Ubuntu 8.04 desktop CD installs to the disk from its live session."
                      : "The machine boots from the CD while the disk is blank.")
             }
-            if preset.needsVideoBIOS {
-                Section {
-                    VideoBIOSField(path: $vgaROM)
-                } footer: {
-                    Text("The Radeon 9700 needs the card's own video BIOS ROM, which pcslop does not ship.")
-                }
-            }
         }
         .formStyle(.grouped)
         .scrollContentBackground(.hidden)
@@ -186,17 +188,16 @@ struct NewMachineWizard: View {
             }
             Section("Summary") {
                 LabeledContent("Starting point", value: preset.title)
-                LabeledContent("Hardware", value: preset.hardware)
+                LabeledContent("Hardware", value: preset.hardware(radeon: hasRadeon))
                 LabeledContent("Hard disk", value: diskSummary)
                 LabeledContent("CD-ROM", value: fileName(cdrom) ?? "Empty")
-                if preset.needsVideoBIOS {
-                    LabeledContent("Video BIOS", value: fileName(vgaROM) ?? "Missing")
-                }
             }
         }
         .formStyle(.grouped)
         .scrollContentBackground(.hidden)
     }
+
+    private var hasRadeon: Bool { !radeonROM.isEmpty }
 
     private var diskSummary: String {
         switch diskChoice {
@@ -249,7 +250,7 @@ struct NewMachineWizard: View {
         var machine = preset.machine(
             name: name.trimmingCharacters(in: .whitespaces),
             disk: diskChoice == .existing ? existingDisk : nil,
-            cdrom: cdrom, vgaROM: vgaROM)
+            cdrom: cdrom, radeon: hasRadeon)
         if diskChoice == .new {
             let folder = library.store.folder(of: machine.id)
             let disk = folder.appendingPathComponent("disk.img")
@@ -271,6 +272,7 @@ struct NewMachineWizard: View {
 private struct PresetCard: View {
     let preset: Preset
     let selected: Bool
+    let radeon: Bool
     @State private var hovering = false
 
     var body: some View {
@@ -278,8 +280,8 @@ private struct PresetCard: View {
             OSIcon(os: preset.os, size: 52)
             VStack(alignment: .leading, spacing: 4) {
                 Text(preset.title).font(.title3.weight(.semibold))
-                Text(preset.blurb).foregroundStyle(.secondary)
-                Text(preset.hardware)
+                Text(preset.blurb(radeon: radeon)).foregroundStyle(.secondary)
+                Text(preset.hardware(radeon: radeon))
                     .font(.caption)
                     .foregroundStyle(.tertiary)
             }

@@ -7,6 +7,7 @@ struct ContentView: View {
     @Environment(EditorRequest.self) private var editor
     @State private var selection: Machine.ID?
     @State private var dropTargeted = false
+    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         @Bindable var editor = editor
@@ -106,6 +107,7 @@ struct ContentView: View {
         switch ManagerApp.argument("--open") {
         case "new": editor.newMachine()
         case "new-drives": editor.newMachine(NewMachineRequest(preset: .windowsXPRadeon))
+        case "preferences": openSettings()
         case "settings": if let machine = library.machine(selection) { editor.edit(machine) }
         default: break
         }

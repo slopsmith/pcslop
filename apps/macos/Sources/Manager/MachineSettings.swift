@@ -42,6 +42,7 @@ struct MachineSettings: View {
     @Environment(\.dismiss) private var dismiss
     @State private var page: SettingsPage? = ManagerApp.argument("--page").flatMap(SettingsPage.init) ?? .information
     @State private var forwards: String
+    @AppStorage(Defaults.radeonROM) private var radeonROM = ""
 
     init(machine: Machine, save: @escaping (Machine) -> Void) {
         _machine = State(initialValue: machine)
@@ -97,7 +98,7 @@ struct MachineSettings: View {
 
     private var footer: some View {
         HStack {
-            let problems = machine.config.problems()
+            let problems = machine.config.problems(radeonROM: radeonROM.isEmpty ? nil : radeonROM)
             if !problems.isEmpty {
                 Label(problems.count == 1 ? problems[0] : "\(problems.count) problems", systemImage: "exclamationmark.triangle.fill")
                     .foregroundStyle(.orange)
@@ -185,20 +186,27 @@ struct MachineSettings: View {
             Section {
                 Picker("Graphics card", selection: $machine.config.gpu) {
                     Text("Standard VGA").tag(GPU.stdvga)
-                    Text("ATI Radeon 9700 (2D and 3D)").tag(GPU.radeon)
+                    Text("ATI Radeon 9700, with 3D").tag(GPU.radeon)
+                        .disabled(radeonROM.isEmpty && machine.config.gpu != .radeon)
                 }
                 .pickerStyle(.radioGroup)
+            } footer: {
+                if radeonROM.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("The Radeon 9700 needs a copy of the real card's video BIOS. Choose one in Settings to use it.")
+                        SettingsLink { Text("Open Settings…") }
+                    }
+                }
             }
             if machine.config.gpu == .radeon {
                 Section {
-                    VideoBIOSField(path: $machine.config.vgaROM)
                     Picker("3D rendering", selection: $machine.config.renderer) {
                         Text("Metal").tag(Renderer.metal)
-                        Text("CPU reference").tag(Renderer.cpu)
+                        Text("CPU").tag(Renderer.cpu)
                     }
                     .pickerStyle(.segmented)
                 } footer: {
-                    Text("The Radeon needs the card's own video BIOS ROM. The CPU renderer is slow, and only useful to compare against Metal.")
+                    Text("Metal draws on this Mac's GPU. The CPU renderer is much slower and only useful for comparing against Metal.")
                 }
             }
         }
@@ -208,8 +216,11 @@ struct MachineSettings: View {
         Section {
             Toggle("Network card", isOn: $machine.config.network)
             if machine.config.network {
-                TextField("Port forwards", text: $forwards, prompt: Text("tcp::2222-:22"))
-                    .font(.body.monospaced())
+                LabeledContent("Port forwards") {
+                    TextField("Port forwards", text: $forwards, prompt: Text("tcp::2222-:22"))
+                        .labelsHidden()
+                        .font(.body.monospaced())
+                }
             }
         } footer: {
             Text("An RTL8139 on a user-mode network: the guest reaches the internet through this Mac. Port forwards are separated by spaces, as [tcp|udp]:[HOSTADDR]:HOSTPORT-[GUESTADDR]:GUESTPORT.")
@@ -281,9 +292,12 @@ struct MachineSettings: View {
 
     private var advanced: some View {
         Section {
-            TextField("Extra arguments", text: $machine.config.extraArgs, prompt: Text("--serial com1.log"))
-                .font(.body.monospaced())
-            ForEach(machine.config.problems(), id: \.self) { problem in
+            LabeledContent("Extra arguments") {
+                TextField("Extra arguments", text: $machine.config.extraArgs, prompt: Text("--serial com1.log"))
+                    .labelsHidden()
+                    .font(.body.monospaced())
+            }
+            ForEach(machine.config.problems(radeonROM: radeonROM.isEmpty ? nil : radeonROM), id: \.self) { problem in
                 Label(problem, systemImage: "exclamationmark.triangle.fill")
                     .foregroundStyle(.orange)
             }
@@ -395,21 +409,6 @@ struct DiskField: View {
             path = url.path
         } catch {
             self.error = error.localizedDescription
-        }
-    }
-}
-
-struct VideoBIOSField: View {
-    @Binding var path: String?
-
-    var body: some View {
-        FileField(
-            title: "Video BIOS", path: $path, placeholder: "Required",
-            message: "Choose the Radeon 9700's video BIOS ROM.")
-        if path?.isEmpty ?? true, let found = BinaryLocator.radeonROM() {
-            LabeledContent("") {
-                Button("Use \(found.lastPathComponent)") { path = found.path }
-            }
         }
     }
 }

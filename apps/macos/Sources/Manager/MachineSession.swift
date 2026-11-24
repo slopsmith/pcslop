@@ -258,7 +258,7 @@ final class Sessions {
                 "pcslop or its BIOS was not found. Set them in Settings, set PCSLOP_BIN, or build target/release/pcslop."
             return
         }
-        let problems = machine.config.problems()
+        let problems = machine.config.problems(radeonROM: appRadeonROM())
         if load == nil, !problems.isEmpty {
             lastError = problems.joined(separator: "\n")
             return

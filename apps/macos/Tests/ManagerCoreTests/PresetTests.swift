@@ -7,30 +7,28 @@ struct PresetTests {
     private let allFilesExist: (String) -> Bool = { _ in true }
 
     @Test(arguments: [Preset.windowsXPRadeon, .ubuntuRadeon])
-    func radeonPresetsMakeAMachinePcslopAccepts(preset: Preset) {
-        let machine = preset.machine(name: "M", disk: "/d.img", cdrom: "/c.iso", vgaROM: "/r.rom")
-        #expect(machine.config.problems(fileExists: allFilesExist).isEmpty)
+    func radeonPresetsUseTheRadeonWhenThereIsAVideoBIOS(preset: Preset) {
+        let machine = preset.machine(name: "M", disk: "/d.img", cdrom: "/c.iso", radeon: true)
         #expect(machine.config.gpu == .radeon)
+        #expect(machine.config.problems(radeonROM: "/r.rom", fileExists: allFilesExist).isEmpty)
     }
 
     @Test(arguments: [Preset.windowsXPRadeon, .ubuntuRadeon])
-    func radeonPresetsNeedTheVideoBIOS(preset: Preset) {
-        let machine = preset.machine(name: "M", disk: "/d.img", cdrom: nil, vgaROM: nil)
-        #expect(!machine.config.problems(fileExists: allFilesExist).isEmpty)
-        #expect(preset.needsVideoBIOS)
+    func radeonPresetsFallBackToStandardVGA(preset: Preset) {
+        let machine = preset.machine(name: "M", disk: "/d.img", cdrom: nil, radeon: false)
+        #expect(machine.config.gpu == .stdvga)
+        #expect(machine.config.problems(radeonROM: nil, fileExists: allFilesExist).isEmpty)
     }
 
-    @Test func theCustomPresetKeepsTheDefaultHardware() {
-        let machine = Preset.custom.machine(name: "M", disk: nil, cdrom: nil, vgaROM: "/r.rom")
-        var expected = MachineConfig()
-        expected.vgaROM = nil
-        #expect(machine.config == expected)
-        #expect(!Preset.custom.needsVideoBIOS)
+    @Test(arguments: [true, false])
+    func theCustomPresetKeepsTheDefaultHardware(radeon: Bool) {
+        let machine = Preset.custom.machine(name: "M", disk: nil, cdrom: nil, radeon: radeon)
+        #expect(machine.config == MachineConfig())
     }
 
     @Test(arguments: Preset.allCases)
     func everyPresetPutsTheDisksWhereTheyWereGiven(preset: Preset) {
-        let machine = preset.machine(name: "M", disk: "/d.img", cdrom: "/c.iso", vgaROM: "/r.rom")
+        let machine = preset.machine(name: "M", disk: "/d.img", cdrom: "/c.iso", radeon: true)
         #expect(machine.config.hda == "/d.img")
         #expect(machine.config.cdrom == "/c.iso")
         #expect(machine.os == preset.os)
@@ -69,27 +67,5 @@ struct MemorySizeTests {
         #expect(MemorySize.clamped(1) == MemorySize.range.lowerBound)
         #expect(MemorySize.clamped(700) == 700)
         #expect(MemorySize.clamped(99_999) == MemorySize.range.upperBound)
-    }
-}
-
-struct RadeonROMLocatorTests {
-    @Test func findsAROMInTheReferenceDocs() throws {
-        let repo = FileManager.default.temporaryDirectory.appendingPathComponent("pcslop-repo-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: repo) }
-        let folder = repo.appendingPathComponent("references/docs/ati-r300")
-        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        try Data().write(to: folder.appendingPathComponent("notes.txt"))
-        let rom = folder.appendingPathComponent("card.rom")
-        try Data().write(to: rom)
-        let deep = repo.appendingPathComponent("apps/macos")
-        try FileManager.default.createDirectory(at: deep, withIntermediateDirectories: true)
-        #expect(BinaryLocator.radeonROM(searchFrom: [deep])?.standardizedFileURL.path == rom.standardizedFileURL.path)
-    }
-
-    @Test func findsNothingWithoutTheReferenceDocs() throws {
-        let empty = FileManager.default.temporaryDirectory.appendingPathComponent("pcslop-none-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: empty, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: empty) }
-        #expect(BinaryLocator.radeonROM(searchFrom: [empty]) == nil)
     }
 }
