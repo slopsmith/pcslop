@@ -8,24 +8,23 @@ struct ManagerApp: App {
     @State private var library = Library(store: ManagerApp.store())
     @State private var sessions = Sessions()
     @State private var editor = EditorRequest()
+    @State private var updates = Updates()
 
     var body: some Scene {
         Window("pcslop", id: "library") {
-            ContentView()
-                .environment(library)
-                .environment(sessions)
-                .environment(editor)
-                .frame(minWidth: 760, minHeight: 520)
-                .task { await Snapshot.takeIfAsked() }
-                .onAppear {
-                    delegate.sessions = sessions
-                    Snapshot.sessions = sessions
-                    sessions.onExit = { _ in library.thumbnailsChanged() }
-                    sessions.onThumbnail = { _ in library.thumbnailsChanged() }
-                }
+            if Self.showsAbout {
+                AboutView()
+                    .task { await Snapshot.takeIfAsked() }
+            } else {
+                libraryView
+            }
         }
-        .defaultSize(width: 1080, height: 720)
+        .defaultSize(width: Self.showsAbout ? 860 : 1080, height: Self.showsAbout ? 600 : 720)
         .commands {
+            CommandGroup(replacing: .appInfo) {
+                AboutButton()
+                Button("Check for Updates…") { Task { await updates.checkNow() } }
+            }
             CommandGroup(replacing: .newItem) {
                 Button("New Machine…") { editor.newMachine() }
                     .keyboardShortcut("n")
@@ -34,10 +33,38 @@ struct ManagerApp: App {
             }
         }
 
+        Window("About pcslop", id: "about") {
+            AboutView()
+        }
+        .defaultSize(width: 860, height: 600)
+        .windowResizability(.contentMinSize)
+        .restorationBehavior(.disabled)
+        .defaultLaunchBehavior(.suppressed)
+
         Settings {
             SettingsView()
         }
     }
+
+    private var libraryView: some View {
+        ContentView()
+            .environment(library)
+            .environment(sessions)
+            .environment(editor)
+            .frame(minWidth: 760, minHeight: 520)
+            .task { await Snapshot.takeIfAsked() }
+            .onAppear {
+                delegate.sessions = sessions
+                Snapshot.sessions = sessions
+                sessions.onExit = { _ in library.thumbnailsChanged() }
+                sessions.onThumbnail = { _ in library.thumbnailsChanged() }
+            }
+            .task { await updates.checkOnLaunch() }
+            .modifier(UpdateAlert(updates: updates))
+    }
+
+    /// `--about` shows the About view in the main window instead of the library, for `--snapshot`.
+    static let showsAbout = CommandLine.arguments.contains("--about")
 
     static func argument(_ name: String) -> String? {
         let args = CommandLine.arguments
@@ -49,6 +76,14 @@ struct ManagerApp: App {
     private static func store() -> MachineStore {
         if let path = argument("--store") { return MachineStore(root: URL(fileURLWithPath: path)) }
         return .standard
+    }
+}
+
+struct AboutButton: View {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Button("About pcslop") { openWindow(id: "about") }
     }
 }
 
@@ -122,4 +157,5 @@ enum Defaults {
     static let binary = "pcslopBinary"
     static let bios = "biosPath"
     static let vgaBIOS = "vgaBIOSPath"
+    static let checkForUpdates = "checkForUpdates"
 }

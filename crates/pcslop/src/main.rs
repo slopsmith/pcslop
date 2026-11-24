@@ -62,6 +62,8 @@ enum BatterySource {
     Fixed(Power),
 }
 
+/// The version and the commit this binary was built from (see `build.rs`).
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("SLOP_COMMIT"), ")");
 const BATTERY_USAGE: &str = "host | off | PERCENT[:ac]";
 
 /// `host` mirrors the Mac, `off` has no battery on AC power, and `PERCENT`
@@ -102,7 +104,7 @@ fn describe_power(p: &Power) -> String {
 
 /// An x86 PC for Windows XP and Linux guests, on Hypervisor.framework.
 #[derive(clap::Parser)]
-#[command(name = "pcslop", version)]
+#[command(name = "pcslop", version = VERSION)]
 struct Cli {
     /// SeaBIOS image.
     #[arg(long, value_name = "FILE")]
@@ -1306,6 +1308,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    eprintln!("pcslop {VERSION}");
     let read = |p: &str| std::fs::read(p).map_err(|e| format!("cannot read {p}: {e}"));
     let bios = match read(&args.bios) {
         Ok(b) => b,

@@ -7,6 +7,7 @@ struct SettingsView: View {
     @AppStorage(Defaults.binary) private var binary = ""
     @AppStorage(Defaults.bios) private var bios = ""
     @AppStorage(Defaults.vgaBIOS) private var vgaBIOS = ""
+    @AppStorage(Defaults.checkForUpdates) private var checkForUpdates = true
 
     var body: some View {
         Form {
@@ -35,6 +36,11 @@ struct SettingsView: View {
                 Text("Components")
             } footer: {
                 Text("pcslop comes with its emulator and SeaBIOS. Choose other files only to try a build of your own.")
+            }
+            Section {
+                Toggle("Check for updates when pcslop starts", isOn: $checkForUpdates)
+            } footer: {
+                Text("Compares this build with the newest nightly on GitHub. Local builds never check.")
             }
         }
         .formStyle(.grouped)
