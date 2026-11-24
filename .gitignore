@@ -1,4 +1,5 @@
 /target
+/apps/macos/.build
 /references
 /result*
 /.claude/worktrees
