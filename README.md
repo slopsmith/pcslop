@@ -5,6 +5,10 @@ An x86-32 PC emulator for Apple Silicon Macs. The goal is to run Windows XP fast
 - [Architecture](docs/architecture.md)
 - [References](docs/references.md)
 
+## Download
+
+Nightly builds of the Mac app (macOS 26, Apple Silicon) are at https://github.com/slopsmith/pcslop/releases/tag/nightly; https://github.com/slopsmith/pcslop/releases/download/nightly/pcslop-macos-arm64.zip is always the newest. See [apps/macos/README.md](apps/macos/README.md#nightly-builds).
+
 ## Setup
 
 ```sh

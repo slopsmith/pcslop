@@ -1,0 +1,33 @@
+name: nightly
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Build even if trunk has not changed since the last nightly
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  nightly:
+    uses: slopsmith/ci/.github/workflows/macos-nightly.yml@main
+    with:
+      project: pcslop
+      app: target/pcslop.app
+      binary: Contents/MacOS/pcslop
+      bundle: apps/macos/Tools/bundle-app
+      cargo-target: target/work
+      # SeaBIOS is an x86 build, which needs a Linux machine.
+      linux-build: |
+        for p in seabios seavgabios; do
+          mkdir -p "references/$p/share/seabios"
+          cp "$(nix build --no-link --print-out-paths ".#packages.aarch64-darwin.$p")"/share/seabios/*.bin "references/$p/share/seabios/"
+        done
+      linux-out: references
+      # Hosted runners cannot make Hypervisor.framework VMs.
+      checks: nix develop . -c cargo test --workspace --exclude jit --exclude hvf

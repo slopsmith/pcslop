@@ -24,7 +24,46 @@ Inside `nix develop`, call Apple's toolchain directly:
 
 `Tools/bundle-app` builds `target/pcslop.app` with pcslop, the libraries it
 links and SeaBIOS inside. `Tools/screenshots` saves preview screenshots with a
-few sample machines.
+few sample machines. `--about` opens only the About window, for `--snapshot`.
+
+The shared bundle steps come from `slop-app` in
+[slopsmith/ci](https://github.com/slopsmith/ci), pinned in `flake.lock`
+(`nix flake update slopsmith-ci` moves it). The script ends with the upload
+checks the nightly workflow also runs: everything is arm64 and nothing links
+into `/nix/store` (Apple's libiconv and libresolv are linked from `/usr/lib`
+instead of bundled), the signatures verify and pcslop has the hypervisor
+entitlement, the bundled `pcslop --version` names the same commit as the app,
+and every bundled library is listed in `Licenses/README.txt`.
+
+Every build is stamped with the commit it was built from: `SLOP_COMMIT` if
+set (the nightly workflow sets it), else `git rev-parse HEAD`, plus `-dirty`
+from `Tools/bundle-app` when tracked files differ and `-dev` from a plain
+`cargo build`. `pcslop --version`, the first line pcslop prints, Info.plist's
+`SlopCommit` and the About window show it.
+
+## Nightly builds
+
+`.github/workflows/nightly.yml` runs the shared workflow from slopsmith/ci at
+03:00 UTC when `trunk` has moved (or by hand). It builds SeaBIOS on a Linux
+runner, runs `cargo test` without the `jit` and `hvf` crates (hosted macOS
+runners cannot make Hypervisor.framework VMs), bundles the app, runs the
+checks and replaces the assets of the rolling `nightly` release:
+`pcslop-macos-arm64.zip` and `nightly.json`. Older builds are not kept.
+
+The app is signed ad hoc, not notarised: the first time, open it, then go to
+System Settings > Privacy & Security and choose Open Anyway.
+
+## About, licenses and updates
+
+pcslop > About pcslop shows the version, the commit (linked on GitHub, with a
+copy button) and every license in `Contents/Resources/Licenses`: the texts in
+`Licenses/`, pcslop's own `LICENSE` and the Rust crates' notices, which
+`cargo about` writes. A new bundled library needs its license text in
+`Licenses/` and a line in `Licenses/README.txt`.
+
+A nightly build reads `nightly.json` when it starts and offers to download a
+newer nightly; pcslop > Check for Updates… checks at once. Local builds never
+check. Settings turns the launch check off.
 
 ## Where things are found
 

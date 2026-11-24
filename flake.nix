@@ -2,9 +2,11 @@
   description = "pcslop: x86-32 PC emulator for Apple Silicon";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/0bb2eedc20e4739f29e8045034f2828ad7054f8f";
+  inputs.slopsmith-ci.url = "github:slopsmith/ci";
+  inputs.slopsmith-ci.inputs.nixpkgs.follows = "nixpkgs";
 
   outputs =
-    { nixpkgs, ... }:
+    { nixpkgs, slopsmith-ci, ... }:
     let
       system = "aarch64-darwin";
       pkgs = nixpkgs.legacyPackages.${system};
@@ -12,6 +14,8 @@
     in
     {
       packages.${system} = {
+        slop-app = slopsmith-ci.packages.${system}.slop-app;
+
         seabios = (x86pkgs.seabios.override { ___build-type = "qemu"; }).overrideAttrs (old: {
           patches = (old.patches or [ ]) ++ [ ./nix/seabios-i440bx.patch ];
           postConfigure = ''
