@@ -89,6 +89,12 @@ struct AboutButton: View {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     @MainActor var sessions: Sessions?
+    @MainActor static var showLibrary: (() -> Void)?
+
+    @MainActor
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        (sessions?.runningCount ?? 0) == 0
+    }
 
     @MainActor
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -100,7 +106,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.informativeText = "Quitting turns them off without saving their state."
         alert.addButton(withTitle: "Stop and Quit")
         alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return .terminateCancel }
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            // SwiftUI has already closed the window on its way to quitting.
+            DispatchQueue.main.async { AppDelegate.showLibrary?() }
+            return .terminateCancel
+        }
         sessions.terminateAll()
         return .terminateNow
     }

@@ -8,6 +8,7 @@ struct ContentView: View {
     @State private var selection: Machine.ID?
     @State private var dropTargeted = false
     @Environment(\.openSettings) private var openSettings
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         @Bindable var editor = editor
@@ -57,7 +58,11 @@ struct ContentView: View {
         } message: {
             Text($0)
         }
-        .onAppear(perform: applyLaunchArguments)
+        .onAppear {
+            let openWindow = openWindow
+            AppDelegate.showLibrary = { openWindow(id: "library") }
+            applyLaunchArguments()
+        }
         .onChange(of: library.machines.map(\.id)) { _, ids in
             if let id = selection, !ids.contains(id) { selection = nil }
         }
