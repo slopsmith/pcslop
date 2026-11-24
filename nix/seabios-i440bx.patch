@@ -2,7 +2,7 @@ Treat the Intel 82443BX host bridge (8086:7190) like the 82441FX.
 
 Both keep their PAM registers at 0x59..0x5f, so SeaBIOS can unlock and lock
 shadow RAM, lay out the PCI hole and route PIIX interrupts the same way.
-86slopper's 440BX board (with an AGP port) needs this; SeaBIOS 1.17 only
+pcslop's 440BX board (with an AGP port) needs this; SeaBIOS 1.17 only
 matches the 82441FX and Q35.
 
 That board moves the PIIX3 from device 1 to device 7, as on real 440BX

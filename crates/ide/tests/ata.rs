@@ -70,7 +70,7 @@ fn identify_reports_geometry_capacity_and_modes() {
     assert_ne!(w[83] & (1 << 10), 0, "LBA48");
     assert_eq!(w[63] & 0x07, 0x07, "MWDMA 0-2");
     assert_eq!(w[88] & 0x3f, 0x3f, "UDMA 0-5");
-    assert_eq!(ascii(&w[27..47]), "86slopper HARDDISK");
+    assert_eq!(ascii(&w[27..47]), "pcslop HARDDISK");
     assert_eq!(w[93] & 0xdf61, 0x4041, "device 0 reports no device 1");
     assert_eq!(w[255] & 0xff, 0xa5);
     let sum = w.iter().fold(0u8, |s, &x| s.wrapping_add(x as u8).wrapping_add((x >> 8) as u8));

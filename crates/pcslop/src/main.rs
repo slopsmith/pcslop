@@ -102,7 +102,7 @@ fn describe_power(p: &Power) -> String {
 
 /// An x86 PC for Windows XP and Linux guests, on Hypervisor.framework.
 #[derive(clap::Parser)]
-#[command(name = "slopper", version)]
+#[command(name = "pcslop", version)]
 struct Cli {
     /// SeaBIOS image.
     #[arg(long, value_name = "FILE")]
@@ -123,11 +123,11 @@ struct Cli {
     #[arg(long, value_name = "FILE")]
     gpu_trace: Option<String>,
     /// Where the Radeon's 3D engine draws: metal (the default) or cpu, the
-    /// reference. SLOPPER_R3D sets the default.
+    /// reference. PCSLOP_R3D sets the default.
     #[arg(long = "gpu-3d", value_name = "metal|cpu", value_parser = ["metal", "cpu"])]
     gpu_3d: Option<String>,
     /// Run the Radeon's command processor on a thread of its own (on, the
-    /// default) or on the emulation thread (off). SLOPPER_GPU_THREAD sets the default.
+    /// default) or on the emulation thread (off). PCSLOP_GPU_THREAD sets the default.
     #[arg(long = "gpu-thread", value_name = "on|off", value_parser = ["on", "off"])]
     gpu_thread: Option<String>,
     /// CD-ROM image on the secondary master.
@@ -242,8 +242,8 @@ fn parse_args() -> Result<Args, String> {
         radeon,
         vga_rom: cli.vga_rom,
         gpu_trace: cli.gpu_trace,
-        gpu_3d_metal: cli.gpu_3d.or_else(|| std::env::var("SLOPPER_R3D").ok()).as_deref() != Some("cpu"),
-        gpu_thread: !matches!(cli.gpu_thread.or_else(|| std::env::var("SLOPPER_GPU_THREAD").ok()).as_deref(), Some("off" | "0")),
+        gpu_3d_metal: cli.gpu_3d.or_else(|| std::env::var("PCSLOP_R3D").ok()).as_deref() != Some("cpu"),
+        gpu_thread: !matches!(cli.gpu_thread.or_else(|| std::env::var("PCSLOP_GPU_THREAD").ok()).as_deref(), Some("off" | "0")),
         cdrom: cli.cdrom,
         hda: cli.hda,
         hdb: cli.hdb,
@@ -573,7 +573,7 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
             net::start_user_network(cfg, Box::new(wake))
         }
     };
-    if std::env::var_os("SLOPPER_AUDIO_SYNC").is_none() {
+    if std::env::var_os("PCSLOP_AUDIO_SYNC").is_none() {
         let emu = std::thread::current();
         let kicker = jit.as_ref().map(|j| j.kicker());
         board.start_audio_thread(Box::new(move || {
@@ -753,9 +753,7 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
                 Event::Type(text) => text.chars().for_each(|c| keyq.push_char(c)),
                 Event::Serial(bytes) => board.serial_input(&bytes),
                 Event::Mouse(dx, dy, wheel, b) => board.mouse_motion(dx, dy, wheel, b),
-                // A guest with a USB tablet driver gets absolute positions only:
-                // feeding the same motion through PS/2 as well would move the
-                // cursor twice and send every click twice.
+                // With a tablet driver, PS/2 too would move the cursor and click twice.
                 Event::Pointer { x, y, dx, dy, buttons, wheel } => {
                     if board.tablet_in_use() && !shared.mouse_captured.load(Ordering::Relaxed) {
                         board.tablet(x, y, buttons, wheel);
@@ -1092,7 +1090,7 @@ fn emulate(mut args: Args, board_cfg: Config, events: Receiver<Event>, shared: A
         let bytes: Vec<String> = (0..64).map(|i| format!("{:02x}", x86::bus::Bus::read8(&mut board, phys - 32 + i))).collect();
         eprintln!("code at eip: {}", bytes.join(" "));
     }
-    if let Some(addr) = std::env::var("SLOPPER_DUMP_STR").ok().and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok()) {
+    if let Some(addr) = std::env::var("PCSLOP_DUMP_STR").ok().and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok()) {
         let mut text = String::new();
         for i in 0..256 {
             let Ok(p) = x86::interp::translate(&mut cpu, &mut board, addr + i, false) else { break };
@@ -1352,7 +1350,7 @@ fn main() -> ExitCode {
     let shared = Arc::new(Shared::default());
     let (tx, rx) = channel();
     let headless = args.headless || !cfg!(feature = "window");
-    let control_path = args.control.clone().unwrap_or_else(|| std::env::temp_dir().join(format!("86slopper-{}.sock", std::process::id())));
+    let control_path = args.control.clone().unwrap_or_else(|| std::env::temp_dir().join(format!("pcslop-{}.sock", std::process::id())));
     if let Some(addr) = &args.vnc {
         let listener = match std::net::TcpListener::bind(addr) {
             Ok(l) => l,

@@ -73,7 +73,7 @@ pub(crate) struct Raster {
     pub textures: [Option<Texture>; 16],
     pub zpass: u32,
     pub pixels: u64,
-    /// SLOPPER_R3D_PROBE=x,y
+    /// PCSLOP_R3D_PROBE=x,y
     pub probe: Option<(i32, i32)>,
     pub probe_hits: Vec<String>,
     pub probe_tri: String,

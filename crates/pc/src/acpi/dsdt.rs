@@ -228,7 +228,7 @@ fn power_devices() -> Vec<Aml> {
         aml::string("SLOP-1"),
         aml::string("86"),
         aml::string("LION"),
-        aml::string("86slopper"),
+        aml::string("pcslop"),
     ]);
     let bif_fields = [("BDCP", 1), ("BFCP", 2), ("BDVL", 4), ("BWRN", 5), ("BLOW", 6), ("BGRN", 7), ("BGRN", 8)];
     let bst_fields = [("BSTA", 0), ("BRAT", 1), ("BRCP", 2), ("BPVL", 3)];

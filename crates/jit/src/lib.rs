@@ -325,11 +325,11 @@ pub struct Jit {
     shadow_key: Option<u64>,
     /// Whether new blocks count their entries and exits.
     counting: bool,
-    /// Whether every block goes through tier 2 first (SLOPPER_JIT_TIER2=eager).
+    /// Whether every block goes through tier 2 first (PCSLOP_JIT_TIER2=eager).
     tier2_eager: bool,
-    /// Whether x87 code stays with tier 1 (SLOPPER_JIT_TIER2_X87=exact).
+    /// Whether x87 code stays with tier 1 (PCSLOP_JIT_TIER2_X87=exact).
     tier2_exact_x87: bool,
-    /// Whether blocks that turn out hot are compiled again by tier 2 (on unless SLOPPER_JIT_TIER2=off).
+    /// Whether blocks that turn out hot are compiled again by tier 2 (on unless PCSLOP_JIT_TIER2=off).
     tier2_auto: bool,
     /// Samples per tier-1 block, from the periodic kicks.
     tier2_samples: HashMap<u64, u32>,
@@ -376,17 +376,17 @@ pub struct Jit {
     pub stats: Stats,
     /// Runs each block against the interpreter and stops at the first difference.
     pub verify: bool,
-    /// Fills shadow entries inside the VM; SLOPPER_JIT_NO_VM_FILL turns it off.
+    /// Fills shadow entries inside the VM; PCSLOP_JIT_NO_VM_FILL turns it off.
     pub vm_fill: bool,
     /// FEAT_AFP works in the guest, so SSE arithmetic can run on the A64 FPU.
     afp: bool,
     fpcr: u64,
-    /// Verify only blocks with recent translations (SLOPPER_JIT_VERIFY=new).
+    /// Verify only blocks with recent translations (PCSLOP_JIT_VERIFY=new).
     verify_recent_only: bool,
-    /// Measures time spent in the VM and per exit kind (SLOPPER_JIT_PROFILE).
+    /// Measures time spent in the VM and per exit kind (PCSLOP_JIT_PROFILE).
     timing: bool,
     audit: bool,
-    /// Audit every this many runs (the value of SLOPPER_JIT_AUDIT).
+    /// Audit every this many runs (the value of PCSLOP_JIT_AUDIT).
     audit_every: u32,
     audit_tick: u32,
     audit_seen: HashSet<(usize, u32, u32)>,
@@ -497,11 +497,11 @@ impl Jit {
             },
             root: 0,
             shadow_key: None,
-            counting: std::env::var_os("SLOPPER_JIT_PROFILE").is_some() || std::env::var_os("SLOPPER_JIT_COUNT").is_some(),
+            counting: std::env::var_os("PCSLOP_JIT_PROFILE").is_some() || std::env::var_os("PCSLOP_JIT_COUNT").is_some(),
             counters_next: 0,
-            tier2_eager: std::env::var("SLOPPER_JIT_TIER2").is_ok_and(|v| v == "eager"),
-            tier2_exact_x87: std::env::var("SLOPPER_JIT_TIER2_X87").is_ok_and(|v| v == "exact"),
-            tier2_auto: !std::env::var("SLOPPER_JIT_TIER2").is_ok_and(|v| v == "off" || v == "eager"),
+            tier2_eager: std::env::var("PCSLOP_JIT_TIER2").is_ok_and(|v| v == "eager"),
+            tier2_exact_x87: std::env::var("PCSLOP_JIT_TIER2_X87").is_ok_and(|v| v == "exact"),
+            tier2_auto: !std::env::var("PCSLOP_JIT_TIER2").is_ok_and(|v| v == "off" || v == "eager"),
             tier2_samples: HashMap::default(),
             tier2_queue: Vec::new(),
             tier2_tried: HashSet::default(),
@@ -525,20 +525,20 @@ impl Jit {
             chain_wanted: HashMap::default(),
             chain_in: HashMap::default(),
             stats: Stats::default(),
-            interp_profile: std::env::var_os("SLOPPER_JIT_PROFILE").map(|_| HashMap::default()),
+            interp_profile: std::env::var_os("PCSLOP_JIT_PROFILE").map(|_| HashMap::default()),
             interp_sites: HashMap::default(),
             translated_at: HashMap::default(),
             pc_samples: HashMap::default(),
             block_samples: HashMap::default(),
             host_samples: HashMap::default(),
-            verify: std::env::var_os("SLOPPER_JIT_VERIFY").is_some(),
-            vm_fill: std::env::var_os("SLOPPER_JIT_NO_VM_FILL").is_none(),
+            verify: std::env::var_os("PCSLOP_JIT_VERIFY").is_some(),
+            vm_fill: std::env::var_os("PCSLOP_JIT_NO_VM_FILL").is_none(),
             afp: false,
             fpcr: 0,
-            verify_recent_only: std::env::var("SLOPPER_JIT_VERIFY").is_ok_and(|v| v == "new"),
-            timing: std::env::var_os("SLOPPER_JIT_PROFILE").is_some(),
-            audit: std::env::var_os("SLOPPER_JIT_AUDIT").is_some(),
-            audit_every: std::env::var("SLOPPER_JIT_AUDIT").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1),
+            verify_recent_only: std::env::var("PCSLOP_JIT_VERIFY").is_ok_and(|v| v == "new"),
+            timing: std::env::var_os("PCSLOP_JIT_PROFILE").is_some(),
+            audit: std::env::var_os("PCSLOP_JIT_AUDIT").is_some(),
+            audit_every: std::env::var("PCSLOP_JIT_AUDIT").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1),
             audit_tick: 0,
             audit_seen: HashSet::default(),
             vm,
@@ -568,7 +568,7 @@ impl Jit {
         v.set_reg(reg::X0 + 28, layout::va(layout::STATE))?;
         let probe = state::fpcr_for(x86::cpu::mxcsr::RESET);
         v.set_reg(reg::FPCR, probe)?;
-        jit.afp = v.reg(reg::FPCR)? == probe && std::env::var_os("SLOPPER_JIT_NO_SSE").is_none();
+        jit.afp = v.reg(reg::FPCR)? == probe && std::env::var_os("PCSLOP_JIT_NO_SSE").is_none();
         jit.fpcr = if jit.afp { probe } else { 0 };
         if !jit.afp {
             v.set_reg(reg::FPCR, 0)?;
@@ -580,7 +580,7 @@ impl Jit {
     }
 
     /// Compares every shadow mapping with the x86 page tables and reports
-    /// mappings that disagree (SLOPPER_JIT_AUDIT).
+    /// mappings that disagree (PCSLOP_JIT_AUDIT).
     fn audit<B: Bus>(&mut self, cpu: &Cpu, bus: &mut B) {
         if cpu.cr0 & x86::cpu::cr0::PG == 0 {
             return;

@@ -7,7 +7,7 @@ Windows XP and prints one line per test.
 
 ```sh
 scripts/build-bench                 # target/bench/xpbench.iso
-VM_BIN=target/vm/slopper scripts/bench-xp
+VM_BIN=target/vm/pcslop scripts/bench-xp
 ```
 
 `scripts/build-bench` enters the `xpbench` dev shell from `flake.nix`

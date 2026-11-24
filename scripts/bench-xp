@@ -40,7 +40,7 @@ trap cleanup EXIT
 vm() { "$root/scripts/vm" "$@"; }
 mips() { vm status "$name" | sed -n 's/.*mips \([0-9.]*\).*/\1/p' | cut -d. -f1; }
 start=$(date +%s)
-[ -n "${BENCH_PROFILE:-}" ] && export SLOPPER_JIT_PROFILE=1
+[ -n "${BENCH_PROFILE:-}" ] && export PCSLOP_JIT_PROFILE=1
 # shellcheck disable=SC2086
 VM_TIMEOUT=${VM_TIMEOUT:-900} vm start "$name" --hda "$img" --cdrom "$iso" --ram 256 --no-net --serial "$serial" ${BENCH_FLAGS:-} >/dev/null
 busy=0 low=0

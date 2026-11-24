@@ -343,7 +343,7 @@ impl Channel {
         w[21] = 512;
         w[22] = 4;
         put_string(&mut w[23..27], "1.0");
-        put_string(&mut w[27..47], "86slopper HARDDISK");
+        put_string(&mut w[27..47], "pcslop HARDDISK");
         w[47] = 0x8000 | MAX_MULT as u16;
         w[48] = 1;
         w[49] = (1 << 11) | (1 << 9) | (1 << 8);

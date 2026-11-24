@@ -3,7 +3,7 @@
 
 Usage: scripts/ctl [SOCKET] COMMAND [COMMAND...]   (each COMMAND is one line, quote it)
 
-Without SOCKET, connects to the newest live $TMPDIR/86slopper-PID.sock.
+Without SOCKET, connects to the newest live $TMPDIR/pcslop-PID.sock.
 """
 import glob
 import os
@@ -18,7 +18,7 @@ if args and os.path.exists(args[0]) and stat.S_ISSOCK(os.stat(args[0]).st_mode):
 elif args and ("/" in args[0] or args[0].endswith(".sock")):
     sys.exit(f"no control socket at {args[0]}")
 else:
-    socks = glob.glob(os.path.join(tempfile.gettempdir(), "86slopper-*.sock"))
+    socks = glob.glob(os.path.join(tempfile.gettempdir(), "pcslop-*.sock"))
     path = None
     for candidate in sorted(socks, key=os.path.getmtime, reverse=True):
         probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

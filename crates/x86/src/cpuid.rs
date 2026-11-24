@@ -51,7 +51,7 @@ pub const PAT_RESET: u64 = 0x0007_0406_0007_0406;
 /// Vista's winload reads it; writes are ignored.
 pub const MISC_ENABLE: u64 = 1 | 1 << 11 | 1 << 12;
 
-const BRAND: &[u8; 48] = b"86slopper Virtual CPU\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+const BRAND: &[u8; 48] = b"pcslop Virtual CPU\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
 
 fn brand_regs(part: usize) -> [u32; 4] {
     let mut out = [0; 4];

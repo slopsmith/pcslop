@@ -27,7 +27,7 @@ pub fn edid() -> [u8; 128] {
         0, 0, 0, 0xfd, 0, 50, 85, 30, 80, 14, 0, 0x0a, b' ', b' ', b' ', b' ', b' ', b' ',
     ]);
     e[90..95].copy_from_slice(&[0, 0, 0, 0xfc, 0]);
-    e[95..108].copy_from_slice(b"86slopper\n   ");
+    e[95..108].copy_from_slice(b"pcslop\n      ");
     e[108..113].copy_from_slice(&[0, 0, 0, 0x10, 0]);
     e[127] = 0u8.wrapping_sub(e[..127].iter().fold(0u8, |a, &b| a.wrapping_add(b)));
     e

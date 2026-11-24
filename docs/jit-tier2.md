@@ -34,7 +34,7 @@ is where tier 2 falls back to.
     80-bit interpreter.
 - When something breaks, tier 2 must step back for that code: a region that
   deopts too often is dropped and its entry marked tier-1 only;
-  `SLOPPER_JIT_TIER2=off` turns tier 2 off, and `SLOPPER_JIT_TIER2_X87=exact`
+  `PCSLOP_JIT_TIER2=off` turns tier 2 off, and `PCSLOP_JIT_TIER2_X87=exact`
   keeps x87 regions on tier 1's exact semantics, to tell tier-2 bugs from
   others.
 
@@ -166,14 +166,14 @@ That is simpler to check, and still allows the other optimisations.
   code into the code cache, applies relocations, patches the entry block and
   links chains.
 - Which exit installs a region varies from run to run, so
-  `SLOPPER_JIT_TIER2=sync` compiles on the vCPU thread at the moment of the
+  `PCSLOP_JIT_TIER2=sync` compiles on the vCPU thread at the moment of the
   request, for reproducible debugging.
 
 ## Testing
 
 - The random-program tests and verify mode compare tier 1 with the
   interpreter today. They extend to tier 2 with a mode that makes every
-  block a region at once (`SLOPPER_JIT_TIER2=eager`). The integer tests then
+  block a region at once (`PCSLOP_JIT_TIER2=eager`). The integer tests then
   compare all three; x87 tests compare tier 2 within the documented
   tolerance.
 - Each pass gets unit tests on IR snippets.

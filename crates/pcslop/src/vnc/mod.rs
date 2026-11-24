@@ -20,7 +20,7 @@ use crate::{Event, Shared, pixel_to_tablet};
 
 /// Environment variable holding the VNC password. Without it the server
 /// asks for no authentication.
-pub const PASSWORD_VAR: &str = "SLOPPER_VNC_PASSWORD";
+pub const PASSWORD_VAR: &str = "PCSLOP_VNC_PASSWORD";
 
 const DEFAULT_SIZE: (u32, u32) = (720, 400);
 
@@ -69,7 +69,7 @@ fn client(mut conn: TcpStream, tx: Sender<Event>, shared: Arc<Shared>, password:
         if f.width == 0 { DEFAULT_SIZE } else { (f.width, f.height) }
     };
     let pw = password.as_deref().map(str::as_bytes);
-    proto::handshake(&mut conn, pw, random_challenge()?, (w as u16, h as u16), "86slopper")?;
+    proto::handshake(&mut conn, pw, random_challenge()?, (w as u16, h as u16), "pcslop")?;
 
     let size = Arc::new(AtomicU32::new(pack_size(w, h)));
     let (msg_tx, msg_rx) = channel();

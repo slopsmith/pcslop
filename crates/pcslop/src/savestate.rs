@@ -211,7 +211,7 @@ pub fn read(dir: &Path) -> Result<Snapshot, String> {
     let mut r = Reader::new(&data);
     let bad = |e: snapshot::Error| format!("{}: {e}", file.display());
     if r.bytes(8).map_err(bad)? != MAGIC {
-        return Err(format!("{} is not a 86slopper snapshot", file.display()));
+        return Err(format!("{} is not a pcslop snapshot", file.display()));
     }
     let version = r.u32().map_err(bad)?;
     if version != VERSION {

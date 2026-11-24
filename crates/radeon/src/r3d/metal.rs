@@ -297,8 +297,8 @@ impl MetalR3d {
             gpu_seconds: 0.0,
             compile_seconds: 0.0,
             textures: TexCache::new(),
-            native_textures: std::env::var("SLOPPER_TEX").as_deref() != Ok("decode"),
-            gpu_vertices: std::env::var("SLOPPER_VS").as_deref() != Ok("cpu"),
+            native_textures: std::env::var("PCSLOP_TEX").as_deref() != Ok("decode"),
+            gpu_vertices: std::env::var("PCSLOP_VS").as_deref() != Ok("cpu"),
             vertex_draws: 0,
         })
     }
@@ -352,7 +352,7 @@ impl MetalR3d {
         let start = std::time::Instant::now();
         let p = self.build_inner(src);
         self.compile_seconds += start.elapsed().as_secs_f64();
-        if let Ok(dir) = std::env::var("SLOPPER_MSL_DUMP") {
+        if let Ok(dir) = std::env::var("PCSLOP_MSL_DUMP") {
             let _ = std::fs::write(format!("{dir}/{}.metal", self.pipelines.len()), src);
         }
         p

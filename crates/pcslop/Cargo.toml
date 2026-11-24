@@ -1,5 +1,5 @@
 [package]
-name = "slopper"
+name = "pcslop"
 description = "x86-32 PC emulator for Apple Silicon"
 version.workspace = true
 edition.workspace = true

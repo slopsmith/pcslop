@@ -1,9 +1,9 @@
 ---
 name: emulator
-description: How to build, run, drive and debug the 86slopper emulator from an agent session - background runs with scripts/vm, the control socket, guest disk images, booting Ubuntu, measuring and profiling. Use it before running any guest, testing an emulator change, timing a boot or chasing a hang.
+description: How to build, run, drive and debug the pcslop emulator from an agent session - background runs with scripts/vm, the control socket, guest disk images, booting Ubuntu, measuring and profiling. Use it before running any guest, testing an emulator change, timing a boot or chasing a hang.
 ---
 
-# Working with the 86slopper emulator
+# Working with the pcslop emulator
 
 ## Never block on a guest
 
@@ -17,7 +17,7 @@ description: How to build, run, drive and debug the 86slopper emulator from an a
 ## Build
 
 ```sh
-scripts/vm build        # nix develop + cargo into target/work, signed copy at target/vm/slopper
+scripts/vm build        # nix develop + cargo into target/work, signed copy at target/vm/pcslop
 ```
 
 - **Build inside `nix develop`.** It provides libslirp; without it the guest has no network card.
@@ -49,8 +49,8 @@ scripts/vm stop xp
 - **Always use your own socket.** `scripts/ctl` without a socket argument talks to the newest emulator on the machine, which may be another agent's or the user's. Keys, `shot`, and once a `quit`, landed in other sessions that way. `scripts/vm` always passes the socket.
 - **Keep socket paths under about 100 bytes**, or binding fails and nothing says so.
 - **`shot` with a relative path** writes into the emulator's working directory, which may be the repo root. Use absolute paths; `scripts/vm shot` does.
-- **Kill only your own runs.** `scripts/vm stop` kills by socket path. Never `pkill -f slopper` or anything broad.
-- **Defaults.** The JIT, AC'97 sound, the RTL8139 network card and the battery mirror are on by default. `scripts/vm start` adds `--no-audio`, so tests don't play sound on the user's Mac; set `VM_AUDIO=1` to keep sound. To check what the guest plays without sound, pass `--audio-silent --audio-wav PATH`: the WAV is what the speaker would play, gaps included, and `status` shows how often the host ring ran dry. Opt-outs: `--no-jit`, `--no-net`, `--no-battery`. `slopper --help` lists everything.
+- **Kill only your own runs.** `scripts/vm stop` kills by socket path. Never `pkill -f pcslop` or anything broad.
+- **Defaults.** The JIT, AC'97 sound, the RTL8139 network card and the battery mirror are on by default. `scripts/vm start` adds `--no-audio`, so tests don't play sound on the user's Mac; set `VM_AUDIO=1` to keep sound. To check what the guest plays without sound, pass `--audio-silent --audio-wav PATH`: the WAV is what the speaker would play, gaps included, and `status` shows how often the host ring ran dry. Opt-outs: `--no-jit`, `--no-net`, `--no-battery`. `pcslop --help` lists everything.
 
 ## Save states: skip repeated boots
 
@@ -74,9 +74,9 @@ scripts/vm stop xp
     `/casper/vmlinuz file=/cdrom/preseed/ubuntu.seed boot=casper initrd=/casper/initrd.gz console=tty0 console=ttyS0,115200`
     Options typed after `live` land after `--`, so the kernel never sees them.
   - **Serial in and out:** start with `--serial "$SCRATCH/serial.log"`. Type into COM1 with `ctl NAME "serial dmesg | grep -i acpi"` and read the log. Commands that aren't busybox applets may be missing in the initramfs shell.
-- **Radeon 9700:** `--gpu radeon --vga-rom /Volumes/Projects/86slopper/references/docs/ati-r300/ATI.9700NP.128.Infineon.021216.rom` (implies the 440BX board). The ROM is the user's copyrighted firmware: never copy it into the repo, a test or the Nix store. `--gpu-trace FILE` logs every register access and collapses repeats into `... N more times`. The tail of the trace shows what a driver is spinning on.
-  - The 3D engine draws with Metal; `--gpu-3d cpu` (or `SLOPPER_R3D=cpu`) uses the CPU reference path. `status` prints a `radeon:` line with 3D draws, `flips` (CRTC_OFFSET writes, so two samples give a page-flipping app's frame rate), Metal draws, CPU fallbacks and waits.
-  - The command processor runs on its own thread (`cp thread` at the end of the `radeon:` line). `--gpu-thread off` (or `SLOPPER_GPU_THREAD=off`) runs it on the emulation thread again, to rule the thread out when chasing a GPU bug.
+- **Radeon 9700:** `--gpu radeon --vga-rom references/docs/ati-r300/ATI.9700NP.128.Infineon.021216.rom` (implies the 440BX board; `references/` is in the main checkout, see `scripts/main-checkout`). The ROM is the user's copyrighted firmware: never copy it into the repo, a test or the Nix store. `--gpu-trace FILE` logs every register access and collapses repeats into `... N more times`. The tail of the trace shows what a driver is spinning on.
+  - The 3D engine draws with Metal; `--gpu-3d cpu` (or `PCSLOP_R3D=cpu`) uses the CPU reference path. `status` prints a `radeon:` line with 3D draws, `flips` (CRTC_OFFSET writes, so two samples give a page-flipping app's frame rate), Metal draws, CPU fallbacks and waits.
+  - The command processor runs on its own thread (`cp thread` at the end of the `radeon:` line). `--gpu-thread off` (or `PCSLOP_GPU_THREAD=off`) runs it on the emulation thread again, to rule the thread out when chasing a GPU bug.
   - XP's first boot with the card installs the ATI driver and asks to restart: answer with a `tablet` click and let it reboot. Killing the run mid-install left agp440 broken (Code 39) and XP on VgaSave at 1280x1024; the ATI desktop is 1440x900. Save a state at that desktop and load it instead of booting.
 - **Firmware:** `references/seabios` and `references/seavgabios` are Nix out-links. After changing the SeaBIOS part of `flake.nix`, run `nix build .#seabios --out-link references/seabios`. That needs the flake changes committed in jj (`jj new` first).
 
@@ -88,7 +88,7 @@ scripts/vm stop xp
   - in-VM TPR rate, translations/s, guest #PF/s;
   - APIC and NIC rates.
   Exits cost about 0.7 µs each, so a high exit rate is usually the first thing to look at.
-- **Profiling:** start with `SLOPPER_JIT_PROFILE=1` (pass it as an env var to `scripts/vm start`), then `ctl NAME "profile on"`, wait, then `ctl NAME status profile`. That gives time per exit kind, interpreter exits by opcode, and PC samples.
+- **Profiling:** start with `PCSLOP_JIT_PROFILE=1` (pass it as an env var to `scripts/vm start`), then `ctl NAME "profile on"`, wait, then `ctl NAME status profile`. That gives time per exit kind, interpreter exits by opcode, and PC samples.
   - **Opcode keys:**
     - `0x1xx` is a `0F xx` opcode;
     - `+0x2000` means REP;
@@ -98,8 +98,8 @@ scripts/vm stop xp
   - **PC samples:** `rt+0x980` is the `hvc` at the end of the runtime's exit path, i.e. time spent in the host handling exits, not in guest code.
 - **Hangs:** sample `ctl NAME status` a few times. `regs` gives EIP and registers, and `mem ADDR LEN` dumps guest memory at linear addresses, enough to disassemble a busy loop. Add `--gpu-trace` for the Radeon, or `--serial` for Linux.
 - **JIT correctness:**
-  - `SLOPPER_JIT_VERIFY=1` runs each block against the interpreter for its first executions and panics on the first difference; `=new` checks only recent translations.
-  - `SLOPPER_JIT_AUDIT=N` audits the shadow page tables every Nth run.
+  - `PCSLOP_JIT_VERIFY=1` runs each block against the interpreter for its first executions and panics on the first difference; `=new` checks only recent translations.
+  - `PCSLOP_JIT_AUDIT=N` audits the shadow page tables every Nth run.
   - Both are slow, so run them on a short reproduction.
   - A JIT panic names FAR, ELR and ESR. ELR in the code cache means translated code faulted.
 - **Boot time:**

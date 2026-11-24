@@ -116,8 +116,8 @@ const REPORT_LEN: usize = 6;
 
 fn string(index: u8) -> Option<&'static str> {
     Some(match index {
-        STR_MANUFACTURER => "86slopper",
-        STR_PRODUCT => "86slopper USB Tablet",
+        STR_MANUFACTURER => "pcslop",
+        STR_PRODUCT => "pcslop USB Tablet",
         STR_SERIAL => "1",
         STR_CONFIG => "HID Tablet",
         _ => return None,
@@ -416,7 +416,7 @@ mod tests {
         assert_eq!(get_descriptor(&mut t, 0x80, 3, 0, 255).unwrap(), [4, 3, 0x09, 0x04]);
         let product = get_descriptor(&mut t, 0x80, 3, STR_PRODUCT, 255).unwrap();
         let text: Vec<u16> = product[2..].chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-        assert_eq!(String::from_utf16(&text).unwrap(), "86slopper USB Tablet");
+        assert_eq!(String::from_utf16(&text).unwrap(), "pcslop USB Tablet");
         assert!(get_descriptor(&mut t, 0x80, 3, 0xee, 255).is_err());
 
         control(&mut t, [0x00, 0x09, 1, 0, 0, 0, 0, 0]).unwrap();

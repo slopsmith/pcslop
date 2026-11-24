@@ -76,7 +76,7 @@ pub struct Compiled {
     pub chains: Vec<(u32, u32)>,
     /// The block contains a REP string instruction.
     pub has_rep: bool,
-    /// The block uses a translation from the latest batch (SLOPPER_JIT_VERIFY=new).
+    /// The block uses a translation from the latest batch (PCSLOP_JIT_VERIFY=new).
     pub recent: bool,
     /// The block leaves for the interpreter after this many instructions.
     pub interp_after: Option<usize>,

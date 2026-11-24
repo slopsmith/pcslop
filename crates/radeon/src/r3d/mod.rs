@@ -1197,16 +1197,16 @@ impl Radeon {
 fn probe_pixel() -> Option<(i32, i32)> {
     static PROBE: std::sync::OnceLock<Option<(i32, i32)>> = std::sync::OnceLock::new();
     *PROBE.get_or_init(|| {
-        let v = std::env::var("SLOPPER_R3D_PROBE").ok()?;
+        let v = std::env::var("PCSLOP_R3D_PROBE").ok()?;
         let (x, y) = v.split_once(',')?;
         Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
     })
 }
 
-/// SLOPPER_R3D_PROBE_DUMP=dir: base levels as .ppm (C2 C1 C0) and .pgm (C3).
+/// PCSLOP_R3D_PROBE_DUMP=dir: base levels as .ppm (C2 C1 C0) and .pgm (C3).
 fn dump_textures(textures: &[Option<tex::Texture>; 16], vram: &[u8]) {
     static DONE: std::sync::Mutex<Vec<(usize, u32)>> = std::sync::Mutex::new(Vec::new());
-    let Ok(dir) = std::env::var("SLOPPER_R3D_PROBE_DUMP") else { return };
+    let Ok(dir) = std::env::var("PCSLOP_R3D_PROBE_DUMP") else { return };
     for (unit, t) in textures.iter().enumerate() {
         let Some(t) = t else { continue };
         let key = (match t.mem {

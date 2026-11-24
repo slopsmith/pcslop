@@ -93,7 +93,7 @@ mod tests {
 
     #[test]
     fn recording_is_a_wav_file_at_the_first_rate() {
-        let dir = std::env::temp_dir().join(format!("slopper-wav-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pcslop-wav-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("out.wav");
         {

@@ -195,10 +195,10 @@ impl<B: Bus> Ctx<'_, B> {
     }
 }
 
-/// `SLOPPER_TRACE_FAULTS=1` logs every fault but page faults; `=all` logs those too.
+/// `PCSLOP_TRACE_FAULTS=1` logs every fault but page faults; `=all` logs those too.
 fn trace_faults(vector: u8) -> bool {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    let mode = *MODE.get_or_init(|| match std::env::var("SLOPPER_TRACE_FAULTS").as_deref() {
+    let mode = *MODE.get_or_init(|| match std::env::var("PCSLOP_TRACE_FAULTS").as_deref() {
         Ok("all") => 2,
         Ok(_) => 1,
         Err(_) => 0,

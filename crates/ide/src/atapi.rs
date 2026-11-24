@@ -247,7 +247,7 @@ impl Channel {
         w[21] = 512;
         w[22] = 4;
         put_string(&mut w[23..27], "1.0");
-        put_string(&mut w[27..47], "86slopper DVD-ROM");
+        put_string(&mut w[27..47], "pcslop DVD-ROM");
         w[48] = 1;
         w[49] = (1 << 9) | (1 << 8);
         w[53] = 7;

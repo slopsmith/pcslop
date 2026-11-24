@@ -1046,6 +1046,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "pcslop"
+version = "0.1.0"
+dependencies = [
+ "ac97",
+ "clap",
+ "flate2",
+ "jit",
+ "jpeg-encoder",
+ "net",
+ "objc2 0.6.5",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
+ "objc2-foundation 0.3.2",
+ "objc2-metal 0.3.2",
+ "objc2-quartz-core 0.3.2",
+ "pc",
+ "png",
+ "snapshot",
+ "usb",
+ "winit",
+ "x86",
+ "zune-jpeg",
+]
+
+[[package]]
 name = "pin-project"
 version = "1.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1296,31 +1321,6 @@ name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
-
-[[package]]
-name = "slopper"
-version = "0.1.0"
-dependencies = [
- "ac97",
- "clap",
- "flate2",
- "jit",
- "jpeg-encoder",
- "net",
- "objc2 0.6.5",
- "objc2-core-foundation",
- "objc2-core-graphics",
- "objc2-foundation 0.3.2",
- "objc2-metal 0.3.2",
- "objc2-quartz-core 0.3.2",
- "pc",
- "png",
- "snapshot",
- "usb",
- "winit",
- "x86",
- "zune-jpeg",
-]
 
 [[package]]
 name = "smol_str"

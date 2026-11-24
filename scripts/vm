@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# Runs 86slopper in the background for agents and scripts. See
+# Runs pcslop in the background for agents and scripts. See
 # .claude/skills/emulator/SKILL.md for how to use it.
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 refs=${VM_REFS:-$root/references}
 [ -e "$refs/seabios" ] || refs=$("$root/scripts/main-checkout")/references
-bin=${VM_BIN:-$root/target/vm/slopper}
+bin=${VM_BIN:-$root/target/vm/pcslop}
 
 usage() {
 	cat <<EOF
 usage: scripts/vm build
-       scripts/vm start NAME [slopper options...]
+       scripts/vm start NAME [pcslop options...]
        scripts/vm ctl NAME COMMAND...
        scripts/vm shot NAME [PATH]
        scripts/vm wait-text NAME TEXT [SECONDS]
@@ -50,9 +50,9 @@ shift
 case $cmd in
 build)
 	cd "$root"
-	nix develop . -c env CARGO_TARGET_DIR="$root/target/work" cargo build --release -p slopper
+	nix develop . -c env CARGO_TARGET_DIR="$root/target/work" cargo build --release -p pcslop
 	mkdir -p "$(dirname "$bin")"
-	cp "$root/target/work/release/slopper" "$bin"
+	cp "$root/target/work/release/pcslop" "$bin"
 	codesign -s - -f --entitlements "$root/scripts/hypervisor.entitlements" "$bin" 2>/dev/null
 	echo "$bin"
 	;;

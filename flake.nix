@@ -1,5 +1,5 @@
 {
-  description = "86slopper: x86-32 PC emulator for Apple Silicon";
+  description = "pcslop: x86-32 PC emulator for Apple Silicon";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/0bb2eedc20e4739f29e8045034f2828ad7054f8f";
 

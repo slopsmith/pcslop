@@ -167,15 +167,15 @@ const IRQ0_PIN: u8 = 2;
 const PIRQ_PIN: u8 = 16;
 /// SMBIOS strings by (structure type, field offset within the structure).
 const SMBIOS: &[(u8, u16, &str)] = &[
-    (0, 4, "86slopper"),
+    (0, 4, "pcslop"),
     (0, 5, "SeaBIOS on Hypervisor.framework"),
     (0, 8, "11/17/2026"),
-    (1, 4, "86slopper"),
+    (1, 4, "pcslop"),
     (1, 5, "Slop Station 86"),
     (1, 6, "Apple Silicon Edition"),
     (1, 26, "Totally Real PC"),
-    (3, 4, "86slopper"),
-    (4, 7, "86slopper"),
+    (3, 4, "pcslop"),
+    (4, 7, "pcslop"),
 ];
 
 impl Board {
@@ -1743,7 +1743,7 @@ mod tests {
 
     #[test]
     fn a_disk_attached_as_the_primary_slave_answers_identify() {
-        let path = std::env::temp_dir().join(format!("slopper-hdb-{}.img", std::process::id()));
+        let path = std::env::temp_dir().join(format!("pcslop-hdb-{}.img", std::process::id()));
         std::fs::write(&path, vec![0u8; 1 << 20]).unwrap();
         let mut b = board();
         b.attach_disk_at(path.to_str().unwrap(), 1).unwrap();
@@ -2051,7 +2051,7 @@ mod tests {
         b.io_write(0x176, 1, 0xa0);
         assert_eq!((b.io_read(0x174, 1), b.io_read(0x175, 1)), (0x14, 0xeb), "guests only look for a drive at boot");
         assert_eq!(b.cdrom(), None);
-        let iso = std::env::temp_dir().join(format!("slopper-cdrom-test-{}.iso", std::process::id()));
+        let iso = std::env::temp_dir().join(format!("pcslop-cdrom-test-{}.iso", std::process::id()));
         std::fs::write(&iso, vec![0u8; 2048 * 16]).unwrap();
         let path = iso.to_str().unwrap();
         b.change_cdrom(Some(path)).unwrap();

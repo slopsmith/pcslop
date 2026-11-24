@@ -279,7 +279,7 @@ impl App {
     fn retitle(&self) {
         if let Some(w) = &self.window {
             let hint = if self.captured { format!(" | {RELEASE_HINT}") } else { String::new() };
-            w.set_title(&format!("86slopper | {:.1} MIPS{hint}", self.mips));
+            w.set_title(&format!("pcslop | {:.1} MIPS{hint}", self.mips));
         }
     }
 }
@@ -299,7 +299,7 @@ impl ApplicationHandler for App {
             return;
         }
         let attrs = Window::default_attributes()
-            .with_title("86slopper")
+            .with_title("pcslop")
             .with_inner_size(LogicalSize::new(FIRST_SIZE.0, FIRST_SIZE.1))
             .with_resizable(true);
         let window = match event_loop.create_window(attrs) {

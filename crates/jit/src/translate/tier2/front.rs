@@ -101,10 +101,10 @@ pub fn build(entry: u32, byte: &mut dyn FnMut(u32) -> Option<u8>, x87: Option<(u
     Some(f)
 }
 
-/// SLOPPER_TIER2_WHY: report the instructions that end regions.
+/// PCSLOP_TIER2_WHY: report the instructions that end regions.
 fn why() -> bool {
     static WHY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *WHY.get_or_init(|| std::env::var_os("SLOPPER_TIER2_WHY").is_some())
+    *WHY.get_or_init(|| std::env::var_os("PCSLOP_TIER2_WHY").is_some())
 }
 
 fn empty(f: &mut Func, eip: u32) -> Block {
