@@ -1,8 +1,15 @@
 import Foundation
 
 public enum OSKind: String, Sendable, Hashable, Codable, CaseIterable {
+    case windows98 = "windows-98"
+    case windows2000 = "windows-2000"
     case windowsXP = "windows-xp"
+    case windowsVista = "windows-vista"
+    case ubuntu
+    case debian
+    case fedora
     case linux
+    case dos
     case other
 
     public init(from decoder: Decoder) throws {
@@ -12,8 +19,15 @@ public enum OSKind: String, Sendable, Hashable, Codable, CaseIterable {
 
     public var label: String {
         switch self {
+        case .windows98: "Windows 98"
+        case .windows2000: "Windows 2000"
         case .windowsXP: "Windows XP"
+        case .windowsVista: "Windows Vista"
+        case .ubuntu: "Ubuntu"
+        case .debian: "Debian"
+        case .fedora: "Fedora"
         case .linux: "Linux"
+        case .dos: "DOS"
         case .other: "Other"
         }
     }
@@ -145,20 +159,5 @@ public struct Machine: Sendable, Hashable, Codable, Identifiable {
     public func matches(_ query: String) -> Bool {
         let q = query.trimmingCharacters(in: .whitespaces)
         return q.isEmpty || name.localizedCaseInsensitiveContains(q) || os.label.localizedCaseInsensitiveContains(q)
-    }
-
-    public static func template(_ os: OSKind) -> Machine {
-        var config = MachineConfig()
-        switch os {
-        case .windowsXP:
-            config.ramMiB = 512
-            config.captureMouse = .auto
-        case .linux:
-            config.ramMiB = 1024
-            config.captureMouse = .click
-        case .other:
-            break
-        }
-        return Machine(name: os == .other ? "New Machine" : os.label, os: os, config: config)
     }
 }

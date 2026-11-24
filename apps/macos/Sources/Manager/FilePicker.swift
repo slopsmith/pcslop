@@ -29,6 +29,7 @@ struct FileField: View {
     var placeholder = "None"
     var kinds: [UTType] = FileKind.any
     var message: String?
+    var detail: String?
 
     var body: some View {
         LabeledContent(title) {
@@ -38,6 +39,11 @@ struct FileField: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .help(path ?? placeholder)
+                if shown != nil, let detail {
+                    Text(detail)
+                        .foregroundStyle(.secondary)
+                        .fixedSize()
+                }
                 Spacer(minLength: 0)
                 Button("Choose…") {
                     if let url = FilePicker.open(kinds: kinds, message: message) { path = url.path }

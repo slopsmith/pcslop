@@ -15,17 +15,17 @@ struct ManagerApp: App {
                 .environment(library)
                 .environment(sessions)
                 .environment(editor)
-                .frame(minWidth: 820, minHeight: 520)
+                .frame(minWidth: 760, minHeight: 520)
                 .task { await Snapshot.takeIfAsked() }
                 .onAppear {
                     delegate.sessions = sessions
                     sessions.onExit = { _ in library.thumbnailsChanged() }
                 }
         }
-        .defaultSize(width: 1180, height: 740)
+        .defaultSize(width: 1080, height: 720)
         .commands {
             CommandGroup(replacing: .newItem) {
-                Button("New Machine…") { editor.new(.windowsXP) }
+                Button("New Machine…") { editor.newMachine() }
                     .keyboardShortcut("n")
                 Divider()
                 Button("Open Machines Folder") { openMachinesFolder(library.store) }
@@ -69,20 +69,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+struct NewMachineRequest: Identifiable {
+    let id = UUID()
+    var preset: Preset?
+    var disk: String?
+    var cdrom: String?
+}
+
 @MainActor
 @Observable
 final class EditorRequest {
-    var draft: Machine?
-    var isNew = false
+    var creating: NewMachineRequest?
+    var editing: Machine?
 
-    func new(_ os: OSKind) {
-        draft = .template(os)
-        isNew = true
+    func newMachine(_ request: NewMachineRequest = NewMachineRequest()) {
+        creating = request
     }
 
     func edit(_ machine: Machine) {
-        draft = machine
-        isNew = false
+        editing = machine
     }
 }
 
@@ -108,5 +113,4 @@ enum Defaults {
     static let binary = "pcslopBinary"
     static let bios = "biosPath"
     static let vgaBIOS = "vgaBIOSPath"
-    static let showInspector = "showInspector"
 }

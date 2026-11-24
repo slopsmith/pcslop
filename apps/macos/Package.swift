@@ -9,7 +9,7 @@ let package = Package(
     ],
     targets: [
         .target(name: "ManagerCore"),
-        .executableTarget(name: "Manager", dependencies: ["ManagerCore"]),
+        .executableTarget(name: "Manager", dependencies: ["ManagerCore"], resources: [.copy("Logos")]),
         .testTarget(name: "ManagerCoreTests", dependencies: ["ManagerCore"]),
     ]
 )

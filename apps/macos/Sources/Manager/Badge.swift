@@ -5,37 +5,61 @@ import SwiftUI
 extension OSKind {
     var tint: Color {
         switch self {
-        case .windowsXP: .blue
-        case .linux: .orange
-        case .other: .gray
+        case .windows98, .windows2000: .teal
+        case .windowsXP, .windowsVista: .blue
+        case .ubuntu: .orange
+        case .debian: .pink
+        case .fedora: .cyan
+        case .linux: .yellow
+        case .dos: .gray
+        case .other: .indigo
         }
     }
 
     var symbol: String {
         switch self {
-        case .windowsXP: "macwindow"
-        case .linux: "terminal"
-        case .other: "desktopcomputer"
+        case .dos: "apple.terminal"
+        default: "pc"
         }
     }
+
+    var logoName: String? {
+        switch self {
+        case .windows98, .windows2000: "windows-9x"
+        case .windowsXP, .windowsVista: "windows-xp"
+        case .ubuntu: "ubuntu"
+        case .debian: "debian"
+        case .fedora: "fedora"
+        case .linux: "tux"
+        case .dos, .other: nil
+        }
+    }
+
+    @MainActor var logo: NSImage? { logoName.flatMap(Logos.image) }
 }
 
-struct OSBadge: View {
-    let os: OSKind
-    var showsSymbol = false
+@MainActor
+enum Logos {
+    private static var cache: [String: NSImage] = [:]
 
-    var body: some View {
-        HStack(spacing: 4) {
-            if showsSymbol { Image(systemName: os.symbol) }
-            Text(os.label)
+    // SwiftPM puts resources in a bundle next to the executable; bundle-app copies it into Resources.
+    private static let folder: URL? = {
+        let name = "pcslop-manager_Manager.bundle"
+        let places = [
+            Bundle.main.resourceURL, Bundle.main.bundleURL, Bundle.main.executableURL?.deletingLastPathComponent(),
+        ]
+        return places.compactMap { $0?.appendingPathComponent(name) }
+            .flatMap { [Bundle(url: $0)?.resourceURL, $0].compactMap { $0?.appendingPathComponent("Logos") } }
+            .first { FileManager.default.fileExists(atPath: $0.path) }
+    }()
+
+    static func image(_ name: String) -> NSImage? {
+        if let hit = cache[name] { return hit }
+        guard let url = folder?.appendingPathComponent("\(name).png"), let image = NSImage(contentsOf: url) else {
+            return nil
         }
-        .font(.caption.weight(.semibold))
-        .foregroundStyle(.white)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 3)
-        .background(os.tint.gradient, in: .capsule)
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(os.label)
+        cache[name] = image
+        return image
     }
 }
 
@@ -100,4 +124,59 @@ enum ThumbnailCache {
         cache[url] = (date, image)
         return image
     }
+}
+
+struct OSIcon: View {
+    let os: OSKind
+    var size: CGFloat = 36
+
+    var body: some View {
+        Group {
+            if let logo = os.logo {
+                Image(nsImage: logo)
+                    .resizable()
+                    .interpolation(.high)
+                    .aspectRatio(contentMode: .fit)
+                    .padding(size * 0.04)
+                    .shadow(color: .black.opacity(0.2), radius: size * 0.04, y: size * 0.02)
+            } else {
+                Image(systemName: os.symbol)
+                    .font(.system(size: size * 0.48, weight: .medium))
+                    .foregroundStyle(.white)
+                    .frame(width: size, height: size)
+                    .background(os.tint.gradient, in: .rect(cornerRadius: size * 0.26, style: .continuous))
+            }
+        }
+        .frame(width: size, height: size)
+        .accessibilityLabel(os.label)
+    }
+}
+
+extension MachineConfig {
+    var summary: String {
+        let board = gpu == .radeon || board == .bx ? "440BX" : "440FX"
+        let display = gpu == .radeon ? "Radeon 9700" : "Standard VGA"
+        return [board, display, Self.memory(ramMiB)].joined(separator: " · ")
+    }
+
+    var shortSummary: String {
+        [gpu == .radeon ? "Radeon 9700" : "VGA", Self.memory(ramMiB)].joined(separator: " · ")
+    }
+
+    static func memory(_ mib: Int) -> String {
+        mib >= 1024 && mib % 512 == 0
+            ? "\((Double(mib) / 1024).formatted()) GB" : "\(mib) MB"
+    }
+}
+
+func fileName(_ path: String?) -> String? {
+    guard let path, !path.isEmpty else { return nil }
+    return URL(fileURLWithPath: path).lastPathComponent
+}
+
+func fileSize(_ path: String?) -> String? {
+    guard let path, !path.isEmpty,
+        let size = (try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? NSNumber
+    else { return nil }
+    return ByteCountFormatter.string(fromByteCount: size.int64Value, countStyle: .file)
 }

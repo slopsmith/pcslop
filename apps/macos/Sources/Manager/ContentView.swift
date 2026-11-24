@@ -1,49 +1,37 @@
 import ManagerCore
 import SwiftUI
 
-enum SidebarItem: Hashable {
-    case all
-    case running
-    case os(OSKind)
-}
-
 struct ContentView: View {
     @Environment(Library.self) private var library
     @Environment(Sessions.self) private var sessions
     @Environment(EditorRequest.self) private var editor
-    @AppStorage(Defaults.showInspector) private var showInspector = true
-    @State private var sidebar: SidebarItem? = .all
     @State private var selection: Machine.ID?
-    @State private var search = ""
     @State private var dropTargeted = false
 
     var body: some View {
         @Bindable var editor = editor
         NavigationSplitView {
-            Sidebar(selection: $sidebar)
-                .navigationSplitViewColumnWidth(min: 180, ideal: 210)
-        } detail: {
-            libraryView
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .navigationTitle(title)
-                .navigationSubtitle(subtitle)
-                .inspector(isPresented: $showInspector) {
-                    inspector
-                        .inspectorColumnWidth(min: 300, ideal: 340, max: 460)
+            MachineList(selection: $selection)
+                .navigationSplitViewColumnWidth(min: 250, ideal: 290, max: 380)
+                .toolbar {
+                    ToolbarItem(placement: .primaryAction) {
+                        Button("New Machine", systemImage: "plus") { editor.newMachine() }
+                            .help("Make a new machine")
+                    }
                 }
+        } detail: {
+            detail
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .searchable(text: $search, placement: .toolbar, prompt: "Name or system")
-        .toolbar { toolbar }
-        .sheet(item: $editor.draft) { draft in
-            MachineEditor(machine: draft, isNew: editor.isNew) { saved in
-                library.save(saved)
-                selection = saved.id
-            }
+        .sheet(item: $editor.creating) { request in
+            NewMachineWizard(request: request) { machine in selection = machine.id }
+        }
+        .sheet(item: $editor.editing) { machine in
+            MachineSettings(machine: machine) { library.save($0) }
         }
         .dropDestination(for: URL.self) { urls, _ in
-            guard let draft = Self.draft(from: urls) else { return false }
-            editor.draft = draft
-            editor.isNew = true
+            guard let request = Self.request(from: urls) else { return false }
+            editor.newMachine(request)
             return true
         } isTargeted: {
             dropTargeted = $0
@@ -68,46 +56,28 @@ struct ContentView: View {
         } message: {
             Text($0)
         }
-        .onAppear {
-            if let name = ManagerApp.argument("--select") {
-                selection = library.machines.first { $0.name == name }?.id
-            }
+        .onAppear(perform: applyLaunchArguments)
+        .onChange(of: library.machines.map(\.id)) { _, ids in
+            if let id = selection, !ids.contains(id) { selection = nil }
         }
     }
 
-    @ViewBuilder private var libraryView: some View {
-        let machines = visibleMachines
-        if library.machines.isEmpty {
-            ContentUnavailableView {
-                Label("No Machines Yet", systemImage: "desktopcomputer")
-            } description: {
-                Text("Make a machine, or drop a disk image or CD image here.")
-            } actions: {
-                Button("New Machine…", systemImage: "plus") { editor.new(.windowsXP) }
-                    .buttonStyle(.glassProminent)
-                    .controlSize(.large)
-            }
-        } else if machines.isEmpty {
-            if !search.isEmpty {
-                ContentUnavailableView.search(text: search)
-            } else {
-                ContentUnavailableView(
-                    sidebar == .running ? "Nothing Is Running" : "No Machines Here", systemImage: "desktopcomputer")
-            }
-        } else {
-            MachineGrid(machines: machines, selection: $selection)
-        }
-    }
-
-    @ViewBuilder private var inspector: some View {
+    @ViewBuilder private var detail: some View {
         if let machine = library.machine(selection) {
-            MachineInspector(machine: machine)
+            MachineDetail(machine: machine)
                 .id(machine.id)
+                .navigationTitle(machine.name)
+                .navigationSubtitle(machine.config.summary)
         } else {
-            ContentUnavailableView(
-                "No Machine Selected", systemImage: "desktopcomputer",
-                description: Text("Select a machine to see its details."))
+            WelcomeView()
+                .navigationTitle("pcslop")
+                .navigationSubtitle(library.machines.isEmpty ? "" : machineCount)
         }
+    }
+
+    private var machineCount: String {
+        let n = library.machines.count
+        return n == 1 ? "1 machine" : "\(n) machines"
     }
 
     @ViewBuilder private var dropHighlight: some View {
@@ -128,102 +98,29 @@ struct ContentView: View {
         }
     }
 
-    @ToolbarContentBuilder private var toolbar: some ToolbarContent {
-        ToolbarItem(placement: .primaryAction) {
-            Button("New Machine", systemImage: "plus") { editor.new(.windowsXP) }
-                .help("Make a new machine")
+    // `--select NAME` and `--open new|settings` set up the window for Tools/screenshots.
+    private func applyLaunchArguments() {
+        if let name = ManagerApp.argument("--select") {
+            selection = library.machines.first { $0.name == name }?.id
         }
-        ToolbarSpacer(.fixed, placement: .primaryAction)
-        ToolbarItem(placement: .primaryAction) {
-            if let machine = library.machine(selection), sessions.isRunning(machine.id) {
-                Button("Stop", systemImage: "stop.fill") {
-                    sessions.session(for: machine.id)?.stop(thumbnail: library.store.thumbnail(of: machine.id))
-                }
-                .help("Shut the machine off")
-            } else {
-                Button("Start", systemImage: "play.fill") {
-                    if let machine = library.machine(selection) { start(machine) }
-                }
-                .buttonStyle(.glassProminent)
-                .disabled(selection == nil)
-                .help("Start the selected machine")
-            }
-        }
-        ToolbarItem(placement: .primaryAction) {
-            Button("Inspector", systemImage: "sidebar.trailing") { showInspector.toggle() }
-                .help(showInspector ? "Hide the machine details" : "Show the machine details")
+        switch ManagerApp.argument("--open") {
+        case "new": editor.newMachine()
+        case "new-drives": editor.newMachine(NewMachineRequest(preset: .windowsXPRadeon))
+        case "settings": if let machine = library.machine(selection) { editor.edit(machine) }
+        default: break
         }
     }
 
-    private var visibleMachines: [Machine] {
-        library.machines.filter { machine in
-            switch sidebar {
-            case .running: if !sessions.isRunning(machine.id) { return false }
-            case .os(let os): if machine.os != os { return false }
-            case .all, nil: break
-            }
-            return machine.matches(search)
-        }
-    }
-
-    private var title: String {
-        switch sidebar {
-        case .running: "Running"
-        case .os(let os): os.label
-        case .all, nil: "All Machines"
-        }
-    }
-
-    private var subtitle: String {
-        let n = visibleMachines.count
-        return n == 1 ? "1 machine" : "\(n) machines"
-    }
-
-    private func start(_ machine: Machine) {
-        sessions.start(machine, settings: launchSettings(), folder: library.store.folder(of: machine.id))
-    }
-
-    private static func draft(from urls: [URL]) -> Machine? {
+    static func request(from urls: [URL]) -> NewMachineRequest? {
         let disks = urls.filter { ["img", "raw", "hdd", "bin"].contains($0.pathExtension.lowercased()) }
         let isos = urls.filter { ["iso", "cdr"].contains($0.pathExtension.lowercased()) }
         guard !disks.isEmpty || !isos.isEmpty else { return nil }
         let name = (disks.first ?? isos.first)!.deletingPathExtension().lastPathComponent
-        let guess: OSKind =
+        let preset: Preset =
             name.localizedCaseInsensitiveContains("xp") || name.localizedCaseInsensitiveContains("win")
-            ? .windowsXP
-            : ["ubuntu", "linux", "debian", "fedora", "arch"].contains { name.localizedCaseInsensitiveContains($0) }
-                ? .linux : .other
-        var draft = Machine.template(guess)
-        draft.name = name
-        draft.config.hda = disks.first?.path
-        draft.config.hdb = disks.dropFirst().first?.path
-        draft.config.cdrom = isos.first?.path
-        return draft
-    }
-}
-
-struct Sidebar: View {
-    @Environment(Library.self) private var library
-    @Environment(Sessions.self) private var sessions
-    @Binding var selection: SidebarItem?
-
-    var body: some View {
-        List(selection: $selection) {
-            Section("Library") {
-                Label("All Machines", systemImage: "square.grid.2x2")
-                    .badge(library.machines.count)
-                    .tag(SidebarItem.all)
-                Label("Running", systemImage: "play.circle")
-                    .badge(sessions.runningCount)
-                    .tag(SidebarItem.running)
-            }
-            Section("Systems") {
-                ForEach(OSKind.allCases, id: \.self) { os in
-                    Label(os.label, systemImage: os.symbol)
-                        .badge(library.machines.filter { $0.os == os }.count)
-                        .tag(SidebarItem.os(os))
-                }
-            }
-        }
+            ? .windowsXPRadeon
+            : ["ubuntu", "linux", "debian", "fedora"].contains { name.localizedCaseInsensitiveContains($0) }
+                ? .ubuntuRadeon : .custom
+        return NewMachineRequest(preset: preset, disk: disks.first?.path, cdrom: isos.first?.path)
     }
 }

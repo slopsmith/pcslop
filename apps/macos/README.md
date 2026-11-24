@@ -45,3 +45,16 @@ A save state is a folder made by the control socket's `save DIR`. It holds a
 copy of the primary disk, so a machine started from a state runs on that
 copy, and the machine's own disk image stays as it was. pcslop refuses
 `--hdb` with `--load`, so a state starts without the secondary disk.
+
+## Logos
+
+The system logos in `Sources/Manager/Logos` were rendered from SVGs on
+Wikimedia Commons. They are trademarks of their owners and are only used to
+show which system a machine runs.
+
+- `windows-9x.png`, `windows-xp.png`: Microsoft Windows logos, public domain on
+  Commons ("Windows logo - 1992.svg", "Windows logo - 2002–2012 (Multicolored).svg").
+- `ubuntu.png`: Canonical's Ubuntu Circle of Friends, public domain on Commons ("UbuntuCoF.svg").
+- `debian.png`: the Debian open use logo, public domain on Commons ("Openlogo-debianV2.svg").
+- `fedora.png`: the Fedora logo, public domain on Commons ("Fedora icon (2021).svg").
+- `tux.png`: Tux by Larry Ewing (lewing@isc.tamu.edu), drawn with The GIMP ("Tux.svg").

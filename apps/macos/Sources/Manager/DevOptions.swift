@@ -24,7 +24,24 @@ enum Snapshot {
                 Data("window capture failed (\(error.localizedDescription)); drawing without glass\n".utf8))
             drawWithoutWindowServer(window, to: url)
         }
+        await escapeSheets()
         NSApp.terminate(nil)
+    }
+
+    // AppKit will not quit with a sheet open, so press Escape in it the way a person would.
+    private static func escapeSheets() async {
+        for _ in 0..<20 {
+            guard let sheet = NSApp.windows.lazy.compactMap(\.attachedSheet).first else { return }
+            sheet.makeKey()
+            if let escape = NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: sheet.windowNumber, context: nil, characters: "\u{1b}",
+                charactersIgnoringModifiers: "\u{1b}", isARepeat: false, keyCode: 53)
+            {
+                NSApp.postEvent(escape, atStart: false)
+            }
+            try? await Task.sleep(for: .milliseconds(300))
+        }
     }
 
     private static func drawWithoutWindowServer(_ window: NSWindow, to url: URL) {

@@ -32,6 +32,22 @@ public enum BinaryLocator {
         firmware("vgabios.bin", in: "references/seavgabios/share/seabios", bundle: bundle, searchFrom: searchFrom)
     }
 
+    public static func radeonROM(searchFrom: [URL] = defaultSearchFolders) -> URL? {
+        let fm = FileManager.default
+        for start in searchFrom {
+            guard
+                let folder = findUpwards(
+                    "references/docs/ati-r300", from: start,
+                    isUsable: { var dir: ObjCBool = false; return fm.fileExists(atPath: $0, isDirectory: &dir) && dir.boolValue })
+            else { continue }
+            let roms = (try? fm.contentsOfDirectory(atPath: folder.path))?
+                .filter { $0.lowercased().hasSuffix(".rom") }
+                .sorted()
+            if let first = roms?.first { return folder.appendingPathComponent(first) }
+        }
+        return nil
+    }
+
     public static var defaultSearchFolders: [URL] {
         var folders = [URL(fileURLWithPath: FileManager.default.currentDirectoryPath)]
         if let exe = Bundle.main.executableURL { folders.append(exe.deletingLastPathComponent()) }

@@ -24,13 +24,15 @@ JSON
 }
 machine 11111111-1111-1111-1111-111111111111 "Windows XP" windows-xp \
 	'{"board": "bx", "gpu": "radeon", "vgaROM": "/roms/r300.rom", "ramMiB": 512, "hda": "/disks/xp.img", "captureMouse": "auto"}'
-machine 22222222-2222-2222-2222-222222222222 "Ubuntu 8.04" linux \
+machine 22222222-2222-2222-2222-222222222222 "Ubuntu 8.04" ubuntu \
 	'{"ramMiB": 1024, "cdrom": "/isos/ubuntu-8.04-desktop-i386.iso", "hostForwards": ["tcp::2222-:22"]}'
-machine 33333333-3333-3333-3333-333333333333 "FreeDOS" other '{"ramMiB": 64, "audio": false, "network": false}'
+machine 33333333-3333-3333-3333-333333333333 "FreeDOS" dos '{"ramMiB": 64, "audio": false, "network": false}'
 
 app=$tmp/Manager.app
 mkdir -p "$app/Contents/MacOS"
 cp "$bin" "$app/Contents/MacOS/pcslop-manager"
+mkdir -p "$app/Contents/Resources"
+cp -R "$(dirname "$bin")/pcslop-manager_Manager.bundle" "$app/Contents/Resources/"
 cat >"$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -48,9 +50,14 @@ shot() {
 	echo "== $name"
 	open -n -W "$app" --args --window 1280x800 --snapshot "$out/$name.png" "$@"
 }
-shot library-light --store "$tmp/store" --appearance light -showInspector NO
-shot library-dark --store "$tmp/store" --appearance dark -showInspector NO
-shot inspector-light --store "$tmp/store" --appearance light --select "Windows XP" -showInspector YES
-shot inspector-dark --store "$tmp/store" --appearance dark --select "Windows XP" -showInspector YES
-shot empty-light --store "$tmp/empty" --appearance light -showInspector NO
+shot welcome-empty --store "$tmp/empty" --appearance dark
+shot welcome --store "$tmp/store" --appearance dark
+shot machine-dark --store "$tmp/store" --appearance dark --select "Windows XP"
+shot machine-light --store "$tmp/store" --appearance light --select "Windows XP"
+shot settings --store "$tmp/store" --appearance dark --select "Windows XP" --open settings
+shot settings-light --store "$tmp/store" --appearance light --select "Ubuntu 8.04" --open settings
+shot new-machine --store "$tmp/store" --appearance dark --open new
+shot new-machine-drives --store "$tmp/store" --appearance dark --open new-drives
+shot settings-system --store "$tmp/store" --appearance dark --select "Windows XP" --open settings --page system
+shot settings-drives --store "$tmp/store" --appearance light --select "Windows XP" --open settings --page drives
 echo "screenshots in $out"
