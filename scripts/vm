@@ -5,7 +5,7 @@ set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 refs=${VM_REFS:-$root/references}
-[ -e "$refs/seabios" ] || refs=/Volumes/Projects/86slopper/references
+[ -e "$refs/seabios" ] || refs=$("$root/scripts/main-checkout")/references
 bin=${VM_BIN:-$root/target/vm/slopper}
 
 usage() {

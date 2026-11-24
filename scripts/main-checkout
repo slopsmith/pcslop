@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Prints the root of the main jj checkout, even when run from a secondary
+# workspace (whose .jj/repo is a file pointing at the main one). The main
+# checkout holds the gitignored files every workspace shares: references/
+# and bench/states/.
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+if [ -f "$root/.jj/repo" ]; then
+	repo=$(cat "$root/.jj/repo")
+	case $repo in /*) ;; *) repo=$root/.jj/$repo ;; esac
+	root=$(cd "$repo/../.." && pwd)
+fi
+echo "$root"

@@ -5,7 +5,7 @@
 # binary, UBUNTU_ISO the CD (default ~/Documents/ISOs/ubuntu-8.04.4-desktop-i386.iso).
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
-state=${1:-/Volumes/Projects/.workspaces/86slopper/bench/ubuntu-shell}
+state=${1:-$("$root/scripts/main-checkout")/bench/states/ubuntu-shell}
 iso=${UBUNTU_ISO:-$HOME/Documents/ISOs/ubuntu-8.04.4-desktop-i386.iso}
 tmp=$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || echo "${TMPDIR:-/tmp}")
 name=ubs$$

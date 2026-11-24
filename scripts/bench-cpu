@@ -8,7 +8,7 @@
 # VM_BIN picks the emulator binary; extra flags go in BENCH_FLAGS.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
-state=${1:-/Volumes/Projects/.workspaces/86slopper/bench/ubuntu-shell}
+state=${1:-$("$root/scripts/main-checkout")/bench/states/ubuntu-shell}
 name=bench$$
 tmp=$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || echo "${TMPDIR:-/tmp}")
 serial=${tmp%/}/bench-$$.serial

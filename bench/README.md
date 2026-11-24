@@ -125,8 +125,8 @@ state only holds the booted CD and the shell. The Python, Perl and md5
 values were computed on the host; the others come from the guest, because
 Ubuntu's old `seq` prints large numbers differently.
 
-The state lives outside the repo, by default in
-`/Volumes/Projects/.workspaces/86slopper/bench/ubuntu-shell`. Recreate it
+The state is gitignored and lives by default in `bench/states/ubuntu-shell`
+of the main checkout (`scripts/main-checkout`), shared by all jj workspaces. Recreate it
 with `scripts/make-bench-cpu-state [STATE_DIR]`, which needs
 `~/Documents/ISOs/ubuntu-8.04.4-desktop-i386.iso` (or `UBUNTU_ISO`). It boots
 the CD to the text `boot:` prompt, breaks into the initramfs to start a root
