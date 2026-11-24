@@ -9,83 +9,33 @@ struct RunningControls: View {
 
     var body: some View {
         DetailSection("Machine") {
-            GlassEffectContainer(spacing: 8) {
-                HStack(spacing: 8) {
-                    control(session.isPaused ? "Resume" : "Pause", session.isPaused ? "play.fill" : "pause.fill") {
-                        await session.setPaused(!session.isPaused)
-                    }
-                    control("Power Button", "power") { await session.perform("power") }
-                    control("Ctrl+Alt+Delete", "command.square") { await session.perform("key ctrl+alt+delete") }
-                    control("Update Screenshot", "camera") {
-                        await session.screenshot(to: library.store.thumbnail(of: machine.id))
-                        library.thumbnailsChanged()
-                    }
-                    control("Save State", "square.and.arrow.down") {
-                        let folder = library.store.newStateFolder(of: machine.id)
-                        if await session.saveState(into: folder) {
-                            library.refreshStates(of: machine.id)
-                            library.thumbnailsChanged()
-                        }
-                    }
-                    Menu("More", systemImage: "ellipsis") {
-                        Group {
-                            Button("Change CD…", systemImage: "opticaldisc") {
-                                if let iso = FilePicker.open(kinds: FileKind.cdImage) {
-                                    Task { await session.changeCD(iso.path) }
-                                }
-                            }
-                            Button("Eject CD", systemImage: "eject") { Task { await session.changeCD(nil) } }
-                                .disabled(session.cdrom == nil)
-                            Button("Release Mouse", systemImage: "cursorarrow") {
-                                Task { await session.perform("capture off") }
-                            }
-                        }
-                        .disabled(session.busy != nil)
-                        Divider()
-                        Button("Force Quit", systemImage: "xmark.octagon", role: .destructive) { session.forceQuit() }
-                    }
-                    .labelStyle(.iconOnly)
-                    .menuIndicator(.hidden)
-                    .buttonStyle(.glass)
-                    .help("More actions")
-                }
-            }
             if let busy = session.busy {
                 HStack(spacing: 6) {
                     ProgressView().controlSize(.small)
                     Text(busy).foregroundStyle(.secondary)
                 }
             }
-            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 6) {
-                DetailRow("CD-ROM", session.cdrom.flatMap(fileName) ?? "Empty")
+            VStack(spacing: 0) {
                 if let status = session.status {
-                    DetailRow("Speed", String(format: "%.1f MIPS", status.mips), monospaced: true)
-                    DetailRow("CPU", status.halted ? "\(status.mode), halted" : status.mode, monospaced: true)
-                    DetailRow("Instructions", status.instructions.formatted(), monospaced: true)
-                    DetailRow(
-                        "Guest time", Duration.seconds(status.uptime).formatted(.time(pattern: .hourMinuteSecond)),
-                        monospaced: true)
+                    InfoRow("speedometer", "Speed", String(format: "%.1f MIPS", status.mips))
+                    InfoRow("cpu", "CPU", status.halted ? "\(status.mode.uppercased()), idle" : status.mode.uppercased())
+                    InfoRow("number", "Instructions", status.instructions.formatted())
+                    InfoRow(
+                        "clock", "Guest time", Duration.seconds(status.uptime).formatted(.time(pattern: .hourMinuteSecond)))
                 } else {
-                    DetailRow("Status", "Waiting for the machine")
+                    InfoRow("hourglass", "Status", "Waiting for the machine")
                 }
+                InfoRow("opticaldisc", "CD-ROM", session.cdrom.flatMap(fileName) ?? "Empty", last: true)
             }
             if let details = session.status?.details, !details.isEmpty {
                 DisclosureGroup("Status report") {
                     Text(details)
-                        .font(.system(.caption2, design: .monospaced))
+                        .font(.system(.caption, design: .monospaced))
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
         }
-    }
-
-    private func control(_ title: String, _ symbol: String, action: @escaping () async -> Void) -> some View {
-        Button(title, systemImage: symbol) { Task { await action() } }
-            .labelStyle(.iconOnly)
-            .buttonStyle(.glass)
-            .help(title)
-            .disabled(session.busy != nil)
     }
 }
 

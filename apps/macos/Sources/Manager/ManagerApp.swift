@@ -19,6 +19,7 @@ struct ManagerApp: App {
                 .task { await Snapshot.takeIfAsked() }
                 .onAppear {
                     delegate.sessions = sessions
+                    Snapshot.sessions = sessions
                     sessions.onExit = { _ in library.thumbnailsChanged() }
                 }
         }

@@ -108,6 +108,10 @@ struct ContentView: View {
         case "new": editor.newMachine()
         case "new-drives": editor.newMachine(NewMachineRequest(preset: .windowsXPRadeon))
         case "preferences": openSettings()
+        case "start":
+            if let machine = library.machine(selection) {
+                sessions.start(machine, settings: launchSettings(), folder: library.store.folder(of: machine.id))
+            }
         case "settings": if let machine = library.machine(selection) { editor.edit(machine) }
         default: break
         }

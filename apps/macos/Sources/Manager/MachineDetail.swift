@@ -43,16 +43,74 @@ struct MachineDetail: View {
     }
 
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {
-        ToolbarItemGroup(placement: .primaryAction) {
-            Button("Delete", systemImage: "trash") { confirmDelete(machine, library: library) }
-                .disabled(running)
-                .help("Delete this machine")
-            Button("Duplicate", systemImage: "plus.square.on.square") { _ = library.duplicate(machine) }
-                .help("Make a copy of this machine's settings")
-            Button("Show in Finder", systemImage: "folder") {
-                NSWorkspace.shared.activateFileViewerSelecting([store.folder(of: machine.id)])
+        if let session, running {
+            ToolbarItemGroup(placement: .primaryAction) {
+                let idle = session.busy == nil
+                Button(session.isPaused ? "Resume" : "Pause", systemImage: session.isPaused ? "play" : "pause") {
+                    Task { await session.setPaused(!session.isPaused) }
+                }
+                .disabled(!idle)
+                .help(session.isPaused ? "Resume the machine" : "Pause the machine")
+                Button("Power Button", systemImage: "power") { Task { await session.perform("power") } }
+                    .disabled(!idle)
+                    .help("Press the power button")
+                Button("Ctrl+Alt+Delete", systemImage: "command") {
+                    Task { await session.perform("key ctrl+alt+delete") }
+                }
+                .disabled(!idle)
+                .help("Send Ctrl+Alt+Delete")
             }
-            .help("Show the machine's folder in Finder")
+            ToolbarSpacer(.fixed, placement: .primaryAction)
+            ToolbarItemGroup(placement: .primaryAction) {
+                let idle = session.busy == nil
+                Button("Update Screenshot", systemImage: "camera") {
+                    Task {
+                        await session.screenshot(to: store.thumbnail(of: machine.id))
+                        library.thumbnailsChanged()
+                    }
+                }
+                .disabled(!idle)
+                .help("Take a screenshot for the library")
+                Button("Save State", systemImage: "square.and.arrow.down") {
+                    Task {
+                        if await session.saveState(into: store.newStateFolder(of: machine.id)) {
+                            library.refreshStates(of: machine.id)
+                            library.thumbnailsChanged()
+                        }
+                    }
+                }
+                .disabled(!idle)
+                .help("Save the machine's state")
+                Menu("More", systemImage: "ellipsis") {
+                    Group {
+                        Button("Change CD…", systemImage: "opticaldisc") {
+                            if let iso = FilePicker.open(kinds: FileKind.cdImage) {
+                                Task { await session.changeCD(iso.path) }
+                            }
+                        }
+                        Button("Eject CD", systemImage: "eject") { Task { await session.changeCD(nil) } }
+                            .disabled(session.cdrom == nil)
+                        Button("Release Mouse", systemImage: "cursorarrow") {
+                            Task { await session.perform("capture off") }
+                        }
+                    }
+                    .disabled(!idle)
+                    Divider()
+                    Button("Force Quit", systemImage: "xmark.octagon", role: .destructive) { session.forceQuit() }
+                }
+                .help("More actions")
+            }
+        } else {
+            ToolbarItemGroup(placement: .primaryAction) {
+                Button("Delete", systemImage: "trash") { confirmDelete(machine, library: library) }
+                    .help("Delete this machine")
+                Button("Duplicate", systemImage: "plus.square.on.square") { _ = library.duplicate(machine) }
+                    .help("Make a copy of this machine's settings")
+                Button("Show in Finder", systemImage: "folder") {
+                    NSWorkspace.shared.activateFileViewerSelecting([store.folder(of: machine.id)])
+                }
+                .help("Show the machine's folder in Finder")
+            }
         }
         ToolbarSpacer(.fixed, placement: .primaryAction)
         ToolbarItemGroup(placement: .primaryAction) {

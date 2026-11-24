@@ -3,6 +3,8 @@ import ScreenCaptureKit
 
 @MainActor
 enum Snapshot {
+    static weak var sessions: Sessions?
+
     static func takeIfAsked() async {
         if let appearance = ManagerApp.argument("--appearance") {
             NSApp.appearance = NSAppearance(named: appearance == "dark" ? .darkAqua : .aqua)
@@ -15,7 +17,9 @@ enum Snapshot {
             window?.center()
         }
         guard let path = ManagerApp.argument("--snapshot"), var window else { return }
-        try? await Task.sleep(for: .seconds(2))
+        // Launched with `open -g`, the app never activates, and an unordered window skips drawing its sidebar.
+        window.orderFrontRegardless()
+        try? await Task.sleep(for: .seconds(ManagerApp.argument("--delay").flatMap(Double.init) ?? 2))
         if ManagerApp.argument("--open") == "preferences",
             let settings = NSApp.windows.first(where: { $0.isVisible && $0 !== window })
         {
@@ -30,7 +34,16 @@ enum Snapshot {
             drawWithoutWindowServer(window, to: url)
         }
         await escapeSheets()
+        await stopMachines()
         NSApp.terminate(nil)
+    }
+
+    private static func stopMachines() async {
+        guard let sessions else { return }
+        sessions.terminateAll()
+        for _ in 0..<50 where sessions.runningCount > 0 {
+            try? await Task.sleep(for: .milliseconds(100))
+        }
     }
 
     // AppKit will not quit with a sheet open, so press Escape in it the way a person would.
@@ -68,6 +81,7 @@ enum Snapshot {
         config.width = Int(filter.contentRect.width * scale)
         config.height = Int(filter.contentRect.height * scale)
         config.showsCursor = false
+
         let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
         let rep = NSBitmapImageRep(cgImage: image)
         guard let png = rep.representation(using: .png, properties: [:]) else {
