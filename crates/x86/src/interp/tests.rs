@@ -67,6 +67,20 @@ impl Machine {
         Ok(())
     }
 
+    /// Runs one instruction already in memory at `eip`, restoring EIP on a fault.
+    fn run_at(&mut self, eip: u32) -> Result<(), Exception> {
+        self.cpu.eip = eip;
+        let mut ctx = Ctx { cpu: &mut self.cpu, bus: &mut self.ram, insn: Insn::default(), start_eip: eip };
+        match ctx.exec() {
+            Ok(()) => Ok(()),
+            Err(Trap::Fault(e)) => {
+                self.cpu.eip = eip;
+                Err(e)
+            }
+            Err(Trap::Unimplemented(what)) => panic!("unimplemented: {what}"),
+        }
+    }
+
     fn put(&mut self, addr: u32, bytes: &[u8]) {
         self.ram.0[addr as usize..addr as usize + bytes.len()].copy_from_slice(bytes);
     }
@@ -846,4 +860,100 @@ fn entering_protected_mode_from_a_cs_with_low_bits_set_runs_at_cpl0() {
         assert_eq!(ctx.exec().map_err(|_| ()), Ok(()), "HIMEM's #GP handler makes this jump");
     }
     assert_eq!((mc.cpu.segs[CS].selector, mc.cpu.eip, mc.cpu.cpl()), (0x08, 0x6000, 0));
+}
+
+fn call_gate(sel: u16, offset: u32, typ: u8, dpl: u8, params: u8) -> [u8; 8] {
+    let lo = (offset & 0xffff) | (sel as u32) << 16;
+    let hi = (offset & 0xffff_0000) | 1 << 15 | (dpl as u32) << 13 | (typ as u32) << 8 | params as u32;
+    let mut d = [0; 8];
+    d[..4].copy_from_slice(&lo.to_le_bytes());
+    d[4..].copy_from_slice(&hi.to_le_bytes());
+    d
+}
+
+/// Ring-3 16-bit code with a ring-0 16-bit code segment and stack, as a DOS extender sets up.
+fn ring3_machine_with_gates() -> Machine {
+    use crate::cpu::{CS, SS};
+    const GDT: u32 = 0x3000;
+    const TSS: u32 = 0x4000;
+    let mut mc = Machine::new();
+    mc.put(GDT + 0x08, &descriptor(0, 0xffff, 0x9b, 0));
+    mc.put(GDT + 0x10, &descriptor(0, 0xffff, 0x93, 0));
+    mc.put(GDT + 0x18, &descriptor(0, 0xffff, 0xfb, 0));
+    mc.put(GDT + 0x20, &descriptor(0, 0xffff, 0xf3, 0));
+    mc.put(GDT + 0x28, &descriptor(TSS, 0x67, 0x8b, 0));
+    mc.put(GDT + 0x30, &call_gate(0x08, 0x6000, 4, 3, 2));
+    mc.put(GDT + 0x38, &call_gate(0x1b, 0x7000, 4, 3, 0));
+    mc.put(TSS + 4, &0x9000u32.to_le_bytes());
+    mc.put(TSS + 8, &0x10u32.to_le_bytes());
+    mc.cpu.gdtr = crate::cpu::DescriptorTable { base: GDT, limit: 0x3f };
+    mc.cpu.tr = Segment { selector: 0x28, attr: 0x8b, base: TSS, limit: 0x67 };
+    for s in mc.cpu.segs.iter_mut() {
+        *s = Segment { selector: 0x23, attr: 0xf3, base: 0, limit: 0xffff };
+    }
+    mc.cpu.segs[CS] = Segment { selector: 0x1b, attr: 0xfb, base: 0, limit: 0xffff };
+    mc.cpu.segs[SS] = Segment { selector: 0x23, attr: 0xf3, base: 0, limit: 0xffff };
+    mc
+}
+
+fn step(mc: &mut Machine) -> Result<(), ()> {
+    let start = mc.cpu.eip;
+    let mut ctx = Ctx { cpu: &mut mc.cpu, bus: &mut mc.ram, insn: Insn::default(), start_eip: start };
+    ctx.exec().map_err(|_| ())
+}
+
+#[test]
+fn call_through_a_16bit_gate_to_ring0_switches_stacks_and_copies_parameters() {
+    use crate::cpu::{CS, ESP, SS};
+    let mut mc = ring3_machine_with_gates();
+    mc.cpu.regs[ESP] = 0x8000 - 4;
+    mc.put(0x8000 - 4, &[0x11, 0x11, 0x22, 0x22]);
+    mc.put(0x5000, &[0x9a, 0x00, 0x00, 0x33, 0x00]);
+    mc.cpu.eip = 0x5000;
+    assert_eq!(step(&mut mc), Ok(()), "the Japanese Windows 98 Setup calls one at ring 3");
+    assert_eq!((mc.cpu.segs[CS].selector, mc.cpu.eip, mc.cpu.cpl()), (0x08, 0x6000, 0));
+    assert_eq!((mc.cpu.segs[SS].selector, mc.cpu.regs[ESP]), (0x10, 0x9000 - 12));
+    let frame: Vec<u16> = mc.get(0x9000 - 12, 12).chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    assert_eq!(frame, [0x5005, 0x1b, 0x1111, 0x2222, 0x7ffc, 0x23], "return IP, CS, parameters, old SP, old SS");
+}
+
+#[test]
+fn retf_with_parameter_bytes_returns_from_a_ring0_gate_call() {
+    use crate::cpu::{CS, ESP, SS};
+    let mut mc = ring3_machine_with_gates();
+    mc.cpu.regs[ESP] = 0x8000 - 4;
+    mc.put(0x5000, &[0x9a, 0x00, 0x00, 0x33, 0x00]);
+    mc.put(0x6000, &[0xca, 0x04, 0x00]);
+    mc.cpu.eip = 0x5000;
+    step(&mut mc).unwrap();
+    step(&mut mc).unwrap();
+    assert_eq!((mc.cpu.segs[CS].selector, mc.cpu.eip, mc.cpu.cpl()), (0x1b, 0x5005, 3));
+    assert_eq!((mc.cpu.segs[SS].selector, mc.cpu.regs[ESP]), (0x23, 0x8000));
+}
+
+#[test]
+fn jmp_through_a_gate_to_the_same_ring_keeps_the_stack() {
+    use crate::cpu::{CS, ESP};
+    let mut mc = ring3_machine_with_gates();
+    mc.cpu.regs[ESP] = 0x8000;
+    mc.put(0x5000, &[0xea, 0x00, 0x00, 0x3b, 0x00]);
+    mc.cpu.eip = 0x5000;
+    step(&mut mc).unwrap();
+    assert_eq!((mc.cpu.segs[CS].selector, mc.cpu.eip, mc.cpu.regs[ESP]), (0x1b, 0x7000, 0x8000));
+}
+
+#[test]
+fn jmp_through_a_gate_to_an_inner_ring_faults() {
+    let mut mc = ring3_machine_with_gates();
+    mc.put(0x5000, &[0xea, 0x00, 0x00, 0x33, 0x00]);
+    mc.cpu.eip = 0x5000;
+    assert_eq!(mc.run_at(0x5000), Err(Exception::with_error(vector::GP, 0x08)));
+}
+
+#[test]
+fn call_through_a_gate_more_privileged_than_the_caller_faults() {
+    let mut mc = ring3_machine_with_gates();
+    mc.put(0x3000 + 0x30, &call_gate(0x08, 0x6000, 4, 0, 0));
+    mc.put(0x5000, &[0x9a, 0x00, 0x00, 0x33, 0x00]);
+    assert_eq!(mc.run_at(0x5000), Err(Exception::with_error(vector::GP, 0x30)));
 }

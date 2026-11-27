@@ -208,6 +208,9 @@ impl<B: Bus> Ctx<'_, B> {
             self.cpu.eip = eip;
             return Ok(());
         }
+        if let Some(gate) = self.call_gate(sel)? {
+            return self.through_call_gate(sel, gate, false);
+        }
         let (mut d, addr) = self.code_target(sel)?;
         if eip > d.limit() {
             return gp(0);
@@ -215,6 +218,81 @@ impl<B: Bus> Ctx<'_, B> {
         let cpl = self.cpu.cpl();
         self.load_cs_checked(sel, &mut d, addr, cpl)?;
         self.cpu.eip = eip;
+        Ok(())
+    }
+
+    /// The descriptor for `sel` when it is a 16- or 32-bit call gate.
+    fn call_gate(&mut self, sel: u16) -> Res<Option<Descriptor>> {
+        if sel & !3 == 0 {
+            return Ok(None);
+        }
+        let (d, _) = self.descriptor(sel)?;
+        Ok((d.system() && matches!(d.typ(), 4 | 12)).then_some(d))
+    }
+
+    fn through_call_gate(&mut self, gate_sel: u16, gate: Descriptor, call: bool) -> Res<()> {
+        let cpl = self.cpu.cpl();
+        if gate.dpl() < cpl || gate.dpl() < (gate_sel & 3) as u8 {
+            return gp(sel_error(gate_sel));
+        }
+        if !gate.present() {
+            return Err(Exception::with_error(vector::NP, sel_error(gate_sel)).into());
+        }
+        let sel = gate.gate_selector();
+        if sel & !3 == 0 {
+            return gp(0);
+        }
+        let (mut d, addr) = self.descriptor(sel)?;
+        let inner = !d.conforming() && d.dpl() < cpl;
+        if !d.is_code() || d.dpl() > cpl || (!call && inner) {
+            return gp(sel_error(sel));
+        }
+        if !d.present() {
+            return Err(Exception::with_error(vector::NP, sel_error(sel)).into());
+        }
+        let sz = if gate.typ() == 12 { 4 } else { 2 };
+        let offset = if sz == 4 { gate.gate_offset() } else { gate.gate_offset() & 0xffff };
+        if offset > d.limit() {
+            return gp(0);
+        }
+        let old_cs = self.cpu.segs[CS].selector as u32;
+        let ret = self.cpu.eip;
+        if !call {
+            self.load_cs_checked(sel, &mut d, addr, cpl)?;
+        } else if inner {
+            let new_cpl = d.dpl();
+            let (new_ss, new_esp) = self.tss_stack(new_cpl)?;
+            let count = gate.hi & 0x1f;
+            let params = (0..count).map(|i| self.peek(i * sz, sz)).collect::<Res<Vec<u32>>>()?;
+            let old_ss = self.cpu.segs[SS].selector as u32;
+            let old_esp = self.sp();
+            let saved = (self.cpu.segs, self.cpu.regs[4]);
+            let result = (|| -> Res<()> {
+                self.load_cs_checked(sel, &mut d, addr, new_cpl)?;
+                self.load_ss_for_cpl(new_ss, new_cpl)?;
+                self.cpu.regs[4] = new_esp;
+                self.push(old_ss, sz)?;
+                self.push(old_esp, sz)?;
+                for &p in params.iter().rev() {
+                    self.push(p, sz)?;
+                }
+                self.push(old_cs, sz)?;
+                self.push(ret, sz)
+            })();
+            if let Err(err) = result {
+                self.cpu.segs = saved.0;
+                self.cpu.regs[4] = saved.1;
+                return Err(err);
+            }
+        } else {
+            let saved_sp = self.cpu.regs[4];
+            if let Err(e) = self.push(old_cs, sz).and_then(|_| self.push(ret, sz)) {
+                self.cpu.regs[4] = saved_sp;
+                return Err(e);
+            }
+            self.load_cs_checked(sel, &mut d, addr, cpl)?;
+        }
+        self.cpu.eip = offset;
         Ok(())
     }
 
@@ -227,6 +305,9 @@ impl<B: Bus> Ctx<'_, B> {
             self.load_cs_real(sel);
             self.cpu.eip = eip;
             return Ok(());
+        }
+        if let Some(gate) = self.call_gate(sel)? {
+            return self.through_call_gate(sel, gate, true);
         }
         let (mut d, addr) = self.code_target(sel)?;
         if eip > d.limit() {
