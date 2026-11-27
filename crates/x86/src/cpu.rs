@@ -406,7 +406,9 @@ impl Cpu {
         } else if self.v86_mode() {
             3
         } else {
-            (self.segs[CS].selector & 3) as u8
+            // The hidden SS.DPL, not CS.RPL: right after CR0.PE is set, CS still holds
+            // a real-mode selector whose low bits mean nothing.
+            self.segs[SS].dpl()
         }
     }
 

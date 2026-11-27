@@ -821,3 +821,29 @@ fn double_fault_through_a_task_gate_switches_tasks_and_iret_returns() {
     assert!(!mc.cpu.flag(flags::NT));
     assert_eq!(mc.get(GDT + 0x25, 1)[0] & 0xf, 0x9, "IRET frees the handler's TSS");
 }
+
+#[test]
+fn entering_protected_mode_from_a_cs_with_low_bits_set_runs_at_cpl0() {
+    use crate::cpu::{CS, EAX, SS};
+    const GDT: u32 = 0x3000;
+    let mut mc = Machine::new();
+    mc.cpu.cr0 = cr0::ET | cr0::NE;
+    for s in mc.cpu.segs.iter_mut() {
+        *s = Segment::real(0x100);
+    }
+    mc.cpu.segs[CS] = Segment::real(0x0b33);
+    mc.cpu.segs[CS].attr |= attr::CODE;
+    mc.cpu.segs[SS] = Segment::real(0x7000);
+    mc.put(GDT + 0x08, &descriptor(0, 0xfffff, 0x9b, 0xc));
+    mc.cpu.gdtr = crate::cpu::DescriptorTable { base: GDT, limit: 0x0f };
+    mc.cpu.regs[EAX] = mc.cpu.cr0 | cr0::PE;
+    let at = 0xb330 + 0x100;
+    mc.put(at, &[0x0f, 0x22, 0xc0, 0xea, 0x00, 0x60, 0x08, 0x00]);
+    mc.cpu.eip = 0x100;
+    for _ in 0..2 {
+        let start = mc.cpu.eip;
+        let mut ctx = Ctx { cpu: &mut mc.cpu, bus: &mut mc.ram, insn: Insn::default(), start_eip: start };
+        assert_eq!(ctx.exec().map_err(|_| ()), Ok(()), "HIMEM's #GP handler makes this jump");
+    }
+    assert_eq!((mc.cpu.segs[CS].selector, mc.cpu.eip, mc.cpu.cpl()), (0x08, 0x6000, 0));
+}
